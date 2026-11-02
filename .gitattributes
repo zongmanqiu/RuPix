@@ -1,0 +1,37 @@
+# RuPix 宿主（main/）行尾治理 —— 对齐 CurSeen。
+#
+# 为什么需要这个文件（缺了会静默出事）：
+#   * .bat 交给 cmd.exe 解析。LF-only 的 .bat 里 cmd 会错误解析括号块，
+#     表现是「流水线每跑必停、输出却像正常结束」——静默改变块语义。
+#   * 无扩展名文件（LICENSE）必须显式声明为文本，否则 git 按二进制处理；
+#     且必须 UTF-8（存成 UTF-16 同样会被当成二进制）。
+
+# cmd.exe 脚本强制 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 源码 / 文档 / 配置统一 LF
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.ps1 text eol=lf
+*.c text eol=lf
+# 补丁归档（patches/ 是 `.3rd` 的完整副本，重放要逐字节对得上，行尾不许被换）
+*.patch text eol=lf
+# 资源脚本与锁文件：本机 core.autocrlf=true，不声明就会在 checkout 时变 CRLF
+*.rc text eol=lf
+*.rc.in text eol=lf
+*.lock text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# LICENSE 无扩展名：显式文本 + LF
+LICENSE text eol=lf
+
+# 二进制资产：绝不碰
+*.png binary
+*.ico binary
+*.svg binary
+*.dll binary
+*.exe binary

@@ -1,18 +1,27 @@
-# Build and Release Folders
-bin-debug/
-bin-release/
-[Oo]bj/
-[Bb]in/
+# RuPix 宿主（main/）忽略规则 —— 三段式，对齐 CurSeen。
+#
+# 本仓自 2026-11-02 起是 git 仓（origin = gitee.com/qiuzongman/RuPix），
+# 此文件即实际生效的忽略规则；同时仍是给所有工具（索引器 / 备份脚本）的清单。
+# 快照（.bf/）继续保留：它连 `.3rd` 与解码器仓一起存，git 只管本目录。
 
-# Other files and folders
-.settings/
+# ── 一、构建产物与本地杂物 ──────────────────────────────────────────
+# target 已由 .cargo/config.toml 外置到 ../.temp/target，这里只是兜底——
+# 防止有人把 target-dir 改回 ./target 后把 2.9GB 垃圾提交进来。
+target/
+*.pdb
+*.log
+*.rs.bk
+__pycache__/
+*.pyc
 
-# Executables
-*.swf
-*.air
-*.ipa
-*.apk
+# ── 二、本地大文件 / 一次性草稿 ────────────────────────────────────
+# 实测转储、样本图片、探针输出一律放仓库根 .temp/，永不入库。
+*.bin
+*.dmp
 
-# Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
-# should NOT be excluded as they contain compiler settings and other important
-# information for Eclipse / Flash Builder.
+# ── 三、编辑器与系统 ──────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

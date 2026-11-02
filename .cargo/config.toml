@@ -1,0 +1,18 @@
+# 编译中间产物全部落在仓库根的 `.temp`，源码目录与 `.3rd` 保持干净。
+# 与 CurSeen 同一套路：`target-dir` 只在 `.cargo/config.toml` 里生效，
+# 写在 `[package]` 下的 `target-dir` 是无效键（cargo 会警告并回落到 ./target）。
+[build]
+target-dir = "../.temp/target"
+
+# 静态链接 MSVC 运行库：exe 增大约 150–250KB，换来用户机器无需装 VC++ 运行时的
+# 「解压即用」。与"小巧单文件"的产品定位一致。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# ★ 测试临时产物的重定向**不在这里**做（试过并撤回）：`[env] TEMP = "$CARGO_MANIFEST_DIR/../.temp"`
+# 会把带 `..` 的路径交给 MSVC 的 `link.exe`，它按自己的 CWD 再解一次，结果去开
+# `main\.temp\lnk{...}.tmp` ⇒ `LNK1104 无法打开文件`，整条构建直接链不动。
+# 现在的口径：夹具的落点由代码钉死 —— `core::paths::test_scratch_root()` = 仓内 `.temp/rupix-test/`
+# （2026-10-29 m159，§21.4 结案），所以 IDE 裸跑 `cargo test` 也不再写系统 TEMP；
+# `build/5_test.bat` 与 `build/gate.py` 各自把 TEMP/TMP 指到仓内 `.temp` 这一层保留，
+# 给的是 link.exe 一类中间文件，不再是测试夹具的唯一防线。

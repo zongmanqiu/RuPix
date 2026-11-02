@@ -1,0 +1,96 @@
+//! 配置兼容门禁（CurSeen Phase 5）：老配置必须被现行解析器完整直读——
+//! 现行键生效、淘汰键静默忽略、看不懂的值回退默认、绝不 panic。
+
+use rupix_lib::core::config::{Config, CtrlWheel, DblClick, InitWindow, SourceId, Wheel};
+use rupix_lib::core::decode::RawParams;
+use rupix_lib::core::hotkey::Hotkeys;
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::PathBuf;
+
+fn temp_ini(name: &str, text: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.temp");
+    fs::create_dir_all(&dir).unwrap();
+    let p = dir.join(format!("rupix_cfg_compat_{}_{}", std::process::id(), name));
+    fs::write(&p, text).unwrap();
+    p
+}
+
+/// fixtures/default.ini：全键非默认 + 旧版淘汰键混排，逐键断言。
+#[test]
+fn legacy_ini_loads_without_loss() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/default.ini");
+    let text = fs::read_to_string(&fixture).expect("tests/fixtures/default.ini 缺失");
+    let p = temp_ini("legacy.ini", &text);
+    let cfg = Config::load_from(&p);
+    let _ = fs::remove_file(&p);
+
+    let expected = Config {
+        stay_on_top: true,
+        dbl_click: DblClick::Fullscreen,
+        // 旧版 fixture 不含 slide_interval 键（m167 新增）→ 回默认 3 秒。
+        // 这条正是"加了新设置项也不能读坏老配置"的兼容判据：老 ini 缺键必须安静回默认。
+        slide_interval: 3,
+        // show_title_bar=0 → minimal_mode=true（见 config.rs 的兼容映射）
+        minimal_mode: true,
+        // 旧版 fixture 不含 checker/filmstrip/locked → 全部回默认（关）。
+        checker: false,
+        filmstrip: false,
+        locked: false,
+        long_image_fit: true,
+        wheel: Wheel::Switch,
+        // 旧版 fixture 不含 ctrl_wheel 键 → 回退默认（翻页）。
+        ctrl_wheel: CtrlWheel::Switch,
+        init_window: InitWindow::Fullscreen,
+        window_w: 1024,
+        window_h: 768,
+        opacity: 40,
+        // ★ 2026-10-26 键名从旧键统一到 `decoders_disabled`。
+        //   **刻意不做读兼容**（用户 2026-10-26 拍板：改键名不兼容），所以这份旧 fixture
+        //   里那行 `legacy_disabled=av;raw` 现在是**未知键** → 静默回空。
+        //   代价要说清楚：老用户的"停用 / 首选解码器"这两项在升级后需重设一次。
+        decoders_disabled: Vec::new(),
+        // 旧 fixture 不含 extensions_disabled 键 → 回空表。
+        extensions_disabled: Vec::new(),
+        // 旧 fixture 不含 extensions_isolated 键 → 回空表。
+        extensions_isolated: Vec::new(),
+        // 这份 fixture 是**旧版** ini：缺 decoders_preferred 键必须回空表，
+        // 这正是"加了新设置项也不能读坏老配置"的兼容判据之一。
+        decoders_preferred: BTreeMap::new(),
+        prefetch: false,
+        close_to_tray: true,
+        // 旧版 fixture 不含 space_preview 键 → 回默认（关）。
+        space_preview: false,
+        raw_last: Some(RawParams {
+            width: 1920,
+            height: 1080,
+            layout: 8,
+        }),
+        // 这份 fixture 是**旧版** ini：缺 download_source 键必须回默认（Gitee），
+        // 这正是"加了新设置项也不能读坏老配置"的兼容判据之一。
+        // ★ 2026-10-30 起联网来源只有一个键（旧 fixture 里的 decoder_source / plugin_source
+        //   已不再被读——这条用例照样绿，因为缺新键就是回默认）。
+        download_source: SourceId::Gitee,
+        // 旧 fixture 不含这四个地址键 → 必须回落内置默认（"加了新键也不能读坏老配置"）。
+        decoder_index_gitee: SourceId::Gitee.index_url().to_string(),
+        decoder_index_github: SourceId::Github.index_url().to_string(),
+        plugin_index_gitee: SourceId::Gitee.plugin_index_url().to_string(),
+        plugin_index_github: SourceId::Github.plugin_index_url().to_string(),
+        hotkeys: Hotkeys::default(),
+    };
+    assert_eq!(cfg, expected, "老配置直读结果与预期不符");
+}
+
+/// 乱值/越界/未知键：一律回退或夹紧，解析器不得 panic。
+#[test]
+fn garbage_values_never_panic() {
+    let p = temp_ini(
+        "garbage.ini",
+        "stay_on_top=maybe\nopacity=999\nwindow_w=abc\nunknown_key=1\nbird_eye=1\n",
+    );
+    let cfg = Config::load_from(&p);
+    let _ = fs::remove_file(&p);
+    assert!(!cfg.stay_on_top, "看不懂的布尔值应回退默认（0）");
+    assert_eq!(cfg.opacity, 90, "越界不透明度回退默认档");
+    assert_eq!(cfg.window_w, 800, "非数字宽高回退默认");
+}

@@ -1,0 +1,10 @@
+[package]
+name = "rupix-abi"
+version = "0.5.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "RuPix 解码器 C-ABI 契约 + 解码器样板 kit（宿主侧快照；真源在解码器仓库 RuPix-Decoder/abi，更新方式 = 把那份 abi/src/lib.rs 整份复制覆盖本文件；kit 段宿主不用，但为逐字节守卫不许删）"
+
+# ★ 不要在这里加依赖，也不要手改 src/lib.rs：本 crate 是解码器仓库那份契约的逐字节副本。
+#   内容比对守卫：main/src/core/abi.rs 的 abi_snapshot_matches_upstream_when_present。
+[dependencies]

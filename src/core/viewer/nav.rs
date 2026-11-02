@@ -1,0 +1,308 @@
+//! 打开与导航：装新图、翻页、跳转、目录重扫、尺寸口径。
+//!
+//! 「切图不闪烁」的时序前提在这里：`reset_view` **不许**清 `loaded`，旧图要留屏到
+//! 新解码结果由 [`Viewer::apply`](super::Viewer::apply) 原子替换（见 `tests.rs` 的用例）。
+use super::*;
+
+impl Viewer {
+    pub fn new(decoder: Rc<Decoder>, config: Rc<RefCell<Config>>) -> Self {
+        Self {
+            decoder,
+            config,
+            gallery: None,
+            loaded: None,
+            edited: std::collections::HashMap::new(),
+            error: None,
+            preview_meta: None,
+            prefetch_seq: None,
+            prefetch_stopped: false,
+            meta_cache: std::collections::HashMap::new(),
+            prefetched: Vec::new(),
+            last_dir: 0,
+            main_sent_at: Cell::new(None),
+            stall_logged: Cell::new(false),
+            wait_shown_secs: Cell::new(None),
+            fit: true,
+            zoom: 1.0,
+            rot: 0,
+            flip: false,
+            want_rot: 0,
+            want_flip: false,
+            pan: (0.0, 0.0),
+            view: (0.0, 0.0, 1.0, 1.0),
+            dpi: 1.0,
+            want_seq: 0,
+            need_at: None,
+            last_nav_at: Cell::new(None),
+            native_requested: None,
+            vector_zoom_req: None,
+            epoch: 0,
+            levels: None,
+            inflight: None,
+            anim_next_at: None,
+
+            anim_due_at: None,
+            anim_paused: false,
+            step_target: None,
+            note: None,
+            thumbs: Thumbs::new(),
+            drag: None,
+            image_gen: 0,
+        }
+    }
+
+    // ── 打开 / 导航 ──────────────────────────────────────────────
+
+    /// 打开一张图（同时把它所在目录建成清单）。
+    pub fn open(&mut self, path: &Path) {
+        let t0 = Instant::now();
+        // 新开一张 = 换目录或换图，翻页方向无从推测。
+        self.last_dir = 0;
+        // ★ m101：**同一目录里再开一张不是换目录**。清单里认得它，就只换当前项。
+        //   旧写法无条件 `Gallery::from_file` + 清 `prefetched` + 清 `thumbs`，于是
+        //   资源管理器里连双击每张都要：整条胶片条重解（实测 6 张目录 = 每开一张
+        //   6 发 `kind=Thumb`，格子越多发得越多）、首屏必走现场解码（预读命中率恒 0）。
+        //   清单的新鲜度本来就不归 `open` 管——目录被外部增删由 `dir_watch` 送到
+        //   [`Self::rescan_dir`]，而那条路**同样不清这两个缓存**，本分支与它口径一致。
+        //   锚点不在清单里（刚拷进来的新文件、或它其实是个文件夹）⇒ 退回完整重建。
+        let slot = self.gallery.as_ref().and_then(|g| g.slot_for(path));
+        if let Some(idx) = slot {
+            let len = self.gallery.as_ref().map_or(0, Gallery::len);
+            log::debug!(
+                "[open] 同目录复用清单（第 {}/{} 项，{} ms）→ 只换当前项",
+                idx + 1,
+                len,
+                t0.elapsed().as_millis()
+            );
+            self.error = None;
+            self.note = None;
+            if let Some(g) = self.gallery.as_mut() {
+                g.jump_to(idx);
+            }
+            self.navigate();
+            return;
+        }
+        match Gallery::from_file(path) {
+            Ok(g) => {
+                log::debug!(
+                    "[open] 清单就绪（{} 项，{} ms）→ 请求解码",
+                    g.len(),
+                    t0.elapsed().as_millis()
+                );
+                self.gallery = Some(g);
+                self.error = None;
+                // 换图 = 用户已经在看新东西，旧提示立刻作废（m50-C）。
+                self.note = None;
+                // 换了目录，旧预读全部作废。
+                self.prefetch_seq = None;
+                self.prefetched.clear();
+                // 缩略图同理：旧目录那批再也看不见，别占着内存。
+                self.thumbs.clear();
+                self.anim_next_at = None;
+                // m75：时间线随闸一起作废，下一帧重新起表（不续旧账）。
+                self.anim_due_at = None;
+                self.reset_view();
+                // 命中元数据缓存：之前看过这张图，立即填回预览尺寸。
+                if let Some(g) = self.gallery.as_ref() {
+                    if let Some(p) = g.current() {
+                        if let Some(m) = self.meta_cache.get(p) {
+                            self.preview_meta = Some(*m);
+                        }
+                    }
+                }
+                // 视口还没真实尺寸时不发请求（首帧 paint 之前是 (1,1)，会渲出一张
+                // 1×1 废图白等一整轮，实测 1.2s+）——闸在 [`Self::request_decode`] 里，
+                // 与翻页那条路共用同一条判据。
+                self.request_decode();
+                self.bump_image_gen();
+            }
+            Err(e) => self.fail(e.to_string()),
+        }
+    }
+
+    /// 相对翻页。**永远循环**（用户拍板 2026-10-09）：3/3 再下一张 → 1/3。
+    pub fn step(&mut self, delta: isize) -> bool {
+        let moved = match self.gallery.as_mut() {
+            Some(g) => g.step_looped(delta),
+            None => false,
+        };
+        if moved {
+            // 记方向供预读窗口定向（见 [`Self::last_dir`]）。跳转/新开图不经过这里，
+            // 各自把方向清 0——那时"下一张往哪边"没有依据可赌。
+            self.last_dir = delta.signum() as i8;
+            self.navigate();
+        }
+        moved
+    }
+
+    /// 当前图"版本"自增：属性窗轮询比对这个值，变了才重算刷新。
+    pub(super) fn bump_image_gen(&mut self) {
+        self.image_gen = self.image_gen.wrapping_add(1);
+    }
+
+    pub fn jump(&mut self, to: Jump) {
+        if let Some(g) = self.gallery.as_mut() {
+            // 跳转后方向无从推测（跳到首/尾再往下翻与前翻一样可能），清零让预读
+            // 回到对称窗口。
+            self.last_dir = 0;
+            g.jump(to);
+            self.navigate();
+        }
+    }
+
+    /// 翻页后的公共动作：复位视图 → 命中预读就零延迟上屏，否则发解码请求
+    /// → 顺手为新的相邻图补预读。
+    pub(super) fn navigate(&mut self) {
+        // 换了当前项 = 用户在看另一张图，上一条提示立刻作废（m50-C）。
+        self.note = None;
+        // 翻页计时起点（m58：原图档升级在这段宽限期内让位给下一张的首屏）。
+        self.last_nav_at.set(Some(Instant::now()));
+        self.reset_view();
+        // 翻页后旧动画的推进闸立即作废：新图要么是静态（无闸可续），
+        // 要么由它自己的首帧 install 重新排。带着旧时刻表推进新图必然乱帧。
+        self.anim_next_at = None;
+        // m75：时间线随闸一起作废，下一帧重新起表（不续旧账）。
+        self.anim_due_at = None;
+        // 命中元数据缓存：之前看过这张图，立即填回预览尺寸，不必等 MetaEvent。
+        if let Some(g) = self.gallery.as_ref() {
+            if let Some(p) = g.current() {
+                if let Some(m) = self.meta_cache.get(p) {
+                    self.preview_meta = Some(*m);
+                }
+            }
+        }
+        if self.use_prefetched() {
+            // 预读命中：矢量要按可视区域 1:1 重渲（tick 无闸必发）；位图由
+            // tick 的 enough/at_native 闸自己判定，不满足才补解。
+            self.mark_need();
+        } else {
+            self.request_decode();
+        }
+        self.request_prefetch();
+        self.bump_image_gen();
+    }
+
+    /// 目录被外部（资源管理器）增删 / 改名后，重扫当前目录并尽量保留当前位置。
+    ///
+    /// 返回 `true` 表示清单或当前项变了（调用方据此刷新缩略图条 / 状态栏 / 标题）。
+    /// 若当前正在看的图被删 / 改名，自动 [`Viewer::navigate`] 到相邻图并重新发起解码；
+    /// 若只是兄弟项变了（分母变、当前图未动），则不动画面、只更新清单。
+    ///
+    /// 去抖不在这一层做——runtime 的 16ms 轮询负责（一次 tick 只调一次，把一整波
+    /// 拷贝合并成一次 `read_dir`）。
+    pub fn rescan_dir(&mut self) -> bool {
+        let Some(g) = self.gallery.as_ref() else {
+            return false;
+        };
+        let old_current = g.current().cloned();
+        let old_len = g.len();
+        let rescan = g.rescan();
+        let rebuilt = match rescan {
+            Ok(g) => g,
+            // 目录还在、但一张图都没有了：不能继续显示已经删掉的那张（标题/分母/
+            // 画面全是旧账）。读不到目录（盘掉线、权限）才保持旧清单，等它回来。
+            Err(e @ ViewError::NoImages(_)) => {
+                self.fail(e.to_string());
+                return true;
+            }
+            Err(_) => return false,
+        };
+        let new_current = rebuilt.current().cloned();
+        let current_gone = old_current.as_ref() != new_current.as_ref();
+        // 兄弟项改名/重排时长度与当前项都没变，但胶片条内容已经不同；
+        // `same_listing` 把这一形也算进"要通知 UI 重绘"。
+        let same_listing = self
+            .gallery
+            .as_ref()
+            .is_some_and(|old| old.same_listing(&rebuilt));
+        let list_changed = rebuilt.len() != old_len || current_gone || !same_listing;
+        self.gallery = Some(rebuilt);
+        if current_gone {
+            // 当前图没了 → 重新解码相邻图（navigate 会复位视图 + 请求解码）。
+            self.navigate();
+        }
+        if list_changed {
+            self.prefetch_stopped = false;
+            self.request_prefetch();
+            self.bump_image_gen();
+        }
+        list_changed
+    }
+
+    /// 旋转/镜像后**有效**显示尺寸（rot 为奇数时宽高互换）。
+    ///
+    /// 以 `natural`（原图）为基准而非位图：dst_rect 画的是 `natural × scale`，
+    /// 位图只是"恰好够清晰"的采样，放大绘制是常态（1:1 大图时）。
+    pub(super) fn eff_dims_of(&self, l: &Loaded) -> (f32, f32) {
+        Self::eff_dims_in(l, self.rot)
+    }
+
+    /// 任一朝向下的有效显示尺寸（`rot` 为奇数时宽高互换）。
+    pub(super) fn eff_dims_in(l: &Loaded, rot: u8) -> (f32, f32) {
+        match rot % 2 {
+            0 => (l.natural.0 as f32, l.natural.1 as f32),
+            _ => (l.natural.1 as f32, l.natural.0 as f32),
+        }
+    }
+
+    /// 当前有效显示尺寸（无图时 (0, 0)）。
+    pub(super) fn eff_dims(&self) -> (f32, f32) {
+        self.loaded
+            .as_ref()
+            .map_or((0.0, 0.0), |l| self.eff_dims_of(l))
+    }
+
+    /// 视口状态复位：旋转/镜像归零、缩放回适应、平移归位——翻图恒重置变换。
+    ///
+    /// ★ **不清 `loaded`**（用户报障 2026-10-09「切图闪烁」的根因）：旧图必须
+    /// 一直留在屏上，直到新图解码完成由 [`Viewer::apply`] 原子替换。提前清掉，
+    /// 从翻页到 Done 之间画布只剩背景——大图几十毫秒，肉眼就是一闪。
+    /// rot/flip 的归零只落在**目标**上：屏上那张旧图继续按它自己的朝向画着，
+    /// 直到新图的解码结果 [`Self::install`] 原子替换。这里不重建旧图——原图档在
+    /// 100% 档下重建一次要一百多毫秒，而这份像素马上就要被丢掉了（m72）。
+    pub(super) fn reset_view(&mut self) {
+        self.prefetch_stopped = false;
+        self.want_rot = 0;
+        self.want_flip = false;
+        self.fit = true;
+        self.zoom = 1.0;
+        self.pan = (0.0, 0.0);
+        self.error = None;
+        // 清掉查询阶段预览：换图后旧尺寸不该再显示在 info bar（元数据缓存审计 2026-10-18）。
+        self.preview_meta = None;
+        // 新图从头计：原图档升级那道闩（`native_requested`）是按路径记的，
+        // 复位视图就是"开始看另一张图"的唯一汇合点（open / navigate 都走这里）。
+        self.native_requested = None;
+        // 缩放重渲的档位账同样只属于当前那张（m189）。
+        self.vector_zoom_req = None;
+    }
+
+    /// 放弃当前画面与清单，进入"只有错误"的状态。
+    ///
+    /// 打开失败 / 目录被清空时走这里。不清 `gallery` 会留下旧标题与旧 `n/n`；
+    /// 而晚到的旧图回包在"没有清单"时不做路径裁决（`apply` 那条判据会跳过），
+    /// 于是它还能重新上屏。`cancel_pending()` 预留一个不会被后续请求复用的 seq，
+    /// 把这些在途回包全部判成过期。
+    pub(super) fn fail(&mut self, msg: String) {
+        self.gallery = None;
+        self.loaded = None;
+        self.prefetched.clear();
+        self.prefetch_seq = None;
+        self.thumbs.clear();
+        // 先复位视图（它会把 error 清成 None），再落错误文本。
+        self.reset_view();
+        self.anim_next_at = None;
+        self.anim_due_at = None;
+        self.step_target = None;
+        self.anim_paused = false;
+        self.drag = None;
+        self.note = None;
+        self.last_dir = 0;
+        self.main_sent_at.set(None);
+        self.stall_logged.set(false);
+        self.wait_shown_secs.set(None);
+        self.want_seq = self.decoder.cancel_pending();
+        self.error = Some(msg);
+        self.bump_image_gen();
+    }
+}

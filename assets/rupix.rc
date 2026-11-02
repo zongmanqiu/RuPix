@@ -1,0 +1,5 @@
+// RuPix exe PE icon (Explorer / Task Manager / pinned shortcuts / Alt-Tab fallback).
+// Window class LoadIconW tries name MAINICON first (packer slot), then falls back
+// to ordinal 1 - this entry. Runtime window/tray icons come from brand::logo_rgba
+// instead; both rasterize the same image/icon.svg (sync guarded by brand tests).
+1 ICON "rupix.ico"

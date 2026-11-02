@@ -1,0 +1,217 @@
+[package]
+name = "rupix"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+description = "RuPix — Windows 上小巧极速的看图器（解码全部由 decoders 目录的 DLL 解码器承担，SVG 内置）"
+authors = ["view"]
+license = "AGPL-3.0"
+readme = "README.md"
+
+# Windows GUI 子系统：发布版不弹控制台窗口。
+# 产物目录由 `.cargo/config.toml` 的 `[build] target-dir` 指定（→ ../.temp/target）。
+[[bin]]
+name = "rupix"
+path = "src/main.rs"
+
+[lib]
+name = "rupix_lib"
+path = "src/lib.rs"
+
+# ── 第三方补丁：usvg（0.48.1 本地副本）──
+# 真源 = 上游 usvg 0.48.1（crates.io）逐字节副本落 `.3rd/usvg-0.48.1`，其上打了
+# **补丁 U01**（`ShaperData` 线程级缓存——CJK 大字体的排版表解析每 text chunk 重付
+# ~100 ms，实测 6 节点文档 ~650 ms → 缓存后几十 ms；登记与验收见
+# `patches/usvg-0.48.1/PATCHES.md`，归档逐字节由 j13 守）。版本必须与 Cargo.lock 里的
+# usvg 0.48.1 一致；升 resvg 时整份重放。
+[patch.crates-io]
+usvg = { path = "../.3rd/usvg-0.48.1" }
+
+[build-dependencies]
+# 宿主侧的 C SEH 隔离层（`build.rs` 编译 `seh_shim.c`）。只在 Windows 下实际编译，
+# 但作为构建依赖统一声明。已在 Cargo.lock 中（其它 crate 的传递依赖），无需额外下载。
+cc = "1"
+# PE 图标资源嵌入（`assets/rupix.rc` → exe 的 .rsrc，资源管理器/任务管理器显示它）。
+# windui 已把它带进 Cargo.lock（3.0.12），此处是同版本直接声明，同样无新增下载。
+embed-resource = "3"
+
+# ── 开发/示例/测试专用（不进 release exe）──
+# `gen_icon` 示例与 `brand::tests` 用它将图标帧编码/解码为 PNG（ICO 内嵌 PNG），
+# 把 assets/rupix.ico 从 ~300KB 压到几十 KB。
+# ★ png 已因「复制当前 = PNG」升为正式依赖（见 [dependencies]），这里不再重复声明。
+[dev-dependencies]
+# `paint_cost_probe` 示例要直接驱动生产的软光栅入口 `windui::render::SkiaCanvas`，
+# 它的目标缓冲类型是 `tiny_skia::Pixmap`（windui 没有公开可命名它的别名）。
+# windui 已把它带进 Cargo.lock（0.12.0），此处是同版本直接声明，无新增下载；
+# dev-only，不进发布的 rupix 二进制，零体积代价（与上面 png 同一套路）。
+tiny-skia = "0.12"
+
+[dependencies]
+# ── UI 框架：本地 path 依赖（wind-ui-rust 0.23.0）──
+# 显式列出默认 feature（`svg` / `d2d`）：SVG 走 windui 内置 resvg 解码器，
+# 是唯一的内置解码例外（矢量要按视口重渲，位图解码器语义表达不了）。
+# `svg-text`：resvg 文字栈 + 系统字体加载——看图器必须能看带文字的 SVG。
+# 那一次系统字体扫描今天不再压在启动关键路径上：windui 补丁 017 让**没有 text 元素的
+# SVG**（本仓三枚图标都是）不去取字体库（m86 实测：空启动 437→133ms）。
+# 库本身自补丁 06 起是全局 `OnceLock`（不是这句旧注释写的 thread_local）；带文字的照旧共享它。
+windui = { path = "../.3rd/wind-ui-rust-0.23.0", version = "0.23.0", default-features = false, features = [
+    "svg",
+    "svg-text",
+    "d2d",
+] }
+
+# ── 日志 ──
+# **一个特性都不留**（m95）：`regex`（过滤器正则）用不上；`humantime`（时间戳）不用——
+# 时刻自己拼（见 `platform::logging`）；`auto-color` 也不用——那条腿只服务 env_logger
+# 自带的着色 formatter，而我们装的是纯文本闭包 + 落盘 tee，ANSI 码进日志文件是噪音。
+# 关掉它同时摘掉 anstream / anstyle-wincon 一整串终端着色依赖（实测账见 本仓历史记录）。
+log = "0.4"
+env_logger = { version = "0.11", default-features = false }
+
+# ── 解码器宿主（方案 v2 M3）──
+# libloading 只做 LoadLibrary 包装；解码器的一切自述（id/名称/说明/格式）都从 DLL 自己读，
+# 不再需要清单文件或哈希校验。真正解码的字节仍在解码器 DLL 里，不进 exe。
+libloading = "0.8"
+
+# ── 解码器文件读取：mmap 免去 12MB 级堆分配+拷贝（失败回退 fs::read）──
+memmap2 = "0.9"
+
+# ── 复制当前图像：RGBA → PNG 编码（注册剪贴板格式 "PNG"）──
+# 与 resvg/tiny-skia 传递拉入的版本一致，锁文件里本来就有；此处的增量只是把
+# 编码器链进最终二进制（解码入口不被调用，LTO 会削掉一部分）。
+png = "0.18.1"
+
+# ── svgz：gzip 解压（m188）──
+# windui 的 resvg 没开 svgz feature（实测：svgz 在生产路报 "enable svgz cargo
+# feature"），而清单与路由都登记了 svgz ⇒ 解压由宿主自己做。flate2 与 png 的
+# 传递依赖同版本，锁文件里本来就有；此处的增量只是把解压器链进二进制。
+flate2 = "1"
+
+# ZIP decoder package: download ZIP, verify/extract DLL + versioned license folder.
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+
+# ── 解码器 ABI 契约（宿主侧快照）──
+# 真源在解码器仓库 `RuPix-Decoder/abi`（独立 workspace，将来的 rupix-decoder）。
+# 这里是一份逐字节副本；同步唯一动作 = 把上游 abi/src/lib.rs 整份复制覆盖本目录的 src/lib.rs
+# 守卫测试见 `src/core/abi.rs`（两份内容不一致 → 宿主测试跑红）。
+# 结构体布局仍靠编译期 size_of 断言钉死；快照机制换掉的是「宿主构建必须能看见解码器仓库」。
+rupix-abi = { path = "vendor/rupix-abi" }
+
+# ── 平台（仅 Windows 目标）──
+# ★ 这里没有任何图片解码 crate：位图解码**全部**走 decoders/ 的 DLL 解码器，内置路只剩
+#   一枚「内置解码库」——resvg（SVG，矢量要按视口重渲，位图解码器的语义表达不了）。
+#   feature 都是"绑定"而非"实现"。
+#   （2026-10-25 用户裁决：删掉 WIC 那枚内置位图库与其绑定——便携看图器不调系统解码器，
+#     同一张图在两台机器上必须解出同一个结果，见 `docs/产品定位与边界.md` §5.1。）
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    # GENERIC_READ / GlobalFree / HANDLE 等基础类型
+    "Win32_Foundation",
+    # SECURITY_ATTRIBUTES：CreateFileMappingW 的签名引用它（共享内存）
+    "Win32_Security",
+    # ConvertSidToStringSidW / ConvertStringSecurityDescriptorToSecurityDescriptorW / SDDL_REVISION_1
+    # （管道 DACL：只放当前用户 + SYSTEM，堵住"同机另一用户连上可预测管道名"）
+    "Win32_Security_Authorization",
+    # CreateNamedPipeW / ConnectNamedPipe / WaitNamedPipeW（扩展进程 IPC）
+    "Win32_System_Pipes",
+    # BITMAPINFOHEADER / GetDC / GetDeviceCaps（显示刷新率、抓屏分析等）
+    "Win32_Graphics_Gdi",
+    # OpenClipboard / SetClipboardData（复制图像）
+    "Win32_System_DataExchange",
+    # CF_HDROP / CF_UNICODETEXT 剪贴板格式常量
+    "Win32_System_Ole",
+    # GlobalAlloc / GlobalLock（DIB 内存）
+    "Win32_System_Memory",
+    # EmptyWorkingSet（工作集裁剪：把可归还页退给系统，让任务管理器数字落回个位数）
+    "Win32_System_ProcessStatus",
+    # GetCurrentProcess（取当前进程伪句柄，交 EmptyWorkingSet 裁剪）
+    "Win32_System_Threading",
+    # ProcessIdToSessionId（诊断头里的会话号）——符号是 kernel32 的，但 windows crate 把它
+    # 放在 RemoteDesktop 模块下，只能开这个 feature（只多生成元数据，不多链任何库）。
+    "Win32_System_RemoteDesktop",
+    # GetTickCount（空闲判定：取当前 tick 计数，与最近输入做差）
+    "Win32_System_SystemInformation",
+    # MessageBoxW（崩溃兜底的错误框）
+    "Win32_UI_WindowsAndMessaging",
+    # GetLastInputInfo（空闲判定：取最近一次键鼠输入的 tick）
+    "Win32_UI_Input_KeyboardAndMouse",
+    # AdjustWindowRectExForDpi（无边框主窗按 DPI 反算不可见系统边框，校正可见尺寸）
+    "Win32_UI_HiDpi",
+    # SetDefaultDllDirectories（解码器加载前硬化 DLL 搜索路径，防劫持）
+    "Win32_System_LibraryLoader",
+    # SHFileOperationW（卸载解码器 = 移进回收站，可还原）
+    "Win32_UI_Shell",
+    # CoInitializeEx（外壳 API 的前置要求）
+    "Win32_System_Com",
+    # 空格预览：VARIANT（Shell 枚举索引）在 Variant；GetAsyncKeyState / VK_* 在
+    # KeyboardAndMouse、GetTickCount 在 SystemInformation——三者都已由上面的条目开过，
+    # 这里只补 Variant 与 Shell::Common（2026-10-23 m95 去掉两行重复声明）。
+    "Win32_System_Variant",
+    # SHGetPathFromIDListW / ITEMIDLIST（选中项 → 文件系统路径）在 Shell::Common 子模块
+    "Win32_UI_Shell_Common",
+    # 崩溃取证：SetUnhandledExceptionFilter / MiniDumpWriteDump / EXCEPTION_POINTERS
+    # （见 `platform::crash_evidence`；dbghelp 的这几个符号挂在 Diagnostics_Debug 下）。
+    # ★ `EXCEPTION_DISPOSITION`（filter 的返回类型）却挂在 **Kernel** 下，两个 feature 都得开。
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    # ★ MiniDumpWriteDump 这一个符号还额外要 FileSystem（windows crate 的 cfg 是三个 feature 与）
+    "Win32_Storage_FileSystem",
+    # ReadDirectoryChangesW 的 OVERLAPPED / 完成例程参数挂在 System::IO 下
+    "Win32_System_IO",
+    # 扩展进程 Job Object（KILL_ON_JOB_CLOSE：宿主退出/崩溃时内核兑底杀整组子进程）
+    "Win32_System_JobObjects",
+    # SystemTimeToFileTime：会话戳 / crash.log 的时间戳要换算到本地时区
+    # （偏移用 GetLocalTime − GetSystemTime 实测，那两只挂在已开的 SystemInformation 下）
+    "Win32_System_Time",
+    # WinHTTP：设置页「可下载」卡读解码器清单（`decoders/remote.rs` → `platform::http`）。
+    # 选 WinHTTP 而不是 WinInet：后者带浏览器缓存 / Cookie / 自动拨号的一套语义，我们只要
+    # 一个"取一份 JSON"的 GET；WinHTTP 是服务型 API，无缓存副作用，且 HTTPS 开箱可用。
+    "Win32_Networking_WinHttp",
+] }
+
+# ── 体积优先的发布配置（照抄 CurSeen 的实测结论）──
+# ★ `lto` 这里是 **false**，不是笔误：见下面"例外"那段——`lto = true` 会让
+# `opt-level` 那两条例外整个失效，光栅内核反而按 `z` 编（实测 2026-10-17，
+# `examples/paint_cost_probe.rs` 同一臂中位 9.7 ms → 关 LTO 后 7.1 ms）。
+# 代价 exe 4.35 → 4.92 MB（+13%），换来整条软光栅路径快 24–64%。
+[profile.release]
+opt-level = "z"
+lto = false
+codegen-units = 1
+strip = true
+# ★ `debug = 1`（行表）不是笔误，也不与 `strip` 互相替代：**MSVC 下调试信息只进 PDB、
+# 不进 exe**，实测 `rupix.exe` 4,956,672 → 4,956,160（−512 B，在链接噪声里），pdb 7.8 →
+# 21.3 MB。这一行决定"崩溃能不能定位到源码行"：不开时 PDB 里只有公开符号（实测能搜到
+# `seh_filter`、搜不到 `nav_pan_to`，`.rs` 文件名 0 命中 = 没有行表），拿着 .dmp 也只能解到
+# `<地址>+偏移`；开了之后 `build/dump_sym.py` 能把每一帧解成 `函数 + 文件:行`（实测
+# `rupix::main main/src/main.rs:67`、`rupix_lib::run main/src/lib.rs:85`、`runtime::run
+# main/src/runtime/mod.rs:788` 三处逐行核对无误）。
+# ★★ 勘误（2026-10-25 m129）：这里曾写着"`debug = 1` 只发行表、函数名要 `debug = 2`"——
+# **是错的**。真实原因是 `dump_sym.py` 的 `SYMBOL_INFO` 结构体漏了
+# `Address/Register/Scope/Tag` 四个字段，`SymFromAddr` 返回成功但名字空。修正后 debug=1
+# 名字齐全（pdb 21.9 MB）；debug=2 是 **74.2 MB**，白胖 3.4 倍。别为"要名字"去开 2。
+# 整段来龙去见 `docs/踩坑记录.md` K56 / K135。
+debug = 1
+# 刻意不写 `panic = "abort"`：后台解码线程的 panic 需要 `unwind` 才能被
+# `catch_unwind` 转成"这张图解码失败"而不是整个进程消失（CurSeen 2026-09-29 同款教训）。
+overflow-checks = false
+
+# ★ 例外：光栅化内核按速度优化。**必须配 `lto = false` 才成立**。
+# 机理（2026-10-17 五档配对实测，`examples/paint_cost_probe.rs` 同一臂中位）：
+# `lto = "fat"` 把依赖位码合进**最终链接的那一级**再优化一遍，用的是宿主 profile 的
+# `opt-level`，`[profile.release.package.*]` 的例外在那一步被冲掉——
+#   `z`+fat 9.7 ｜ `s`+fat 9.6（照理 windui/tiny-skia 都"提 3"，却一模一样慢）｜
+#   `thin` 9.5（也没救，还多 0.38 MB）｜ **`z`+关 LTO 7.1** ｜ `3`+fat 6.9（全体提 3，+0.98 MB）。
+# 当年 CurSeen 记的"两边都得开、循环会单态化进调用方 crate"只对了一半：单态化确实在
+# windui（提 3）里，可那份代码在 LTO 链接期又被按宿主档位重编了一次。
+# 关 LTO 后整条软光栅都快了，不止例外那两箱：整窗铺底 0.130 → 0.048 ms、
+# 1:1 blit 3.67 → 2.06 ms、生产@200% 一帧 10.3 → 7.7 ms。
+[profile.release.package.tiny-skia]
+opt-level = 3
+
+[profile.release.package.windui]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+debug = true

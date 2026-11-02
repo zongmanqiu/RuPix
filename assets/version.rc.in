@@ -1,0 +1,43 @@
+// RuPix exe 版本资源（VERSIONINFO）。build.rs 只替换四个版本占位符，其余字面值在此维护。
+//
+// ★ 不 #include 任何东西：embed_resource 调 rc.exe 时只把 OUT_DIR 当 /I，机器上没装
+// VS 开发环境时 INCLUDE 也是空的，`#include <winresrc.h>` 会直接编不过。下面用到的符号
+// 按 SDK `um/verrsrc.h` 的字面值写死并注明出处——改它要同步改 deploy.py 的 RT_VERSION 门禁：
+//   VS_VERSION_INFO = 1 · VOS_NT_WINDOWS32 = 0x00040004L · VFT_APP = 0x1L · VFF_MASK = 0x3fL
+//
+// 版本号的唯一来源是 Cargo.toml 的 `[package] version`（build.rs 注入），**别在这里手填**：
+// 第二份版本字符串必然漂移，漂移的后果是资源管理器显示 0.1.0、崩溃报告里写着另一套。
+//
+// code_page 65001：本文件是 UTF-8，下面有中文显示串（FileDescription）。写进资源的是
+// 宽字符，中文在中文系统里显示正常；`Translation` 那对 (0x804, 0x4b0) = zh-CN + Unicode，
+// 与字符串实际语言一致，别让 Explorer 的"语言"列显示成英语。
+#pragma code_page(65001)
+
+1 VERSIONINFO
+ FILEVERSION @FILEVERSION_NUM@
+ PRODUCTVERSION @PRODUCTVERSION_NUM@
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS @FILEFLAGS_NUM@
+ FILEOS 0x00040004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "RuPix"
+            VALUE "FileDescription", "RuPix 轻量看图器"
+            VALUE "FileVersion", "@VERSION_STR@"
+            VALUE "InternalName", "rupix.exe"
+            VALUE "LegalCopyright", "AGPL-3.0"
+            VALUE "OriginalFilename", "rupix.exe"
+            VALUE "ProductName", "RuPix"
+            VALUE "ProductVersion", "@VERSION_STR@"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 0x4b0
+    END
+END
