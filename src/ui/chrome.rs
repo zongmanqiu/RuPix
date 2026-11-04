@@ -32,20 +32,17 @@ use std::rc::Rc;
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use windui::geometry::{Color, Rect};
+use windui::geometry::Rect;
 use windui::render::image::{Fit, Image};
 use windui::render::{Canvas, Paint};
 use windui::spec::Align;
 use windui::text::TextStyle;
 
 use crate::core::hotkey::Hotkeys;
-// 配色一律取自全 ui 共用的令牌（[`crate::ui::tokens`]）：本文件不自带色值，
-// 只保留便于绘制代码书写的短名（换令牌常量，字节不变）。
-use super::tokens::{
-    to_color, to_color4, OVERLAY_ARROW_HOVER, OVERLAY_ARROW_PRESS, OVERLAY_BTN_DANGER_HOVER,
-    OVERLAY_BTN_HOVER, OVERLAY_BTN_PRESS, OVERLAY_PILL_BG, OVERLAY_PILL_SEP, OVERLAY_SLIDING_BG,
-    OVERLAY_TEXT, OVERLAY_TEXT_ACTIVE, OVERLAY_TEXT_MUTED,
-};
+// 配色一律取自全 ui 共用的令牌（[`crate::ui::tokens`]）：本文件不自带色值。
+// 用模块别名而不是逐个 import：跟随主题那一组是**函数**（运行期切主题），
+// 名字又短又常见（`text` / `empty_bg`），逐个引入容易和局部变量撞名。
+use super::tokens as tk;
 
 /// 顶部拖动条高度（逻辑 dp）：画布据此判定"指针落在顶条里"以发起窗口拖动，
 /// 也与画出来的那条标题区同高（见 `ui::canvas` 的 `start_window_drag` 分支）。
@@ -120,19 +117,6 @@ const FRAME: f32 = 56.0;
 /// 而窗内任何真实移动都会在下一枚 `Move` 里把锚点刷新，误清只活一帧。
 const STALE_DRIFT_PX: i32 = 8;
 
-// ── 配色（恒定深色：这一层压在图片上，不走主题 Role）─────────────────
-const PILL_BG: Color = to_color4(OVERLAY_PILL_BG);
-const BTN_HOVER_BG: Color = to_color4(OVERLAY_BTN_HOVER);
-/// 按下态：比悬停再亮一档（这个字面值以前在文件里出现过两次，现在只有一个名字）。
-const BTN_PRESS_BG: Color = to_color4(OVERLAY_BTN_PRESS);
-/// 关闭按钮悬停：红底——**唯一一枚"危险"底**，与浅色系那枚强调红是两套语义。
-const BTN_DANGER_HOVER_BG: Color = to_color4(OVERLAY_BTN_DANGER_HOVER);
-/// 翻页箭头：悬停 / 按下两档底色（与按钮档位分开，箭头是圆的、视觉面积更大）。
-const ARROW_HOVER_BG: Color = to_color4(OVERLAY_ARROW_HOVER);
-const ARROW_PRESS_BG: Color = to_color4(OVERLAY_ARROW_PRESS);
-/// 放映进度色（整颗底自左向右被它推满）。字形**永远最后画**，所以进度层遮不到箭头。
-const ARROW_SLIDING_BG: Color = to_color4(OVERLAY_SLIDING_BG);
-
 /// 放映进度推到哪了——**整颗底的擦除宽度**（自左向右，`0..=ARROW_R*2`）。
 ///
 /// 判据抽成纯函数的理由：这格的形状是"底色一点点被推满、推满就翻页"，而不是里面加一根条
@@ -141,11 +125,6 @@ const ARROW_SLIDING_BG: Color = to_color4(OVERLAY_SLIDING_BG);
 fn wipe_width(step: u32) -> f32 {
     (step.min(SLIDE_STEPS) as f32 / SLIDE_STEPS as f32) * (ARROW_R * 2.0)
 }
-/// 状态格与第一颗按钮之间的分隔线（定宽格子必然在文本右侧留白，没这条线像排错了版）。
-const PILL_SEP: Color = to_color4(OVERLAY_PILL_SEP);
-const TEXT: Color = to_color(OVERLAY_TEXT);
-const TEXT_MUTED: Color = to_color(OVERLAY_TEXT_MUTED);
-const TEXT_ACTIVE: Color = to_color(OVERLAY_TEXT_ACTIVE);
 
 /// 工具栏图标的字体。Win10/11 系统自带的图标字形字体（PUA 码位），
 /// 与菠萝看图的工具栏一样用"纯图标 + 悬停提示"的极简形式。
@@ -347,6 +326,12 @@ pub struct Chrome {
     pub minimal_mode: Cell<bool>,
     /// 棋盘格透明背景开关（右键菜单与工具栏共用；m53 起落盘，ini 键 `checker`）。
     pub checker: Cell<bool>,
+    /// 取色器开关（m217，右键「工具 ▸ 取色器」）。会话临时态，同极简模式，不落盘。
+    /// 只进菜单不进浮条——用户口径「一排按钮已经很多了」。
+    pub picker: Cell<bool>,
+    /// 取色器当前的指针位置（画布逻辑坐标）。关模式、换图、指针离窗时清掉；
+    /// 浮层绘制与点击复制读的是同一份，不许另存第二正本。
+    pub picker_at: Cell<Option<(f32, f32)>>,
     /// 底部缩略图条开关（T 键 / 右键菜单）。
     ///
     /// 会话态但**落盘**（m53-L，ini 键 `filmstrip`）：开着关窗，下次启动照样开着。
@@ -417,6 +402,15 @@ pub struct Chrome {
     pub pan_interval: Cell<Duration>,
     /// 上一帧画过的状态文本。只用来判"状态变了没有"，见 [`Chrome::wake_on_status_change`]。
     last_info: RefCell<String>,
+    /// 状态文本最后一次变化时，浮条该亮到什么时候——[`Chrome::wake_on_status_change`] 的唯一凭证。
+    ///
+    /// ★ **必须独立于 `hover_toolbar` 那一格**。逐像素透明窗每次重绘都会让系统补一条指针消息，
+    /// `activity` 于是每帧都把"指针在不在浮条上"重算成 `false` 并清掉 `hover_toolbar`；
+    /// 而动画每 100 ms 又唤醒一次——两条通道抢同一格，浮条就在显示/隐藏之间高频翻转。
+    /// 用户在极简模式下播 AVIF 序列时看到的"底部按钮栏一直闪"就是这条（实测见
+    /// `build/pill_probe.ps1`：同一点在 `FF101010` 与 `FF1B1B1C` 之间交替）。
+    /// 状态唤醒有自己的到期时刻，`activity` / `pointer_left` 都碰不到它。
+    status_until: Cell<Option<Instant>>,
     /// 下一次允许平移重绘的最早时刻。
     pan_due: Cell<Instant>,
     /// 落在间隔里、被**挂起**的那一帧：pan 已写进状态机，只是还没画。
@@ -527,6 +521,8 @@ impl Chrome {
     pub fn new(minimal_mode: bool) -> Rc<Self> {
         std::rc::Rc::new(Self {
             minimal_mode: Cell::new(minimal_mode),
+            picker: Cell::new(false),
+            picker_at: Cell::new(None),
             checker: Cell::new(false),
             filmstrip: Cell::new(false),
             locked: Cell::new(false),
@@ -550,6 +546,7 @@ impl Chrome {
                 1.0 / crate::platform::display::refresh_hz() as f64,
             )),
             last_info: RefCell::new(String::new()),
+            status_until: Cell::new(None),
             pan_due: Cell::new(Instant::now()),
             pan_pending: Cell::new(false),
             wheel_interval: Cell::new(WHEEL_PACE),
@@ -572,6 +569,19 @@ impl Chrome {
             pins: RefCell::new(None),
             text: RefCell::new(TextMemo::default()),
         })
+    }
+
+    /// 取色器开关（m217）：菜单项、K 键共用这一处，`picker_at` 随手清掉，
+    /// 免得下次开模式时有一枚停在旧位置的浮层。
+    pub fn toggle_picker(&self) {
+        self.picker.set(!self.picker.get());
+        self.picker_at.set(None);
+    }
+
+    /// 关掉取色器（m217）：点画面复制、Esc、指针离窗后的收尾都走这一处。
+    pub fn close_picker(&self) {
+        self.picker.set(false);
+        self.picker_at.set(None);
     }
 
     /// 量一次文本宽，走过 [`TextMemo`] 的账：同一串字 + 同一字号 + 同一 DPI 只量一次。
@@ -759,7 +769,20 @@ impl Chrome {
         Some(dir)
     }
 
-    /// 切换幻灯片放映。快捷键、右键「操作」菜单项两条路都进这里——只有一套语义，
+    /// WASD 方向编码 → 平移符号（`sx`, `sy`），与 [`crate::core::viewer::Viewer::pan_nudge`]
+    /// 的约定一致：`sy = +1` 是"看上方"（图像下移）。canvas 的动作臂专用这一份表——
+    /// 符号写反的症状是按 W 画面往上飘（看的是图的下缘），越按越离谱。
+    pub(crate) fn wasd_signs(dir: u8) -> (f32, f32) {
+        match dir {
+            0 => (0.0, 1.0),  // W：上看
+            1 => (1.0, 0.0),  // A：左看
+            2 => (0.0, -1.0), // S：下看
+            3 => (-1.0, 0.0), // D：右看
+            _ => (0.0, 0.0),
+        }
+    }
+
+    /// 切换幻灯片放映。快捷键、右键顶层「幻灯片放映」菜单项两条路都进这里——只有一套语义，
     /// 不存在"键会停、菜单不会"这种半截实现（与动画三颗同一条纪律）。
     ///
     /// 进入时把到点时刻直接设成"现在"：按下就该**立刻**看见下一张，而不是先空等一个
@@ -994,8 +1017,36 @@ impl Chrome {
         if info.is_empty() {
             return false;
         }
-        self.last_move.set(Instant::now());
-        !self.hover_toolbar.replace(true)
+        // 记**自己的**到期时刻，不碰 `hover_toolbar`：那一格归 `activity` 管，逐像素透明窗
+        // 每帧重绘都会补一条指针消息把它判成 false（见字段注释）。返回值仍是"从暗到亮"
+        // 这一个翻转，调用方据此标脏。
+        let was = self.status_alive();
+        self.status_until.set(Some(Instant::now() + IDLE_HIDE));
+        !was
+    }
+
+    /// 「状态刚变、浮条该亮着」是否还在有效期。
+    ///
+    /// 与 [`Chrome::hover_toolbar`] 是**两条独立通道**：前者由状态文本驱动（动画每帧刷新，
+    /// 于是播放期一直亮），后者由指针位置驱动（每帧重算，指针离开浮条就灭）。
+    /// 绘制里两者取"或"，谁亮都算亮——这正是"亮一会儿再淡出"的原意。
+    pub fn status_alive(&self) -> bool {
+        matches!(self.status_until.get(), Some(t) if t > Instant::now())
+    }
+
+    /// 指针落在**顶部标题栏那一条**里吗。
+    ///
+    /// 比画出来的 [`STRIP_H`] 高 8px（迟滞）：贴着边缘按下不该因 1px 之差掉出标题栏。
+    /// 用窗口绝对坐标，不随 layout 变化。
+    ///
+    /// ★ 这条判据在这里只写一份，三个消费方共用：极简模式下的悬停显隐
+    /// （[`Chrome::activity`]）、静止收起（[`Chrome::tick_hide`]）、以及左键手势的分工
+    /// （`ui::canvas` 里"标题栏那一条永远拖窗口"）。各算一遍就会出现
+    /// "标题栏的按钮亮着、而那一按拖的是图片"——同一块面积两套说法。
+    pub fn in_title_strip(pos: (f32, f32), view: (f32, f32, f32, f32)) -> bool {
+        let (abs_x, abs_y) = pos;
+        let (_, _, vw, _) = view;
+        abs_y >= 0.0 && abs_y < (STRIP_H + 8) as f32 && abs_x >= 0.0 && abs_x < vw
     }
 
     /// 指针活动（Enter/Move/Down 时调用）。更新各区域悬停状态。
@@ -1020,8 +1071,8 @@ impl Chrome {
             .set(crate::platform::cursor::screen_pos());
         let (vx, vy, vw, vh) = view;
         let (abs_x, abs_y) = pos;
-        // 标题栏：窗口顶部固定 48px（STRIP_H+8 迟滞），用绝对坐标，不随 layout 变化
-        let title = abs_y >= 0.0 && abs_y < (STRIP_H + 8) as f32 && abs_x >= 0.0 && abs_x < vw;
+        // 标题栏：判据的单一来源见 [`Chrome::in_title_strip`]
+        let title = Self::in_title_strip(pos, view);
         // 工具栏/信息条/箭头边带：仍需相对 view 定位（随窗口大小变化）
         let (x, y) = (abs_x - vx, abs_y - vy);
         let (px, py, pw, ph) = Chrome::pill(view, self.anim.get(), self.info_cell.get());
@@ -1093,19 +1144,28 @@ impl Chrome {
         if !self.minimal_mode.get() {
             return false;
         }
+        // 状态唤醒到期得**有人报这一帧**：`activity` 只在指针动时标脏，靠它兜就等于
+        // 浮条到期后停在屏幕上不动。这一位不归指针管，所以在这里单独收。
+        let expired = match self.status_until.get() {
+            Some(t) if t <= Instant::now() => {
+                self.status_until.set(None);
+                true
+            }
+            _ => false,
+        };
         // 过期判据走在静止计时之前：光标早就离开栏了，还要等 2 秒才收是纯粹的迟钝。
         if let (Some(now), Some(anchor)) = (cursor, self.cursor_anchor.get()) {
             if (now.0 - anchor.0).abs() + (now.1 - anchor.1).abs() > STALE_DRIFT_PX {
-                return self.pointer_left();
+                return self.pointer_left() || expired;
             }
         }
         if self.last_move.get().elapsed() < IDLE_HIDE {
-            return false;
+            return expired;
         }
         let (abs_x, abs_y) = self.last_pos.get();
         let (_, _, vw, vh) = viewport;
-        // 标题栏：用绝对坐标，与 activity() 完全一致
-        let in_title = abs_y >= 0.0 && abs_y < (STRIP_H + 8) as f32 && abs_x >= 0.0 && abs_x < vw;
+        // 标题栏：与 activity() 同一份判据（单一来源 [`Chrome::in_title_strip`]）
+        let in_title = Self::in_title_strip(self.last_pos.get(), viewport);
         // 工具栏/信息条/边框：需相对坐标
         let (vx, vy, _, _) = viewport;
         let x = abs_x - vx;
@@ -1117,7 +1177,7 @@ impl Chrome {
         let (ix, iy, iw, ih) = self.info_rect.get();
         let in_info = iw > 0.0 && abs_x >= ix && abs_x < ix + iw && abs_y >= iy && abs_y < iy + ih;
         if in_title || in_toolbar || in_info || in_frame {
-            return false;
+            return expired;
         }
         // 清除所有悬停状态
         if self.hover_title.get() || self.hover_toolbar.get() || self.hover_info.get() {
@@ -1126,7 +1186,7 @@ impl Chrome {
             self.hover_info.set(false);
             return true;
         }
-        false
+        expired
     }
 
     // ── 几何 ────────────────────────────────────────────────────
@@ -1436,7 +1496,12 @@ pub fn paint(
     let show_title = !minimal_mode || chrome.hover_title.get();
     // 悬停信息条也算"在浮条上"：整行档（窄窗）就住在那儿。不认它的后果是极简模式下
     // 指针停在状态那一行 2 秒后整组消失、且再也悬不回来（`info_rect` 只有画出来才非零）。
-    let show_toolbar = !minimal_mode || chrome.hover_toolbar.get() || chrome.hover_info.get();
+    // 三条来源取或：常驻（传统模式）／指针在浮条上（`activity` 现算）／状态刚变
+    // （`wake_on_status_change` 自己的到期时刻，指针通道清不掉它）。
+    let show_toolbar = !minimal_mode
+        || chrome.hover_toolbar.get()
+        || chrome.hover_info.get()
+        || chrome.status_alive();
     // 状态跟着浮条走（用户 2026-10-18 拍板"并进浮条"）：浮条在它就画，浮条收它就收。
     // 不再单独跟着标题栏显示——那一档已经取消。
     let show_info = show_toolbar && !info.is_empty();
@@ -1480,7 +1545,7 @@ pub fn paint(
     // ── 标题栏（顶部拖动区 + 标题 + 窗口按钮）──
     if show_title {
         // 标题栏背景
-        canvas.fill_rect(vx, vy, vw, STRIP_H as f32, &Paint::fill(PILL_BG));
+        canvas.fill_rect(vx, vy, vw, STRIP_H as f32, &Paint::fill(tk::pill_bg()));
         let title_ts = TextStyle::new(13.0);
         // 标题文本：左对齐，右侧让出 5 颗窗口按钮。**必须截断**：直绘的 `draw_text`
         // 不截断，长文件名会折行画到图片上，第二行压在画面中央（`clip_text` 的注释里
@@ -1494,7 +1559,7 @@ pub fn paint(
                 title_room as i32,
                 STRIP_H,
             ),
-            TEXT,
+            tk::overlay_text(),
             Align::Start,
             &title_ts,
         );
@@ -1509,20 +1574,20 @@ pub fn paint(
             let active = !locked || tb == TitleBtn::Lock;
             if active && (hovered || pressed) {
                 let c = if pressed {
-                    BTN_PRESS_BG
+                    tk::btn_press()
                 } else if tb == TitleBtn::Close {
                     // 关闭按钮悬停时红色背景
-                    BTN_DANGER_HOVER_BG
+                    tk::BTN_DANGER_HOVER
                 } else {
-                    BTN_HOVER_BG
+                    tk::btn_hover()
                 };
                 canvas.fill_rect(lx, ly, lw, lh, &Paint::fill(c));
             }
             let fg = match tb {
                 // 锁住态：绿色高亮（同 Checker/Fullscreen/置顶 激活模式）。
-                TitleBtn::Lock if locked => TEXT_ACTIVE,
-                _ if !active => TEXT_MUTED,
-                _ => TEXT,
+                TitleBtn::Lock if locked => tk::overlay_text_active(),
+                _ if !active => tk::overlay_text_muted(),
+                _ => tk::overlay_text(),
             };
             let (tx, ty, tw, th) = local(bx, by, bw, bh);
             if tb == TitleBtn::Topmost {
@@ -1530,7 +1595,7 @@ pub fn paint(
                 // 未置顶斜躺（字形原生姿态），已置顶立正 + 绿。
                 let mut pins = chrome.pins.borrow_mut();
                 if pins.is_none() {
-                    *pins = super::pin::render_pins(TEXT, TEXT_ACTIVE);
+                    *pins = super::pin::render_pins(tk::overlay_text(), tk::overlay_text_active());
                 }
                 if let Some((tilted, upright)) = pins.as_ref() {
                     let img = if topmost_on { upright } else { tilted };
@@ -1591,11 +1656,11 @@ pub fn paint(
         // 常态底只有三档（按下 / 悬停 / 常态）。放映**不占一档**——它是叠在上面的进度层，
         // 所以鼠标经过正在推进的那颗时，底下照样是悬停档，读得出"这颗我可以点"。
         let bg = if pressed {
-            ARROW_PRESS_BG
+            tk::arrow_press()
         } else if hovered {
-            ARROW_HOVER_BG
+            tk::arrow_hover()
         } else {
-            PILL_BG
+            tk::pill_bg()
         };
         let (x, y, w, h) = local(cx - ARROW_R, cy - ARROW_R, ARROW_R * 2.0, ARROW_R * 2.0);
         canvas.fill_circle(x + ARROW_R, y + ARROW_R, ARROW_R, &Paint::fill(bg));
@@ -1614,7 +1679,7 @@ pub fn paint(
                     x + ARROW_R,
                     y + ARROW_R,
                     ARROW_R,
-                    &Paint::fill(ARROW_SLIDING_BG),
+                    &Paint::fill(tk::SLIDING_BG),
                 );
                 canvas.restore();
             }
@@ -1624,7 +1689,7 @@ pub fn paint(
         canvas.draw_text(
             glyph,
             Rect::new((x) as i32, (y) as i32, w as i32, h as i32),
-            TEXT,
+            tk::overlay_text(),
             Align::Center,
             &ts,
         );
@@ -1637,7 +1702,7 @@ pub fn paint(
     // 参与总宽，两处用的是同一个 `Chrome::pill`）。
     if show_toolbar {
         let (lx, ly, lw, lh) = local(px, py, pw, ph);
-        canvas.fill_round_rect(lx, ly, lw, lh, 10.0, &Paint::fill(PILL_BG));
+        canvas.fill_round_rect(lx, ly, lw, lh, 10.0, &Paint::fill(tk::pill_bg()));
 
         // ── 状态格：浮条左端那段定宽位 ──
         //
@@ -1653,12 +1718,12 @@ pub fn paint(
             canvas.draw_text(
                 &shown,
                 Rect::new(lx as i32, ly as i32, lw as i32, lh as i32),
-                TEXT_MUTED,
+                tk::overlay_text_muted(),
                 Align::Start,
                 &info_ts,
             );
             let (sx, sy, sw, sh) = local(tx + tw + INFO_GAP_L, py + 10.0, 1.0, ph - 20.0);
-            canvas.fill_rect(sx, sy, sw, sh, &Paint::fill(PILL_SEP));
+            canvas.fill_rect(sx, sy, sw, sh, &Paint::fill(tk::pill_sep()));
             chrome.info_rect.set((tx, py, tw, ph));
         }
 
@@ -1673,15 +1738,19 @@ pub fn paint(
             let pressed = chrome.pressed.get() == Some(Press::Btn(b));
             if hovered || pressed {
                 let (hx, hy, hw, hh) = local(bx, by, bw, bh);
-                let c = if pressed { BTN_PRESS_BG } else { BTN_HOVER_BG };
+                let c = if pressed {
+                    tk::btn_press()
+                } else {
+                    tk::btn_hover()
+                };
                 canvas.fill_round_rect(hx, hy, hw, hh, 6.0, &Paint::fill(c));
             }
             let glyph = b.glyph(paused);
             let color = match b {
                 // 开关类按钮激活时给一点绿色，扫一眼能看出状态。
-                Btn::Checker if checker_on => TEXT_ACTIVE,
-                Btn::Fullscreen if fullscreen_on => TEXT_ACTIVE,
-                _ => TEXT,
+                Btn::Checker if checker_on => tk::overlay_text_active(),
+                Btn::Fullscreen if fullscreen_on => tk::overlay_text_active(),
+                _ => tk::overlay_text(),
             };
             let (tx, ty, tw, th) = local(bx, by, bw, bh);
             let ts = if b.text_glyph() { &text_ts } else { &icon_ts };
@@ -1714,11 +1783,11 @@ pub fn paint(
             };
             if ty > vy {
                 let (lx, ly, lw, lh) = local(tx, ty, w, h);
-                canvas.fill_round_rect(lx, ly, lw, lh, 6.0, &Paint::fill(PILL_BG));
+                canvas.fill_round_rect(lx, ly, lw, lh, 6.0, &Paint::fill(tk::pill_bg()));
                 canvas.draw_text(
                     text,
                     Rect::new(lx as i32, ly as i32, lw as i32, lh as i32),
-                    TEXT,
+                    tk::overlay_text(),
                     Align::Center,
                     &small,
                 );
@@ -1735,7 +1804,7 @@ pub fn paint(
         let (lx, ly, lw, lh) = local(ix, iy, w, INFO_H);
 
         // 背景：同工具栏风格
-        canvas.fill_round_rect(lx, ly, lw, lh, 10.0, &Paint::fill(PILL_BG));
+        canvas.fill_round_rect(lx, ly, lw, lh, 10.0, &Paint::fill(tk::pill_bg()));
 
         // 文本：垂直居中、水平居中。宽度是照**同一份 style** 量出来的（旧写法量 12 号、
         // 画 13 号，胶囊比字窄一圈，居中的字两头各溢出去一点）；只有窗口比文本还窄时
@@ -1744,7 +1813,7 @@ pub fn paint(
         canvas.draw_text(
             &shown,
             Rect::new(lx as i32, ly as i32, lw as i32, INFO_H as i32),
-            TEXT_MUTED,
+            tk::overlay_text_muted(),
             Align::Center,
             &info_ts,
         );
@@ -1754,6 +1823,7 @@ pub fn paint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windui::geometry::Color;
 
     #[test]
     fn host_audit_save_error_is_reported_separately_from_copy() {
@@ -1865,20 +1935,69 @@ mod tests {
     #[test]
     fn status_change_wakes_the_pill_once() {
         let c = Chrome::new(true);
-        c.hover_toolbar.set(false);
         assert!(c.wake_on_status_change("1/3 · 100%"), "新状态应当叫醒浮条");
-        assert!(c.hover_toolbar.get(), "叫醒 = 这一帧该画浮条");
+        assert!(c.status_alive(), "叫醒 = 这一帧该画浮条");
         assert!(
             !c.wake_on_status_change("1/3 · 100%"),
             "同样的文本不算变化（动画播放期每帧都重绘）"
         );
-        c.hover_toolbar.set(false);
         assert!(
             !c.wake_on_status_change(""),
             "空状态（错误只留中央）没有可看的内容"
         );
-        assert!(!c.hover_toolbar.get(), "空状态不该亮一条空浮条");
-        assert!(c.wake_on_status_change("2/3 · 100%"), "翻页了要再叫一次");
+        assert!(c.status_alive(), "空状态不该把已经亮着的浮条掐掉");
+        assert!(!c.hover_toolbar.get(), "空状态不借指针通道，指针位保持原样");
+        // 浮条还亮着时再变文本：返回 false 是**对的**——它只报"从暗到亮"这一个翻转，
+        // 字变了由状态路径自己重绘。但续期必须发生，否则动图播到一半浮条会自己灭。
+        assert!(
+            !c.wake_on_status_change("2/3 · 100%"),
+            "已经亮着，不算从暗到亮"
+        );
+        assert!(c.status_alive(), "文本还在变就必须续期");
+    }
+
+    /// 极简模式播 AVIF 序列时"底部按钮栏一直闪"的回归（2026-11-02 用户报障）。
+    ///
+    /// 真实时序：动画每 100 ms 换一帧 ⇒ 状态文本每帧都变；同一时刻逐像素透明窗每帧重绘
+    /// 都会补一条指针消息 ⇒ `activity` 每帧把指针判成"不在浮条上"并把 `hover_toolbar`
+    /// 清掉。两条通道共用那一格时，浮条就在"状态唤醒"与"指针清空"之间高频翻转。
+    /// 分开之后：指针怎么清都碰不到状态唤醒。
+    #[test]
+    fn pointer_channel_cannot_cancel_the_status_wake() {
+        let c = Chrome::new(true);
+        let view = (0.0, 0.0, 800.0, 600.0);
+        for i in 0..12 {
+            let _ = c.wake_on_status_change(&format!("1/1 · 100% ({}/120)", i + 1));
+            // 指针一直停在画布中央，每帧都被判成"不在浮条上"
+            let _ = c.activity((400.0, 300.0), view);
+            assert!(c.status_alive(), "第 {i} 帧：状态唤醒被指针通道掐掉了");
+            assert!(
+                !c.hover_toolbar.get(),
+                "第 {i} 帧：指针在画布上时 hover 位本来就该是 false"
+            );
+        }
+    }
+
+    /// 标题栏那一条的边界。左键手势分工（`ui::canvas::left_drag` 的调用方）与
+    /// 悬停显隐读的是同一份判据，所以边界必须钉在这里，不能钉在调用方。
+    #[test]
+    fn title_strip_band_is_top_48_dp_and_inside_width() {
+        let view = (0.0, 0.0, 800.0, 600.0);
+        assert!(Chrome::in_title_strip((10.0, 0.0), view), "顶边");
+        assert!(
+            Chrome::in_title_strip((10.0, (STRIP_H + 7) as f32), view),
+            "迟滞那 8dp 之内仍算标题栏"
+        );
+        assert!(
+            !Chrome::in_title_strip((10.0, (STRIP_H + 8) as f32), view),
+            "出了那一条就交给画布"
+        );
+        assert!(!Chrome::in_title_strip((10.0, 300.0), view), "画布正中");
+        assert!(
+            !Chrome::in_title_strip((-1.0, 10.0), view),
+            "窗口外不许算标题栏"
+        );
+        assert!(!Chrome::in_title_strip((800.0, 10.0), view), "右缘是开区间");
     }
 
     /// 「操作」子菜单按 [`Btn::ALL`] 生成，故每个按钮都必须自带标签与字形——
@@ -3142,6 +3261,20 @@ mod tests {
             assert!(chrome.key_gate(1), "间隔大于闸的手按不该被压");
             assert_eq!(chrome.tick_key_pace(), None);
         }
+    }
+
+    /// 方向表第二正本：W/A/S/D 的符号必须与"视口往哪边看"一致——符号写反的症状
+    /// 是按 W 画面往上飘（图移上去 = 看到下方），越按越离谱。
+    #[test]
+    fn wasd_signs_match_viewport_directions() {
+        let (sx, sy) = Chrome::wasd_signs(0); // W：上看 → 图下移 → pan.y 增
+        assert_eq!((sx, sy), (0.0, 1.0));
+        let (sx, sy) = Chrome::wasd_signs(1); // A：左看 → 图右移 → pan.x 增
+        assert_eq!((sx, sy), (1.0, 0.0));
+        let (sx, sy) = Chrome::wasd_signs(2); // S：下看
+        assert_eq!((sx, sy), (0.0, -1.0));
+        let (sx, sy) = Chrome::wasd_signs(3); // D：右看
+        assert_eq!((sx, sy), (-1.0, 0.0));
     }
 
     /// 幻灯片放映（m167）的到点判定。它**没有自己的线程**——整条功能就是这个 tick 加

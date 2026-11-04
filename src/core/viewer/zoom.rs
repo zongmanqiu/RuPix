@@ -5,6 +5,29 @@
 use super::transform::*;
 use super::*;
 
+/// 溢出到图外时，仍然必须留在窗口内的**最少**图像宽度（逻辑 dp，两轴各算一次）。
+///
+/// 这条常数是"能不能把图拖丢"的界线。qView 的做法是给场景开一个
+/// `QGraphicsScene(-1e6, -1e6, 2e6, 2e6)` 的固定 sceneRect（`.ex` 里那份源码的构造函数），
+/// 于是它的滚动范围几乎无限——图能被拖到**完全看不见**。我们抄它的手感，
+/// 不抄它的下界：留一枚 24dp 的"衣角"在画面里，用户永远看得见东西在哪儿、
+/// 也永远能一把拖回来；而按 `0` / `1` 复位只是第二道保险，不该是唯一的出口。
+pub(super) const PAN_KEEP_VISIBLE: f32 = 24.0;
+
+/// 单轴的平移上限：`(视口 + 图) / 2 - 至少留在画面里的量`。
+///
+/// 纯函数抽出来的理由与画布那边的 `beyond_slop` 同一条——这条线就是手感的全部，
+/// 要能在无头环境里钉住。三个分支各有实感，都得测：
+/// 大图（图边可以越过窗口边，只留衣角）、小图（能拖到只剩衣角）、
+/// 图或窗口比 `PAN_KEEP_VISIBLE` 还小（**留不下衣角就整张留在画面里**，上限退回"图边贴窗口边"）。
+pub(super) fn overscroll(view: f32, img: f32) -> f32 {
+    if view <= 0.0 || img <= 0.0 {
+        return 0.0;
+    }
+    let keep = PAN_KEEP_VISIBLE.min(img).min(view);
+    ((view + img) / 2.0 - keep).max(0.0)
+}
+
 impl Viewer {
     // ── 缩放 / 平移 ──────────────────────────────────────────────
 
@@ -431,6 +454,25 @@ impl Viewer {
         self.apply_pan(p)
     }
 
+    /// WASD 平移一步（m216）：`sx`/`sy` ∈ {-1, 0, +1}，是**视口该往哪边看**的符号——
+    /// `sy = +1` 是"看上方"（W），图像整体下移，pan.y 增大。步长 = 视口短边的 1/8
+    /// （下限 24 逻辑像素），内部常量不进配置（待办 §59 已拒「平移步长参数暴露」）。
+    #[must_use = "返回值是「画面变了、要重绘」，吞掉就等于按了没反应"]
+    pub fn pan_nudge(&mut self, sx: f32, sy: f32) -> bool {
+        let step = self.pan_step_len();
+        self.apply_pan((self.pan.0 + sx * step, self.pan.1 + sy * step))
+    }
+
+    /// 平移步长：视口短边的 1/8，下限 24 逻辑像素（再小按一下就看不出生移动）。
+    fn pan_step_len(&self) -> f32 {
+        let step = self.view.2.min(self.view.3) / 8.0;
+        if step < 24.0 {
+            24.0
+        } else {
+            step
+        }
+    }
+
     /// 平移的唯一入口：写入 → 夹取 → **比较**。返回 `true` 才算"画面变了、要重绘"。
     ///
     /// 为什么要比较：拖到图片边界外时 `clamp_pan` 把新值钳回同一个位置，而拖动仍在
@@ -460,18 +502,44 @@ impl Viewer {
         self.drag.is_some()
     }
 
-    /// 平移夹取：图比视口小时居中不动，比视口大时不许拖出黑边。
-    pub(super) fn clamp_pan(&mut self) {
+    /// 平移的可达范围（半宽 / 半高，逻辑像素）——**允许图边越过窗口边**，
+    /// 但永远还剩 [`PAN_KEEP_VISIBLE`] 在画面里（见 [`overscroll`]）。
+    ///
+    /// 2026-11-03 用户第三条与第四条口径的落点：
+    /// · 第三条："任何情况下，开启这个功能就都要能拖动"（图比窗口小也拖得动）；
+    /// · 第四条："拖图范围相当于被鸟瞰图限制死了……允许图片的边缘离开我们的窗口边缘，
+    ///   并让整个图片继续向上移动"。旧口径 `|图 - 视口| / 2` 的含义是"永远不许露出黑边"，
+    ///   那正是把图钉死在窗口里的那道界。
+    ///
+    /// 仍然返回 `(0, 0)` 的只有：还没有图，或视口还没量出来（首帧之前）。
+    ///
+    /// ★ 夹取与"能不能拖"共用这一份算法：两处各写一遍就会出现"夹出来其实拖不动、
+    /// 但判据说可拖"的手感（按下、拖动、画面一动不动）。
+    pub(super) fn pan_limits(&self) -> (f32, f32) {
         let (nw, nh) = self.eff_dims();
         if nw <= 0.0 {
-            self.pan = (0.0, 0.0);
-            return;
+            return (0.0, 0.0);
         }
         let s = self.scale();
-        let (dw, dh) = (nw * s, nh * s);
-        let (vw, vh) = (self.view.2, self.view.3);
-        let max_x = ((dw - vw) / 2.0).max(0.0);
-        let max_y = ((dh - vh) / 2.0).max(0.0);
+        (
+            overscroll(self.view.2, nw * s),
+            overscroll(self.view.3, nh * s),
+        )
+    }
+
+    /// 这张图**此刻拖得动吗**——左键手势分工的判据之一（见 `ui::canvas::left_drag`）。
+    ///
+    /// 溢出上限改成 [`overscroll`] 之后，这条几乎总是真：只剩"没有图"与"视口还没量出来"
+    /// 两种拖不动的情况，那一按留着拖窗口（**不许把拖窗口这条路堵死**）。
+    pub fn can_pan(&self) -> bool {
+        let (mx, my) = self.pan_limits();
+        mx > 0.0 || my > 0.0
+    }
+
+    /// 平移夹取：上限来自 [`Self::pan_limits`]——图边可以越过窗口边，
+    /// 但画面里永远还剩 [`PAN_KEEP_VISIBLE`]（图比衣角还小就整张留在画面里）。
+    pub(super) fn clamp_pan(&mut self) {
+        let (max_x, max_y) = self.pan_limits();
         self.pan.0 = self.pan.0.clamp(-max_x, max_x);
         self.pan.1 = self.pan.1.clamp(-max_y, max_y);
     }

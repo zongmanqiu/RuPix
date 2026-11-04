@@ -57,4 +57,21 @@ set "PS_EXE="
 if defined SystemRoot if exist "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" set "PS_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 if not defined PS_EXE set "PS_EXE=powershell.exe"
 
+
+REM ---- source-path fingerprint (no host paths in shipped binaries) ----------
+REM rustc bakes absolute paths into panic locations and debug info, so the exe
+REM and every DLL would carry "<project>\main\src\.." plus
+REM "%USERPROFILE%\.rustup\..". A portable build must not ship a map of the
+REM author's disk. --remap-path-prefix is a plain prefix replacement:
+REM   %PROJECT_ROOT% -> .   (anything inside the workspace)
+REM   %USERPROFILE%  -> ~   (rustup toolchain + cargo registry)
+REM NOTE: defining RUSTFLAGS REPLACES the rustflags from .cargo\config.toml
+REM wholesale, so +crt-static has to be repeated here - same trap as the one
+REM documented in build\size_map.py.
+REM NOTE: it invalidates cargo's fingerprint, so the first build after this
+REM change is a full one (~9 min); later builds are normal again.
+REM Only set when absent: a caller can always override.
+if not defined USERPROFILE set "USERPROFILE=%SystemDrive%\Users\%USERNAME%"
+if not defined RUSTFLAGS set "RUSTFLAGS=-C target-feature=+crt-static --remap-path-prefix=%PROJECT_ROOT%=. --remap-path-prefix=%USERPROFILE%=~"
+
 exit /b 0

@@ -1,7 +1,7 @@
 //! 配置兼容门禁（CurSeen Phase 5）：老配置必须被现行解析器完整直读——
 //! 现行键生效、淘汰键静默忽略、看不懂的值回退默认、绝不 panic。
 
-use rupix_lib::core::config::{Config, CtrlWheel, DblClick, InitWindow, SourceId, Wheel};
+use rupix_lib::core::config::{Config, CtrlWheel, DblClick, InitWindow, SourceId, UiTheme, Wheel};
 use rupix_lib::core::decode::RawParams;
 use rupix_lib::core::hotkey::Hotkeys;
 use std::collections::BTreeMap;
@@ -28,6 +28,8 @@ fn legacy_ini_loads_without_loss() {
     let expected = Config {
         stay_on_top: true,
         dbl_click: DblClick::Fullscreen,
+        // 旧版 fixture 不含 decode_timeout_s（2026-11-04 挂死恢复新增）→ 回默认 20 秒。
+        decode_timeout_s: 20,
         // 旧版 fixture 不含 slide_interval 键（m167 新增）→ 回默认 3 秒。
         // 这条正是"加了新设置项也不能读坏老配置"的兼容判据：老 ini 缺键必须安静回默认。
         slide_interval: 3,
@@ -61,6 +63,9 @@ fn legacy_ini_loads_without_loss() {
         close_to_tray: true,
         // 旧版 fixture 不含 space_preview 键 → 回默认（关）。
         space_preview: false,
+        // 旧版 fixture 不含 drag_image 键 → 回默认（**开**）。这条钉的是"新键默认开，
+        // 也不许把老配置读成关"——老 ini 升级后左键拖图片照常，不必重设。
+        drag_image: true,
         raw_last: Some(RawParams {
             width: 1920,
             height: 1080,
@@ -71,12 +76,16 @@ fn legacy_ini_loads_without_loss() {
         // ★ 2026-10-30 起联网来源只有一个键（旧 fixture 里的 decoder_source / plugin_source
         //   已不再被读——这条用例照样绿，因为缺新键就是回默认）。
         download_source: SourceId::Gitee,
+        // 旧 fixture 不含 ui_theme 键 → 回默认（深色）。看图窗口配色是 m200 新增的，
+        // 老配置没有它必须安静落回深色——与 `download_source` 上面那条同一个判据。
+        ui_theme: UiTheme::Dark,
         // 旧 fixture 不含这四个地址键 → 必须回落内置默认（"加了新键也不能读坏老配置"）。
         decoder_index_gitee: SourceId::Gitee.index_url().to_string(),
         decoder_index_github: SourceId::Github.index_url().to_string(),
         plugin_index_gitee: SourceId::Gitee.plugin_index_url().to_string(),
         plugin_index_github: SourceId::Github.plugin_index_url().to_string(),
         hotkeys: Hotkeys::default(),
+        allow_multiple: false,
     };
     assert_eq!(cfg, expected, "老配置直读结果与预期不符");
 }

@@ -14,18 +14,24 @@
 //! 见 `ui::chrome` 模块头注释——一句话：指针移到兄弟 `Element` 浮层上时画布收不到
 //! Move，"悬停显示/静止隐藏"会闪烁；一个控件吃下整窗事件就没有这个问题。
 //!
-//! # 鼠标手势的分工（2026-10-08 用户拍板）
+//! # 鼠标手势的分工
 //!
 //! 无边框窗口里"拖 == 动东西"的候选有两个：拖动窗口本体、平移图片。二者抢同一块面积，
-//! 分工按下表——**拖动窗口是本体**（窗口可以任意位置左键拖动），"图片在窗口里的位置"
-//! 交给右下角的鸟瞰缩略图去调，这也是菠萝看图 NavigatorView 的用法：
+//! 分工按下表。**左键归谁是一个开关**（ini 键 `drag_image`，默认开）——
+//! 2026-10-08 那次拍的是"拖动窗口是本体"，2026-11-03 用户加了开关：
+//! "允许我们只拖动图片，而窗口画布不变。但是在标题栏按住依然是可以拖动窗口的"。
 //!
-//! | 手势                      | 效果                       |
-//! |---------------------------|----------------------------|
-//! | 左键拖动（任意位置）      | 移动窗口                   |
-//! | 拖右下角鸟瞰图里的视口框  | 改变视角（平移图片）       |
-//! | Ctrl+左键拖动 / 中键拖动  | 平移图片（兜底手势）       |
-//! | 右键                      | 上下文菜单                 |
+//! | 手势（`drag_image` **开**，默认）  | 效果                                   |
+//! |-------------------------------------|----------------------------------------|
+//! | 左键拖动 · 标题栏那一条             | 移动窗口（永远，不受开关影响）         |
+//! | 左键拖动 · 画布里                     | **平移图片**，窗口不动；图边能越过窗口边，但永远还剩 24dp 在画面里 |
+//! | 左键拖动 · 空窗（没有图 / 视口未量出）| 移动窗口（拖不动东西时不堵这条路）                        |
+//! | 拖右下角鸟瞰图里的视口框            | 改变视角（平移图片）                   |
+//! | Ctrl+左键拖动 / 中键拖动            | 平移图片（兜底手势，不看开关）         |
+//! | 右键                                | 上下文菜单                             |
+//!
+//! `drag_image` **关** = 回到 2026-10-08 那套：任意位置左键拖 = 移动窗口，
+//! 平移图片只剩 Ctrl+左键、中键与鸟瞰三条。判据本体是 [`left_drag`]（纯函数，有单测）。
 //!
 //! 另外左键**挪够 4dp 才升级成拖窗口**（[`DRAG_SLOP`]）：按下即拖会去走系统的窗口移动
 //! 模态循环，第二次按下就再也送不进本控件，双击关窗当场失效。
@@ -45,7 +51,7 @@ use windui::event::{
     window_state, Event, Key, KeyEvent, MenuItem, MouseButton, PointerEvent, PointerKind,
     WindowState,
 };
-use windui::geometry::{Color, Point, Rect, Size};
+use windui::geometry::{Point, Rect, Size};
 use windui::render::image::Fit;
 use windui::render::{Canvas, Paint};
 use windui::spec::Align;
@@ -59,12 +65,9 @@ use crate::core::gallery::Jump;
 use crate::core::geometry::RectI;
 use crate::core::pixels::MAX_TEXTURE_SIDE;
 // 鸟瞰 / 浮层的配色取自全 ui 共用的令牌（[`crate::ui::tokens`]），本文件不自带色值。
+// 别名引入：跟随主题那组是函数，名字短（`empty_bg` / `hint_text`），逐个 import 易撞名。
 use super::chrome::{self, Arrow, Btn, Press, TitleBtn};
-use super::tokens::{
-    to_color, to_color4, OVERLAY_CHECKER_A, OVERLAY_CHECKER_B, OVERLAY_EMPTY_BG,
-    OVERLAY_ERROR_TEXT, OVERLAY_HINT_TEXT, OVERLAY_NAV_FILL, OVERLAY_PILL_BG, OVERLAY_STROKE_DARK,
-    OVERLAY_STROKE_LIGHT,
-};
+use super::tokens as tk;
 use super::{filmstrip, settings};
 use super::{to_key_input, Chrome, Hub, Strip};
 use crate::core::hotkey::Action;
@@ -75,15 +78,10 @@ use windui::render::image::Image;
 
 /// 棋盘格格子边长（逻辑 dp）。深浅两灰，与常见图像编辑器一致。
 const CHECKER: f32 = 12.0;
-const CHECKER_A: Color = to_color(OVERLAY_CHECKER_A);
-const CHECKER_B: Color = to_color(OVERLAY_CHECKER_B);
-/// 无图时的空场底色（近黑；与 `ui::window::DARK` 是同一块，取自同一个令牌）。
-const EMPTY_BG: Color = to_color(OVERLAY_EMPTY_BG);
-const HINT_TEXT: Color = to_color(OVERLAY_HINT_TEXT);
-const ERROR_TEXT: Color = to_color(OVERLAY_ERROR_TEXT);
-/// 双层高对比描边：外黑内白（黑图上白线可见、白图上黑线可见）。
-const STROKE_DARK: Color = to_color(OVERLAY_STROKE_DARK);
-const STROKE_LIGHT: Color = to_color(OVERLAY_STROKE_LIGHT);
+// 底色 / 棋盘格 / 提示文字 / 错误文字都走主题访问函数（`tk::empty_bg()` 那一组）：
+// 它们是"压在我们自己的底上"的颜色，深色主题与浅色主题各有一套。
+// 只有双层描边是常量（`tk::tk::STROKE_DARK` / `tk::tk::STROKE_LIGHT`）——它压在用户图片上，
+// 职责是"任意图片上都看得见"，不跟主题翻。
 
 /// 鸟瞰缩略图盒（菠萝 NavigatorView setFixedSize(220, 160) 同尺寸），右上角。
 const NAV_W: f32 = 220.0;
@@ -128,7 +126,13 @@ pub struct ImageCanvas {
     /// 条是常驻的一块地（不是盖在画面上的浮层），所以摆图、缩放锚点、鸟瞰几何
     /// 都用这一份；悬浮工具栏那一层仍用完整的 `last`（它本来就是浮层）。
     last_work: Cell<Rect>,
+    /// 「新建窗口」的落地：由 `runtime` 注入（画布不知道窗口怎么建——那要解码线程、
+    /// 目录监视、一整套运行期状态）。`None` = 单窗口场景（测试 / 示例），菜单里不出现。
+    new_window: Option<NewWindowFn>,
 }
+
+/// 「新建窗口」的回调签名（`runtime` 注入给画布，见 [`ImageCanvas::with_new_window`]）。
+pub type NewWindowFn = Rc<dyn Fn(&mut EventCtx)>;
 
 /// 滚轮翻页档每张图需要的增量（一格 WHEEL_DELTA）。
 const WHEEL_STEP: i32 = 120;
@@ -162,6 +166,34 @@ fn beyond_slop(start: (f32, f32), pos: (f32, f32)) -> bool {
     let dx = pos.0 - start.0;
     let dy = pos.1 - start.1;
     dx * dx + dy * dy >= DRAG_SLOP * DRAG_SLOP
+}
+
+/// 左键按下之后"这一拖归谁"。判据抽成纯函数的理由与 [`beyond_slop`] 同一条：
+/// 它是手感的全部，测试要能钉住，不能靠"跑起来拖一下看看"。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum LeftDrag {
+    /// 移动窗口（越过 [`DRAG_SLOP`] 才真的交给系统模态循环）。
+    Window,
+    /// 平移图片（`Viewer::begin_drag` 开局，Move 里跟手）。
+    PanImage,
+}
+
+/// 分工规则（ini 键 `drag_image`，默认开）。三条**全部**满足才拖图片，任一不满足
+/// 就回老行为拖窗口——**不许把窗口拖走的那条路堵死**：
+///
+/// - `drag_image`：用户自己要的开关；关掉就是 2026-10-08 那套拍板。
+/// - `can_pan`：这张图**此刻拖得动**。★ 2026-11-03 用户第三、第四条口径连着放宽到这里：
+///   图比窗口小也拖得动，而且**图边允许越过窗口边**（拖到只剩一枚衣角），
+///   上限本体是 `Viewer::pan_limits` → `overscroll`。仍然拖不动的只剩"还没有图"（空窗）
+///   与"视口还没量出来"两种——那时那一按留着拖窗口，**不许把拖窗口这条路堵死**。
+/// - `!in_title`：指针不在顶部标题栏那一条里——**标题栏永远带走窗口**（判据单一来源
+///   见 [`Chrome::in_title_strip`]）。
+fn left_drag(drag_image: bool, can_pan: bool, in_title: bool) -> LeftDrag {
+    if drag_image && can_pan && !in_title {
+        LeftDrag::PanImage
+    } else {
+        LeftDrag::Window
+    }
 }
 
 /// 上屏纹理缓存：按 [`RgbaImage::gen`] 代号判脏，仅代号变化才重新上传 windui `Image`。
@@ -306,7 +338,14 @@ impl ImageCanvas {
             strip_hover: Cell::new(None),
             strip: Strip::new(),
             last_work: Cell::new(Rect::new(0, 0, 1, 1)),
+            new_window: None,
         }
+    }
+
+    /// 注入「新建窗口」的落地（见字段说明）。装配期调一次，`None` 时菜单不出现该项。
+    pub fn with_new_window(mut self, f: NewWindowFn) -> Self {
+        self.new_window = Some(f);
+        self
     }
 
     fn center(&self) -> (f32, f32) {
@@ -473,26 +512,38 @@ impl ImageCanvas {
         ctx.mark_dirty();
     }
 
-    /// 右键菜单——与菠萝看图同构，但按"少弹一级"重排过：
+    /// 右键菜单——与菠萝看图同构，按分组与可达性重排过：
     ///
     /// ```text
     /// 打开…
-    /// RAW 参数…               ← 常驻；仅无头裸像素可点（相机 RAW / 普通图片置灰）
-    /// 复制当前（PNG）          ← 当前显示尺寸的 PNG 位图（注册剪贴板格式 "PNG"）
-    /// 复制原文件                ← 磁盘上的文件本身（CF_HDROP），不重解码
-    /// 复制文件路径
+    /// 新建窗口                   ← 多开开启时才出现
+    /// RAW 参数…                 ← 常驻；仅无头裸像素可点（相机 RAW / 普通图片置灰）
+    /// 复制 ▸                    画面 PNG / 原文件 / 文件路径
     /// ─────
-    /// 操作 ▸            缩小/放大/适应窗口/1:1/全屏/棋盘格/旋转/镜像/属性
+    /// 操作 ▸            **严格等于底部浮条**：浮条有什么按钮就有什么项（同一份 `Btn::ALL`）
+    /// 工具 ▸                    宿主内置低频辅助（取色器等）
+    /// 插件 ▸                    外部进程命令
     /// ─────
-    /// 极简模式（勾选）  缩略图条（勾选）
-    /// 不透明度 ▸       10% / 20% / … / 100%（勾选当前档，10% 一档）
+    /// 窗口 ▸                    极简模式（勾选）/ 缩略图条（勾选）/ 不透明度 ▸ 10~100%
+    /// 幻灯片放映 / 停止放映
+    /// 左键拖图（勾选）
     /// ─────
     /// 设置…（「关于」不再单列，已收编为设置窗的第三个标签）
     /// ```
     ///
-    /// 「操作」子菜单由工具栏的 [`Btn::ALL`] **自动生成**（见 [`exec_btn`]）：
-    /// 底部按钮栏有什么，菜单里就有什么，加按钮不会只改一处。
+    /// 「窗口 ▸」收的是**改变窗口长什么样**的三项（2026-11-04 用户口径）：装饰显隐、
+    /// 底部常驻区、整窗 alpha。放映改的是看图行为，左键拖图改的是手势分工，都不是窗口
+    /// 外观，所以留在顶层；放映还因为不在浮条 `Btn::ALL` 里而必须随手可及（见下方 ★）。
+    ///
+    /// 装配出口会调 [`align_menu_columns`] 把**每一级**的标签左沿对齐：勾选列是
+    /// 逐级判定的，纯动作列表（复制 / 插件）不补就会比别的子菜单少缩进一列。
+    ///
+    /// 「操作」子菜单由工具栏的 [`Btn::ALL`] **自动生成**（见 [`exec_btn`]），
+    /// 底部按钮栏有什么、菜单里就有什么，加按钮不会只改一处。
     /// 也因此原来顶层的「全屏 / 棋盘格 / 水平翻转」不再单独占一行——它们在操作里。
+    /// ★ 反过来也成立（2026-11-02）：**菜单里不许有浮条上没有的动作**。幻灯片放映
+    ///   因为浮条放不下而只能当菜单项，所以它搬到顶层、不进「操作」——否则那条对账就破了，
+    ///   用户看到的是"菜单里的操作和底部按钮对不上"。
     fn context_menu(&self, ctx: &mut EventCtx, at: Point) {
         let ws = window_state();
         let has_file = self.viewer.borrow().current_path().is_some();
@@ -533,6 +584,17 @@ impl ImageCanvas {
             it
         });
 
+        // ── 新建窗口（多开开启时才出现）──
+        //
+        // 多开的口径是「窗口可以有多个，进程与托盘都只有一个」：这一项开的还是同一个
+        // 进程里的另一扇窗，不是第二个 rupix.exe。关着多开时它不出现——菜单里摆一个
+        // 点了就违反当前约定的项，比没有更糟。
+        if self.config.borrow().allow_multiple {
+            if let Some(f) = self.new_window.clone() {
+                items.push(MenuItem::run("新建窗口", move |ctx| f(ctx), false));
+            }
+        }
+
         // 裸数据参数：**常驻**，只有当前文件确实是无头裸像素时才可点。
         // 相机 RAW（CR2/NEF…）有完整文件头，参数窗对它们没有意义，所以同样置灰；
         // 这样用户永远找得到入口，又不会在普通图片上误触。
@@ -550,77 +612,25 @@ impl ImageCanvas {
             items.push(it);
         }
 
-        // ── 复制（平铺，不再进子菜单）──
-        items.push({
-            let mut it = MenuItem::run(
-                "复制当前（PNG）",
-                {
-                    let v = self.viewer.clone();
-                    let chrome = self.chrome.clone();
-                    move |ctx| match copy_display(&chrome, &v) {
-                        CopyNow::Nothing => {}
-                        CopyNow::Sync(Ok(())) => ctx.toast_ok("当前画面已复制（PNG）"),
-                        CopyNow::Sync(Err(e)) => ctx.toast_err(e),
-                        CopyNow::Posted(note) => ctx.toast_ok(note),
-                        CopyNow::Busy => ctx.toast_err("上一次复制还在进行，等它结束再按"),
-                        CopyNow::SpawnFailed(e) => ctx.toast_err(e),
-                    }
-                },
-                false,
-            );
-            it.enabled = has_image;
-            it.shortcut = self.config.borrow().hotkeys.display(Action::CopyImage);
-            it
-        });
-        items.push({
-            let mut it = MenuItem::run(
-                "复制原文件",
-                {
-                    let v = self.viewer.clone();
-                    move |ctx| {
-                        // 复制磁盘上的文件本身（CF_HDROP）：粘贴到资源管理器就是原文件。
-                        // 不重解码——大图不会因为这一下卡住 UI。
-                        let path = v.borrow().current_path();
-                        if let Some(p) = path {
-                            match clipboard::copy_file(&p) {
-                                Ok(()) => ctx.toast_ok("原文件已复制到剪贴板"),
-                                Err(e) => ctx.toast_err(e),
-                            }
-                        }
-                    }
-                },
-                false,
-            );
-            it.enabled = has_file;
-            it
-        });
-        items.push({
-            let mut it = MenuItem::run(
-                "复制文件路径",
-                {
-                    let v = self.viewer.clone();
-                    move |ctx| {
-                        let path = v.borrow().current_path();
-                        if let Some(p) = path {
-                            // 回执说话：占用剪贴板时报错，而不是无条件说"已复制"（O7）。
-                            match clipboard::copy_text(&p.to_string_lossy()) {
-                                Ok(()) => ctx.toast_ok("路径已复制到剪贴板"),
-                                Err(e) => ctx.toast_err(e),
-                            }
-                        }
-                    }
-                },
-                false,
-            );
-            it.enabled = has_file;
-            it.shortcut = self.config.borrow().hotkeys.display(Action::CopyPath);
-            it
-        });
+        // ── 复制（二级菜单，向右弹出）──
+        // 2026-11-03 用户口径「三个复制收纳到"复制"里面，向右弹出，这样比较节省空间」。
+        // 这三项本来就不该并排：同一次只选一种口径（画面 PNG / 文件本身 / 路径文本），
+        // 平铺把它们摊成菜单最长的三段。快捷键仍挂在「复制当前」与「复制文件路径」上，
+        // 收进子菜单不影响按键——菜单显示的是同一份 `hotkeys.display(...)`。
+        items.push(MenuItem::submenu(
+            "复制",
+            self.copy_items(has_image, has_file),
+        ));
 
         items.push(MenuItem::separator());
 
         // ── 操作：底部按钮栏的全部动作，改成菜单项的样子 ──
         items.push(MenuItem::submenu("操作", self.ops_items(ws)));
+
+        // ── 工具：宿主内置的低频辅助（m217）──
+        // 夹在「操作」（严格等于浮条 Btn::ALL 的对账）与「插件」（外部进程）之间。
+        // 这组只进菜单不进浮条——用户口径「一排按钮已经很多了，太占空间」。
+        items.push(MenuItem::submenu("工具", self.tool_items(has_image)));
 
         // ── 插件：只列已发现且启用的命令型插件；空目录给可读空态 ──
         items.push(MenuItem::submenu("插件", self.plugin_items()));
@@ -631,8 +641,102 @@ impl ImageCanvas {
         //
         // 「窗口置顶」入口已移到标题栏置顶钮（📌，读写同一 `ws.topmost`），
         // 菜单里不再重复。
-        // ── 极简模式：当前窗口临时切换（不落盘）──
+        // ── 窗口 ▸：三项窗口外观收成一个子菜单（2026-11-04 用户口径）──
+        items.push(MenuItem::submenu("窗口", self.window_items()));
+
+        // ── 幻灯片放映：改的是"怎么浏览这一组图"，不是窗口外观，所以留在顶层 ──
+        //
+        // 它不在 `Btn::ALL` 里（浮条上没有这一颗：MDL2 的 PUA 字形是赌局，而浮条几何由
+        // `Btn::ALL` 驱动，多一颗要连动命中与窄窗排布），因此只能作为菜单项存在；
+        // 行为仍走 `exec_action` 那唯一入口——键与菜单同一份代码，不存在"菜单里有、点了没反应"。
+        // 名字随状态换（放映中读「停止放映」），双状态写法与 `Btn::PlayPause` 同一条规矩。
         items.push({
+            let mut it = MenuItem::run(
+                if self.chrome.slideshow_on() {
+                    "停止放映"
+                } else {
+                    "幻灯片放映"
+                },
+                {
+                    let v = self.viewer.clone();
+                    let chrome = self.chrome.clone();
+                    let cfg = self.config.clone();
+                    let hub = self.hub.clone();
+                    move |ctx| {
+                        exec_action(
+                            Some(ctx),
+                            &v,
+                            &chrome,
+                            &cfg,
+                            &hub,
+                            crate::core::hotkey::Action::Slideshow,
+                        );
+                        ctx.mark_dirty();
+                    }
+                },
+                false,
+            );
+            it.shortcut = self
+                .config
+                .borrow()
+                .hotkeys
+                .display(crate::core::hotkey::Action::Slideshow);
+            it
+        });
+
+        // ── 左键拖图：指针交互的开关（ini 键：drag_image），留在顶层 ──
+        //
+        // 2026-11-03 用户点名进菜单（"和极简模式那些放一起"）。理由成立：这条改的是手感，
+        // 而手感不对的时候人正盯着画面——不该要先开设置页才能试另一种分工。
+        // 2026-11-04 三项窗口外观收进「窗口 ▸」时，本项按"手势分工 ≠ 窗口外观"留在顶层。
+        // 勾选态**直接读 `config.drag_image`**，不像 `filmstrip` 那样另存一份会话位：
+        // canvas 每次按下都现读配置，多存一份就是第二正本（还会漂）。
+        // 不标脏：切换不改这一帧的任何像素，下一次按下自然按新分工走。
+        items.push({
+            let on = self.config.borrow().drag_image;
+            let cfg = self.config.clone();
+            let hub = self.hub.clone();
+            let mut it = MenuItem::run(
+                "左键拖图",
+                move |_ctx| {
+                    let on = !cfg.borrow().drag_image;
+                    persist_session(&cfg, &hub, |c| c.drag_image = on);
+                },
+                on,
+            );
+            it.checkable = true;
+            it.checked = on;
+            it
+        });
+
+        items.push(MenuItem::separator());
+        items.push({
+            let mut it = MenuItem::run(
+                "设置…",
+                {
+                    let config = self.config.clone();
+                    let hub = self.hub.clone();
+                    move |ctx| settings::open_settings(ctx, &config, &hub)
+                },
+                false,
+            );
+            it.shortcut = self.config.borrow().hotkeys.display(Action::Settings);
+            it
+        });
+        align_menu_columns(&mut items);
+        ctx.show_context_menu(at, items);
+    }
+
+    /// 「窗口 ▸」子菜单：只放**改变窗口长什么样**的三项（2026-11-04 用户口径）。
+    ///
+    /// 极简模式（chrome 显隐）、缩略图条（底部常驻区）、不透明度（整窗 alpha）都是
+    /// 窗口外观；放映改的是浏览行为、左键拖图改的是手势分工，留在顶层不进来。
+    /// 不透明度保留自己的档位子菜单：十档铺平会把这里撑成一长列，三级反而好找。
+    fn window_items(&self) -> Vec<MenuItem> {
+        let mut out = Vec::new();
+
+        // ── 极简模式：当前窗口临时切换（不落盘）──
+        out.push({
             let on = self.chrome.minimal_mode.get();
             let chrome = self.chrome.clone();
             let mut it = MenuItem::run(
@@ -650,10 +754,11 @@ impl ImageCanvas {
             it.shortcut = self.config.borrow().hotkeys.display(Action::Minimal);
             it
         });
+
         // ── 缩略图条：底部一排缩略图，点一格直接跳过去 ──
         //
         // 会话态（同棋盘格），m53 起落盘：开着关窗，下次启动照样开着。
-        items.push({
+        out.push({
             let on = self.chrome.filmstrip.get();
             let chrome = self.chrome.clone();
             let cfg = self.config.clone();
@@ -674,6 +779,8 @@ impl ImageCanvas {
             it.shortcut = self.config.borrow().hotkeys.display(Action::Filmstrip);
             it
         });
+
+        out.push(MenuItem::separator());
 
         // ── 不透明度：10%~100%，10% 一档，勾选当前档（ini 键：opacity）──
         let cur = self.config.borrow().opacity;
@@ -704,23 +811,8 @@ impl ImageCanvas {
                 .check(cur == pct),
             );
         }
-        items.push(MenuItem::submenu("不透明度", op_items));
-
-        items.push(MenuItem::separator());
-        items.push({
-            let mut it = MenuItem::run(
-                "设置…",
-                {
-                    let config = self.config.clone();
-                    let hub = self.hub.clone();
-                    move |ctx| settings::open_settings(ctx, &config, &hub)
-                },
-                false,
-            );
-            it.shortcut = self.config.borrow().hotkeys.display(Action::Settings);
-            it
-        });
-        ctx.show_context_menu(at, items);
+        out.push(MenuItem::submenu("不透明度", op_items));
+        out
     }
 
     /// 「插件」子菜单：按 `<exe>/plugins/*/manifest.json` 动态生成。
@@ -896,6 +988,104 @@ impl ImageCanvas {
     }
 
     /// 「操作」子菜单的项：由 [`Btn::ALL`] 生成，动作与浮条按钮同一份代码。
+    /// 「复制 ▸」的三项：画面 PNG / 磁盘上的文件本身 / 路径文本。
+    ///
+    /// 从主菜单搬进子菜单只是**层级**变化（2026-11-03 用户要省空间），行为一字未改：
+    /// 灰项判据（`has_image` / `has_file`）、回执 toast、以及"占用剪贴板时报错而不是
+    /// 无条件说已复制"那条都原样跟着走。
+    /// 「工具」子菜单（m217）：宿主内置的低频辅助，只进菜单不进浮条。
+    ///
+    /// 取色器是**会话临时态**（同极简模式，不落盘）：开关与指针位置都在 `Chrome`，
+    /// 菜单回调、画布事件、paint 三者读同一份；切换时清掉旧指针位置，免得下次
+    /// 一开模式就有一枚停在别处的浮层。没有图时置灰——空窗没有像素可采样。
+    fn tool_items(&self, has_image: bool) -> Vec<MenuItem> {
+        let on = self.chrome.picker.get();
+        let chrome = self.chrome.clone();
+        let mut it = MenuItem::run(
+            "取色器",
+            move |ctx| {
+                chrome.toggle_picker();
+                ctx.mark_dirty();
+            },
+            on,
+        );
+        it.checkable = true;
+        it.checked = on;
+        it.enabled = has_image;
+        it.shortcut = self.config.borrow().hotkeys.display(Action::Picker);
+        vec![it]
+    }
+
+    fn copy_items(&self, has_image: bool, has_file: bool) -> Vec<MenuItem> {
+        let mut out = Vec::with_capacity(3);
+        out.push({
+            let mut it = MenuItem::run(
+                "复制当前（PNG）",
+                {
+                    let v = self.viewer.clone();
+                    let chrome = self.chrome.clone();
+                    move |ctx| match copy_display(&chrome, &v) {
+                        CopyNow::Nothing => {}
+                        CopyNow::Sync(Ok(())) => ctx.toast_ok("当前画面已复制（PNG）"),
+                        CopyNow::Sync(Err(e)) => ctx.toast_err(e),
+                        CopyNow::Posted(note) => ctx.toast_ok(note),
+                        CopyNow::Busy => ctx.toast_err("上一次复制还在进行，等它结束再按"),
+                        CopyNow::SpawnFailed(e) => ctx.toast_err(e),
+                    }
+                },
+                false,
+            );
+            it.enabled = has_image;
+            it.shortcut = self.config.borrow().hotkeys.display(Action::CopyImage);
+            it
+        });
+        out.push({
+            let mut it = MenuItem::run(
+                "复制原文件",
+                {
+                    let v = self.viewer.clone();
+                    move |ctx| {
+                        // 复制磁盘上的文件本身（CF_HDROP）：粘贴到资源管理器就是原文件。
+                        // 不重解码——大图不会因为这一下卡住 UI。
+                        let path = v.borrow().current_path();
+                        if let Some(p) = path {
+                            match clipboard::copy_file(&p) {
+                                Ok(()) => ctx.toast_ok("原文件已复制到剪贴板"),
+                                Err(e) => ctx.toast_err(e),
+                            }
+                        }
+                    }
+                },
+                false,
+            );
+            it.enabled = has_file;
+            it
+        });
+        out.push({
+            let mut it = MenuItem::run(
+                "复制文件路径",
+                {
+                    let v = self.viewer.clone();
+                    move |ctx| {
+                        let path = v.borrow().current_path();
+                        if let Some(p) = path {
+                            // 回执说话：占用剪贴板时报错，而不是无条件说"已复制"（O7）。
+                            match clipboard::copy_text(&p.to_string_lossy()) {
+                                Ok(()) => ctx.toast_ok("路径已复制到剪贴板"),
+                                Err(e) => ctx.toast_err(e),
+                            }
+                        }
+                    }
+                },
+                false,
+            );
+            it.enabled = has_file;
+            it.shortcut = self.config.borrow().hotkeys.display(Action::CopyPath);
+            it
+        });
+        out
+    }
+
     fn ops_items(&self, ws: WindowState) -> Vec<MenuItem> {
         let mut out = Vec::with_capacity(Btn::ALL.len());
         // 与浮条同一份 `Chrome::row`：`chrome.anim` 装的是 `has_index()`（有没有帧/页号），
@@ -932,48 +1122,39 @@ impl ImageCanvas {
             }
             out.push(it);
         }
-        // 幻灯片放映：这一项**不在 `Btn::ALL` 里**。进那一枚就得在浮条上画一个字形，而 MDL2
-        // 的 PUA 码位是赌局（`Btn::Info` 当年退回文本 "!" 就是这条赌局的先例），浮条几何又由
-        // `Btn::ALL` 驱动、多一颗要连动命中与窄窗排布。所以放映先进「操作」子菜单 + 快捷键，
-        // 行为仍走 `exec_action` 那唯一入口——键与菜单同一份代码，不存在"菜单里有、点了没反应"。
-        // 名字随状态换（放映中读「停止放映」），双状态写法与 `Btn::PlayPause` 同一条规矩。
-        let slide_on = self.chrome.slideshow_on();
-        let mut slide = MenuItem::run(
-            if slide_on {
-                "停止放映"
-            } else {
-                "幻灯片放映"
-            },
-            {
-                let v = self.viewer.clone();
-                let chrome = self.chrome.clone();
-                let cfg = self.config.clone();
-                let hub = self.hub.clone();
-                move |ctx| {
-                    exec_action(
-                        Some(ctx),
-                        &v,
-                        &chrome,
-                        &cfg,
-                        &hub,
-                        crate::core::hotkey::Action::Slideshow,
-                    );
-                    ctx.mark_dirty();
-                }
-            },
-            false,
-        );
-        if let Some(sc) = self
-            .config
-            .borrow()
-            .hotkeys
-            .display(crate::core::hotkey::Action::Slideshow)
-        {
-            slide.shortcut = Some(sc);
-        }
-        out.push(slide);
+        // ★「幻灯片放映」**不在这里**（2026-11-02 用户要求）：它留在顶层，要随手可及。
+        //   这个子菜单的唯一职责就是"底部按钮栏有什么，这里就有什么"——多一项就破坏了那条
+        //   对账，用户看到的就是"菜单里的操作和浮条不一致"。
         out
     }
+}
+
+/// 让右键菜单**每一级**都留出同一条勾选列，标签左沿才对得齐。
+///
+/// windui 的 `level_width` 逐级判 `items.iter().any(|it| it.checkable)`：本级有开关项
+/// 才让出 `MENU_CHECK_W + MENU_GAP`（24dp），没有就贴左。于是「操作」「工具」「窗口」
+/// 「不透明度」这些含开关的级会缩进，而「复制」「插件」这类纯动作列表不会——同一棵菜单里
+/// 文字左沿差一列，看起来就是插件名"没留间隔"。
+/// 补位递归到每一级，包括「窗口 ▸ 不透明度 ▸ 档位」这样的三级。
+///
+/// 装配出口统一补位：本级没有开关项时，给第一个非分隔线项声明 `checkable`，
+/// `checked` 保持 false（绘制只在 `checked` 时画勾，不会多出一枚没来由的对勾）。
+/// `checkable` 在框架里只是布局与画勾的标记：`is_actionable` 不看它，点击也只执行
+/// 项自己的 `action`、不会自动翻转勾选态，所以补位不改变任何一项的行为。
+/// 以后新增子菜单也不必各自记得这件事，见 `tests::menu_columns_aligned_on_every_level`。
+fn align_menu_columns(level: &mut [MenuItem]) {
+    for it in level.iter_mut() {
+        if !it.submenu.is_empty() {
+            align_menu_columns(&mut it.submenu);
+        }
+    }
+    if level.iter().any(|it| it.checkable) {
+        return;
+    }
+    let Some(first) = level.iter_mut().find(|it| !it.separator) else {
+        return;
+    };
+    first.checkable = true;
 }
 
 /// 执行一次工具栏按钮的动作：**浮条点击与右键菜单「操作」子菜单共用的唯一入口**。
@@ -1078,7 +1259,13 @@ fn exec_title_btn(
         TitleBtn::Maximize => ctx.toggle_maximize(),
         TitleBtn::Close => ctx.request_close(),
         // 读写 ws.topmost（窗口样式位真值）——右键菜单入口已删，本钮是唯一开关。
-        TitleBtn::Topmost => ctx.toggle_topmost(),
+        // ★ 显式标脏：置顶是**唯一不会引起系统级重排**的窗口钮（最小化/最大化/关闭
+        //   都由系统改尺寸或显隐，重绘自然跟着来），不标这一下，本轮分发结束后画布
+        //   没有重绘理由。用户报过"点了不刷新、移开鼠标才变"，指的就是这一档。
+        TitleBtn::Topmost => {
+            ctx.toggle_topmost();
+            ctx.mark_dirty();
+        }
         TitleBtn::Lock => {
             let on = !chrome.locked.get();
             chrome.locked.set(on);
@@ -1121,7 +1308,7 @@ impl Widget for ImageCanvas {
         };
         self.last_work.set(work);
         let (vx, vy, vw, vh) = (work.x as f32, work.y as f32, work.w as f32, work.h as f32);
-        let (checker_a, checker_b) = (CHECKER_A, CHECKER_B);
+        let (checker_a, checker_b) = (tk::checker_a(), tk::checker_b());
         let checker_on = self.chrome.checker.get();
 
         // ① 底：棋盘格（透明背景开关）或近黑空场。
@@ -1145,7 +1332,7 @@ impl Widget for ImageCanvas {
                 y += CHECKER;
             }
         } else {
-            canvas.fill_rect(vx, vy, vw, vh, &Paint::fill(EMPTY_BG));
+            canvas.fill_rect(vx, vy, vw, vh, &Paint::fill(tk::empty_bg()));
         }
 
         // ② 图 + 空场提示 / 错误。
@@ -1174,7 +1361,7 @@ impl Widget for ImageCanvas {
                     );
                     let z = chrome::ARROW_ZONE as i32;
                     let slot = Rect::new(work.x + z, work.y, (work.w - 2 * z).max(60), work.h);
-                    canvas.draw_text(&msg, slot, ERROR_TEXT, Align::Center, &hint_ts);
+                    canvas.draw_text(&msg, slot, tk::error_text(), Align::Center, &hint_ts);
                 }
                 drop(cache);
                 // 鸟瞰缩略图（菠萝 NavigatorView）：显示尺寸超出视口时出现。
@@ -1190,17 +1377,21 @@ impl Widget for ImageCanvas {
                 // 长错误变成两行而不是一行两头截断。
                 let z = chrome::ARROW_ZONE as i32;
                 let slot = Rect::new(work.x + z, work.y, (work.w - 2 * z).max(60), work.h);
-                canvas.draw_text(&e, slot, ERROR_TEXT, Align::Center, &hint_ts);
+                canvas.draw_text(&e, slot, tk::error_text(), Align::Center, &hint_ts);
             } else {
                 // 首图还在解 = 说"载入中"，不许写"把图片拖进来"（m71）：后者是
                 // **空窗口**的邀请，摆在已经打开的文件上就是谎话——真机上那张卡住
                 // 13 s 的截图中央正是这句。
-                let hint = if v.awaiting_first_bitmap() {
-                    "载入中…"
+                //
+                // 两句的**颜色也分开**（2026-11-02 用户口径"这句感觉要设置红色比较好"）：
+                // 空窗是"等你做事"，灰字容易被当成背景装饰略过，用红请人动手；
+                // "载入中…"是"已经在做事"，红字反而像出错了，保持灰。
+                let (hint, color) = if v.awaiting_first_bitmap() {
+                    ("载入中…", tk::hint_text())
                 } else {
-                    "把图片拖进来 · 右键打开"
+                    ("把图片拖进来 · 右键打开", tk::hint_invite())
                 };
-                canvas.draw_text(hint, work, HINT_TEXT, Align::Center, &hint_ts);
+                canvas.draw_text(hint, work, color, Align::Center, &hint_ts);
             }
         }
 
@@ -1212,7 +1403,7 @@ impl Widget for ImageCanvas {
                 box_r.y as f32,
                 box_r.w as f32,
                 box_r.h as f32,
-                &Paint::fill(to_color4(OVERLAY_PILL_BG)),
+                &Paint::fill(tk::pill_bg()),
             );
             // 盒框双层高对比描边（与视口框同款，2026-10-12 用户拍板）：
             // 内白 1px + 外黑 1px——鸟瞰面板压在任意底色的图片上都能看清边界。
@@ -1223,7 +1414,7 @@ impl Widget for ImageCanvas {
                 box_r.h as f32 + 2.0,
                 0.0,
                 1.0,
-                &Paint::fill(STROKE_DARK),
+                &Paint::fill(tk::STROKE_DARK),
             );
             canvas.stroke_round_rect(
                 box_r.x as f32,
@@ -1232,7 +1423,7 @@ impl Widget for ImageCanvas {
                 box_r.h as f32,
                 0.0,
                 1.0,
-                &Paint::fill(STROKE_LIGHT),
+                &Paint::fill(tk::STROKE_LIGHT),
             );
             // 缩略图：**鸟瞰永远显示完整图片**（菠萝 NavigatorView 语义）。画的
             // 是 viewer 那份 ≤512 的整图缩略（`nav_image_dst`），不是主位图——
@@ -1273,7 +1464,7 @@ impl Widget for ImageCanvas {
                 let fy = inner.y as f32 + v0 * inner.h as f32;
                 let fw = ((u1 - u0) * inner.w as f32).max(4.0);
                 let fh = ((v1 - v0) * inner.h as f32).max(4.0);
-                canvas.fill_rect(fx, fy, fw, fh, &Paint::fill(to_color4(OVERLAY_NAV_FILL)));
+                canvas.fill_rect(fx, fy, fw, fh, &Paint::fill(tk::NAV_FILL));
                 // 视口框双层高对比描边（用户拍板 2026-10-12）：内白 1px + 外黑 1px
                 // ——黑图片上白线可见、白图片上黑线可见，单色框在极端底色下会隐身。
                 // 直角描边 = 圆角半径 0（windui 只有圆角描边原语）。
@@ -1284,9 +1475,9 @@ impl Widget for ImageCanvas {
                     fh + 2.0,
                     0.0,
                     1.0,
-                    &Paint::fill(STROKE_DARK),
+                    &Paint::fill(tk::STROKE_DARK),
                 );
-                canvas.stroke_round_rect(fx, fy, fw, fh, 0.0, 1.0, &Paint::fill(STROKE_LIGHT));
+                canvas.stroke_round_rect(fx, fy, fw, fh, 0.0, 1.0, &Paint::fill(tk::STROKE_LIGHT));
             }
         }
 
@@ -1363,6 +1554,53 @@ impl Widget for ImageCanvas {
         } else {
             Vec::new()
         };
+
+        // ⑥ 取色器浮层（m217）：最后画，压在包括鸟瞰/缩略图条在内的所有图层之上。
+        // 判据与点击复制共用 `Viewer::pick_at` —— 屏上显示哪一格，就复制哪一格。
+        if let (true, Some(pos)) = (self.chrome.picker.get(), self.chrome.picker_at.get()) {
+            if let Some(pk) = self.viewer.borrow().pick_at(from_rect(work), pos) {
+                let [r, g, b, _] = pk.rgba;
+                let hex = format!("#{r:02X}{g:02X}{b:02X}");
+                let text = format!("{hex} · rgb({r}, {g}, {b}) · ({}, {})", pk.at.0, pk.at.1);
+                let ts = TextStyle::new(12.0);
+                let tw = self.chrome.measure_w(canvas, &text, &ts);
+                let (sw, gap, pad, box_h) = (16.0, 8.0, 9.0, 28.0);
+                let box_w = sw + gap + tw + pad * 2.0;
+                // 跟随光标但不许出内容矩形：贴右/下边时翻到指针另一侧。
+                let mut x = pos.0 + 16.0;
+                let mut y = pos.1 + 18.0;
+                if x + box_w > vx + vw - 4.0 {
+                    x = (pos.0 - box_w - 16.0).max(vx + 4.0);
+                }
+                if y + box_h > vy + vh - 4.0 {
+                    y = (pos.1 - box_h - 12.0).max(vy + 4.0);
+                }
+                canvas.fill_round_rect(x, y, box_w, box_h, 6.0, &Paint::fill(tk::pill_bg()));
+                canvas.stroke_round_rect(
+                    x - 1.0,
+                    y - 1.0,
+                    box_w + 2.0,
+                    box_h + 2.0,
+                    6.0,
+                    1.0,
+                    &Paint::fill(tk::STROKE_DARK),
+                );
+                canvas.fill_rect(
+                    x + pad,
+                    y + (box_h - sw) / 2.0,
+                    sw,
+                    sw,
+                    &Paint::fill(tk::to_color4([r, g, b, 255])),
+                );
+                let slot = Rect::new(
+                    (x + pad + sw + gap) as i32,
+                    y as i32,
+                    (tw + 2.0) as i32,
+                    box_h as i32,
+                );
+                canvas.draw_text(&text, slot, tk::overlay_text(), Align::Center, &ts);
+            }
+        }
     }
 
     fn on_event(&mut self, ctx: &mut EventCtx, ev: &Event) -> bool {
@@ -1376,6 +1614,13 @@ impl Widget for ImageCanvas {
                 }
                 // 锁定：键盘全封。返回 true = 已消费，Esc 也就轮不到框架的关窗兜底。
                 if self.chrome.locked.get() {
+                    return true;
+                }
+                // 取色模式（m217）：Esc 优先退出模式，不让「Esc 关窗」把窗口一起带走。
+                // 其它键照常派发——切图/缩放时取色器保持开启，方便连续取色。
+                if self.chrome.picker.get() && k.key == Key::Escape {
+                    self.chrome.close_picker();
+                    ctx.mark_dirty();
                     return true;
                 }
                 // 先给用户绑定的动作让路：Esc 若被绑到某动作，handle_key 命中并消费执行。
@@ -1443,6 +1688,59 @@ impl ImageCanvas {
         self.chrome.hit(pos, self.work_tuple())
     }
 
+    /// 左键按下的归属分派（Down 分支只调这一句）。
+    ///
+    /// ★ 抽成方法不是为了好看，是为了**把接线钉住**：[`left_drag`] 是纯函数，它绿了
+    /// 不代表调用点真在用它（用例见 `left_press_wires_the_switch_to_the_pan_state`）。
+    /// `ctrl` = 按住 Ctrl：那是 2026-10-08 起的平移兜底手势，**不看开关**一律平移。
+    ///
+    /// 先算成局部变量再分支：`self.viewer.borrow()` 的 `Ref` 若活进分支里，
+    /// 那句 `borrow_mut()` 就是 `already borrowed` panic（§七 的禁写形状）。
+    fn press_left(&self, pos: (f32, f32), view: (f32, f32, f32, f32), ctrl: bool) {
+        let mode = left_drag(
+            self.config.borrow().drag_image,
+            self.viewer.borrow().can_pan(),
+            Chrome::in_title_strip(pos, view),
+        );
+        if ctrl || mode == LeftDrag::PanImage {
+            self.viewer.borrow_mut().begin_drag(pos);
+        } else {
+            self.lmb_pending.set(Some(pos));
+        }
+    }
+
+    /// 按当前指针位置与拖动状态换光标：拖动中=抓手、可拖区悬停=松手、其余=箭头。
+    ///
+    /// ★ 判据与 [`left_drag`] **同源**：光标说"这一拖归图片"，按下去就一定是拖图。
+    /// 两边各写一套的话会出现"光标是手、按下却把窗口拖走了"。
+    ///
+    /// 浮条/左右箭头/标题钮上不接手——那里点的是控件；标题栏那一条也留箭头，
+    /// 因为那里永远拖窗口（[`left_drag`] 的第三项）。
+    fn sync_hand(&self, pos: (f32, f32)) {
+        // 取色模式优先（m217）：十字光标，且不许被下面的抓手/箭头覆盖。
+        // 光标说"这一拖归图片"、按下去却是取样，是最刺眼的语义错位。
+        if self.chrome.picker.get() {
+            crate::platform::cursor::use_cross();
+            return;
+        }
+        // 拖动中不看位置：指针可能已经拖出画布，手型要一直握着。
+        if self.viewer.borrow().dragging() {
+            super::hand_cursor::apply(Some(true));
+            return;
+        }
+        if self.chrome_hit(pos).is_some() {
+            super::hand_cursor::apply(None);
+            return;
+        }
+        let in_title = Chrome::in_title_strip(pos, self.work_tuple());
+        let can_pan = self.viewer.borrow().can_pan();
+        let mode = left_drag(self.config.borrow().drag_image, can_pan, in_title);
+        super::hand_cursor::apply(match mode {
+            LeftDrag::PanImage => Some(false),
+            LeftDrag::Window => None,
+        });
+    }
+
     fn on_pointer(&mut self, ctx: &mut EventCtx, p: &PointerEvent) -> bool {
         let pos = (p.pos.x as f32, p.pos.y as f32);
         match p.kind {
@@ -1482,6 +1780,18 @@ impl ImageCanvas {
                 true
             }
             PointerKind::Enter | PointerKind::Move => {
+                // 光标先于一切分支：无论这一帧被哪一支吞掉，手型都要跟上指针。
+                self.sync_hand(pos);
+                // 取色模式（m217）：只记指针位置，其余悬停/拖图/按钮高亮一律不碰——
+                // 那一套会在鼠标掠过浮条时反复整窗重绘，还会把左键解释成拖窗口。
+                // 浮层必须跟着光标走，所以位置一变就标脏；同一位置复读不重画。
+                if self.chrome.picker.get() {
+                    if self.chrome.picker_at.get() != Some(pos) {
+                        self.chrome.picker_at.set(Some(pos));
+                        ctx.mark_dirty();
+                    }
+                    return true;
+                }
                 // 与 paint 同一份几何（`last_work`）：开条时工具栏/箭头/信息条上移一条，
                 // 悬停、命中、绘制三者必须同进同出，否则点得到的画不到、画得到的点不到。
                 // 显隐位一翻就当场标脏——"悬停立即浮现、移开立即收走"只有这一个触发点，
@@ -1533,9 +1843,9 @@ impl ImageCanvas {
                 if btn_changed || arrow_changed || title_changed {
                     ctx.mark_dirty();
                 }
-                // 平移图片是**第二手势**（第一手势让给了拖窗口，见模块头）：
-                // Ctrl+左键拖动 或 中键拖动。已经开局的平移不因中途松开 Ctrl 而断，
-                // 故判据里带上 `dragging()`。图片在窗口里的位置主要靠右下角鸟瞰图调。
+                // 平移图片的跟手帧。三种开局都汇到这一条：Ctrl+左键、中键（都不看开关），
+                // 以及 `drag_image` 开着时的裸左键（[`left_drag`] 判成 PanImage 那一支）。
+                // 已经开局的平移不因中途松开 Ctrl 而断，故判据里带上 `dragging()`。
                 let panning = self.viewer.borrow().dragging();
                 if p.kind == PointerKind::Move
                     && self.chrome.pressed.get().is_none()
@@ -1570,12 +1880,42 @@ impl ImageCanvas {
                 if left || strip || was_nav || was_strip || was_pending || was_drag {
                     ctx.mark_dirty();
                 }
+                // 指针离窗：清掉取色采样点（回来时第一记 Move 会重新落点），
+                // 手型交回系统箭头；取色模式仍开着，光标保持十字。
+                self.chrome.picker_at.set(None);
+                if self.chrome.picker.get() {
+                    crate::platform::cursor::use_cross();
+                } else {
+                    super::hand_cursor::apply(None);
+                }
                 false
             }
             PointerKind::Down if p.button == MouseButton::Left => {
                 // 按下就是插手（拖图/点按钮都算）； bare 移动**不算**——否则光标停在窗口里
                 // 就把放映掐死了，而那不该是判据。
                 self.chrome.slide_stop();
+                // 取色模式（m217）：点画面 = 取色并复制 HEX，随即退出模式。
+                // 浮条/标题钮/箭头仍让给原逻辑——点按钮不该被误当成取样。
+                if self.chrome.picker.get() && self.chrome_hit(pos).is_none() {
+                    let pick = self
+                        .viewer
+                        .borrow()
+                        .pick_at(from_rect(self.last_work.get()), pos);
+                    self.chrome.close_picker();
+                    match pick {
+                        Some(pk) => {
+                            let hex =
+                                format!("#{:02X}{:02X}{:02X}", pk.rgba[0], pk.rgba[1], pk.rgba[2]);
+                            match clipboard::copy_text(&hex) {
+                                Ok(()) => ctx.toast_ok(format!("已复制 {hex}")),
+                                Err(e) => ctx.toast_err(e),
+                            }
+                        }
+                        None => ctx.toast_err("这里没有图像像素"),
+                    }
+                    ctx.mark_dirty();
+                    return true;
+                }
                 if self.chrome_activity(pos) {
                     ctx.mark_dirty();
                 }
@@ -1630,16 +1970,16 @@ impl ImageCanvas {
                     }
                     return true;
                 }
-                // Ctrl+左键拖动是"平移图片"（见 Move 分支的同款判据），
-                // 其余左键按下先记账：挪够阈值就升级成拖窗口。
+                // Ctrl+左键一直是"平移图片"的兜底手势，不看开关（见 Move 分支同款判据）。
+                // 裸左键归谁由 [`left_drag`] 判：开关开着、这张图有可平移余量、且不在标题栏
+                // 那一条里 ⇒ 拖图片；否则照旧先记账，挪够阈值升级成拖窗口。
                 if self.chrome.locked.get() {
                     return true; // 锁定：吞掉这一击，不记拖窗账、不开平移
                 }
-                if p.mods.ctrl {
-                    self.viewer.borrow_mut().begin_drag(pos);
-                } else {
-                    self.lmb_pending.set(Some(pos));
-                }
+                self.press_left(pos, self.work_tuple(), p.mods.ctrl);
+                // 按下即换手：`press_left` 已经把平移局面打开了（判成 PanImage 时），
+                // 所以此刻读 `dragging()` 拿到的就是这一按的结果。
+                self.sync_hand(pos);
                 true
             }
             // 中键拖动平移图片（不看修饰键）。
@@ -1696,6 +2036,10 @@ impl ImageCanvas {
                 }
                 let was = self.viewer.borrow().dragging();
                 self.viewer.borrow_mut().end_drag();
+                // 松手就把手型放回去：此时 `dragging()` 已归位，`sync_hand` 会判成
+                // "还在可拖区 ⇒ 松手"或"不在 ⇒ 箭头"。**不能等下一次 Move**——
+                // 松手时指针常常是静止的，那一帧没有 Move 来补。
+                self.sync_hand(pos);
                 // 平移手势收尾：同鸟瞰拖动，挂起的那一帧要在松手这一下画出去。
                 if self.chrome.flush_pan() {
                     ctx.mark_dirty();
@@ -1705,6 +2049,10 @@ impl ImageCanvas {
             PointerKind::Up if p.button == MouseButton::Middle => {
                 let was = self.viewer.borrow().dragging();
                 self.viewer.borrow_mut().end_drag();
+                // 松手就把手型放回去：此时 `dragging()` 已归位，`sync_hand` 会判成
+                // "还在可拖区 ⇒ 松手"或"不在 ⇒ 箭头"。**不能等下一次 Move**——
+                // 松手时指针常常是静止的，那一帧没有 Move 来补。
+                self.sync_hand(pos);
                 // 平移手势收尾：同鸟瞰拖动，挂起的那一帧要在松手这一下画出去。
                 if self.chrome.flush_pan() {
                     ctx.mark_dirty();
@@ -1974,6 +2322,15 @@ fn exec_action(
             viewer.borrow_mut().step_anim(1);
             true
         }
+        // WASD 平移（m216）：一记一步，范围与拖动共用同一份钳位（`pan_limits`）。
+        // 连按到边随做随撤（用户实测不好用，m216 同日），不再有状态机与轮询兜底。
+        // 返回 `true` = 已消费，画布不再让 `App::on_shortcut` 重复走一遍——透传
+        // 返回值的历史教训见 FramePrev 上方。
+        Action::PanUp | Action::PanLeft | Action::PanDown | Action::PanRight => {
+            let (sx, sy) = Chrome::wasd_signs(wasd_dir(a));
+            let _ = viewer.borrow_mut().pan_nudge(sx, sy);
+            true
+        }
         // 缩略图条：会话态开关（m53 起落盘，见 `persist_session`）。
         Action::Filmstrip => {
             let on = !chrome.filmstrip.get();
@@ -1985,6 +2342,14 @@ fn exec_action(
             let on = !chrome.checker.get();
             chrome.checker.set(on);
             persist_session(cfg, hub, |c| c.checker = on);
+            true
+        }
+        // 取色器（m217）：与右键「工具 ▸ 取色器」共用一个 toggle，不另写一份状态。
+        Action::Picker => {
+            chrome.toggle_picker();
+            if let Some(c) = ctx {
+                c.mark_dirty();
+            }
             true
         }
         Action::Minimal => {
@@ -2113,9 +2478,57 @@ fn exec_action(
     }
 }
 
+/// WASD 四个动作 → 方向编码（0=上 1=左 2=下 3=右）。
+/// 符号表在 [`Chrome::wasd_signs`]——这里只认动作，不碰符号，两份表各管一半。
+fn wasd_dir(a: Action) -> u8 {
+    match a {
+        Action::PanUp => 0,
+        Action::PanLeft => 1,
+        Action::PanDown => 2,
+        Action::PanRight => 3,
+        _ => u8::MAX,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn menu_columns_aligned_on_every_level() {
+        // 纯动作列表（复制 / 插件）本来不含开关项；含开关的级不该被多余改动。
+        // 根级这里全用动作项，刻意覆盖补位分支（真实菜单根级自带「左键拖图」开关项）；
+        // 「窗口 ▸ 不透明度 ▸ 档位」是收编后新出现的三级，递归必须够得着。
+        let mut items = vec![
+            MenuItem::separator(),
+            MenuItem::run("打开…", |_| {}, false),
+            MenuItem::submenu("插件", vec![MenuItem::run("色阶分析", |_| {}, false)]),
+            MenuItem::submenu(
+                "窗口",
+                vec![
+                    MenuItem::run("极简模式", |_| {}, true),
+                    MenuItem::separator(),
+                    MenuItem::submenu("不透明度", vec![MenuItem::run("50%", |_| {}, true)]),
+                ],
+            ),
+            MenuItem::run("幻灯片放映", |_| {}, false),
+        ];
+        align_menu_columns(&mut items);
+        let has_checks = |v: &[MenuItem]| v.iter().any(|it| it.checkable);
+        assert!(has_checks(&items), "根级要留列");
+        assert!(has_checks(&items[2].submenu), "纯动作子菜单也要留列");
+        assert!(has_checks(&items[3].submenu), "窗口子菜单照旧留列");
+        assert!(
+            has_checks(&items[3].submenu[2].submenu),
+            "三级档位列表也要留列"
+        );
+        assert!(
+            items[2].submenu.iter().all(|it| !it.checked),
+            "补位不能凭空多出一枚对勾"
+        );
+        assert!(!items[0].checkable, "分隔线不参与补位");
+        assert!(!items[3].submenu[1].checkable, "子菜单分隔线不参与补位");
+    }
 
     #[test]
     fn host_audit_copy_busy_blocks_small_and_large() {
@@ -2172,6 +2585,157 @@ mod tests {
         // 真的挪了：升级成拖窗口。
         assert!(beyond_slop(origin, (origin.0 + 5.0, origin.1)));
         assert!(beyond_slop(origin, (origin.0 - 20.0, origin.1 + 3.0)));
+    }
+
+    /// 左键这一拖归谁：`drag_image` 开关 × 有没有可平移余量 × 是不是标题栏，**八格全钉**。
+    ///
+    /// 只有一格（开关开 + 拖得动 + 画布内）是本次新增的行为，其余七格一律回到拖窗口——
+    /// 用户要的是"能只拖图片"，不是"把拖窗口这条路堵死"：标题栏那一条永远带走窗口，
+    /// 拖不动东西（只有"还没有图"这一种）时也留着拖窗口。
+    /// ★ "拖得动"到 2026-11-03 第四条口径时已经放宽到**几乎总是真**，判据本体见
+    /// `Viewer::pan_limits` → `overscroll`（并集的一半减一枚衣角）。
+    #[test]
+    fn left_drag_yields_the_window_unless_there_is_room_in_the_canvas() {
+        use LeftDrag::{PanImage, Window};
+        assert_eq!(
+            left_drag(true, true, false),
+            PanImage,
+            "本次功能的全部新行为"
+        );
+        assert_eq!(left_drag(true, true, true), Window, "标题栏永远拖窗口");
+        assert_eq!(
+            left_drag(true, false, false),
+            Window,
+            "空窗（没有图）时别堵死拖窗口"
+        );
+        assert_eq!(left_drag(true, false, true), Window);
+        assert_eq!(
+            left_drag(false, true, false),
+            Window,
+            "开关关掉就是 2026-10-08 那套分工"
+        );
+        assert_eq!(left_drag(false, true, true), Window);
+        assert_eq!(left_drag(false, false, false), Window);
+        assert_eq!(left_drag(false, false, true), Window);
+    }
+
+    /// 接线自检：`ImageCanvas::press_left` 真的按 [`left_drag`] 的结论开局。
+    ///
+    /// 纯函数绿了不代表线接对——写错一个分支方向，用例照过、手感照错，而这正是
+    /// "按下拖的是图片还是窗口"这种**只有用户能发现**的缺陷。四臂各钉一条：
+    /// 默认档平移 / 关掉记账 / 标题栏记账 / Ctrl 不看开关。
+    #[test]
+    fn left_press_wires_the_switch_to_the_pan_state() {
+        let (canvas, shared) = zoomed_canvas(); // 图 400×300 已放大到超出 200×150 视口
+        let view = (0.0, 0.0, 200.0, 150.0);
+        assert!(
+            canvas.config.borrow().drag_image,
+            "本例的前提是默认档（开）"
+        );
+
+        // ① 开 + 有余量 + 画布内 ⇒ 开平移局，且不记拖窗口的账。
+        canvas.press_left((50.0, 80.0), view, false);
+        assert!(shared.borrow().dragging(), "画布内按下该开平移局");
+        assert!(
+            canvas.lmb_pending.get().is_none(),
+            "拖窗口那笔账不该记，否则抬起前就被升级成拖窗口"
+        );
+
+        // ② 同一枚画布把开关关掉 ⇒ 反过来：记账、不开局。
+        shared.borrow_mut().end_drag();
+        canvas.config.borrow_mut().drag_image = false;
+        canvas.press_left((50.0, 80.0), view, false);
+        assert!(!shared.borrow().dragging(), "开关关掉就不该开平移局");
+        assert_eq!(
+            canvas.lmb_pending.get(),
+            Some((50.0, 80.0)),
+            "该记下拖窗口的起点"
+        );
+
+        // ③ 开关开着，但落在标题栏那一条里 ⇒ 那一按永远带走窗口。
+        canvas.config.borrow_mut().drag_image = true;
+        canvas.lmb_pending.set(None);
+        canvas.press_left((50.0, 10.0), view, false);
+        assert!(!shared.borrow().dragging(), "标题栏那一按不许变成拖图片");
+        assert!(canvas.lmb_pending.get().is_some());
+
+        // ④ Ctrl+左键是兜底平移手势，**不看开关**（2026-10-08 起）。
+        canvas.config.borrow_mut().drag_image = false;
+        canvas.lmb_pending.set(None);
+        canvas.press_left((50.0, 80.0), view, true);
+        assert!(shared.borrow().dragging(), "Ctrl+左键一直平移");
+
+        // ⑤ 第三条口径的新行为：**图比窗口小也拖图**（旧口径在这里会退回拖窗口）。
+        // 400×300 的图缩到 100×75，落在 200×150 的视口里 ⇒ 四周都是空白，仍该拖得动。
+        shared.borrow_mut().end_drag();
+        canvas.config.borrow_mut().drag_image = true;
+        canvas.lmb_pending.set(None);
+        shared.borrow_mut().set_fit(false);
+        shared.borrow_mut().zoom_at_center(0.25);
+        assert!(
+            shared.borrow().can_pan(),
+            "夹具的前提：图确实比视口小（100×75 落在 200×150 里）"
+        );
+        canvas.press_left((50.0, 80.0), view, false);
+        assert!(
+            shared.borrow().dragging(),
+            "小图也该开平移局——用户 2026-11-03 第三条口径"
+        );
+        assert!(canvas.lmb_pending.get().is_none(), "拖窗口那笔账不该记");
+    }
+
+    /// 「复制 ▸」的三项：名字、顺序、灰项判据、以及键位提示还在不在。
+    ///
+    /// 菜单文本是用户唯一看得见的东西，写错字或漏掉一项**没有任何别的门禁会响**；
+    /// 而从平铺改成子菜单，最容易丢的正是挂在第一项与第三项上的快捷键提示。
+    #[test]
+    fn copy_submenu_carries_the_three_copy_actions() {
+        let (canvas, _v) = zoomed_canvas();
+        // 默认档这两个键位是**空的**（`hotkeys=…copy_img:;copy_path:`），所以先自己绑上，
+        // 否则下面的 `is_some()` 断言测的是配置而不是接线。
+        canvas.config.borrow_mut().hotkeys =
+            crate::core::hotkey::Hotkeys::from_ini("copy_img:C;copy_path:V");
+        let items = canvas.copy_items(true, true);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["复制当前（PNG）", "复制原文件", "复制文件路径"],
+            "「复制 ▸」的内容或顺序变了"
+        );
+        let cfg = canvas.config.borrow();
+        assert!(
+            items[0].shortcut.is_some() && items[2].shortcut.is_some(),
+            "本例的前提是两项都绑到了键"
+        );
+        assert_eq!(
+            items[0].shortcut,
+            cfg.hotkeys.display(Action::CopyImage),
+            "第一项的键位提示必须来自 CopyImage"
+        );
+        assert_eq!(
+            items[2].shortcut,
+            cfg.hotkeys.display(Action::CopyPath),
+            "第三项的键位提示必须来自 CopyPath（收进子菜单最容易接错的一格）"
+        );
+        assert_eq!(
+            items[1].shortcut, None,
+            "「复制原文件」从来没有键位，别在这里冒出第二个来源"
+        );
+        drop(cfg);
+        assert!(
+            items[0].enabled && items[1].enabled && items[2].enabled,
+            "有图有文件时三项都该可点"
+        );
+        // 灰项各归各：没图 ⇒ 只有「复制当前」关掉；没文件 ⇒ 后两项关掉。
+        let no_image = canvas.copy_items(false, true);
+        assert!(!no_image[0].enabled, "没图不该能复制画面");
+        assert!(no_image[1].enabled && no_image[2].enabled);
+        let no_file = canvas.copy_items(true, false);
+        assert!(no_file[0].enabled);
+        assert!(
+            !no_file[1].enabled && !no_file[2].enabled,
+            "没打开文件时那两项都该灰着"
+        );
     }
 
     /// 鸟瞰盒必须在**右下角**，且始终整个落在视口内。
@@ -2993,5 +3557,95 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── 取色器模式（m217）──────────────────────────────────────────
+    //
+    // 全走生产事件入口 on_event：状态位、重绘请求、以及"别把取样解释成拖窗口"
+    // 都是可数的判据，不靠肉眼。
+
+    #[test]
+    fn picker_mode_records_position_then_closes_on_click_or_esc() {
+        use windui::event::{MouseButton, PointerEvent, PointerKind};
+        use windui::geometry::Point;
+        let (mut canvas, _viewer) = zoomed_canvas();
+        let chrome = canvas.chrome.clone();
+        chrome.picker.set(true);
+
+        let at = (100.0_f32, 75.0_f32);
+        let pointer = |kind| {
+            Event::Pointer(PointerEvent::single(
+                kind,
+                Point::new(at.0 as i32, at.1 as i32),
+                MouseButton::Left,
+            ))
+        };
+        let key = |k| {
+            Event::Key(KeyEvent {
+                key: k,
+                pressed: true,
+                shift: false,
+                ctrl: false,
+                alt: false,
+                meta: false,
+            })
+        };
+        let feed = |c: &mut ImageCanvas, e: &Event| -> bool {
+            windui::testing::run_with_ctx(|ctx| {
+                c.on_event(ctx, e);
+            })
+            .repaint
+        };
+
+        // ① Move 记下位置并标脏；同一位置复读不重画一整帧（浮层跟随光标是唯一
+        //    必须跟着 Move 重绘的东西，位置没动就不该有第二次）。
+        assert!(feed(&mut canvas, &pointer(PointerKind::Move)));
+        assert_eq!(chrome.picker_at.get(), Some(at));
+        assert!(
+            !feed(&mut canvas, &pointer(PointerKind::Move)),
+            "同一位置不该再重画"
+        );
+
+        // ② 左键：取样后立刻退出模式，且不进拖窗口/拖图那条路。
+        assert!(feed(&mut canvas, &pointer(PointerKind::Down)));
+        assert!(!chrome.picker.get(), "点完就该退出取色模式");
+        assert_eq!(chrome.picker_at.get(), None);
+        assert_eq!(
+            canvas.lmb_pending.get(),
+            None,
+            "取样不该被解释成拖窗口（lmb_pending 是那条路的起点）"
+        );
+
+        // ③ Esc 优先退出：不让「Esc 关窗」的动作把窗口一起带走。
+        chrome.picker.set(true);
+        assert!(feed(&mut canvas, &key(Key::Escape)));
+        assert!(!chrome.picker.get());
+        assert_eq!(chrome.picker_at.get(), None);
+
+        // ④ 非 Esc 键照常派发且**不关模式**——切图/缩放时可连续取色。
+        chrome.picker.set(true);
+        assert!(feed(&mut canvas, &key(Key::Char('t'))));
+        assert!(chrome.picker.get(), "T 键不该把取色器关掉");
+    }
+
+    #[test]
+    fn tool_submenu_exposes_picker_as_a_checkable_shortcut_item() {
+        let (canvas, _) = zoomed_canvas();
+        let items = canvas.tool_items(true);
+        assert_eq!(items.len(), 1, "工具组目前只有取色器一项");
+        let it = &items[0];
+        assert_eq!(it.label, "取色器");
+        assert!(it.checkable, "菜单里要能看出开没开");
+        assert!(!it.checked, "默认关");
+        assert!(it.enabled, "有图时可点");
+        let sc = it.shortcut.as_deref().expect("菜单项要显示 K 快捷键");
+        assert!(
+            sc.to_uppercase().contains('K'),
+            "快捷键提示该含 K，实得 {sc}"
+        );
+        assert!(
+            !canvas.tool_items(false)[0].enabled,
+            "空窗没有像素可采样，取色器必须置灰"
+        );
     }
 }

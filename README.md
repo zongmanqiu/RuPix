@@ -1,12 +1,12 @@
 # RuPix
 
 
-**[⬇️ 下载 1.1.2 (Gitee)](https://gitee.com/qiuzongman/pecia/releases/download/1.1.2/Pecia_x64_1.1.2.zip)**
- ｜ **[⬇️ 下载 1.1.2 (GitHub)](https://github.com/zongmanqiu/Pecia/releases/download/1.1.2/Pecia_x64_1.1.2.zip)**
+**[⬇️ 发布版 (Gitee)](https://gitee.com/qiuzongman/RuPix/releases)**
+ ｜ **[⬇️ 发布版 (GitHub)](https://github.com/zongmanqiu/RuPix/releases)**
  ｜ [Gitee主仓](https://gitee.com/qiuzongman/RuPix)
  ｜ [GitHub镜像](https://github.com/zongmanqiu/RuPix)
 
-> 解码器仓库: [Gitee](https://gitee.com/qiuzongman/RuPix-Decoders) | [GitHub](https://gitee.com/qiuzongman/RuPix-Decoders)
+> 解码器仓库: [Gitee](https://gitee.com/qiuzongman/RuPix-Decoders) | [GitHub](https://github.com/zongmanqiu/RuPix-Decoders)
 
 > 插件仓库: [Gitee](https://gitee.com/qiuzongman/RuPix-Plugins) | [GitHub](https://github.com/zongmanqiu/RuPix-Plugins)
 
@@ -43,7 +43,7 @@ Windows 10/11 上的小巧极速看图器。**宿主只做「看图」，位图�
 - 导航：`← →` 翻页（**永远循环**）、`Home/End` 首末张；‹ › 箭头——传统模式常驻，**极简模式靠边浮现**（图形按需显示，热区一寸不小）。所有快捷键都能在设置页改
 - 滚轮翻页：一格一张，且**每 100 ms 最多一张**——触控板一次惯性滑行不会滑掉一排；故意慢滚每格都当场生效
 - 缩放：滚轮（指针为锚点）、小键盘 `+ -`、`0` 适应窗口、`1` 原尺寸；`R` 旋转 90°、`M` 水平镜像
-- 鼠标手势：左键拖窗口（挪够 4dp 才升级，保住双击关窗）、Ctrl/中键拖动平移图片、拖鸟瞰框改视角
+- 鼠标手势：默认**左键在画布里拖图片**（图比窗口小也拖得动，图边还能越过窗口边——但永远留 24dp 的图在画面里，拖不丢）、移动窗口交给顶部标题栏那一条；`Ctrl+左键` / 中键拖动平移图片（不看开关）、拖鸟瞰框改视角；开关在「选项 → 左键拖图」与右键菜单的开关区都有，取消勾选就回到"任意位置左键拖窗口"（挪够 4dp 才升级成拖动，保住双击关窗）
 - 双击行为可配置（无操作/关窗/最大化/全屏），默认关窗；`Esc` 退出全屏
 - 解码全在后台线程，UI 不卡；缩放停下 120ms 后才按需重新解码；相邻图预取（还在连续翻页时，
   原图档的补解会给翻页让路，手一停 0.4s 自动补上）

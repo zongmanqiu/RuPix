@@ -12,26 +12,21 @@ use std::rc::Rc;
 
 use windui::prelude::*;
 
-use super::tokens::{to_color, OVERLAY_EMPTY_BG};
+use super::tokens as tk;
 use super::{Chrome, Hub, ImageCanvas};
 use crate::core::config::Config;
 use crate::core::viewer::Viewer;
-
-/// 窗口与画布共用的深色（恒定深色 UI，不走主题 Role）。
-///
-/// ★ 数值取自全 ui 共用的令牌：`canvas` 的 `EMPTY_BG` 与它本是同一块深黑，
-///   以前各写一遍 `15,15,15`，改色只改一处必然漏另一处。
-pub(crate) const DARK: Color = to_color(OVERLAY_EMPTY_BG);
 
 pub(crate) fn build_root(
     viewer: &Rc<RefCell<Viewer>>,
     chrome: &Rc<Chrome>,
     config: &Rc<RefCell<Config>>,
     hub: &Hub,
+    new_window: super::canvas::NewWindowFn,
 ) -> Element {
     Element::stack()
         .fill()
-        .bg(DARK)
+        .bg(tk::empty_bg())
         // 整窗接收拖放：把文件从资源管理器拖进来即打开。
         .on_drop_files({
             let v = viewer.clone();
@@ -47,12 +42,12 @@ pub(crate) fn build_root(
         .child(
             Element::col()
                 .fill()
-                .widget(ImageCanvas::new(
-                    viewer.clone(),
-                    chrome.clone(),
-                    config.clone(),
-                    hub.clone(),
-                ))
+                .widget(
+                    ImageCanvas::new(viewer.clone(), chrome.clone(), config.clone(), hub.clone())
+                        // 「新建窗口」的落地由 runtime 注入：画布不建窗口，它只把用户的
+                        // 这一次点击交出去（见 `ImageCanvas` 的同名字段）。
+                        .with_new_window(new_window),
+                )
                 .autofocus(),
         )
 }

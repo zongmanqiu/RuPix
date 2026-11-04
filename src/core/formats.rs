@@ -346,14 +346,32 @@ pub fn is_builtin_ext(ext: &str) -> bool {
     builtin_auto_owner(ext).is_some()
 }
 
-/// 空格预览可用的扩展名：内置 ∪ 解码器自述，且排除裸数据参数类（rawpx 等）。
+/// 空格预览可用的扩展名：内置 ∪ 解码器自述（**只看后缀归属，不看"这个文件解不解得开"**）。
 ///
 /// ★ 判据唯一真源放格式清单数据层（本函数）：调用方不再各拼一份。历史缺口——
 /// spacehook 的取件过滤曾只查 `declared_exts()`（解码器自述并集），内置 SVG 不在内，
 /// 选中 SVG 时 `allowed=false` → 空格无效（K39）；主窗「算不算图片」判定
 ///（`gallery::is_image_ext_in` = 内置 ∪ 取好的那份 `declared` 清单）一直是对齐的。
+///
+/// ★ **不再在这里预判"裸像素解不开"**：曾经这里减掉
+/// [`crate::core::decode::is_headerless_ext`] 那 11 个后缀，理由是"没有宽高/布局就解不开"。
+/// 但那是**文件级**的事实，不是**后缀级**的：裸像素的首开参数由后缀定布局、由文件长度
+/// 反推宽高（[`crate::core::decode::infer_raw_params`]），双击路径本来就"推得出就直接开"。
+/// 拿后缀当代理，代价是 `.uyvy` 双击开得开、按空格毫无反应（用户实测，与 m209 的 `.raf`
+/// 同一族）。现在准入只看清单，**能不能真出图由解码前那次参数推断决定**——推不出就静默
+/// 不出窗（预览没有参数窗可弹），与双击"推不出才弹窗"是同一条分岔。
 pub fn is_previewable(ext: &str) -> bool {
-    is_builtin_ext(ext) || (declared_exts().contains(ext) && !is_raw(ext))
+    previewable_of(ext, &declared_exts())
+}
+
+/// [`is_previewable`] 的**纯函数**版本：判据只吃一份清单，不碰全局装入状态。
+///
+/// 抽出来是为了让"准入只看后缀归属、不按 headerless 预判"这件事能被机器验证——
+/// 单测里没有解码器目录（`declared_exts()` 恒空），拿它测不出 `.uyvy` 那条回归。
+/// 大小写在这里统一（清单本身是小写、无点）。
+pub(crate) fn previewable_of(ext: &str, declared: &HashSet<String>) -> bool {
+    let e = ext.to_ascii_lowercase();
+    is_builtin_ext(&e) || declared.contains(&e)
 }
 
 #[cfg(test)]
@@ -438,6 +456,41 @@ mod tests {
         assert!(!is_previewable("png"));
         assert!(!is_previewable("jpg"));
         assert!(!is_previewable("avif"));
+    }
+
+    /// 同一枚 raw 解码器认领的两类后缀，空格预览**都**要接。
+    ///
+    /// ★ 回归锁（用户实测两轮）：`.raf` 与 `.uyvy` 都是"双击开得开、按空格没反应"。
+    /// 第一次的病灶是按 `is_raw`（DLL 级口径）排整档，第二次的病灶是改成按
+    /// `is_headerless_ext` 排裸像素——两次都是**拿后缀当"解不解得开"的代理**。
+    /// 裸像素的真实分岔在解码前那次参数推断（后缀定布局 + 文件长度定宽高），
+    /// 准入这一层只回答"这个后缀有没有解码器认领"，不回答"这个文件解不解得出"。
+    #[test]
+    fn camera_raw_and_headerless_pixels_are_both_admitted() {
+        let declared: HashSet<String> = [
+            "raf", "nef", "cr2", "dng", "rgb", "yuv", "uyvy", "bgra", "nv12", "png",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for ext in ["raf", "nef", "cr2", "dng"] {
+            assert!(
+                previewable_of(ext, &declared),
+                "相机 RAW（.{ext}）自带完整文件头，空格预览必须能开"
+            );
+        }
+        for ext in ["rgb", "yuv", "uyvy", "bgra", "nv12"] {
+            assert!(
+                previewable_of(ext, &declared),
+                "裸像素（.{ext}）的参数可推断，空格预览不该按后缀预判挡掉"
+            );
+        }
+        assert!(previewable_of("png", &declared), "普通位图照旧可预览");
+        assert!(!previewable_of("xyz", &declared), "清单没认领的后缀不接");
+        assert!(
+            previewable_of("SVG", &declared),
+            "大小写不该影响内置格式判定"
+        );
     }
 
     /// 矢量**渲染责任方**的两档分流（m153 A 方案，2026-10-28 收口）。

@@ -24,6 +24,18 @@ pub fn options_page(h: &Handles) -> Element {
                 .child(check_row("极简模式", h.minimal_mode))
                 // ini 键：checker（即时生效：runtime 每帧把配置推给当前窗口，m53-L）
                 .child(check_row("棋盘格", h.checker))
+                // ini 键：ui_theme（0 深色 / 1 浅色）。**只影响看图窗口**——浮层胶囊、
+                // 缩略图条、棋盘格、空窗底与中央提示文字；设置页、属性窗、对话框
+                // 永远是浅底深字那一套（2026-11-02 用户口径）。
+                // 换下拉当场生效：config 写回后 runtime 下一帧就换令牌并重绘。
+                .child(option_row(
+                    "界面主题（仅看图窗口）",
+                    Element::dropdown(
+                        UiTheme::ALL.iter().map(|t| t.label().to_string()).collect(),
+                        h.ui_theme,
+                    )
+                    .width(CONTROL_GROUP_W),
+                ))
                 .child(check_row("适应长图", h.long_fit))
                 // ini 键：close_to_tray（勾上即生效：托盘图标当场出现、关窗转为隐藏）
                 .child(check_row("最小化到托盘", h.to_tray))
@@ -31,6 +43,17 @@ pub fn options_page(h: &Handles) -> Element {
                 // 系统——与快捷键页的看图窗口内键位不同源；16ms 轮询差分装/摘钩，见
                 // platform::spacehook）
                 .child(check_row("空格预览", h.space_preview))
+                // ini 键：drag_image（默认勾上）。勾着 = 画布里按住左键只平移图片、窗口不动，
+                // 移动窗口交给**顶部标题栏**那一条；图比窗口小也拖得动，图边还能越过窗口边
+                // （永远留 24dp 在画面里，图拖不丢）。
+                // 取消勾选 = 回到旧分工：任意位置左键拖都拖窗口，平移改用 Ctrl+左键 / 中键 / 鸟瞰图。
+                // 名字只说"左键"：中键与 Ctrl+左键一直能拖图，这个开关管的确实是左键那一路。
+                // 同一个开关也在右键菜单的开关区（「极简模式 / 缩略图条」那一组）。
+                .child(check_row("左键拖图", h.drag_image))
+                // ini 键：allow_multiple（多开）。勾上后再双击图片，在同一进程里新开
+                // 一扇窗口——进程与托盘始终只有一个；画布右键菜单同时出现「新建窗口」。
+                // 关闭时维持单窗口：双击另一张图会把 argv 转发到已有窗口、就地换图。
+                .child(check_row("允许多开", h.allow_multiple))
                 // ini 键：prefetch（默认勾上）。开着就是"按下方向键立刻换图"：
                 // 后台先解好同文件夹前后各两张的**视口档**，与图片本身多大无关；
                 // 最坏驻留由 `viewer` 的份数闸 + 256 MiB 字节闸封顶。关掉它，

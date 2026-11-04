@@ -87,7 +87,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 // 窗口图标（`App::icon`）：HICON 由 tray 那份 RGBA 转换复用，销毁归 WindowState::drop。
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyIcon, SendMessageW, HICON, ICON_BIG, ICON_SMALL, SM_CXICON, SM_CXSMICON,
+    DestroyIcon, SendMessageW, HCURSOR, HICON, ICON_BIG, ICON_SMALL, SM_CXICON, SM_CXSMICON,
 };
 // 只用于 d2d 后端选择（RDP 远程会话下强制软渲染），随该 feature 一起门控。
 #[cfg(feature = "d2d")]
@@ -648,6 +648,19 @@ unsafe fn apply_app_hotkey_ops() {
             hk.apply(id, op);
         }
     }
+}
+
+/// ★ RuPix 补丁 025 —— 应用级退出的公开入口（`EventCtx::quit_app`）。
+///
+/// 与 [`quit_app`] 的分工：那个会**同步销毁**全部窗口（`DestroyWindow` 派发 `WM_DESTROY`，
+/// 必须在所有窗口状态借用释放之后才敢调）；这一条只投一条退出消息，消息循环收尾时由
+/// [`run_windowed`] 统一销毁窗口。因此本函数可以在任何回调里调用——它不重入 `wnd_proc`。
+///
+/// 为什么不复用 `quit_app`：`EventCtx` 的方法跑在 `wnd_proc` 内部，正持有窗口状态借用，
+/// 此刻 `DestroyWindow` 就是铁律 6 的别名 UB。而"常驻模式 + 最后一个窗口关掉 = 进程该走"
+/// 这个判断只能由应用在窗口回调里做，它需要的就是一条安全的退出通道。
+pub fn post_quit() {
+    unsafe { PostQuitMessage(0) };
 }
 
 /// 关掉整个应用：销毁全部窗口，并保证消息循环一定收到退出消息。
@@ -2447,6 +2460,15 @@ unsafe extern "system" fn wnd_proc(
         // 客户区光标：按当前悬停控件期望形状设置（链接=手型、文本=I 形）。
         // 仅客户区由我们决定，非客户区（边框/标题栏）交默认处理。
         WM_SETCURSOR => {
+            // ★ RuPix 补丁 024：宿主自绘光标优先。
+            // 没有这一段时，鼠标每移动一次系统都发 WM_SETCURSOR，框架按形状把光标
+            // 设回箭头；宿主随后在自己的 MOUSEMOVE 里设回自绘手型——两次 SetCursor
+            // 前后脚，屏幕上就是**手型↔箭头反复闪**。这里先认宿主那枚句柄，设完
+            // 直接返回 TRUE（同下面两条，阻止系统再覆盖成类光标）。
+            if let Some(h) = crate::platform::cursor_override() {
+                let _ = SetCursor(Some(HCURSOR(h as *mut core::ffi::c_void)));
+                return LRESULT(1);
+            }
             let hit = (lparam.0 & 0xffff) as u32;
             if hit == HTCLIENT {
                 if let Some(state) = state_from(hwnd) {

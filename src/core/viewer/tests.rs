@@ -478,6 +478,113 @@ fn switching_keeps_previous_image_on_screen() {
     );
 }
 
+/// 溢出上限的三条分支（纯函数，四档都钉）：大图、小图、比 `PAN_KEEP_VISIBLE` 还小的图、
+/// 以及"没有视口/没有图"。这条线就是"图边能不能越过窗口边、最多越多少"。
+#[test]
+fn overscroll_keeps_a_sliver_and_never_the_whole_window() {
+    use super::zoom::overscroll;
+    // 大图 1000 落在 400 的窗口里：旧口径是 (1000-400)/2 = 300（永远不许露黑边），
+    // 新口径允许把图一直拖到"只剩 24dp 衣角"⇒ (400+1000)/2 - 24 = 676。
+    assert_eq!(overscroll(400.0, 1000.0), 676.0, "大图：图边可以离开窗口边");
+    // 小图 100 落在 400 里：(400+100)/2 - 24 = 226。
+    assert_eq!(overscroll(400.0, 100.0), 226.0, "小图：同样能拖到只剩衣角");
+    // 图比衣角还小（10 < 24）：留不下 24，就整张留在画面里 ⇒ 上限退回"图边贴窗口边"。
+    assert_eq!(
+        overscroll(400.0, 10.0),
+        195.0,
+        "10dp 的小图：keep 退化成图宽，整张不许出画面"
+    );
+    // 窗口比衣角还窄（20 < 24）：同理退化。
+    assert_eq!(
+        overscroll(20.0, 1000.0),
+        490.0,
+        "窗口 20dp：keep 退化成窗口宽"
+    );
+    // 没有窗口或没有图 ⇒ 不动。
+    assert_eq!(overscroll(0.0, 100.0), 0.0);
+    assert_eq!(overscroll(400.0, 0.0), 0.0);
+}
+
+/// `can_pan` 必须与 `clamp_pan` 是**同一份几何**——它是左键手势分工的判据之一
+/// （`ui::canvas::left_drag` 的输入）。两处各算一遍就会出现"判成可拖、按下去画面
+/// 一动不动"，或反过来"没有图时把拖窗口这条路堵死"。
+///
+/// 2026-11-03 用户第三、第四条口径连着改了两回：先"任何情况下都要能拖动"（小图也算），
+/// 再"允许图边离开窗口边"（上限从差值的一半改成并集的一半减衣角）。
+#[test]
+fn can_pan_tracks_the_room_clamp_pan_uses() {
+    let mut v = viewer_with_image(); // 4×4 位图
+    v.on_viewport(0.0, 0.0, 100.0, 100.0, 1.0);
+    // 适应窗口（4×4 铺满 100×100）：旧口径在这里是 0（无处可挪），新口径 = 100 - 24 = 76。
+    assert!(
+        v.can_pan(),
+        "图与视口一样大也该拖得动（第四条口径露出图边）"
+    );
+    let _ = v.set_pan((1.0e6, 0.0));
+    assert_eq!(v.pan().0, 76.0, "上限 = (视口+图)/2 - 衣角 = 76");
+
+    // 图比视口小（50×50 落在 100×100 里）
+    v.zoom_at_center(12.5);
+    assert!(v.can_pan(), "图比视口小也要拖得动（第三条口径）");
+    let _ = v.set_pan((1.0e6, 0.0));
+    assert_eq!(v.pan().0, 51.0, "小图上限 = (100+50)/2 - 24 = 51");
+
+    // 图比视口大（256 落在 100 里）：旧口径 78，新口径 154——多出来的那一段就是"图边离开窗口边"
+    v.zoom_at_center(64.0);
+    let _ = v.set_pan((1.0e7, 0.0));
+    assert_eq!(
+        v.pan().0,
+        154.0,
+        "大图上限 = (100+256)/2 - 24 = 154（旧口径是 78）"
+    );
+
+    // 首开空窗（还没有图）：那一按必须还能拖窗口。
+    let (tx, _rx) = std::sync::mpsc::channel::<crate::core::decode::Done>();
+    let empty = Viewer::new(
+        Rc::new(crate::core::decode::Decoder::spawn_with(tx)),
+        Rc::new(RefCell::new(Config::default())),
+    );
+    assert!(!empty.can_pan(), "没有图就没有可拖的东西");
+}
+
+/// m216：WASD 平移的步进。三件事各钉一条：
+/// ① 步长有下限（视口小到 100 px 时按 24 px 走，不是 12.5）；
+/// ② 平移范围与拖动共用同一份钳位（`set_pan` → `clamp_pan` → `pan_limits`，无第二正本）；
+/// ③ 已在边上时步进不许报"变了"（apply_pan 的比较纪律，M6 老账）。
+#[test]
+fn wasd_pan_nudge_shares_clamp_geometry() {
+    let mut v = viewer_with_image(); // 4×4 位图
+    v.on_viewport(0.0, 0.0, 100.0, 100.0, 1.0);
+    // 适应窗口后 pan 回零（夹具装图即适应）。
+    assert!(v.pan_nudge(0.0, 1.0), "第一记 W 该平移（看上方）");
+    assert_eq!(v.pan().1, 24.0, "步长 = 视口短边 100/8=12.5，下限 24 兜底");
+    assert_eq!(v.pan().0, 0.0, "纵向平移不许带动横向");
+
+    // 推到极限的落点与 set_pan(大数) 的钳位一致（= 76，见 can_pan 用例）：
+    // 平移走的就是 set_pan 这一条路，范围天然与拖动一致。
+    let _ = v.set_pan((0.0, 1.0e6));
+    assert_eq!(v.pan().1, 76.0);
+
+    // 在边上：再步进不许报"变了"（不比较就是每按一下白刷一整帧）。
+    assert!(!v.pan_nudge(0.0, 1.0), "已在下极限，向上看无路可走");
+    // 反方向仍然能动。
+    assert!(v.pan_nudge(0.0, -1.0), "反向平移不受极限影响");
+}
+
+/// m216 符号约定第二正本：`sy = +1`（W）必须让 pan.y **增大**（图像下移 = 视口看上方）。
+/// 写反的症状：按 W 画面往上飘、看的是图的下缘，与"连按到顶部"的承诺背道而驰。
+#[test]
+fn wasd_nudge_signs_follow_viewport_direction() {
+    let mut v = viewer_with_image();
+    v.on_viewport(0.0, 0.0, 100.0, 100.0, 1.0);
+    let base = v.pan();
+    let _ = v.pan_nudge(1.0, 0.0); // A：左看
+    assert!(v.pan().0 > base.0, "A（左看）该让 pan.x 增大（图像右移）");
+    let _ = v.pan_nudge(-1.0, 0.0);
+    let _ = v.pan_nudge(-1.0, 0.0); // D：右看
+    assert!(v.pan().0 < base.0, "D（右看）该让 pan.x 减小（图像左移）");
+}
+
 /// 平移（拖图 / 鸟瞰导航）必须给 SVG 安排可视区域重渲；位图不该触发解码。
 ///
 /// 2026-10-10 用户报障：放大 SVG 后在鸟瞰图拖视角，拖出旧位图 + 30% 边距的
@@ -3032,5 +3139,101 @@ fn region_slice_keeps_the_play_metadata_of_the_whole_document() {
     assert!(
         v.anim_next_at.is_some(),
         "区域重渲后必须重新排播放闸（否则自动切页停止）"
+    );
+}
+
+// ── 取色器采样（m217）────────────────────────────────────────────
+//
+// 两条各钉一半：颜色取自"上屏位图"（所见即所得），坐标取自"原图"（逆掉
+// 旋转/镜像/降采样）。两套几何混用是这个功能最容易写错、又最难肉眼发现的地方。
+
+/// 4×4 彩色坐标网格：`R = x*60, G = y*60, B = 100`——取到哪一格能直接读出来。
+fn viewer_with_color_grid() -> Viewer {
+    use crate::core::decode::{Decoder, Done};
+    use crate::core::pixels::{Anim, Bitmap, Decoded};
+    let (tx, _rx) = std::sync::mpsc::channel::<Done>();
+    let mut v = Viewer::new(
+        Rc::new(Decoder::spawn_with(tx)),
+        Rc::new(RefCell::new(Config::default())),
+    );
+    let (w, h) = (4u32, 4u32);
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            rgba.extend_from_slice(&[(x * 60) as u8, (y * 60) as u8, 100, 255]);
+        }
+    }
+    assert!(v.apply(Done {
+        seq: 0,
+        path: std::path::PathBuf::from("grid.png"),
+        out: Ok(Decoded {
+            natural: (w, h),
+            region: None,
+            anim: Anim::STATIC,
+            bitmap: Bitmap {
+                width: w,
+                height: h,
+                rgba
+            },
+        }),
+    }));
+    v
+}
+
+#[test]
+fn pick_at_reads_the_displayed_pixel_and_reports_native_coords() {
+    let mut v = viewer_with_color_grid();
+    v.on_viewport(0.0, 0.0, 100.0, 100.0, 1.0);
+    let content = RectI::new(0, 0, 100, 100);
+    // 钉在 1:1 档：fit 档会把 4×4 本地重采样成视口大小（100×100），那时取色器
+    // 报的是**屏上插值后**的像素而不是文件里的字节——那是"所见即所得"的正确
+    // 口径，但拿它验"原图坐标映射"会被插值噪声糊住。1:1 档位图 == 原图。
+    v.zoom_at_center(1.0);
+    v.rebuild_image();
+    assert_eq!(v.image().unwrap().width, 4, "前提：1:1 档位图与原图同尺寸");
+    let d = v.image_dst(content).expect("有图就该有目标框");
+    // 第 (1,1) 格的中心：局部归一化 u=v=0.375，落在第 1 格。
+    let pos = (
+        d.x as f32 + d.w as f32 * 0.375,
+        d.y as f32 + d.h as f32 * 0.375,
+    );
+    let p = v.pick_at(content, pos).expect("图内必须有读数");
+    assert_eq!(p.at, (1, 1), "原图坐标必须来自整图 dst 的归一化坐标");
+    assert_eq!(p.rgba, [60, 60, 100, 255], "颜色必须是屏上那一枚像素");
+
+    // 图外（左、右下边界外）一律无读数：不许把钳到边缘的颜色冒充光标下的像素。
+    assert_eq!(v.pick_at(content, (d.x as f32 - 1.0, pos.1)), None);
+    assert_eq!(
+        v.pick_at(content, (d.x as f32 + d.w as f32, d.y as f32 + d.h as f32)),
+        None,
+        "半开区间：右/下边界那条属于图外"
+    );
+}
+
+#[test]
+fn pick_at_inverse_maps_rotation_and_matches_the_pixel_it_shows() {
+    let mut v = viewer_with_color_grid();
+    v.on_viewport(0.0, 0.0, 100.0, 100.0, 1.0);
+    let content = RectI::new(0, 0, 100, 100);
+    v.rotate_cw(); // 4×4 小图走同步落地，rot 当场 = 1
+    assert_eq!(v.rot, 1);
+    let d = v.image_dst(content).expect("旋转后有目标框");
+
+    // 顺时针 90° 的逆映射：显示 (dx,dy) ← 原图 (dy, 1−dx)。
+    // 取 dx=dy=0.125（第 0 格中心）⇒ 原图 (0, 3)。
+    let pos = (
+        d.x as f32 + d.w as f32 * 0.125,
+        d.y as f32 + d.h as f32 * 0.125,
+    );
+    let p = v.pick_at(content, pos).expect("旋转后仍要有读数");
+    assert_eq!(p.at, (0, 3), "旋转后的坐标必须逆变换回原图朝向");
+
+    // 强判据：报出来的颜色必须就是报出来的那个原图坐标的颜色。
+    // 像素变换（rebuild_image）与坐标逆映射（rect_map_image）只要方向不一致，
+    // 这一条必红——那正是"取色器指着红色报蓝色"的现场。
+    assert_eq!(
+        p.rgba,
+        [(p.at.0 * 60) as u8, (p.at.1 * 60) as u8, 100, 255],
+        "颜色与坐标必须指向同一枚原图像素"
     );
 }

@@ -277,6 +277,22 @@ impl Viewer {
         self.vector_zoom_req = None;
     }
 
+    /// 放弃当前画面与清单，回到**空窗**（不留错误、不留提示）。
+    ///
+    /// 用户口径（2026-11-04）："关闭看图窗口后，看图窗口里面的图就清空。这样子我们
+    /// 最小化后，再通过系统托盘打开窗口，不会出现原来的图。"
+    ///
+    /// 为什么必须真清而不能只标记"下次打开时再换图"：收进托盘后这份像素会一直钉在
+    /// 常驻内存里（原图档顶格 160 MB），而用户已经明确表示"不看了"；更要紧的是
+    /// **唤回来时屏幕上那张图会让人以为刚才什么都没发生**——状态与用户的动作用不上。
+    ///
+    /// 清的范围与 [`Self::fail`] 完全同源（同一份 `drop_current`），差别只有一条：
+    /// 这里不留 `error`。清空是**用户主动收走窗口**的结果，不是"这张图坏了"。
+    pub fn clear(&mut self) {
+        self.drop_current();
+        self.error = None;
+    }
+
     /// 放弃当前画面与清单，进入"只有错误"的状态。
     ///
     /// 打开失败 / 目录被清空时走这里。不清 `gallery` 会留下旧标题与旧 `n/n`；
@@ -284,12 +300,23 @@ impl Viewer {
     /// 于是它还能重新上屏。`cancel_pending()` 预留一个不会被后续请求复用的 seq，
     /// 把这些在途回包全部判成过期。
     pub(super) fn fail(&mut self, msg: String) {
+        self.drop_current();
+        self.error = Some(msg);
+    }
+
+    /// [`Self::fail`] 与 [`Self::clear`] 的共同主体：把"当前这张图"的一切账清干净。
+    ///
+    /// 两处唯一的差别由调用方补（一个落错误文本、一个不落），所以清账逻辑只写一遍——
+    /// 漏掉其中任何一项都会留下"看得见却改不动"的残影：
+    /// `gallery`（旧标题与 `n/n`）、`prefetched`（预读缓存几十 MB）、`thumbs`（缩略图条）、
+    /// 在途 `want_seq`（晚到的回包会把旧图重新上屏）。
+    pub(super) fn drop_current(&mut self) {
         self.gallery = None;
         self.loaded = None;
         self.prefetched.clear();
         self.prefetch_seq = None;
         self.thumbs.clear();
-        // 先复位视图（它会把 error 清成 None），再落错误文本。
+        // 复位视图（它会把 error 清成 None）——错误文本由调用方按需补。
         self.reset_view();
         self.anim_next_at = None;
         self.anim_due_at = None;
@@ -302,7 +329,6 @@ impl Viewer {
         self.stall_logged.set(false);
         self.wait_shown_secs.set(None);
         self.want_seq = self.decoder.cancel_pending();
-        self.error = Some(msg);
         self.bump_image_gen();
     }
 }

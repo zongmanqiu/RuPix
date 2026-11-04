@@ -28,8 +28,15 @@
 //! # 边界（写在前面，免得被当成"防卡死"卖）
 //!
 //! 这是**检测**，不是**防护**：它不打断、不杀、不恢复。挂死期间解码线程仍然占着，
-//! 后续请求仍然饿死。真解是独立解码进程（见 `.temp/p11-hang-watchdog.md` §3-A），
-//! 那要另立工程。C1 的价值是把现场变成可读的那几行字。
+//! 后续请求仍然饿死。
+//!
+//! ★ **2026-11-04 起恢复由 `core::decode` 承担**（m212）：那条线程现在只是"监督者"，
+//! 真正的 FFI 跑在可丢弃的 worker 里，单笔超时（`decode_timeout_s`，默认 20 秒）就放弃、
+//! 熔断当时那个解码器、换一条 worker 继续服务。本模块留在原地，职责收窄成**现场记录**——
+//! 它报的 `age_ms` / `pending` 正是校准那个超时值的唯一现场数据（301 条/天那次就是这么
+//! 定下 20 秒的）。别再往这里加"恢复"动作：两条路径各管一半才不会打架。
+//!
+//! 彻底的做法仍是独立解码进程（`.temp/p11-hang-watchdog.md` §3-A），那要另立工程。
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -52,6 +59,14 @@ pub struct Pending {
     pub path: PathBuf,
     /// 发出时刻。
     pub at: Instant,
+    /// **解码线程把它取走**的时刻（`None` = 还在队里排着）。
+    ///
+    /// ★ 两段必须分开计（2026-11-04）：`at → 现在` 是"用户等到现在还看不到图"，
+    /// `begin → 现在` 才是"这一笔在解码器里待了多久"。混成一段的代价是实测过的——
+    /// 快速翻页把队列压到 64 笔时，日志里会出现一堆 `age_ms=10000..40000`，看着像
+    /// 七个格式同时挂死，其实每一笔都是"排队等前面那张"，解码线程一秒都没停过。
+    /// 没有这一位，谁也分不清"堵在队列"和"堵在 FFI"。
+    pub begin: Option<Instant>,
     /// 已经报过几轮（决定下一次什么时候再报）。
     pub reported: u32,
 }
@@ -62,8 +77,10 @@ pub struct WatchdogReport {
     pub seq: u64,
     pub kind: ReqKind,
     pub path: PathBuf,
-    /// 已经卡了多久（毫秒）。
+    /// 用户已经等了多久（毫秒；含排队）。
     pub age_ms: u64,
+    /// 其中**真正在解码**（已被取走）的那一段（毫秒）。`None` = 还在排队。
+    pub run_ms: Option<u64>,
     /// 当前在途总数（积压多少条）。
     pub pending: usize,
 }
@@ -84,8 +101,17 @@ pub fn note_sent(seq: u64, kind: ReqKind, path: &std::path::Path) {
         kind,
         path: path.to_path_buf(),
         at: Instant::now(),
+        begin: None,
         reported: 0,
     });
+}
+
+/// 解码线程取走这一笔（`decode_loop` 出队后立刻调）：从这里起才算"解码耗时"。
+pub fn note_picked(seq: u64) {
+    let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = g.iter_mut().find(|p| p.seq == seq) {
+        p.begin = Some(Instant::now());
+    }
 }
 
 /// 销账（收到回包时调；过期早退的空串 Err Done 也算回包）。
@@ -136,12 +162,16 @@ pub fn watchdog_due(
     let i = idx?;
     let p = &mut pending[i];
     let age_ms = now.saturating_duration_since(p.at).as_millis() as u64;
+    let run_ms = p
+        .begin
+        .map(|b| now.saturating_duration_since(b).as_millis() as u64);
     p.reported += 1;
     Some(WatchdogReport {
         seq: p.seq,
         kind: p.kind,
         path: p.path.clone(),
         age_ms,
+        run_ms,
         pending: total,
     })
 }
@@ -154,12 +184,18 @@ pub fn watchdog_check() -> bool {
     let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
     match watchdog_due(&mut g, threshold, Instant::now()) {
         Some(r) => {
+            // `phase` / `codec` 是这一条日志的**要害**：`hint` 只会把人引向解码器，
+            // 而卡在 `read`/`post` 的那些跟解码器一点关系没有（2026-11-04 的误判）。
             log::warn!(
-                "[decode-watchdog] file={} kind={:?} age_ms={} pending={} hint=用 --safe-mode 启动可临时绕开解码器",
+                "[decode-watchdog] file={} kind={:?} age_ms={} run_ms={} pending={} phase={} codec={}",
                 r.path.display(),
                 r.kind,
                 r.age_ms,
-                r.pending
+                // -1 = 还没被取走：用户等了 age_ms，但**没在解码**，堵的是队列。
+                r.run_ms.map(|ms| ms.to_string()).unwrap_or_else(|| "-1".into()),
+                r.pending,
+                crate::core::decode::current_phase(),
+                crate::core::decode::current_decoder_name().unwrap_or_else(|| "-".into())
             );
             true
         }
@@ -181,6 +217,8 @@ mod tests {
             kind: ReqKind::Main,
             path: PathBuf::from(format!("C:\\{seq}.png")),
             at: now - Duration::from_millis(age_ms),
+            // 已被取走 → 全部记在解码耗时上；排队那一段另有 `run_ms=None` 的用例。
+            begin: Some(now - Duration::from_millis(age_ms)),
             reported,
         }
     }
@@ -223,6 +261,45 @@ mod tests {
         let r = watchdog_due(&mut v, threshold, now).expect("应报");
         assert_eq!(r.seq, 1, "最老的那笔（seq=1）才是根因");
         assert_eq!(r.pending, 3, "积压条数要如实报出来");
+    }
+
+    /// 排队中的那一笔：`age_ms` 一直在涨，但 `run_ms` 必须是 `None`。
+    ///
+    /// 这一条就是"301 条看门狗里绝大多数不是挂死"的判据：快速翻页把队列压到 64 笔时，
+    /// 每一笔都在报 age=10..40s，可解码线程一秒都没停——用户等的是**队列**，不是 FFI。
+    #[test]
+    fn queued_entry_has_no_decode_time() {
+        let threshold = Duration::from_millis(10_000);
+        let now = Instant::now();
+        let mut v = vec![Pending {
+            seq: 7,
+            kind: ReqKind::Main,
+            path: PathBuf::from("q.png"),
+            at: now - Duration::from_millis(12_000),
+            begin: None,
+            reported: 0,
+        }];
+        let r = watchdog_due(&mut v, threshold, now).expect("应报");
+        assert_eq!(r.age_ms, 12_000);
+        assert!(r.run_ms.is_none(), "还在排队就不该有解码耗时");
+    }
+
+    /// 取件之后才开始算解码耗时：同一笔在 `note_picked` 之后必须报出 `run_ms`。
+    #[test]
+    fn note_picked_starts_the_decode_clock() {
+        note_sent(9003, ReqKind::Main, std::path::Path::new("y.png"));
+        {
+            let g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+            let p = g.iter().find(|p| p.seq == 9003).expect("应已登记");
+            assert!(p.begin.is_none(), "刚发出时还没被取走");
+        }
+        note_picked(9003);
+        {
+            let g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+            let p = g.iter().find(|p| p.seq == 9003).expect("应仍在表里");
+            assert!(p.begin.is_some(), "取件后应记下起点");
+        }
+        note_done(9003);
     }
 
     /// 销账即停：登记 → 销账 → 不再报。

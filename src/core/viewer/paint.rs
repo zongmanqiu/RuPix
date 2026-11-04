@@ -80,6 +80,55 @@ impl Viewer {
         rect_map_display(self.rot, self.flip, x0, y0, x1, y1)
     }
 
+    /// 取色器：屏幕坐标 → 当前显示的那枚像素。
+    ///
+    /// 两套几何各司其职，不许混：
+    /// - [`Self::image_dst`] 是**上屏位图**在视口里的目标矩形（SVG 切片时只是整图的一块）——
+    ///   采样必须用它，否则区域渲染时取到的是整图错位后的那份颜色。
+    /// - [`Self::dst_rect`] 是**整图**在显示朝向下的目标矩形——换算原图坐标必须用它，
+    ///   因为 [`rect_map_image`] 收的是相对整图的归一化显示坐标。
+    ///
+    /// 落在图外（棋盘格 / 空场）返回 `None`：那里没有像素可报。
+    pub fn pick_at(&self, content: RectI, pos: (f32, f32)) -> Option<Pick> {
+        let l = self.loaded.as_ref()?;
+        let img = &l.image;
+        let base = self.dst_rect(content)?;
+        let idst = self.image_dst(content)?;
+        if img.width == 0
+            || img.height == 0
+            || idst.w <= 0
+            || idst.h <= 0
+            || base.w <= 0
+            || base.h <= 0
+        {
+            return None;
+        }
+        // 半开区间：右/下边界那一条属于"图外"，取色器不给读数。
+        let u = (pos.0 - idst.x as f32) / idst.w as f32;
+        let v = (pos.1 - idst.y as f32) / idst.h as f32;
+        if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+            return None;
+        }
+        // 所见即所得：上屏位图已按 rot/flip 转正，局部归一化直接就是它的像素坐标。
+        let px = ((u * img.width as f32) as u32).min(img.width - 1);
+        let py = ((v * img.height as f32) as u32).min(img.height - 1);
+        let i = (py as usize * img.width as usize + px as usize) * 4;
+        let c = img.rgba.get(i..i + 4)?;
+        // 把切片里的局部点折回整图显示坐标，再逆掉 rot/flip 得到原图坐标。
+        // 零宽矩形即可：rect_map_image 对点是逐角点变换，退化时仍给出正确单点。
+        let dx = (idst.x as f32 - base.x as f32 + u * idst.w as f32) / base.w as f32;
+        let dy = (idst.y as f32 - base.y as f32 + v * idst.h as f32) / base.h as f32;
+        let (ix, iy, _, _) = rect_map_image(self.rot, self.flip, dx, dy, dx, dy);
+        let at = (
+            ((ix * l.natural.0 as f32).floor() as u32).min(l.natural.0.saturating_sub(1)),
+            ((iy * l.natural.1 as f32).floor() as u32).min(l.natural.1.saturating_sub(1)),
+        );
+        Some(Pick {
+            rgba: [c[0], c[1], c[2], c[3]],
+            at,
+        })
+    }
+
     /// 当前应渲染的 SVG 可视区域（图像坐标 + 设备密度）。
     ///
     /// 视口 ∩ 整图 dst 归一化后，经"显示 → 图像"逆映射得到图像坐标，四周再各扩 30%

@@ -467,3 +467,4 @@ cost=…ms bitmap=…`、`[decode-req] kind=… tier=… verdict=…`、`[close]
 | 11 | 结构文档新鲜度 | `python build\structure_gen.py --check`（漂移则 `--write` 重生成） | exit 0；第一/三/四节数字与第五节符号索引 = `src/` 现状。**这些数字与索引不许手改**，改 `src/` 后跑 `--write` |
 
 > 红线：本清单只检查、不提交。本仓 2026-11-02 起是 git 仓（origin = `gitee.com/qiuzongman/RuPix`，分支 `master`）；`commit` / `push` 仍须先取得用户明确许可。`.bf/` 快照继续打——它存的是 `main/` + `.3rd/` + 解码器仓三处合集，git 只管 `main/` 这一层。
+> ★ 源码只推 Gitee、GitHub 是自动镜像（不手推），但 release 资产与说明两边都要传——规则见 `开发指南.md` §四（本节不复述）。

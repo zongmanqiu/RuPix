@@ -14,14 +14,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use windui::geometry::{Color, Rect};
+use windui::geometry::Rect;
 use windui::render::image::Fit;
 use windui::render::{Canvas, Paint};
 
-use super::tokens::{
-    to_color, to_color4, OVERLAY_PANEL_BG, OVERLAY_SLOT_BG, OVERLAY_SLOT_CUR, OVERLAY_SLOT_HOVER,
-    OVERLAY_TEXT_ACTIVE,
-};
+use super::tokens as tk;
 
 use super::ImageCache;
 use crate::core::pixels::RgbaImage;
@@ -39,13 +36,8 @@ const MARGIN: f32 = 12.0;
 /// 缩略图在格子里缩进去多少（露出背板当边框）。
 const INSET: f32 = 3.0;
 
-// 配色取自全 ui 共用的令牌（[`crate::ui::tokens`]），本文件不自带色值。
-const PANEL: Color = to_color4(OVERLAY_PANEL_BG);
-const SLOT: Color = to_color4(OVERLAY_SLOT_BG);
-const SLOT_HOVER: Color = to_color4(OVERLAY_SLOT_HOVER);
-const SLOT_CUR: Color = to_color4(OVERLAY_SLOT_CUR);
-/// 当前格的描边色（与工具栏开关激活态同一个绿）。
-const FRAME: Color = to_color(OVERLAY_TEXT_ACTIVE);
+// 配色取自全 ui 共用的令牌（`tk::panel_bg()` 那一组），本文件不自带色值；
+// 背板与格子跟着主题走（白条 / 深条），当前格描边与工具栏激活态同一个色。
 
 /// 条放得下的最低视口高度。
 ///
@@ -161,18 +153,18 @@ impl Strip {
         let local = |x: f32, y: f32, w: f32, h: f32| (x - vx, y - vy, w, h);
         let p = panel(view);
         let (px, py, pw, ph) = local(p.x as f32, p.y as f32, p.w as f32, p.h as f32);
-        canvas.fill_round_rect(px, py, pw, ph, 10.0, &Paint::fill(PANEL));
+        canvas.fill_round_rect(px, py, pw, ph, 10.0, &Paint::fill(tk::panel_bg()));
 
         for (i, slot) in slots.iter().enumerate() {
             let (idx, r, path) = (slot.idx, slot.rect, slot.path);
             let (lx, ly, lw, lh) = local(r.x as f32, r.y as f32, r.w as f32, r.h as f32);
             let is_cur = idx == cur;
             let bg = if is_cur {
-                SLOT_CUR
+                tk::slot_cur()
             } else if hover == Some(i) {
-                SLOT_HOVER
+                tk::slot_hover()
             } else {
-                SLOT
+                tk::slot_bg()
             };
             canvas.fill_round_rect(lx, ly, lw, lh, 4.0, &Paint::fill(bg));
 
@@ -219,7 +211,15 @@ impl Strip {
             }
 
             if is_cur {
-                canvas.stroke_round_rect(lx, ly, lw, lh, 4.0, 2.0, &Paint::fill(FRAME));
+                canvas.stroke_round_rect(
+                    lx,
+                    ly,
+                    lw,
+                    lh,
+                    4.0,
+                    2.0,
+                    &Paint::fill(tk::overlay_text_active()),
+                );
             }
         }
     }
@@ -270,6 +270,7 @@ fn contain(x: f32, y: f32, w: f32, h: f32, img: &RgbaImage) -> Option<(f32, f32,
 mod tests {
     use super::*;
     use std::path::Path;
+    use windui::geometry::Color;
 
     /// 布局必须整排居中：左右两侧留白相等。
     #[test]

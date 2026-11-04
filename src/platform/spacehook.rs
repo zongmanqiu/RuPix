@@ -539,13 +539,31 @@ fn dispatch_pick_and_decode() {
     let gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let ctrl = CTRL_HWND.load(Ordering::SeqCst);
     let spawned = std::thread::spawn(move || {
-        // 清单口径与主窗一致：内置（SVG/SVGZ）∪ 解码器自述扩展名的并集，且排除要弹
-        // 参数窗的 raw 类（这类文件走空格预览没有意义，参数窗才解得开）。
+        // 清单口径与主窗一致：内置（SVG/SVGZ）∪ 解码器自述扩展名。判据在 `formats`
+        // 一处，本处只引用。★ 裸像素（`rgb`/`uyvy`/`yuv`…）也在这份清单里：它们能不能
+        // 出图取决于"参数推不推得出"，那是**文件级**事实，下一段按文件长度现场判——
+        // 不在后缀表上预判（否则 `.uyvy` 双击开得开、按空格没反应，用户实测）。
         let allowed = |ext: &str| crate::core::formats::is_previewable(ext);
         let Some(path) = crate::platform::shell_selection::foreground_selected_file(&allowed)
         else {
+            // 按了空格却没出窗的两类原因，日志里要能分开：前台不是资源管理器（取不到
+            // 选中项）／ 选中项的后缀不在清单里（`allowed` 判否）。否则现场只剩
+            // "按了没反应"，与"钩子没挂上"混在一起分不清。
+            log::debug!("spacehook：没取到可预览的选中项（前台非资源管理器，或后缀不在清单内）");
             return;
         };
+        // 裸像素没有文件头，也没有参数窗可弹（预览不该打断用户）：只能自动推断——
+        // 后缀定布局、文件长度反推宽高，与双击 `raw_dialog::open_path` 的"推得出就直接开"
+        // 是同一条推断。推不出就静默不出窗，绝不拿猜的参数去解。
+        if crate::core::decode::is_headerless_path(&path)
+            && crate::core::decode::get_raw_params(&path).is_none()
+        {
+            let Some(params) = crate::core::decode::infer_raw_params(&path) else {
+                log::debug!("spacehook：裸像素推不出宽高，预览跳过（右键「RAW 参数…」可手工指定）");
+                return;
+            };
+            crate::core::decode::set_raw_params(&path, params);
+        }
         let (mx, my, mw, mh) = crate::platform::shell_selection::monitor_work_area_of_foreground();
         let box_w = ((mw as f32) * WORK_AREA_RATIO).max(1.0) as u32;
         let box_h = ((mh as f32) * WORK_AREA_RATIO).max(1.0) as u32;

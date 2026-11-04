@@ -127,11 +127,21 @@ pub enum Action {
     Close,
     /// 幻灯片放映开关（m167）。到点翻下一张，走的是与键盘/滚轮**同一条** `Viewer::step`。
     Slideshow,
+    /// 向上平移一步（m216，WASD；一记一步，范围与拖动共用同一份钳位）。
+    PanUp,
+    /// 向左平移一步（m216）。
+    PanLeft,
+    /// 向下平移一步（m216）。
+    PanDown,
+    /// 向右平移一步（m216）。
+    PanRight,
+    /// 取色器开关（m217）。只进右键「工具 ▸ 取色器」，不进浮条按钮排。
+    Picker,
 }
 
 impl Action {
     /// 动作总数（也是 `bindings` 数组长度）。
-    pub const COUNT: usize = 30;
+    pub const COUNT: usize = 35;
 
     /// 全部动作，下标顺序与枚举定义严格一致（见类型注释）。
     pub const ALL: [Action; Action::COUNT] = [
@@ -165,6 +175,11 @@ impl Action {
         Action::Maximize,
         Action::Close,
         Action::Slideshow,
+        Action::PanUp,
+        Action::PanLeft,
+        Action::PanDown,
+        Action::PanRight,
+        Action::Picker,
     ];
 
     /// 下标（0..COUNT），用于索引 `Hotkeys::bindings`。
@@ -210,6 +225,11 @@ impl Action {
             Action::Maximize => "maximize",
             Action::Close => "close",
             Action::Slideshow => "slideshow",
+            Action::PanUp => "pan_up",
+            Action::PanLeft => "pan_left",
+            Action::PanDown => "pan_down",
+            Action::PanRight => "pan_right",
+            Action::Picker => "picker",
         }
     }
 
@@ -246,6 +266,11 @@ impl Action {
             "maximize" => Some(Action::Maximize),
             "close" => Some(Action::Close),
             "slideshow" => Some(Action::Slideshow),
+            "pan_up" => Some(Action::PanUp),
+            "pan_left" => Some(Action::PanLeft),
+            "pan_down" => Some(Action::PanDown),
+            "pan_right" => Some(Action::PanRight),
+            "picker" => Some(Action::Picker),
             _ => None,
         }
     }
@@ -283,6 +308,11 @@ impl Action {
             Action::Maximize => "最大化 / 还原",
             Action::Close => "关闭窗口",
             Action::Slideshow => "幻灯片放映",
+            Action::PanUp => "向上平移",
+            Action::PanLeft => "向左平移",
+            Action::PanDown => "向下平移",
+            Action::PanRight => "向右平移",
+            Action::Picker => "取色器",
         }
     }
 }
@@ -626,7 +656,8 @@ impl Default for Hotkeys {
         // 逐帧那两个是 `,` `.`，方括号在它们的右上方一格。多页文档与动画是互斥的
         // 两种图，同一只手换一根手指，不需要另置一套方向键语义。
         b[Action::Filmstrip.index()] = vec![dhk(Base::Char('T'), false)];
-        // 不透明度 ±1 档（10%）：裸 ↑/↓ 留给未来可能的纵向平移，这里带 Ctrl；
+        // 不透明度 ±1 档（10%）：带 Ctrl——裸 ↑/↓ 曾被预留作纵向平移，m216 落地
+        // WASD 后该预留作废（纵向归 W/S），裸 ↑/↓ 维持无绑定。
         // 这两个动作过去在设置页可见却永不命中（孤儿），2026-10-19 补出厂键。
         b[Action::OpacityUp.index()] = vec![Hotkey {
             ctrl: true,
@@ -640,6 +671,17 @@ impl Default for Hotkeys {
         // 「关闭窗口」出厂绑 Esc（2026-10-14 用户口径）：看图器通用退出键。全屏里
         // 按 Esc 先退全屏再关窗，由 `canvas::exec_action` 的 Close 臂守住。
         b[Action::Close.index()] = vec![dhk(Base::Escape, false)];
+        // WASD 平移（m216）：视口往哪边看就按哪个字母（W=上看，A=左看，S=下看，
+        // D=右看）。裸 ↑/↓ 已裁决**不做**纵向平移（Ctrl+↑/↓ 是不透明度档），
+        // 2026-10-19 那句「裸 ↑/↓ 留给未来可能的纵向平移」的预留就此作废。
+        // 「连按两下到边」随做随撤（用户实测不好用，m216 同日）——平移只有一记一步。
+        b[Action::PanUp.index()] = vec![dhk(Base::Char('W'), false)];
+        b[Action::PanLeft.index()] = vec![dhk(Base::Char('A'), false)];
+        b[Action::PanDown.index()] = vec![dhk(Base::Char('S'), false)];
+        b[Action::PanRight.index()] = vec![dhk(Base::Char('D'), false)];
+        // 取色器（m217）：ImageGlass 同款 K。低频工具放在菜单里也要有快入口——
+        // 菜单项显示它，浮条按钮排不新增按钮（用户口径「一排按钮已经很多了」）。
+        b[Action::Picker.index()] = vec![dhk(Base::Char('K'), false)];
         Hotkeys { bindings: b }
     }
 }
@@ -1067,14 +1109,14 @@ mod tests {
         assert_eq!(a, b, "修饰键顺序不应影响相等性");
     }
 
-    /// 动作集扩到 30（2026-10-14 扩到 27 + 2026-10-18 逐帧两把 + 2026-10-31 m167 幻灯片一把），
-    /// id 双向映射自洽；
+    /// 动作集扩到 35（2026-10-14 扩到 27 + 2026-10-18 逐帧两把 + 2026-10-31 m167 幻灯片
+    /// 一把 + m216 WASD 平移四把 + m217 取色器一把），id 双向映射自洽；
     /// 那批新动作默认不绑，仅「关闭窗口」出厂绑 Esc（看图器通用退出键，见
     /// `Hotkeys::default`），逐帧的 `,` / `.` 属出厂就绑的那一组；
     /// 2026-10-19 起不透明度 `Ctrl+↑/↓` 也出厂就绑（m53-K，消除两个孤儿动作）。
     #[test]
     fn expanded_action_set_ids_round_trip_and_new_unbound() {
-        assert_eq!(Action::COUNT, 30);
+        assert_eq!(Action::COUNT, 35);
         for a in Action::ALL {
             assert_eq!(
                 Action::from_id(a.id()),
@@ -1116,7 +1158,8 @@ mod tests {
             hk.match_action(&ev(VKey::Down, false, true, false, false)),
             Some(Action::OpacityDown)
         );
-        // 裸 ↑/↓ 不拦截：那是留给画面纵向平移的方向键语义。
+        // 裸 ↑/↓ 不拦截：m216 落地 WASD 后纵向平移归 W/S（"留给未来纵向平移"的
+        // 预留作废），裸 ↑/↓ 维持无绑定（Ctrl+↑/↓ 是不透明度档）。
         assert_eq!(
             hk.match_action(&ev(VKey::Up, false, false, false, false)),
             None
@@ -1124,6 +1167,28 @@ mod tests {
         assert_eq!(
             hk.match_action(&ev(VKey::Down, false, false, false, false)),
             None
+        );
+        // WASD 平移（m216）出厂即绑，四向各自命中。
+        assert_eq!(
+            hk.match_action(&ev(VKey::Char('W'), false, false, false, false)),
+            Some(Action::PanUp)
+        );
+        assert_eq!(
+            hk.match_action(&ev(VKey::Char('A'), false, false, false, false)),
+            Some(Action::PanLeft)
+        );
+        assert_eq!(
+            hk.match_action(&ev(VKey::Char('S'), false, false, false, false)),
+            Some(Action::PanDown)
+        );
+        assert_eq!(
+            hk.match_action(&ev(VKey::Char('D'), false, false, false, false)),
+            Some(Action::PanRight)
+        );
+        // 取色器（m217）出厂即绑 K。
+        assert_eq!(
+            hk.match_action(&ev(VKey::Char('K'), false, false, false, false)),
+            Some(Action::Picker)
         );
         // 「关闭窗口」出厂绑 Esc，单键唯一。
         assert_eq!(

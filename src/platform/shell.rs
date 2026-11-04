@@ -1,13 +1,15 @@
-//! 把一小段东西交给**系统默认程序**打开（URL 或宿主自己刚写的临时文件）。
+//! 把一小段东西交给**系统默认程序**打开（URL），或替调用方把图片字节落进 temp。
 //!
-//! ★ 边界都在调用方：URL 只认 `http(s)`（`is_openable_url`）；图片只认宿主自己
-//!   按文件头写进 `<exe>/temp/` 的那一枚（`save_temp_image` 会**当场复核 magic**，
-//!   插件给什么扩展名都不作数）。这里只负责"把 target 交给 ShellExecute"，
-//!   用哪个程序打开是系统关联的事——不是我们的事。
+//! ★ 边界都在调用方：URL 只认 `http(s)`（`is_openable_url`，走 `open_target` 交系统
+//!   默认浏览器）；图片只认宿主自己按文件头写进 `<exe>/temp/` 的那一枚
+//!   （`save_temp_image` 会**当场复核 magic**，插件给什么扩展名都不作数）。
+//!   ★ 2026-11-04 起图片**不再**交系统关联打开：本机把 `.png` 关联到 RuPix 自己时，
+//!   二次启动被单实例收走、没开多开就"当前窗换图"，用户正在看的图被插件产物顶掉。
+//!   现在落盘后由调用方（runtime）开**新看图窗口**显示，与多开开关无关。
 //!
-//! ★ 为什么由宿主开而不是插件自己 `ShellExecute`：打开 URL/文件是**用户资产**，
-//!   属于"宿主独占"的对外副作用（见 `docs/扩展体系.md` §四）。宿主开能保证：
-//!   只认 http(s)、只碰自己的 temp、并且有事可记日志。
+//! ★ 为什么落盘由宿主做而不是插件自己写文件：写盘是**用户资产**副作用，属于"宿主
+//!   独占"（见 `docs/扩展体系.md` §四）。宿主能保证：只碰自己的 temp、按文件头复核、
+//!   有事可记日志。
 
 use std::path::PathBuf;
 
@@ -78,6 +80,16 @@ pub fn image_ext_of(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// 临时图片的落点：`<exe>/temp/barcode-<毫秒>.<ext>`。
+///
+/// ★ **不许借 `crash_log_path` 拼这个名字**：那个函数会加 `crash-` 前缀与 `.log`
+///   后缀，系统按 `.log` 的文本关联打开，用户看到的会是一个文本编辑器里的二进制乱码
+///   （K195）。图片必须以**真实图片后缀**落地，后续无论谁打开它都走图片路径。
+///   打开方式（宿主开新窗）由调用方决定，这里只负责把字节安全落盘。
+fn temp_image_path(stamp: u128, ext: &str) -> Option<PathBuf> {
+    Some(crate::core::paths::diagnostics_dir()?.join(format!("barcode-{stamp}.{ext}")))
+}
+
 /// 把一段图片字节写进 `<exe>/temp/barcode-<毫秒>.<ext>`，返回落点。
 ///
 /// **扩展名以文件头为准**：插件给的写法只当提示，magic 认不出就直接拒——
@@ -95,8 +107,7 @@ pub fn save_temp_image(claimed_ext: &str, bytes: &[u8]) -> Result<PathBuf, Strin
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let path = crate::core::paths::crash_log_path(&format!("barcode-{stamp}.{ext}"))
-        .ok_or("取不到 exe 同级 temp 目录")?;
+    let path = temp_image_path(stamp, ext).ok_or("取不到 exe 同级 temp 目录")?;
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -126,5 +137,26 @@ mod tests {
         assert_eq!(image_ext_of(b"not an image"), None);
         // 插件说 png、实际不是：拒，而不是写一个后缀骗系统。
         assert!(save_temp_image("png", b"plain text").is_err());
+    }
+
+    #[test]
+    fn temp_image_lands_with_a_real_image_suffix() {
+        // K195 回归钉：曾借 crash_log_path 拼出 crash-barcode-<ms>.png.log，
+        // 系统按 .log 的文本关联打开，图形看不见。
+        let p = temp_image_path(1_793_782_074_815, "png").expect("诊断目录路径");
+        assert_eq!(
+            p.extension().and_then(|e| e.to_str()),
+            Some("png"),
+            "落盘后缀必须是图片头认出的那一个：{}",
+            p.display()
+        );
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        assert!(name.starts_with("barcode-"), "{name}");
+        assert!(!name.contains("crash-"), "{name}");
+        assert!(!name.contains(".log"), "{name}");
+        // 负向：插件声明的后缀不许参与落盘名，只认 magic。
+        let ext = image_ext_of(b"\x89PNG\r\n\x1a\nrest").expect("PNG 头");
+        let q = temp_image_path(1, ext).expect("诊断目录路径");
+        assert_eq!(q.extension().and_then(|e| e.to_str()), Some("png"));
     }
 }

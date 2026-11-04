@@ -54,6 +54,8 @@ pub mod brand;
 pub mod canvas;
 pub mod chrome;
 pub mod filmstrip;
+/// 抓手光标（松手 / 抓手）的 SVG 光栅化与切换。
+pub mod hand_cursor;
 pub mod pin;
 pub mod plugin_result;
 pub mod plugin_settings;

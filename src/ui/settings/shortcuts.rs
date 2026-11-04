@@ -435,6 +435,8 @@ mod tests {
             prefetch: signal(false),
             to_tray: sig(false),
             space_preview: sig(false),
+            drag_image: sig(false),
+            allow_multiple: sig(false),
             opacity: signal(0.75),
             opacity_label: signal(String::new()),
             tab: signal(TAB_SHORTCUTS),
@@ -461,6 +463,7 @@ mod tests {
             card_mouse: sig(true),
             card_plugins: sig(true),
 
+            ui_theme: signal(0),
             download_source: signal(0),
             plugin: PluginUi::new(&Config::default()),
         };

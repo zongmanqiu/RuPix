@@ -121,6 +121,30 @@ panic 那条通道另有对等探针：`cargo run --release --example panic_prob
 （夹具目录就是这种情形）。解不出来时会**分两种说**：`(no pdb archived for this decoder)`
 = 该去归档，`(archived pdb is another build)` = 归档里那枚是另一版，不给行是对的。
 
+## 浮条显隐取证驱动（`build/pill_probe.ps1`）
+
+回答一个肉眼分不清的问题：底部浮条"在闪"到底是**整条显隐在翻**，还是**宽度随状态文本抖**。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File build/pill_probe.ps1 -Tag <臂名> `
+    -Image <图> [-Samples 40] [-EveryMs 30]
+```
+
+做法：私有的 exe 根（hardlink 到 `.build\rupix.exe`，写一份 `minimal_mode=1` 的 ini，不动共享配置），
+启动后等 3 秒，再按 `-EveryMs` 用 `PrintWindow(hwnd, memDC, 2)` 抓客户区，取浮条那一行上
+`w/2±200、±100、0` 五个点的 ARGB，落 `.temp\pill_<臂名>.txt`。
+
+**怎么读**：
+
+| 观察 | 结论 |
+|---|---|
+| 五个点（至少中心 + 两侧）**同步**在"胶囊底色"与"图底色"之间跳 | 整条显隐在翻 → 查 `show_toolbar` 的三条来源谁在抢 |
+| 只有边缘点跳、中心点恒定 | 宽度随文本变（浮条居中，两边一起移）→ 查 `info_cell` |
+| 某点偶尔变成按钮/文字色 | 正常：采样点压在字形上 |
+
+2026-11-02 的实测：修前 `FF101010`（无浮条）与 `FF1B1B1C`（胶囊底）交替、四同步；修后 40 帧
+全是 `FF1B1B1C` 系，`FF101010` 出现 **0** 次。
+
 ## 常见坑（本机实测）
 
 - **杀软锁新链接二进制**：多线程 `cargo test` 像假死——第⑤步强制 `--test-threads=1`。

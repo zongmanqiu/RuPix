@@ -35,6 +35,30 @@ pub fn native_window_handle() -> Option<isize> {
 pub fn native_window_handle() -> Option<isize> {
     None
 }
+
+/// 宿主自绘光标的**全局覆盖**（RuPix 补丁 024）。
+///
+/// [`crate::event::CursorShape`] 只有系统自带的几种形状表达不了自绘光标
+/// （宿主用 `CreateIconIndirect` 造的"张开的手 / 握拳"这一档）。而拖动期间系统
+/// **每次鼠标移动都会发 `WM_SETCURSOR`**，框架按形状设回箭头，宿主随后在
+/// `WM_MOUSEMOVE` 里设回自绘光标——两次 `SetCursor` 前后脚，就是肉眼可见的闪烁。
+///
+/// 置上之后 `WM_SETCURSOR` 先看这里：有值就直接设这枚并返回 TRUE，不再问
+/// [`AppHandler::cursor`]。宿主负责在离开自绘区域时清除（传 `None`）。
+static CURSOR_OVERRIDE: AtomicIsize = AtomicIsize::new(0);
+
+/// 设/清宿主自绘光标句柄（`HCURSOR` 的裸值）。只在 UI 线程调用。
+pub fn set_cursor_override(handle: Option<isize>) {
+    CURSOR_OVERRIDE.store(handle.unwrap_or(0), Ordering::Relaxed);
+}
+
+/// 当前生效的宿主自绘光标句柄。平台后端在应答 `WM_SETCURSOR` 时先问它。
+pub fn cursor_override() -> Option<isize> {
+    match CURSOR_OVERRIDE.load(Ordering::Relaxed) {
+        0 => None,
+        h => Some(h),
+    }
+}
 /// 系统的双击时限（毫秒）与漂移阈值（每侧逻辑像素）。
 ///
 /// 平台层折算 `click_count` 用的就是这两个值；控件侧认三击
@@ -80,6 +104,9 @@ pub fn system_locales() -> Vec<String> {
 
 #[cfg(windows)]
 pub use win32::open_url;
+/// ★ RuPix 补丁 025 —— 应用级退出（见 `EventCtx::quit_app`）。
+#[cfg(windows)]
+pub use win32::post_quit;
 #[cfg(windows)]
 pub(crate) use win32::run;
 #[cfg(windows)]
@@ -93,6 +120,10 @@ pub mod macos;
 pub use macos::clipboard::MacClipboard as Clipboard;
 #[cfg(target_os = "macos")]
 pub use macos::open_url;
+/// ★ RuPix 补丁 025 的平台桩：macOS 侧尚未接 `NSApp::terminate`，这里什么都不做
+/// （与 `run_resident` 在 macOS 上的"未实现"口径一致）。RuPix 只发布 Windows。
+#[cfg(target_os = "macos")]
+pub fn post_quit() {}
 #[cfg(target_os = "macos")]
 pub(crate) use macos::run;
 #[cfg(target_os = "macos")]
@@ -117,6 +148,9 @@ pub mod linux;
 pub use linux::clipboard::LinuxClipboard as Clipboard;
 #[cfg(target_os = "linux")]
 pub use linux::open_url;
+/// ★ RuPix 补丁 025 的平台桩：见 macOS 那份（RuPix 只发布 Windows）。
+#[cfg(target_os = "linux")]
+pub fn post_quit() {}
 #[cfg(target_os = "linux")]
 pub(crate) use linux::run;
 #[cfg(target_os = "linux")]
@@ -136,6 +170,8 @@ pub use tray::{Tray, TrayAction, TrayCtx, TrayHandle, TrayMenuItem, TrayOp};
 use std::cell::Cell;
 use std::path::Path;
 use std::path::PathBuf;
+// RuPix 补丁 024：宿主自绘光标覆盖句柄（见 `set_cursor_override`）。
+use std::sync::atomic::{AtomicIsize, Ordering};
 
 use tiny_skia::Pixmap;
 

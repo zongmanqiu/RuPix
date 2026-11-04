@@ -91,6 +91,46 @@ fn main() {
     }
 
     // ── 4/5. 资源管理器前台 + 取选中 ───────────────────────────────
+    // 清单覆盖面先打一遍：`is_previewable` 是空格预览的**准入判据**，探针里取件用的是
+    // 全放行（`|_| true`），所以这条判据断掉时探针照样全绿——`.raf` / `.uyvy` 就是这么
+    // 漏掉的（排除项先按 DLL 级 `is_raw` 判、后按 headerless 后缀判，两次都是拿后缀当
+    // "解不解得开"的代理）。这里把它抄回来。
+    let declared = rupix_lib::core::formats::declared_exts();
+    if !declared.is_empty() {
+        let mut blocked: Vec<&str> = declared
+            .iter()
+            .filter(|e| !rupix_lib::core::formats::is_previewable(e))
+            .map(String::as_str)
+            .collect();
+        blocked.sort_unstable();
+        println!(
+            "step5 清单 {} 个后缀，其中不可空格预览 {} 个：{}",
+            declared.len(),
+            blocked.len(),
+            blocked.join(" ")
+        );
+        // 相机 RAW 与裸像素都必须能预览：准入只看"有没有解码器认领这个后缀"，
+        // 裸像素解不解得出由解码前那次参数推断现场决定（推不出才静默）。
+        // 两轮用户实测都是这一条断掉——先 `.raf`（按 DLL 级 is_raw 排整档），
+        // 后 `.uyvy`（改按 headerless 后缀排）——两次都是拿后缀当"解不解得开"的代理。
+        let mut bad: Vec<&str> = [
+            "cr2", "nef", "raf", "dng", "arw", "rgb", "rgba", "bgra", "gray", "yuv", "uyvy",
+            "yuy2", "i420", "yv12", "nv12",
+        ]
+        .into_iter()
+        .filter(|e| declared.contains(*e) && !rupix_lib::core::formats::is_previewable(e))
+        .collect();
+        bad.sort_unstable();
+        if bad.is_empty() {
+            println!("ok  step5b: 相机 RAW 与裸像素后缀都在可预览集合内");
+        } else {
+            println!(
+                "FAIL step5b: 这些后缀被挡在空格预览外：{}（双击能开、按空格没反应）",
+                bad.join(" ")
+            );
+            failures += 1;
+        }
+    }
     let sample = make_sample_png();
     match &sample {
         Ok(p) => println!("ok  sample: {}", p.display()),
@@ -187,6 +227,39 @@ fn main() {
                 c1.as_millis(),
                 c2.as_millis()
             );
+        }
+        // ── 6b. 裸像素：空格预览没有参数窗，只能自动推断 ──────────────
+        // 后缀定布局、文件长度反推宽高，与双击 `raw_dialog::open_path` 的"推得出就直接
+        // 开"是同一条推断。任一环断掉，用户看到的就是"双击开得开、按空格没反应"
+        // （`.uyvy` / `.rgb` 实测）。样本用 640×480 的 RGB8，长度 921600。
+        let raw = make_sample_raw(640, 480);
+        match &raw {
+            Ok(raw_path) => {
+                match rupix_lib::core::decode::infer_raw_params(raw_path) {
+                    Some(p) if (p.width, p.height) == (640, 480) => {
+                        rupix_lib::core::decode::set_raw_params(raw_path, p);
+                        match rupix_lib::core::decode::probe_decode(raw_path, IMG_W, IMG_H) {
+                            Ok(d) => println!(
+                                "ok  step7b: 裸像素 .rgb 推断 {}x{} 并解出 {:?}",
+                                p.width, p.height, d.natural
+                            ),
+                            Err(e) => {
+                                println!("FAIL step7b: 裸像素推断出了参数却解不出：{e}");
+                                failures += 1;
+                            }
+                        }
+                    }
+                    other => {
+                        println!("FAIL step7b: 裸像素参数推断失败（{:?}）", other);
+                        failures += 1;
+                    }
+                }
+                let _ = std::fs::remove_file(raw_path);
+            }
+            Err(e) => {
+                println!("FAIL step7b 样本: {e}");
+                failures += 1;
+            }
         }
         let _ = std::fs::remove_file(&path);
     }
@@ -341,6 +414,31 @@ fn inject_space() {
 }
 
 /// 生成 2000×1500 诊断样本 PNG（对角条纹）。
+/// 裸像素样本：RGB8 交错、无文件头，长度 = w×h×3。
+///
+/// 存在的理由：`.uyvy` / `.rgb` 这类文件"双击开得开、按空格没反应"是格式准入的
+/// 经典回归，而它们的解码必须带参数（后缀定布局 + 长度定宽高）。样本自己造，
+/// 不依赖 `.build/1M` 那批真机语料。
+fn make_sample_raw(w: u32, h: u32) -> Result<PathBuf, String> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.temp/probe_samples");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("样本目录创建失败: {e}"))?;
+    let path = dir.join(format!("rupix-space-probe-{}.rgb", std::process::id()));
+    let mut img: Vec<u8> = Vec::with_capacity((w as usize) * (h as usize) * 3);
+    for y in 0..h {
+        for x in 0..w {
+            let stripe = ((x + y) / 32) % 2 == 0;
+            let (r, g, b) = if stripe {
+                (220u8, 40, 60)
+            } else {
+                (30u8, 140, 200)
+            };
+            img.extend_from_slice(&[r, g, b]);
+        }
+    }
+    std::fs::write(&path, &img).map_err(|e| format!("创建裸像素样本失败: {e}"))?;
+    Ok(path)
+}
+
 fn make_sample_png() -> Result<PathBuf, String> {
     // 关键：样本放**小目录**（workspace 的 .temp/probe_samples），不放系统 Temp——
     // Temp 动辄数万文件，explorer /select 打开它要在异步加载里挣扎好几秒，

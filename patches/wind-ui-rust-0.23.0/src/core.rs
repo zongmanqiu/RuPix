@@ -1936,6 +1936,22 @@ impl EventCtx<'_> {
     pub fn force_close(&mut self) {
         self.out.close_forced = true;
     }
+    /// ★ RuPix 补丁 025 —— 退出**整个应用**（不只是本窗口）。
+    ///
+    /// 与 [`request_close`](Self::request_close) 的区别是作用域：那个问的是"这个窗口能不能关"，
+    /// 走本窗的 `on_close_request`；这里问的是"程序该不该结束"，与托盘菜单「退出」
+    /// （[`TrayCtx::quit`](crate::platform::TrayCtx::quit)）同一条路。
+    ///
+    /// 此前应用级退出**只有托盘那一个入口**，于是常驻模式（`App::run_resident`，零主窗）
+    /// 下"所有窗口都关掉了，进程该走了"这件事表达不出来——没有主窗可 `request_close`，
+    /// 而常驻模式又刻意不在最后一个窗口销毁时退消息循环。补上它，多窗口应用的收尾才写得出来。
+    ///
+    /// 直接投 `PostQuitMessage`（不入队、不同步派发），故可以在任何回调里安全调用：
+    /// 它不重入 `wnd_proc`，也不碰窗口状态借用。窗口资源随消息循环收尾由平台统一销毁。
+    pub fn quit_app(&mut self) {
+        crate::platform::post_quit();
+    }
+
     /// 请求把焦点移到本节点。
     pub fn request_focus(&mut self) {
         self.out.focus = Some(self.self_id);

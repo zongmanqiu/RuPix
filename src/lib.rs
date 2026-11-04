@@ -56,6 +56,11 @@ pub fn initial_path(argv: &[String]) -> Option<std::path::PathBuf> {
 /// 按目标尺寸光栅化（宪章 §5.2），宿主不参与它们的像素。
 pub fn install_decode_stack() {
     core::decode::install_backend(Box::new(crate::decoders::Host::new()));
+    // ★ 挂死恢复（2026-11-04）：每个解码 worker 用**自己那份** Host。
+    // 进程级单例那把锁的 guard 覆盖 probe + 查询 + 渲染整段 FFI，一旦某个解码器在
+    // `iv_render` 里死循环，锁就再也放不回来——那正是"打开一张图卡住，之后所有图
+    // 都打不开"的机制。工厂只在 worker 重建时调用（正常启动一次、每次挂死恢复一次）。
+    core::decode::install_backend_factory(|| Box::new(crate::decoders::Host::new()));
     core::decode::set_svg_decoder(ui::svg::decode);
     // ★ m187 —— 字体索引持久缓存落点：exe 旁 `cache\svg-fonts.bin`（缓存目录，
     // 不是 `temp\`——那是按天清理的取证区，纯提速件不住那）。必须在首次 SVG 解析

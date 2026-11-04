@@ -24,9 +24,10 @@ use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::Sender as StdSender;
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender as StdSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use crate::core::pixels::{Decoded, MAX_EDGE, MAX_PIXELS};
 
@@ -58,7 +59,7 @@ pub struct RegionReq {
 }
 
 /// UI → 解码线程。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Req {
     seq: u64,
     path: PathBuf,
@@ -361,15 +362,60 @@ pub struct MetaEvent {
 static META_TX: std::sync::OnceLock<StdSender<MetaEvent>> = std::sync::OnceLock::new();
 
 /// 装入查询事件的接收端（幂等）。由 `runtime::run` 在建解码线程之前调用。
+///
+/// ★ 多窗口（2026-11-04）：这只是**兜底**。GUI 现在每个看图窗口各有一条解码线程，
+/// 各自带着自己的回程（见 [`DecodeSink`]），thread-local 优先——全局单槽留着是给
+/// 直调路径（探针 / 示例 / 无 sink 的旧测试）一个"至少能收到"的落点。
 pub fn install_meta_sender(tx: StdSender<MetaEvent>) {
     let _ = META_TX.set(tx);
+}
+
+/// 一条解码线程的**回程**：Meta 通道 + 主画面唤醒动作。
+///
+/// ★ 多窗口（2026-11-04）之前这两样是进程级单槽（`META_TX` / `DONE_WAKER`），
+/// 因为进程里只有一条解码线程、一个窗口。多个看图窗口各起一条解码线程之后，
+/// 单槽的后果是"第二个窗口的 Meta 全被丢进第一个窗口的队列、唤醒也只叫醒第一个窗口"——
+/// 症状是第二窗的 info bar 与"按原始像素开窗"要等整图解完才动。
+///
+/// 把回程随线程走而不是继续加全局注册表：解码线程与窗口一一对应，回程天然属于线程；
+/// 注册表还要额外的注销路径（窗口关掉要摘，漏了就是往已销毁窗口的通道里发）。
+pub struct DecodeSink {
+    pub meta: StdSender<MetaEvent>,
+    pub wake: Box<dyn Fn() + Send + Sync>,
+}
+
+thread_local! {
+    /// 本解码线程的回程（`decode_loop` 在进循环前装入）。非解码线程恒为 `None`。
+    static SINK: std::cell::RefCell<Option<DecodeSink>> = const { std::cell::RefCell::new(None) };
+    /// 本**解码 worker** 线程的 Meta 通道（2026-11-04）。
+    ///
+    /// Meta 是解码线程自己发的（`publish_meta_from_current_req` 在 `iv_render` 的查询
+    /// 阶段），而回包与唤醒发生在监督者线程。两个线程各拿各自那一半，所以这里只放
+    /// Sender —— 它是 `Clone`，wake 那半个（`Box<dyn Fn>`）只归监督者。
+    static META_SINK: std::cell::RefCell<Option<StdSender<MetaEvent>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// 发出一条查询事件。通道未装或接收端已释放时静默——Meta 只是"锦上添花"，
 /// 拿不到就退回"Frame 到达再刷 UI"的旧行为，绝不因此拖慢或打断解码。
 pub(crate) fn publish_meta(ev: MetaEvent) {
-    if let Some(tx) = META_TX.get() {
+    // 解码 worker 优先（它才是真正在解的那条线程）。
+    let worker_tx = META_SINK.with(|m| m.borrow().clone());
+    if let Some(tx) = worker_tx {
         let _ = tx.send(ev);
+        return;
+    }
+    // 直调路径（探针 / 示例 / 无 worker 的老单线程解码）。
+    let local = SINK.with(|s| s.borrow().as_ref().map(|k| k.meta.clone()));
+    match local {
+        Some(tx) => {
+            let _ = tx.send(ev);
+        }
+        None => {
+            if let Some(tx) = META_TX.get() {
+                let _ = tx.send(ev);
+            }
+        }
     }
 }
 
@@ -384,13 +430,25 @@ pub(crate) fn publish_meta(ev: MetaEvent) {
 static DONE_WAKER: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
 
 /// 装入「主画面回包已入队」的唤醒动作（幂等）。由 `runtime::run` 在事件循环开始前调用。
+///
+/// ★ 多窗口（2026-11-04）：同 [`install_meta_sender`]，这是**兜底**；GUI 走
+/// [`DecodeSink::wake`]（随解码线程、也就是随窗口），本槽只剩直调路径在用。
 pub fn install_done_waker(w: Box<dyn Fn() + Send + Sync>) {
     let _ = DONE_WAKER.set(w);
 }
 
 fn wake_for_main() {
-    if let Some(w) = DONE_WAKER.get() {
-        w();
+    let local = SINK.with(|s| match s.borrow().as_ref() {
+        Some(k) => {
+            (k.wake)();
+            true
+        }
+        None => false,
+    });
+    if !local {
+        if let Some(w) = DONE_WAKER.get() {
+            w();
+        }
     }
 }
 
@@ -526,13 +584,21 @@ impl Drop for Decoder {
 impl Decoder {
     /// 起一个解码线程，结果从 `done_tx` 被 UI 线程的定时器取走。
     pub fn spawn_with(done_tx: StdSender<Done>) -> Self {
+        Self::spawn_with_sink(done_tx, None)
+    }
+
+    /// 同 [`spawn_with`](Self::spawn_with)，但带上这条线程的回程（Meta 通道 + 唤行动作）。
+    ///
+    /// 每个看图窗口一条线程、一份回程（★ 多窗口，2026-11-04）。不带 sink 的旧入口照旧
+    /// 可用：Meta 与唤醒落到进程级兜底槽，行为与单窗口时代一致。
+    pub fn spawn_with_sink(done_tx: StdSender<Done>, sink: Option<DecodeSink>) -> Self {
         let queue = Arc::new(Queue::new());
         let main_floor = Arc::new(AtomicU64::new(0));
         let floor_for_thread = main_floor.clone();
         let q_for_thread = queue.clone();
         thread::Builder::new()
             .name("sv-decode".into())
-            .spawn(move || decode_loop(q_for_thread, done_tx, floor_for_thread))
+            .spawn(move || decode_loop(q_for_thread, done_tx, floor_for_thread, sink))
             // 红线豁免: 起线程失败 = 系统资源耗尽（OOM 级），没有可降级的第二种活法——
             // 发送端还在只会让请求无限排队、图永远出不来，那才是真的装死；就地失败反而
             // 留下崩溃报告。这是 §八.1 的第三类例外，必须像这样写在违规行上方点名。
@@ -742,9 +808,43 @@ static BACKEND: std::sync::OnceLock<std::sync::Mutex<Box<dyn DecodeBackend>>> =
     std::sync::OnceLock::new();
 static SVG: std::sync::OnceLock<SvgDecodeFn> = std::sync::OnceLock::new();
 
+/// 后端工厂：每个解码 worker 自建一份（2026-11-04 挂死恢复）。
+///
+/// **为什么必须有它**：`BACKEND` 那把全局 Mutex 的 guard 覆盖 probe + 查询 + 渲染
+/// 整段 FFI。一旦某个解码器在 `iv_render` 里死循环，那条线程就**永久持有它**，之后
+/// 任何 `with_backend`（包括重启出来的新 worker）全部堵死——这就是"打开一张图卡住，
+/// 之后所有图都打不开"的机制（`decode_watchdog` 模块头的 §2 现场，2026-10-28 已定论）。
+/// 让每个 worker 用自己那份后端，挂死者钉死的就只是它自己那一份。
+pub type BackendFactory = fn() -> Box<dyn DecodeBackend>;
+
+static BACKEND_FACTORY: std::sync::OnceLock<BackendFactory> = std::sync::OnceLock::new();
+
+thread_local! {
+    /// 本线程的私有后端（只有解码 worker 装它）。`None` = 走进程级单例那条老路。
+    static LOCAL_BACKEND: std::cell::RefCell<Option<Box<dyn DecodeBackend>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// 装入位图解码后端（幂等）。入口：`install_decode_stack`。
 pub fn install_backend(b: Box<dyn DecodeBackend>) {
     let _ = BACKEND.set(std::sync::Mutex::new(b));
+}
+
+/// 装入后端工厂（幂等）。`install_decode_stack` 与 [`install_backend`] 一起调。
+///
+/// 工厂只在**解码 worker 重建时**被调用（正常启动一次、每次挂死恢复一次），所以它内部
+/// 做一点点事（扫目录 / `LoadLibrary`）是可以接受的。
+pub fn install_backend_factory(f: BackendFactory) {
+    let _ = BACKEND_FACTORY.set(f);
+}
+
+/// 给**当前线程**装一份私有后端（解码 worker 启动时调）。没有工厂时静默跳过——
+/// 那种装配（单测 / 裸示例）本来就走进程级单例。
+fn install_local_backend() {
+    let Some(f) = BACKEND_FACTORY.get() else {
+        return;
+    };
+    LOCAL_BACKEND.with(|b| *b.borrow_mut() = Some(f()));
 }
 
 /// 装入 SVG 渲染函数（幂等）。入口：`install_decode_stack`。
@@ -755,11 +855,282 @@ pub fn set_svg_decoder(f: SvgDecodeFn) {
 /// 在后端上跑一次解码。未装入时返回可诊断的错误，不 panic——
 /// 启动顺序错位只影响解码，不该把进程带崩。
 fn with_backend<T>(f: impl FnOnce(&mut dyn DecodeBackend) -> T) -> Result<T, String> {
+    // ★ 解码 worker 线程：用**自己那份**后端（见 [`BackendFactory`]）。
+    if LOCAL_BACKEND.with(|b| b.borrow().is_some()) {
+        return LOCAL_BACKEND.with(|b| match b.borrow_mut().as_mut() {
+            Some(backend) => Ok(f(&mut **backend)),
+            None => Err("解码后端未安装（启动装配遗漏 install_decode_stack）".into()),
+        });
+    }
     let Some(m) = BACKEND.get() else {
         return Err("解码后端未安装（启动装配遗漏 install_decode_stack）".into());
     };
     let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
     Ok(f(&mut **g))
+}
+
+// ── 挂死恢复：单笔超时 + 熔断（2026-11-04，用户口径「永久解决」）───────
+//
+// 现场（`.build/temp/rupix-2026-11-04.log`，一天 301 条 `[decode-watchdog]`）：
+// `noise.avifs` 让解码线程 20 秒不回包，之后 `noise.bmp` / `noise.cr2` 的请求全排在
+// 后面——用户看到的是"打开新图片卡住了"，而 UI 本身没死（定时器还在跑）。
+//
+// `decode_watchdog` 只把挂死变成可读的日志，**救不活线程**。这里补上恢复：
+//
+// 1. **单笔超时**：监督者（`decode_loop`）把请求交给 worker 线程，`recv_timeout` 等；
+//    到点就放弃这一笔，给 UI 回一条可读的 Err（画面出错误文案，而不是永远"载入中…"）。
+// 2. **熔断**：超时那一刻正在用的解码器 id（由 `decoders::decode_with` 上报）记进
+//    进程级挂死集，**本会话任何路径都不再调它**——僵尸线程还在那个 DLL 里转，
+//    再进去一次就是 ABI 明令禁止的重入（「可重入但不必 MT-safe」）。
+// 3. **换 worker**：丢弃旧 worker（线程泄漏一条，见下）并起新的；新 worker 是新的
+//    后端实例（[`BackendFactory`]），不会被僵尸持有的锁堵住。
+//
+// 遗留代价（如实记）：每次挂死泄漏一条线程 + 它那份后端 + 一份 mmap，直到进程退出。
+// `ExitProcess` 先杀线程再跑 DETACH，只有当僵尸恰好在 loader 锁里才可能拖慢退出——
+// 这个风险在引入本机制之前就已经存在（挂死时线程同样挂在 DLL 里）。
+//
+// 阈值为什么 20 秒：`decode_watchdog` 的首报是 10 秒（它只记录），这里再等一倍——
+// 误杀一个"合理慢"的解码（网络盘 mmap 页入）比多等 10 秒更糟。用户可改
+// ini `decode_timeout_s`（CONFIG_ONLY_KEYS，见 `core::config`）。
+
+static DECODE_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(20_000);
+
+/// 正在解码的那个解码器 id（由 `decoders::decode_with` 上报）。
+///
+/// 为什么用全局而不是 thread-local：读它的**不是**解码线程，而是超时后的监督者
+/// （worker 已经卡死，问不了它）。写入频率 = 每笔解码一次，代价是一次短锁。
+static CURRENT_DECODER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 这一笔解码**走到哪一段了**（诊断坐标）。
+///
+/// 为什么需要它：`[decode-watchdog]` 只说"某个文件卡了 10 秒"，把它引向解码器——可
+/// 「读文件 / 探测 / 补查尺寸 / 查询 / 渲染 / 后处理」里只有**渲染**是外来的 FFI，
+/// 其余全是宿主的活。没有这一位，一个宿主的死循环和一个解码器的死循环长得一模一样，
+/// 只能靠猜（2026-11-04 就是这么猜偏的）。
+///
+/// 写方是 worker（每段一次 `store`，Relaxed 足够——它只是"最后见到的那一段"），
+/// 读方是**任何**线程：`decode_watchdog` 的巡检、监督者超时后的那条日志。
+static PHASE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(PHASE_IDLE);
+
+/// 没在解码（空闲 / 刚起步）。
+pub const PHASE_IDLE: u8 = 0;
+/// 打开文件、判空、按登记表路由。
+pub const PHASE_OPEN: u8 = 1;
+/// 读文件（mmap 或整读）。
+pub const PHASE_READ: u8 = 2;
+/// `iv_probe`（认不认这个文件）。
+pub const PHASE_PROBE: u8 = 3;
+/// 补查原图尺寸（`iv_render` 查询）。
+pub const PHASE_NATURAL: u8 = 4;
+/// 补查文档自然尺寸（零目标查询，矢量用）。
+pub const PHASE_DOC: u8 = 5;
+/// 正式查询（`iv_render` + `out=NULL`）。
+pub const PHASE_QUERY: u8 = 6;
+/// 正式渲染（`iv_render` + 像素缓冲）——**唯一的外来代码段**。
+pub const PHASE_RENDER: u8 = 7;
+/// 后处理（RGBA 归一 / 转正 / 缩放 / ICC）——纯宿主代码。
+pub const PHASE_POST: u8 = 8;
+/// 区域重渲（`iv_render_region`，矢量放大走这条）。
+pub const PHASE_REGION: u8 = 9;
+/// 内置矢量库（resvg）——宿主自己的代码，不是 DLL。
+pub const PHASE_SVG: u8 = 10;
+
+/// 记下"这一笔走到哪了"。只在 worker 里调；`Relaxed` 足够（见 [`PHASE`]）。
+pub(crate) fn set_phase(p: u8) {
+    PHASE.store(p, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 当前阶段的人话名字（日志用）。
+pub fn phase_name(p: u8) -> &'static str {
+    match p {
+        PHASE_OPEN => "open",
+        PHASE_READ => "read",
+        PHASE_PROBE => "probe",
+        PHASE_NATURAL => "natural",
+        PHASE_DOC => "doc-natural",
+        PHASE_QUERY => "query",
+        PHASE_RENDER => "render",
+        PHASE_POST => "post",
+        PHASE_REGION => "region",
+        PHASE_SVG => "svg",
+        _ => "idle",
+    }
+}
+
+/// 读出当前阶段（人话）。挂死现场那一条日志用它。
+pub fn current_phase() -> &'static str {
+    phase_name(PHASE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// 本会话已熔断的解码器 id（**判据**：`is_hung_decoder` 读它，整个会话有效）。
+static HUNG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// 已经交给 UI 的熔断 id（`take_hung_decoders` 去重用）。
+///
+/// 为什么不直接把 `HUNG` 取空：那会让 `is_hung_decoder` 在 UI 取走的那一刻失效，
+/// 而 UI 补进 `decoders::add_disabled` 是**另一条**路径（见 runtime）——中间那几微秒
+/// 足够让一个新请求挤进去。两道保险就该各管各的，别互相拆台。
+static REPORTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// 设定单笔解码超时（秒）。`runtime` 启动时按 ini 灌入，0 = 不超时（关闭恢复机制）。
+pub fn set_decode_timeout(secs: u64) {
+    DECODE_TIMEOUT_MS.store(
+        secs.saturating_mul(1000),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// 当前单笔解码超时。`None` = 关掉了恢复机制（无限等）。
+fn decode_timeout() -> Option<Duration> {
+    match DECODE_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        ms => Some(Duration::from_millis(ms)),
+    }
+}
+
+/// 上报"下一步要进哪个解码器"。由 `decoders::decode_with` 在拿到 id 后立刻调。
+pub(crate) fn report_current_decoder(id: &str) {
+    let mut g = CURRENT_DECODER.lock().unwrap_or_else(|e| e.into_inner());
+    *g = Some(id.to_string());
+}
+
+/// 当前解码器 id 的人读形式（诊断日志用；`current_decoder` 是它的私有底座）。
+pub fn current_decoder_name() -> Option<String> {
+    current_decoder()
+}
+
+fn current_decoder() -> Option<String> {
+    CURRENT_DECODER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// 该解码器是否已在本次会话被熔断（挂死过）。`decoders::decode_with` 用它挡在调用之前。
+pub fn is_hung_decoder(id: &str) -> bool {
+    HUNG.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|x| x == id)
+}
+
+/// 取走**尚未上报**的熔断 id（`runtime` 取走 → 写进 `decoders_disabled` 落盘 + 提示）。
+///
+/// 取走之后 `is_hung_decoder` 仍然为真（那是本会话的判据，不是待办队列）。
+pub fn take_hung_decoders() -> Vec<String> {
+    let hung = HUNG.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rep = REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+    let fresh: Vec<String> = hung
+        .iter()
+        .filter(|id| !rep.iter().any(|x| x == *id))
+        .cloned()
+        .collect();
+    for id in &fresh {
+        rep.push(id.clone());
+    }
+    fresh
+}
+
+/// 清空熔断集与上报记录（单测用）。
+pub fn clear_hung_decoders() {
+    HUNG.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    REPORTED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+fn note_hung(id: &str) {
+    let mut g = HUNG.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.iter().any(|x| x == id) {
+        g.push(id.to_string());
+        log::warn!("[decode-hang] id={id} verdict=quarantined");
+    }
+}
+
+/// 一笔解码作业（worker → 监督者）。
+struct JobDone {
+    out: Result<Decoded, String>,
+}
+
+/// 解码 worker：一条长驻线程 + 一份**私有后端**（[`BackendFactory`]）。
+///
+/// 为什么它必须可丢弃：挂死在 FFI 里的线程**没有可靠的取消原语**（Rust 没有；
+/// `TerminateThread` 会漏锁、留下半初始化的堆与 DLL 状态）。能做的只有"不再等它"——
+/// 超时后丢掉它的句柄（线程泄漏一条栈），换一条新线程继续服务。
+struct Worker {
+    job_tx: StdSender<Req>,
+    res_rx: Receiver<JobDone>,
+}
+
+impl Worker {
+    fn spawn(meta: Option<StdSender<MetaEvent>>) -> Self {
+        let (job_tx, job_rx) = channel::<Req>();
+        let (res_tx, res_rx) = channel::<JobDone>();
+        // 句柄直接丢掉 = detach：超时之后我们**不再等**这条线程（也没有可靠的取消
+        // 原语），它的栈与后端随进程退出才回收。见类型文档的遗留代价。
+        let _ = thread::Builder::new()
+            .name("sv-decode-w".into())
+            // 红线豁免: 起线程失败 = 资源耗尽（OOM 级），没有第二种活法——不解码只会让
+            // 画面永远停在"载入中"，就地失败反而留下崩溃报告（与 `spawn_with` 同一条）。
+            .spawn(move || worker_main(job_rx, res_tx, meta))
+            .unwrap_or_else(|e| panic!("启动解码 worker 失败：{e}"));
+        Self { job_tx, res_rx }
+    }
+
+    /// 跑一笔。`None` = 超时，或 worker 已经没了（调用方负责熔断与换 worker）。
+    fn run(&self, req: &Req, timeout: Option<Duration>) -> Option<Result<Decoded, String>> {
+        self.job_tx.send(req.clone()).ok()?;
+        let got = match timeout {
+            Some(t) => self.res_rx.recv_timeout(t),
+            // 关掉恢复机制（`decode_timeout_s=0`）：老行为，无限等。
+            None => self
+                .res_rx
+                .recv()
+                .map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        match got {
+            Ok(j) => Some(j.out),
+            Err(_) => None,
+        }
+    }
+}
+
+/// worker 线程主体：装回程与私有后端，然后一笔一笔解。
+fn worker_main(
+    job_rx: Receiver<Req>,
+    res_tx: StdSender<JobDone>,
+    meta: Option<StdSender<MetaEvent>>,
+) {
+    META_SINK.with(|m| *m.borrow_mut() = meta);
+    // 私有后端：挂死时随这条线程一起废掉，不牵连同进程的其它 worker
+    //（进程级单例那把锁会被僵尸永久持有，这是本机制存在的全部理由）。
+    install_local_backend();
+    while let Ok(req) = job_rx.recv() {
+        set_current_req(req.seq, &req.path);
+        let out = decode_one(&req);
+        // 一笔结束就归零：否则"上一笔卡在 render"会一直挂在字段上，下一次挂死
+        // 读到的阶段就是假的（诊断字段最怕的错不是没有，而是**过期**）。
+        set_phase(PHASE_IDLE);
+        clear_current_req();
+        if res_tx.send(JobDone { out }).is_err() {
+            break;
+        }
+    }
+}
+
+/// 超时那一笔给用户的说法：必须点明"哪个解码器被停用、怎么恢复"。
+fn hang_error(req: &Req, id: Option<&str>, timeout: Option<Duration>) -> String {
+    let name = req
+        .path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| req.path.display().to_string());
+    let secs = timeout.map(|t| t.as_secs()).unwrap_or(0);
+    match id {
+        Some(id) => format!(
+            "「{name}」解码超时（{secs} 秒没有返回）：已停用解码器「{id}」（设置 → 解码器 里可重新启用），\
+             其余图片不受影响"
+        ),
+        None => format!("「{name}」解码超时（{secs} 秒没有返回），已跳过这次解码"),
+    }
 }
 
 /// 解码线程主体：取出请求 → 判过期 → 解码 → 回包，直到队列关闭或 UI 侧收包端没了。
@@ -770,7 +1141,21 @@ fn with_backend<T>(f: impl FnOnce(&mut dyn DecodeBackend) -> T) -> Result<T, Str
 /// 用户刚按下去
 /// 的那次缩放重解**前面**。实测 100 MB 级样本、2 张缩略图在前：主图重解 0.37s → 1.98s，
 /// 放大后要盯着糊图看两秒；目录里全是大图时更久。插队后同场景实测 0.25s。
-fn decode_loop(q: Arc<Queue>, done_tx: StdSender<Done>, main_floor: Arc<AtomicU64>) {
+fn decode_loop(
+    q: Arc<Queue>,
+    done_tx: StdSender<Done>,
+    main_floor: Arc<AtomicU64>,
+    sink: Option<DecodeSink>,
+) {
+    // 本线程的回程（Meta 通道 + 主画面唤醒）。装在线程局部而不是每次调用都查一遍
+    // 全局注册表：这条线程只服务一个窗口，回程在它活着期间不变（★ 多窗口，2026-11-04）。
+    // Meta 那一半要转交给 worker（它才是真正在解的那条线程）。
+    let meta_tx = sink.as_ref().map(|s| s.meta.clone());
+    SINK.with(|s| *s.borrow_mut() = sink);
+    // 监督者**自己不解码**：所有 FFI 都在 worker 里跑，这样"挂死"才有地方可逃
+    //（见 `Worker` 与模块内「挂死恢复」小节的说明）。
+    let timeout = decode_timeout();
+    let mut worker = Worker::spawn(meta_tx.clone());
     // 取证开关与 `decoders` 侧的 `[decode-trace]` 同名同闸（`RUPIX_DECODE_TRACE=1`）。
     // 为什么单加这一行：`[decode-trace]` 只说"解了一次"，说不出**是谁发起的**——
     // 主画面 / 预读 / 缩略图三条路混在同一个文件名的多条读数里，翻页命中率这类
@@ -787,6 +1172,9 @@ fn decode_loop(q: Arc<Queue>, done_tx: StdSender<Done>, main_floor: Arc<AtomicU6
         // floor，`req.seq == floor` 是当前主画面，必须真解。
         let cancelled = matches!(req.kind, ReqKind::Main | ReqKind::Prefetch)
             && req.seq < main_floor.load(Ordering::Relaxed);
+        // 从这一刻起才算"解码耗时"（在排队的那一段另计）：看门狗日志靠这一位把
+        // "堵在队列"和"堵在 FFI"分开，混在一起就只会得出"七个格式同时挂死"。
+        crate::core::decode_watchdog::note_picked(req.seq);
         if trace {
             log::debug!(
                 "[decode-req] kind={:?} file={} tier={}x{} scaled={} seq={} verdict={}",
@@ -808,12 +1196,31 @@ fn decode_loop(q: Arc<Queue>, done_tx: StdSender<Done>, main_floor: Arc<AtomicU6
             // 撞进错误显示也不出乱码。
             Err(String::new())
         } else {
-            // 把请求上下文（seq/path）暂存给 thread-local，让解码器宿主在查询阶段
-            // 能就近发出 Meta；decode_one 返回（或 panic 被拦下）后立即清。
-            set_current_req(req.seq, &req.path);
-            let out = decode_one(&req);
-            clear_current_req();
-            out
+            match worker.run(&req, timeout) {
+                Some(out) => out,
+                None => {
+                    // 超时（或 worker 已经没了）：**熔断 → 弃置 → 换新 → 给用户人话**。
+                    //
+                    // 顺序有讲究：熔断必须发生在起新 worker **之前**吗？不必——新 worker
+                    // 是新的后端实例，它进不进那个 DLL 由 `decode_with` 的
+                    // `is_hung_decoder` 挡（本会话立即生效）；先记熔断再换线程只是让日志
+                    // 的因果顺序好读。
+                    let hung = current_decoder();
+                    if let Some(id) = hung.as_deref() {
+                        note_hung(id);
+                    }
+                    log::warn!(
+                        "[decode-timeout] file={} kind={:?} id={} secs={} phase={} verdict=restart-worker",
+                        req.path.display(),
+                        req.kind,
+                        hung.as_deref().unwrap_or("-"),
+                        timeout.map(|t| t.as_secs()).unwrap_or(0),
+                        current_phase()
+                    );
+                    worker = Worker::spawn(meta_tx.clone());
+                    Err(hang_error(&req, hung.as_deref(), timeout))
+                }
+            }
         };
         // 先记类别再 move 走 `req`：唤醒判据在 send 之后还要用。
         let kind = req.kind;
@@ -847,6 +1254,7 @@ fn decode_loop(q: Arc<Queue>, done_tx: StdSender<Done>, main_floor: Arc<AtomicU6
 ///   （2026-10-10 删的是**WIC 兜底**，2026-10-20 它以"可被点名的内置库"回归、
 ///   2026-10-25 又整层删掉——三段历史都不改"兜底永远不做"这条底线。）
 fn decode_one(req: &Req) -> Result<Decoded, String> {
+    set_phase(PHASE_OPEN);
     // 0 字节没有可解码的字节：在路由之前直说。交给后端的话，解码器探测只会答
     // 「不认识这个文件」——把"文件是空的"说成"格式不认"，排查方向就反了。
     if std::fs::metadata(&req.path).is_ok_and(|m| m.len() == 0) {
@@ -881,6 +1289,7 @@ fn decode_route(req: &Req, ext: &str) -> Result<Decoded, String> {
         // 硬并成一种只会让实现侧解包。
         match b.id {
             "resvg" => {
+                set_phase(PHASE_SVG);
                 // 矢量要按**目标尺寸**光栅化才有无损放大，与"位图解码后缩放"本质不同，
                 // 所以它带 region 而不是 frame_index/allow_scaled。
                 let f = SVG.get().ok_or_else(|| {
@@ -936,6 +1345,11 @@ fn decode_route(req: &Req, ext: &str) -> Result<Decoded, String> {
 ///
 /// 后端是进程级单例（[`install_backend`] 装一次全局复用）：连续调用（冒烟 / 基准）
 /// 不重复扫目录与 LoadLibrary，与真实应用"Host 常驻"的实况一致。
+///
+/// ★ `raw` 取**会话 store**（[`get_raw_params`]）而不是恒 `None`：裸像素没有文件头，
+/// 不给参数就解不开；空格预览是独立线程直接调本函数、不经过 `Viewer`，恒 `None`
+/// 会让 `.uyvy` / `.rgb` 这类文件"双击能开、按空格没反应"（用户实测）。
+/// 非裸数据这条永远是 `None`，对普通图片零影响。
 pub fn probe_decode(path: &Path, max_w: u32, max_h: u32) -> Result<Decoded, String> {
     let req = Req {
         seq: 0,
@@ -944,7 +1358,7 @@ pub fn probe_decode(path: &Path, max_w: u32, max_h: u32) -> Result<Decoded, Stri
         max_h,
         region: None,
         frame_index: 0,
-        raw: None,
+        raw: get_raw_params(path),
         kind: ReqKind::Main,
         allow_scaled: false,
     };
@@ -1052,6 +1466,89 @@ mod tests {
         }
     }
 
+    // ── 挂死恢复（2026-11-04，用户口径「永久解决」）────────────────
+
+    /// 没有回包的 worker：`run` 必须在超时后返回 `None`（= 放弃这一笔、换 worker），
+    /// 而不是把监督者一起等死。这是"打开一张图卡住、之后全都卡住"的直接解药。
+    #[test]
+    fn worker_reports_timeout_when_nobody_replies() {
+        // 收端直接丢掉 = 永远不会有回包（模拟挂死在 FFI 里的那条线程）。
+        let (job_tx, _job_rx) = channel::<Req>();
+        let (_res_tx, res_rx) = channel::<JobDone>();
+        let w = Worker { job_tx, res_rx };
+        let t0 = std::time::Instant::now();
+        assert!(
+            w.run(&req(1, ReqKind::Main), Some(Duration::from_millis(20)))
+                .is_none(),
+            "没有回包就该判超时"
+        );
+        assert!(
+            t0.elapsed() >= Duration::from_millis(15),
+            "必须真的等满超时，而不是立刻放弃"
+        );
+    }
+
+    /// 正常路径：worker 回了包就原样交出去（超时机制不能把好路径也判死）。
+    #[test]
+    fn worker_returns_the_reply() {
+        let (job_tx, job_rx) = channel::<Req>();
+        let (res_tx, res_rx) = channel::<JobDone>();
+        let h = thread::spawn(move || {
+            let _ = job_rx.recv();
+            let _ = res_tx.send(JobDone {
+                out: Err("boom".into()),
+            });
+        });
+        let w = Worker { job_tx, res_rx };
+        let got = w.run(&req(2, ReqKind::Main), Some(Duration::from_secs(1)));
+        assert!(matches!(got, Some(Err(m)) if m == "boom"));
+        let _ = h.join();
+    }
+
+    /// 熔断集：重复熔断只记一条；上报一次后不再重复上报；**取走之后判据仍然有效**
+    /// （否则 UI 取走那一瞬间会漏进一个新请求）。
+    #[test]
+    fn hung_set_quarantines_for_the_whole_session() {
+        clear_hung_decoders();
+        assert!(!is_hung_decoder("modern"));
+        note_hung("modern");
+        note_hung("modern");
+        assert!(is_hung_decoder("modern"));
+        assert_eq!(take_hung_decoders(), vec!["modern".to_string()]);
+        assert!(
+            is_hung_decoder("modern"),
+            "取走只是「已上报」，判据必须留到会话结束"
+        );
+        assert!(take_hung_decoders().is_empty(), "同一笔不该上报两次");
+        clear_hung_decoders();
+        assert!(!is_hung_decoder("modern"));
+    }
+
+    /// 超时秒数：0 = 关掉恢复机制（无限等，老行为）。
+    #[test]
+    fn zero_timeout_disables_recovery() {
+        set_decode_timeout(20);
+        assert_eq!(decode_timeout(), Some(Duration::from_secs(20)));
+        set_decode_timeout(0);
+        assert!(decode_timeout().is_none());
+        // 复原全局量，别留给后面的用例。
+        set_decode_timeout(20);
+    }
+
+    /// 超时文案必须点名"哪个解码器被停用"并给出恢复入口——用户看不到这句就只能猜。
+    #[test]
+    fn hang_error_names_the_decoder_and_the_way_back() {
+        let msg = hang_error(
+            &req(3, ReqKind::Main),
+            Some("modern"),
+            Some(Duration::from_secs(20)),
+        );
+        assert!(msg.contains("modern"), "要点名解码器：{msg}");
+        assert!(msg.contains("20 秒"), "要说清等了多久：{msg}");
+        assert!(msg.contains("设置"), "要给恢复入口：{msg}");
+        assert!(msg.contains("p3.png"), "要点名文件：{msg}");
+    }
+
     /// 装好请求并**关闭**的队列：`decode_loop` / `pop` 排空后即返回，测试不会挂在
     /// 条件变量上等一个永远不来的下一个请求。
     fn closed_queue(reqs: impl IntoIterator<Item = Req>) -> Arc<Queue> {
@@ -1112,6 +1609,7 @@ mod tests {
             closed_queue([req(50, ReqKind::Main), req(99, ReqKind::Prefetch)]),
             done_tx,
             floor,
+            None,
         );
 
         let d1 = done_rx.recv().expect("应有 50 号 Done");
@@ -1143,6 +1641,7 @@ mod tests {
             closed_queue([req(10, ReqKind::Main), req(11, ReqKind::Thumb)]),
             done_tx,
             floor,
+            None,
         );
 
         // 两条都必须走真解码：未装 backend 时是"解码后端未安装…"的非空 Err。
@@ -1201,6 +1700,7 @@ mod tests {
             ]),
             done_tx,
             floor,
+            None,
         );
         assert_eq!(
             WAKES.load(Ordering::SeqCst),

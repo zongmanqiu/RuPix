@@ -20,10 +20,12 @@
 //! | `prefetch`        | 邻图预读：后台先解好前后各两张（即时生效）  | `1`  |
 //! | `close_to_tray`   | 关闭改为收进系统托盘（即时生效）            | `0`  |
 //! | `space_preview`   | 空格预览：资源管理器选中图片按空格弹预览（QuickLook 式） | `0`  |
+//! | `drag_image`      | 左键拖动图片：画布里拖动只平移图片，移动窗口交给标题栏 | `1`  |
 //! | `decoders_disabled`| 被停用的解码器 id（分号分隔）             | 空   |
 //! | `decoders_preferred`| 各扩展名的首选解码器 `扩展名=解码器id`（分号分隔）| 空  |
 //! | `raw_last`        | 裸数据参数窗的上次使用值 `宽x高:布局`       | 空   |
 //! | `download_source` | 联网来源（解码器清单 / 插件清单 / 将来的本体更新共用） | `gitee` |
+//! | `ui_theme`       | 看图窗口配色：`dark` / `light`（不碰设置页） | `dark` |
 //! | `decoder_index_gitee` / `decoder_index_github` | 解码器清单地址（可改：镜像/自建） | 内置默认 |
 //! | `plugin_index_gitee` / `plugin_index_github`   | 插件清单地址（可改：镜像/自建）   | 内置默认 |
 //!
@@ -378,6 +380,73 @@ impl InitWindow {
     ];
 }
 
+/// 看图窗口的配色方案（ini 键 `ui_theme`，2026-11-02 用户口径"只需要两种颜色方案切换"）。
+///
+/// ★ **只影响看图器主窗口**：浮层胶囊、缩略图条、棋盘格、空窗底、中央提示文字这一批。
+///   设置页 / 属性窗 / 对话框恒为浅底深字那一套，两档主题下长得一模一样——用户明说
+///   "不影响我们的设置页面颜色"。
+/// ★ 存**字符串**而不是数字：`dark` / `light` 手改 ini 时自解释，也不会像
+///   [`InitWindow`] 那样因为退役值占号而需要两套下标映射。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UiTheme {
+    /// 深色：压在图片上的浮层用深底白字（默认，2026-10-26 以来的观感）。
+    #[default]
+    Dark,
+    /// 浅色：同一批浮层换白底深字。
+    Light,
+}
+
+impl UiTheme {
+    /// 下拉框 / 遍历用的有序清单。顺序即下拉里的显示顺序。
+    pub const ALL: [UiTheme; 2] = [UiTheme::Dark, UiTheme::Light];
+
+    /// ini 里存的稳定标识。
+    pub fn id(self) -> &'static str {
+        match self {
+            UiTheme::Dark => "dark",
+            UiTheme::Light => "light",
+        }
+    }
+
+    /// 下拉框文案。
+    pub fn label(self) -> &'static str {
+        match self {
+            UiTheme::Dark => "深色",
+            UiTheme::Light => "浅色",
+        }
+    }
+
+    /// 从 ini 值还原。认不出的一律回落深色——手改坏的配置不该把界面变成
+    /// 第三种没人设计过的配色（与 [`crate::ui::tokens::Theme::from_id`] 同一判据）。
+    pub fn from_id(s: &str) -> UiTheme {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "light" => UiTheme::Light,
+            _ => UiTheme::Dark,
+        }
+    }
+
+    /// 设置页下拉里的**位置**（0 = 深色 / 1 = 浅色）。
+    ///
+    /// 与 [`UiTheme::id`] 分工：`id()` 是落盘写法（手改 ini 要能读懂），这里是
+    /// 下拉框的序号。两者今天数值一致，但**不要合并**——将来加第三档主题时，
+    /// 序号必须连续、落盘值却不该跟着挪（挪了会让老 ini 指向另一个主题）。
+    pub fn ui_index(self) -> usize {
+        match self {
+            UiTheme::Dark => 0,
+            UiTheme::Light => 1,
+        }
+    }
+
+    /// 下拉位置 → 枚举；越界回落深色（与下拉自身夹取行为一致）。
+    pub fn from_ui_index(i: usize) -> UiTheme {
+        Self::ALL.get(i).copied().unwrap_or(UiTheme::Dark)
+    }
+
+    // ★ 这里**没有** `to_tokens()`：core 层不许引用 ui 层（`layering_scan` 的方向检查
+    //   会判红，2026-11-02 实测）。转换写在 `ui::tokens::Theme::from_config`，
+    //   由 runtime 调用——桥放在允许"高层认识低层"的那一侧。
+}
+
 /// 固定尺寸档的窗口宽/高下限（用户拍板 2026-10-10：最低 100×100）。
 pub const WINDOW_MIN: u32 = 100;
 /// 固定尺寸档的窗口宽/高上限（防手滑把 ini 写成天文数字）。
@@ -534,6 +603,19 @@ pub struct Config {
     /// 输入链路介入，交给用户显式开启。运行期即时生效：16ms 轮询差分装/摘钩子并
     /// 连带收起预览（平台侧见 `platform::spacehook` 模块文档）。
     pub space_preview: bool,
+    /// **左键拖动的分工**（2026-11-03 用户加的功能开关，默认开）。
+    ///
+    /// 开 = 画布（标题栏那一条以外）按住左键拖动 **只平移图片**，窗口不动；
+    ///     移动窗口交给**顶部标题栏**那一条（`Chrome::in_title_strip`）。
+    /// 关 = 回到 2026-10-08 那套拍板：任意位置左键拖 = 移动窗口，
+    ///     平移图片只剩 Ctrl+左键、中键与右下角鸟瞰三条兜底手势。
+    ///
+    /// ★ 默认开是有余量的：这个键改变的是"左键拖到哪算哪"的手感，而看图器的主用途是
+    /// 放大后拖着看；窗口本身照样能从标题栏带走。判据与两处例外（**还没有图**；
+    /// 指针落在标题栏）见 `ui::canvas::left_drag`。
+    /// 图比窗口小也拖得动，且**图边允许越过窗口边**（2026-11-03 第三、四条口径）；
+    /// 夹取永远留一枚 24dp 的衣角在画面里，所以图拖不丢——见 `viewer::zoom::overscroll`。
+    pub drag_image: bool,
     /// 裸数据参数窗的「上次使用值」（宽/高/布局），新裸数据文件的预填默认。
     /// `None` = 还没用过（首开空窗）。
     pub raw_last: Option<crate::core::decode::RawParams>,
@@ -547,6 +629,12 @@ pub struct Config {
     /// （旧版 `decoder_source` / `plugin_source` 各存一份，两个页面的下拉能互相打架）。
     /// 现在只有「选项」页那一处「下载源」，两张卡跟着它走；**旧键不再读取**（一次性重设）。
     pub download_source: SourceId,
+    /// 看图窗口的配色方案（见 [`UiTheme`]）。默认深色。
+    ///
+    /// ★ 只作用于看图器主窗口的浮层；设置页不受影响（见 [`UiTheme`] 的说明）。
+    /// ★ 即时生效：`runtime` 每帧把它差分推给 [`crate::ui::tokens::set_theme`]，
+    ///   变化即重绘——在设置页换个下拉，背后的看图窗口当场换色。
+    pub ui_theme: UiTheme,
     /// 解码器清单的 **Gitee / GitHub 地址**（`decoders.json` 的 raw 链接）。
     ///
     /// ★ 2026-10-28 用户口径：**联网更新的网址要记在配置文件里、允许用户改**——
@@ -564,6 +652,27 @@ pub struct Config {
     /// 快捷键绑定组（见 [`crate::core::hotkey::Hotkeys`]）。出厂默认值见
     /// `Hotkeys::default`；用户可在设置页改，落盘为单一 `hotkeys=` 键。
     pub hotkeys: crate::core::hotkey::Hotkeys,
+    /// **允许多开**（2026-11-04 用户加的功能开关，默认关）。
+    ///
+    /// 多开的口径是**窗口可以有多个，但进程与系统托盘都只有一个**：
+    /// 开 = 再双击一张图 → 在**同一进程里新开一扇看图窗口**（任务管理器里仍是一条，
+    ///      托盘仍是一个）；画布右键菜单也会出现「新建窗口」。
+    /// 关 = 维持单实例单窗口：二次启动把 argv 转发到已有窗口，就地换图。
+    ///
+    /// ★ 这条开关**不影响单实例闸门**（`main.rs` 恒定 `claim_instance`）——它分岔的是
+    /// 「首实例收到 argv 之后怎么办」，不是「要不要起第二个进程」。2026-11-04 第一版
+    /// 实现按后者做（多进程 + 共享托盘），被用户当场判为严重错误：任务管理器两个条目、
+    /// 通知区两个图标。
+    pub allow_multiple: bool,
+    /// **单笔解码超时（秒）**，0 = 不超时（2026-11-04 挂死恢复）。
+    ///
+    /// 解码 worker 超过这个时长还没回包，就判这次解码挂死：熔断当时正在用的解码器
+    /// （本会话不再调它）、换一条新 worker，并给用户一条可读的错误——而不是让整条
+    /// 解码链永远停在那张图上。默认 20 秒（`decode_watchdog` 首报 10 秒的两倍，
+    /// 给"网络盘 mmap 合理慢"留足余量）。
+    ///
+    /// 登记在 [`CONFIG_ONLY_KEYS`]：只有慢盘 / 超大文件这类场景需要手改 ini。
+    pub decode_timeout_s: u64,
 }
 
 impl Default for Config {
@@ -590,13 +699,17 @@ impl Default for Config {
             prefetch: true,
             close_to_tray: false,
             space_preview: false,
+            drag_image: true,
             raw_last: None,
             download_source: SourceId::Gitee,
+            ui_theme: UiTheme::Dark,
             decoder_index_gitee: SourceId::Gitee.index_url().to_string(),
             decoder_index_github: SourceId::Github.index_url().to_string(),
             plugin_index_gitee: SourceId::Gitee.plugin_index_url().to_string(),
             plugin_index_github: SourceId::Github.plugin_index_url().to_string(),
             hotkeys: crate::core::hotkey::Hotkeys::default(),
+            allow_multiple: false,
+            decode_timeout_s: 20,
         }
     }
 }
@@ -786,6 +899,16 @@ impl Config {
                 "close_to_tray" => set_bool(&mut cfg.close_to_tray, v, "close_to_tray"),
                 // 空格预览（QuickLook 式）：16ms 轮询差分装/摘低级键盘钩子。
                 "space_preview" => set_bool(&mut cfg.space_preview, v, "space_preview"),
+                "drag_image" => set_bool(&mut cfg.drag_image, v, "drag_image"),
+                // 多开（2026-11-04）：勾上后再双击图片在同一进程里新开一扇窗口
+                // （进程与托盘仍是一个）；不勾则就地换图。
+                "allow_multiple" => set_bool(&mut cfg.allow_multiple, v, "allow_multiple"),
+                // 挂死恢复：单笔解码超时（秒）。0 = 关掉恢复机制（无限等，老行为）。
+                // 上限 600 秒：再长就等于关了，但写个上限能让手滑的 999999 不至于变成
+                // "永不超时却以为自己设了"。
+                "decode_timeout_s" => {
+                    cfg.decode_timeout_s = v.parse().unwrap_or(20).min(600);
+                }
                 // 快捷键组：整段交给 Hotkeys::from_ini 解析（内部先 default 再覆盖）。
                 "hotkeys" => cfg.hotkeys = crate::core::hotkey::Hotkeys::from_ini(v),
                 // 裸数据「上次使用值」：`宽x高:布局号`（如 `1920x1080:8`）。解析不出
@@ -810,6 +933,7 @@ impl Config {
                 }
                 // 联网来源：gitee / github（未知值回落 gitee，见 `SourceId::from_id`）。
                 "download_source" => cfg.download_source = SourceId::from_id(v),
+                "ui_theme" => cfg.ui_theme = UiTheme::from_id(v),
                 // 清单地址（2026-10-28 落进 ini，用户可改）：空值回落内置默认。
                 "decoder_index_gitee" => {
                     cfg.decoder_index_gitee = url_or(v, SourceId::Gitee.index_url())
@@ -861,7 +985,7 @@ impl Config {
              checker={}\nfilmstrip={}\nlocked={}\n\
              long_image_fit={}\nwheel_behavior={}\nctrl_wheel={}\ninit_window={}\nwindow_w={}\n\
              window_h={}\nopacity={}\n\
-             decoders_disabled={}\nextensions_disabled={}\nextensions_isolated={}\ndecoders_preferred={}\nprefetch={}\nclose_to_tray={}\nspace_preview={}\nraw_last={}\ndownload_source={}\ndecoder_index_gitee={}\ndecoder_index_github={}\nplugin_index_gitee={}\nplugin_index_github={}\nhotkeys={}\n",
+             decoders_disabled={}\nextensions_disabled={}\nextensions_isolated={}\ndecoders_preferred={}\nprefetch={}\nclose_to_tray={}\nspace_preview={}\ndrag_image={}\nraw_last={}\ndownload_source={}\nui_theme={}\ndecoder_index_gitee={}\ndecoder_index_github={}\nplugin_index_gitee={}\nplugin_index_github={}\nhotkeys={}\nallow_multiple={}\ndecode_timeout_s={}\n",
             self.stay_on_top as i32,
             self.dbl_click.index(),
             self.slide_interval,
@@ -883,13 +1007,17 @@ impl Config {
             self.prefetch as i32,
             self.close_to_tray as i32,
             self.space_preview as i32,
+            self.drag_image as i32,
             raw_last,
             self.download_source.id(),
+            self.ui_theme.id(),
             self.decoder_index_gitee,
             self.decoder_index_github,
             self.plugin_index_gitee,
             self.plugin_index_github,
             self.hotkeys.to_ini(),
+            self.allow_multiple as i32,
+            self.decode_timeout_s,
         );
         // 原子写（M2）：写临时文件 → **flush 到盘** → 改名覆盖。
         //
@@ -1077,6 +1205,25 @@ close_to_tray=0
 # 须显式开启；改动即时生效
 space_preview=0
 
+# 左键拖动的分工：开（默认）= 画布（标题栏那一条以外）按住左键拖动只平移图片，
+# 窗口不动；移动窗口交给顶部标题栏。图比窗口小也拖得动，图边还能越过窗口边——
+# 但永远留 24dp 的图在画面里，所以图拖不丢。
+# 关 = 旧行为——任意位置左键拖都拖窗口，平移图片改用 Ctrl+左键 / 中键 / 右下角鸟瞰图。
+# （只有空窗——还没有图——时那一按才归窗口。）
+drag_image=1
+
+# 允许多开：勾上后再双击图片，在**同一个进程**里新开一扇看图窗口——
+# 任务管理器里始终只有一条 rupix.exe，系统托盘也始终只有一个。
+# 画布右键菜单会同时出现「新建窗口」。
+# 关（默认）= 单窗口：二次启动转发到已有窗口，就地换图。
+allow_multiple=0
+
+# 单笔解码超时（秒，默认 20；0 = 不超时）。
+# 解码超过这个时长不回包就判这一次挂死：停用当时那个解码器、换一条解码线程，
+# 并给出一句可读的错误——而不是让整条解码链永远停在那张图上。
+# 只有网络盘 / 超大文件这类「合理很慢」的场景才需要调大。
+decode_timeout_s=20
+
 # 裸数据参数窗的上次使用值（宽x高:布局，如 1920x1080:8；留空 = 还没用过）
 raw_last=
 
@@ -1084,6 +1231,11 @@ raw_last=
 # （选哪个同时决定去哪拉清单、每一枚下载物用哪个地址）。一个用户机器的网络是固定的，
 # 所以只该有一个来源开关：选项页「下载源」。
 download_source=gitee
+
+# 看图窗口配色：dark / light（默认 dark）。**只影响看图器主窗口**——浮层胶囊、
+# 缩略图条、棋盘格、空窗底与中央提示文字；设置页永远是浅底深字那一套，不跟着变。
+# 在「选项」页换下拉当场生效，不必重启。
+ui_theme=dark
 
 # 解码器清单地址：点「刷新」时按 `download_source` 选其中一条去拉 decoders.json。
 # 可改成镜像 / 自建转发；留空 = 内置默认（下面就是内置默认值）
@@ -1113,7 +1265,7 @@ hotkeys={hotkeys}
 ///   ★ 写在 UI 写点处的 `ini 键：<名>` 注释是**给人导航的约定，没有测试读它**（2026-10-24 实测：
 ///   20 个键里 13 个标了，没标的是 `double_click`、`filmstrip`、`locked`、`long_image_fit`、
 ///   `decoders_disabled`、`window_w`、`window_h`）——别把它当成门禁。
-pub const ALL_KEYS: [&str; 28] = [
+pub const ALL_KEYS: [&str; 32] = [
     "stay_on_top",
     "double_click",
     "slide_interval",
@@ -1135,13 +1287,17 @@ pub const ALL_KEYS: [&str; 28] = [
     "prefetch",
     "close_to_tray",
     "space_preview",
+    "drag_image",
     "raw_last",
     "download_source",
+    "ui_theme",
     "decoder_index_gitee",
     "decoder_index_github",
     "plugin_index_gitee",
     "plugin_index_github",
     "hotkeys",
+    "allow_multiple",
+    "decode_timeout_s",
 ];
 
 /// 配置专用键：只给高级用户手改 ini，**界面刻意不出现**（2026-10-29 用户口径）。
@@ -1149,11 +1305,13 @@ pub const ALL_KEYS: [&str; 28] = [
 /// 两个门禁都读这张表，别在别处再抄第二份：
 /// - `hygiene_scan.py` 第 6 查：这类键只豁免"用户入口"，**行为读者照旧必须有**；
 /// - `ui_touchpoints_cover_all_keys`（本文件测试）：跳过"UI 源码里必须出现这个键名"。
-pub const CONFIG_ONLY_KEYS: [&str; 4] = [
+pub const CONFIG_ONLY_KEYS: [&str; 5] = [
     "decoder_index_gitee",
     "decoder_index_github",
     "plugin_index_gitee",
     "plugin_index_github",
+    // 挂死恢复的超时秒数：只服务慢盘 / 超大文件，界面上不出现。
+    "decode_timeout_s",
 ];
 
 #[cfg(test)]
@@ -1375,11 +1533,15 @@ mod tests {
             prefetch: false,
             close_to_tray: true,
             space_preview: true,
+            // 默认是**开**，所以"翻转成非默认"这一路要写 false。
+            drag_image: false,
+            allow_multiple: true,
             raw_last: Some(crate::core::decode::RawParams {
                 width: 1920,
                 height: 1080,
                 layout: 8,
             }),
+            ui_theme: UiTheme::Light,
             ..Config::default()
         };
         c.save_to(&p);
@@ -1394,6 +1556,7 @@ mod tests {
         assert!(back.long_image_fit);
         assert_eq!(back.wheel, Wheel::Switch);
         assert_eq!(back.init_window, InitWindow::Fullscreen);
+        assert_eq!(back.ui_theme, UiTheme::Light, "ui_theme 没存住");
         assert_eq!(
             (back.window_w, back.window_h),
             (1024, 768),
@@ -1403,6 +1566,11 @@ mod tests {
         assert!(!back.prefetch, "prefetch 没存住");
         assert!(back.close_to_tray, "close_to_tray 没存住");
         assert!(back.space_preview, "space_preview 没存住");
+        assert!(
+            !back.drag_image,
+            "drag_image 没存住（默认开，这里喂的是关）"
+        );
+        assert!(back.allow_multiple, "allow_multiple 没存住");
         assert_eq!(
             back.decoders_disabled,
             vec!["abc".to_string(), "def".to_string()],
@@ -1629,6 +1797,31 @@ plugin_source=github
         let _ = std::fs::remove_file(&p);
     }
 
+    /// `ui_theme` 的 ini 写法：往返成立、大小写与空白容错、未知值回落深色。
+    ///
+    /// 手改 ini 是最容易出错的入口（`Light` / ` light ` / 打错成 `lite`），
+    /// 三种都得给出可预期结果，且**绝不 panic**。
+    #[test]
+    fn ui_theme_ids_round_trip_and_bad_values_fall_back() {
+        for t in UiTheme::ALL {
+            assert_eq!(UiTheme::from_id(t.id()), t, "id 与 from_id 必须互逆");
+        }
+        assert_eq!(UiTheme::from_id("LIGHT"), UiTheme::Light, "大小写不敏感");
+        assert_eq!(
+            UiTheme::from_id(" light "),
+            UiTheme::Light,
+            "两侧空白要吃掉"
+        );
+        assert_eq!(UiTheme::from_id(""), UiTheme::Dark, "空值回落默认");
+        assert_eq!(UiTheme::from_id("lite"), UiTheme::Dark, "拼错的值回落默认");
+
+        for (i, t) in UiTheme::ALL.iter().enumerate() {
+            assert_eq!(t.ui_index(), i, "下拉位置必须与 ALL 同序");
+            assert_eq!(UiTheme::from_ui_index(i), *t);
+        }
+        assert_eq!(UiTheme::from_ui_index(9), UiTheme::Dark, "越界回落默认");
+    }
+
     /// M4 消费方测试之一：默认配置写出的键集合必须与 [`ALL_KEYS`] **完全一致**——
     /// 加了键忘登记、登记了却没写盘，都在这里红。
     #[test]
@@ -1658,7 +1851,7 @@ plugin_source=github
             "stay_on_top=1\ndouble_click=3\nminimal_mode=1\n\
              long_image_fit=1\nwheel_behavior=1\nctrl_wheel=0\ninit_window=3\nwindow_w=1024\n\
              window_h=768\nopacity=30\n\
-             decoders_disabled=abc;def\nextensions_disabled=com.example.ocr\ndecoders_preferred=jpg=jpeg;png=png\nprefetch=0\nclose_to_tray=1\nspace_preview=1\nraw_last=1x2:3\ndownload_source=github\n\
+             decoders_disabled=abc;def\nextensions_disabled=com.example.ocr\ndecoders_preferred=jpg=jpeg;png=png\nprefetch=0\nclose_to_tray=1\nspace_preview=1\ndrag_image=0\nraw_last=1x2:3\ndownload_source=github\n\
              decoder_index_gitee=https://a.example/d.json\ndecoder_index_github=https://b.example/d.json\n\
              plugin_index_gitee=https://a.example/p.json\nplugin_index_github=https://b.example/p.json\n\
              hotkeys=prev:Right\n",
@@ -1705,6 +1898,8 @@ plugin_source=github
         assert!(!c.prefetch, "prefetch 没有消费方");
         assert!(c.close_to_tray, "close_to_tray 没有消费方");
         assert!(c.space_preview, "space_preview 没有消费方");
+        // 与 prefetch 同一条理由：默认是**开**，所以喂 `0` 才验得出这条键真有人消费。
+        assert!(!c.drag_image, "drag_image 没有消费方");
         assert_eq!(
             c.raw_last,
             Some(crate::core::decode::RawParams {

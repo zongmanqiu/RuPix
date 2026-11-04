@@ -1257,6 +1257,106 @@ usvg 架构上必须吃一份 `fontdb::Database`，所以**索引必须自己保
 
 ---
 
+## 补丁 024 —— 宿主自绘光标的覆盖通道（拖图时手型不再闪回箭头）
+
+- 编号：024
+- 涉及上游文件：`wind-ui-rust-0.23.0/src/platform/mod.rs`
+  （`CURSOR_OVERRIDE` 原子 + 公开 `set_cursor_override` / `cursor_override`）、
+  `wind-ui-rust-0.23.0/src/platform/win32/mod.rs`
+  （`WM_SETCURSOR` 分支最前插一段、导入 `HCURSOR`）
+- 应用侧接线：`main/src/platform/cursor.rs`（`use_hand` 登记覆盖、`use_arrow` 撤覆盖）
+
+### 问题（用户实测，2026-11-03）
+抓手光标接上之后，按住左键拖图时**光标一闪一闪地回到箭头**（"观感很不好"）。
+
+### 根因（实测，非推测）
+鼠标每次移动，系统都发 `WM_SETCURSOR`；框架应答时按 `AppHandler::cursor()` 的形状
+`SetCursor`（画布没覆写 ⇒ `Arrow`）。宿主随后在自己的 `WM_MOUSEMOVE` 里 `SetCursor`
+回自绘手型，两次调用前后脚，屏幕上就是手型↔箭头反复闪。
+
+取证方式（`.temp/cursor_probe9.py`）：先让光标变成手型，再手动投一枚
+`WM_SETCURSOR(HTCLIENT)` 给窗口，紧接读 `GetCursorInfo` —— 句柄从自绘句柄
+（如 `0x4170C41`）变回 `0x10003`（`IDC_ARROW`）。同一次拖动里逐帧采样也能抓到
+序列中偶现的 `0x10003`。
+
+`CursorShape` 只有箭头/手型/文本/左右/上下五档，表达不了 `CreateIconIndirect` 造出来的
+自绘光标，所以"让 `cursor()` 返回抓手"这条路不存在。
+
+### 修复
+1. `platform/mod.rs`：加模块级 `CURSOR_OVERRIDE: AtomicIsize`（0 = 无覆盖）与
+   `set_cursor_override(Option<isize>)` / `cursor_override() -> Option<isize>`。
+2. `platform/win32/mod.rs`：`WM_SETCURSOR` **最前**判覆盖——有值就
+   `SetCursor(HCURSOR(h))` 并 `return LRESULT(1)`，不再问形状、也不再走缩放边框那支。
+3. 宿主 `platform/cursor.rs`：`use_hand` 里 `set_cursor_override(Some(h))` 再 `SetCursor`；
+   `use_arrow` 里**先**撤覆盖再设箭头（顺序反了，紧随其后的 `WM_SETCURSOR` 会把手型
+   设回来，指针停在手上）。
+
+### 验收（可复现）
+- `.temp/cursor_probe9.py`：悬停读到自绘句柄；投 `WM_SETCURSOR` 之后**仍**是自绘句柄
+  （修复前会变回 `0x10003`）。
+- `.temp/cursor_probe8.py`：拖动中逐帧采样只出现两枚自绘句柄（开手/握拳），不再夹杂
+  `0x10003`。
+- 真机：按住拖图，光标保持握拳，松手回开手，不闪。
+
+### 门禁
+升级 windui 时：若上游给 `CursorShape` 加了自定义句柄变体（或提供等价的"宿主接管光标"
+钩子），本章整段撤掉、宿主改走上游 API；否则按第 1–3 步重放。
+`hygiene_scan` 第 7 查：本章节 ↔ `.3rd` 的 `★ RuPix 补丁 024` 标记对得上；
+`docs_consistency::j13`：`patches/wind-ui-rust-0.23.0/src/platform/mod.rs`、
+`.../src/platform/win32/mod.rs` 与 `.3rd` 工作副本逐字节相同。
+宿主侧回归：`ui::hand_cursor::hands_are_registered_as_cursor_override`（覆盖随手型登记、
+`apply(None)` 撤净）。门禁行：layering 0 / hygiene 0 / lib **610 passed** /
+docs_consistency **15 passed**。
+
+---
+
+## 补丁 025 —— 应用级退出的公开入口（`EventCtx::quit_app`）
+
+- 编号：025
+- 涉及上游文件：`wind-ui-rust-0.23.0/src/core.rs`（`EventCtx::quit_app`）、
+  `wind-ui-rust-0.23.0/src/platform/mod.rs`（`pub use win32::post_quit` + 两平台桩）、
+  `wind-ui-rust-0.23.0/src/platform/win32/mod.rs`（`pub fn post_quit`）
+- 应用侧接线：`main/src/runtime/mod.rs`（`CloseAction::Quit` → `ctx.quit_app()`）、
+  `main/src/runtime/mod.rs` 的应用级轮询兜底（零窗口时 `windui::platform::post_quit()`）
+
+### 问题（用户裁定，2026-11-04）
+多开改造要求「窗口可以有多个，但进程与托盘只有一个」⇒ 界面必须全部由 `Window` 建出、
+进程跑常驻模式（`App::run_resident`，零主窗）。常驻模式**刻意**不在最后一个窗口销毁时
+退消息循环（`should_quit_on_last_window(resident=true, was_last=true) == false`），
+于是"用户关掉最后一扇窗、且没开关闭到托盘 ⇒ 进程该走了"这件事表达不出来。
+
+### 根因（源码定位，非推测）
+应用级退出此前**只有托盘那一个入口**：`TrayCtx::quit()` → `TrayAction::Quit` →
+平台 `quit_app()`。`EventCtx` 上只有 `request_close()`（"这个窗口能不能关"）与
+`force_close()`（跳过决策链关本窗），两者都作用在**窗口**上；非常驻模式还能靠
+"主窗销毁 → 消息循环退出"间接达成，常驻模式没有主窗可关。
+
+### 修复
+1. `core.rs`：`EventCtx::quit_app()` —— 直接调 `crate::platform::post_quit()`。
+2. `platform/win32/mod.rs`：`pub fn post_quit()` = `PostQuitMessage(0)`。**不复用**
+   `quit_app()`：后者同步 `DestroyWindow` 全部窗口，而本方法要在 `wnd_proc` 内部调用
+   （正持有窗口状态借用），那正是铁律 6 的 `&mut` 别名 UB。窗口资源随消息循环收尾
+   由平台统一销毁。
+3. `platform/mod.rs`：Windows 导出真实现；macOS/Linux 给空桩（与 `run_resident`
+   在那两个平台"未实现"的口径一致——RuPix 只发布 Windows）。
+
+### 验收（可复现）
+真机：开「允许多开」→ 开两扇窗 → 关掉一扇，另一扇仍在、进程还在（任务管理器一条）；
+关掉最后一扇（「关闭到托盘」不勾）→ 进程退出、托盘图标消失。
+勾「关闭到托盘」再关最后一扇 → 窗口关掉、进程留在托盘（图标常显），点托盘「显示窗口」
+重新开出一扇。
+无头面：`runtime::tests::close_decision_keeps_the_process_alive_while_other_windows_open`
+钉住三条去路（锁定取消 / 还有别的窗口只关这一扇 / 最后一扇按托盘开关决定关还是退）。
+
+### 门禁
+升级 windui 时：若上游给 `EventCtx` 加了应用级退出（或 `App::request_quit` 一类公开入口），
+本章整段撤掉、宿主改走上游 API；否则按第 1–3 步重放。
+`hygiene_scan` 第 7 查：本章节 ↔ `.3rd` 的 `★ RuPix 补丁 025` 标记对得上；
+`docs_consistency::j13`：`patches/wind-ui-rust-0.23.0/src/core.rs`、
+`.../src/platform/mod.rs`、`.../src/platform/win32/mod.rs` 与 `.3rd` 工作副本逐字节相同。
+
+---
+
 ## 迁移记录 —— 0.20.0 → 0.23.0（2026-10-13，用户裁决"全部迁移为 0.23.0"）
 
 windui 0.23.0 是破坏性重构（托盘子系统重写、跨平台 win32/macos/linux），不是平替。

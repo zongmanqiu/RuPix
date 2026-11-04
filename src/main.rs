@@ -33,11 +33,15 @@ fn main() {
     let (probe, bench, safe_mode) = (args.probe, args.bench, args.safe_mode);
 
     // 单实例闸门：放在一切重活（装解码栈、起线程、建窗）之前。
-    // 二次实例（已有一个窗口/托盘在跑）会把 argv 转发给首实例、自己直接退出，
-    // 绝不新建窗口或托盘——这正是「关闭到托盘后，再双击图片不会冒出第二个托盘」的根基。
+    // 二次实例（已经有一个进程在跑）会把 argv 转发给首实例、自己直接退出，
+    // 绝不新建第二个进程或第二个托盘——这正是「一个进程、一个托盘」的根基。
     // 探针（`probe`/`bench`）例外：它是诊断工具，进闸门就会被转发给 GUI、自己反而没跑。
     // `app_id` 必须与 `runtime::run` 里 `App::single_instance` 完全一致，否则会把自己
     // 误判成二次实例、转发给自己、窗口永不出现。
+    //
+    // ★ 多开（2026-11-04 用户裁定）：多开的意思是**窗口可以有多个，进程与托盘都只有一个**，
+    //   所以闸门恒生效——多开与否的分岔在首实例收到 argv 之后（`runtime` 的 `second_tx`：
+    //   开新窗口 / 在当前窗口换图），不在"要不要起第二个进程"。
     if probe.is_none()
         && bench.is_none()
         && windui::claim_instance(rupix_lib::APP_ID) == windui::InstanceRole::Handoff

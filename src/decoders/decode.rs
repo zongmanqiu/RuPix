@@ -449,6 +449,7 @@ impl Host {
         if safe_mode() {
             return None;
         }
+        crate::core::decode::set_phase(crate::core::decode::PHASE_REGION);
         self.refresh_catalog();
         // 候选：认领该后缀 **且** 实现了 `iv_render_region`。按 id 排序 ⇒ 多枚认领
         // 同一后缀时结果可复现（与矢量导出那条同规）。
@@ -581,9 +582,21 @@ impl Host {
                 l.desc.caps,
             )
         };
+        // ★ 挂死恢复（2026-11-04）：把"下一步要进哪个解码器"报给 core，超时时由
+        //   监督者读它来决定熔断谁（worker 已经卡死，问不了它）。
+        crate::core::decode::report_current_decoder(&id);
+        // 已熔断的解码器**一次都不许再进**：僵尸线程还在那个 DLL 里转，ABI 明写
+        // 「解码器需可重入但不必 MT-safe」，再进去就是违约。
+        // 返回 `Unsupported` 而不是 `Hard`：这是"这一家不能用了"，换下一家还有救。
+        if crate::core::decode::is_hung_decoder(&id) {
+            return Err(Fail::Unsupported(format!(
+                "解码器「{id}」本次会话已因超时停用"
+            )));
+        }
         // 读文件走 mmap：省掉 12MB 级的堆分配+拷贝（解码器只读，切片直给）。
         // 文件极小/被独占等 mmap 不可用时回退整读。Windows 下文件在解码途中被
         // 外部替换的理论风险由每次 FFI 的 catch_unwind + 三振黑名单兜底。
+        crate::core::decode::set_phase(crate::core::decode::PHASE_READ);
         let t0 = std::time::Instant::now();
         let mapped = std::fs::File::open(path)
             .ok()
@@ -610,6 +623,7 @@ impl Host {
             .as_ref()
             .map(|c| c.as_ptr())
             .unwrap_or(std::ptr::null());
+        crate::core::decode::set_phase(crate::core::decode::PHASE_PROBE);
         let t0 = tick();
         match invoke(|| unsafe { probe(data.as_ptr(), data.len(), ext_ptr) }) {
             Ok(c) if c > 0 => {}
@@ -645,6 +659,7 @@ impl Host {
         let full_natural = if allow_scaled && caps & CAP_SCALED != 0 && max_w > 0 && max_h > 0 {
             let mut plain = req;
             plain.flags = 0;
+            crate::core::decode::set_phase(crate::core::decode::PHASE_NATURAL);
             self.query_natural_only(&id, render, data, &plain, ext_ptr)
         } else {
             None
@@ -667,12 +682,14 @@ impl Host {
         //     契约给了正路：`target_w/target_h = 0` 就是"要原始尺寸"（ABI `IvRenderReq`）。
         //     所以矢量路线补一次**零目标查询**（只查不渲，代价是一次解析）。
         let doc_natural = if needs_doc_natural(ext, path, max_w, max_h) {
+            crate::core::decode::set_phase(crate::core::decode::PHASE_DOC);
             self.query_doc_natural(&id, render, data, &req, ext_ptr)
         } else {
             None
         };
 
         // ① 查询阶段：out = NULL。
+        crate::core::decode::set_phase(crate::core::decode::PHASE_QUERY);
         let t0 = tick();
         let mut info = IvRenderOut::default();
         let q = invoke(|| unsafe {
@@ -762,6 +779,7 @@ impl Host {
 
         // ② 渲染阶段：宿主按契约分配 `bytes_needed + icc_len`（规范 §十一），两段长度取查询值、
         // 分配前过闸（同上）。
+        crate::core::decode::set_phase(crate::core::decode::PHASE_RENDER);
         let t0 = tick();
         let (pix_len, icc_len) = out_segments(&info).map_err(Fail::Hard)?;
         let mut buf = vec![0u8; pix_len + icc_len];
@@ -804,6 +822,7 @@ impl Host {
         // ③ 后处理：RGBA 归一 + EXIF 方向补转（`already_oriented=1` 的解码器已转好，
         // 宿主不得再转一次）+ 尺寸适配。natural 尺寸取**转正后**的宽高。
         // ICC 尾段在 truncate 前取出，等缩样之后再转 sRGB（成本跟视口走，m53-J）。
+        crate::core::decode::set_phase(crate::core::decode::PHASE_POST);
         let t0 = tick();
         let icc = take_icc(&mut buf, pix_len, icc_len);
         let rgba = to_rgba8(buf, aw, ah, info.pixel_format, info.bit_depth).map_err(Fail::Hard)?;

@@ -1,6 +1,6 @@
 """6_deploy.bat 的执行体：把 exe 原子地部署到 .build\\，并核对解码器就位。
 
-职责七件（对齐 CurSeen deploy.py 的口径）：
+职责八件（对齐 CurSeen deploy.py 的口径）：
   1. 定位 .temp\\target\\release\\rupix.exe（第一候选）；缺失 = 硬错误。
   2. **PE 图标门禁**：解析 exe 的 .rsrc，RT_GROUP_ICON 必须存在且档位
      = [16,24,32,48,64,256]；缺了 = 硬错误。资源管理器/任务管理器/
@@ -16,19 +16,26 @@
      映像句柄不带写共享，这是实测过的坑，不要改回 copy /Y。
      SIZE + MTIME 对账：只证明「部署的是刚编出来的那个」。不记哈希（2026-11-02 用户口径：
      官方产物不需要指纹）；`shutil.copy2` 保留 mtime，源与目标两者都相同才算部署成功。
-  4. 解码器清单核对：.build\\decoders\\ 里至少要有一个 *\*.dll，
+  4. 解码器清单核对：.build\\decoders\\ 里至少要有一个 *\\*.dll，
      且文件名要能被解析出 id/ver（m139 起不带 abi）；没有解码器的 .build 开图全靠
      内置 SVG，等于残废——按错误处理。
   5. **随包解码器清单**：把解码器仓根的 `decoders.json` 复制成
      `.build\\docs\\decoders.json`。宿主「解码器 / 可下载」卡进页只读它、不发网络
      （m148）；缺了它，离线用户看不到任何可下载项。
   6. **发布目录自洽两问**（m160，判据与红证都在 `--selftest` 里）：
-     a) 随包清单与 `.build\\decoders\\<id>_<ver>.dll` 必须同 id 同版本同字节——
-        漂了会劝用户去下载一个已经装着的旧版本，硬错误拦住；
+     a) 随包清单与 `.build\\decoders\\<id>_<ver>.dll` 必须**同 id 同版本**（2026-11-04
+        用户裁定：**不比字节**——同版本重编一次，MSVC 换 PDB GUID 字节就变，拿 size 对账
+        证明不了"是不是最新"，只会每轮误报）。版本漂了会劝用户去下载一个已经装着的旧版本，
+        硬错误拦住；
      b) `.build\\docs\\<id>_<ver>.zip` 里被清单取代的旧插件包删掉（插件仓的打包器只写不清），
         清单不认识的名字与非 zip 文件一个都不碰。
+  7. **本机路径门禁两处**（判据同一条 `host_path_hits`，红证在 `--selftest`）：
+     a) 即将部署的 rupix.exe —— 拦住"绕过 build\\4_build.bat 直接 cargo build"；
+     b) 发布目录里**每一枚会到达用户手里的 PE**：随包 DLL、已装插件、以及插件 ZIP 的
+        **内层**（ZIP 要解开扫，压缩流里看不见路径明文）。只查 exe 漏的就是子仓那两份：
+        2026-11-02 宿主 exe 当场验到 0，而 `.build\\decoders` 里 8 枚 DLL 一把没重链。
 
-跑法：`python build\\deploy.py --selftest` 只跑上面两问的红/绿夹具，不碰 `.build`。
+跑法：`python build\\deploy.py --selftest` 只跑上面这些判据的红/绿夹具，不碰 `.build`。
 
 退出码：0 = 部署成功且解码器就位；1 = 任一环失败。
 """
@@ -38,6 +45,7 @@ import re
 import shutil
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent          # main\build\
@@ -219,31 +227,91 @@ def pe_version_check(leaves: list[tuple[list[int], int, int]], data: bytes, want
     return f"v{want} 数值 {got} 块 {size} B"
 
 
+# ── 本机路径门禁（便携版不该带着作者的磁盘目录）────────────────────────────
+# rustc 把 panic location / debug info 里的**绝对路径**原样写进二进制，所以没做
+# `--remap-path-prefix` 的构建会把 `C:\Users\<名字>\...` 连同工程目录一起发给每个下载者。
+# 用户 2026-11-02 在**已发布**的 8 枚 DLL 里 strings 出了这些（每个 DLL 3–1300 处），
+# 起因就是构建脚本从来没传过 remap。修法在 `build/_common.bat`（宿主）与
+# `RuPix-Decoder/workspace/tools/toolchain.ps1`（解码器）。
+#
+# 判据刻意窄：
+#   · `X:\Users\`         —— 只要命中就是别人机器上的用户目录，没有正当理由；
+#   · `X:\ … .rs`         —— 盘符开头的源码路径。remap 之后源码路径是相对形式
+#                            （`.\src\lib.rs`），所以这条不会误伤。
+HOST_PATH_RE = re.compile(rb"[a-z]:\\Users\\|[a-z]:\\[^\x00\r\n\"]{0,140}?\.rs", re.I)
+
+
+def host_path_hits(data: bytes, limit: int = 3) -> list[str]:
+    """产物里残留的本机绝对路径（最多回报 limit 条，够定位就行）。"""
+    out: list[str] = []
+    for m in HOST_PATH_RE.finditer(data):
+        out.append(m.group(0).decode("utf-8", "replace"))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def shipped_path_hits(out_dir: Path, limit_each: int = 1) -> tuple[list[str], int]:
+    """发布目录里**每一枚会到达用户手里的 PE**（含插件 ZIP 的内层）过同一条判据。
+
+    为什么不能只查 exe：2026-11-02 那轮加 remap 时宿主 exe 当场验到 0，而 `.build\\decoders`
+    里 8 枚 DLL 一把没重链——「构建脚本改了」不等于「发到用户手里的字节改了」，只盯着 exe
+    的门禁会一直报干净，而用户拿 `strings` 一查就有。解码器由子仓构建、插件由子仓打包，
+    两条路都不经过上面那一步。
+    ★ ZIP 必须**解开再扫**：压缩流里路径不是明文，拿整份 zip 扫字节是假通过。
+    """
+    hits: list[str] = []
+    scanned = 0
+    targets = sorted((out_dir / "decoders").glob("*.dll"))
+    targets += sorted((out_dir / "plugins").rglob("*.exe"))
+    for p in targets:
+        scanned += 1
+        found = host_path_hits(p.read_bytes(), limit_each)
+        if found:
+            hits.append(f"{p.relative_to(out_dir)}: {found[0]}")
+    for zp in sorted((out_dir / "docs").glob("*.zip")):
+        try:
+            with zipfile.ZipFile(zp) as z:
+                for n in z.namelist():
+                    if not n.lower().endswith((".exe", ".dll")):
+                        continue
+                    scanned += 1
+                    found = host_path_hits(z.read(n), limit_each)
+                    if found:
+                        hits.append(f"{zp.name}!{n}: {found[0]}")
+        except (OSError, zipfile.BadZipFile) as e:
+            hits.append(f"{zp.name}: 读不开（{e}）")
+    return hits, scanned
+
+
 def catalog_drift(catalog_path: Path, dll_dir: Path) -> tuple[list[str], list[str], list[str]]:
     """随包解码器清单 ↔ `.build\\decoders` 目录，返回 (必须红的差异, 只在清单里, 只在目录里)。
 
-    ★ 判据只用**文件名与字节数**：部署脚本不该把第三方解码器 `LoadLibrary` 进自己的进程
-    （那玩意儿崩了没人取证），而 `<id>_<ver>.dll` 与清单的 `id`/`version`/`size` 已经够判。
+    ★ 判据只用 **id 与 version**（2026-11-04 用户裁定，**不比字节数**）：部署脚本不该把第三方解码器
+    `LoadLibrary` 进自己的进程（那玩意儿崩了没人取证），而 `<id>_<ver>.dll` 与清单的
+    `id`/`version` 已经够判身份。
+    为什么删掉字节比对：MSVC 每次链接都会换 PDB GUID，**同一个版本重编一次字节就变**，
+    拿 size 对账等于每轮重编都要重出清单，错一次就误报"大小不符"——它证明不了"是不是最新"，
+    只证明"有没有重编过"。真正要守的是"清单说的版本 = 目录里的版本"，那正由 id+version 回答。
+    `size` 字段仍留在清单里（设置页「可下载」卡要显示），只是不再当门禁判据。
 
     "只在清单里"不是缺陷而是设计——清单是**可下载**目录，允许列没随包的项；
     "只在目录里"也只是提醒（清单没重出，UI 会报「清单异常」）。
-    真会红的是**同一个 id 两边版本不同**，或**版本对上了但字节数不同**。
+    真会红的只剩**同一个 id 两边版本不同**。
     """
     shipped = json.loads(catalog_path.read_bytes().decode("utf-8"))
-    want = {(str(e.get("id")), str(e.get("version"))): e.get("size") for e in shipped}
-    have: dict[tuple[str, str], int] = {}
+    want = {(str(e.get("id")), str(e.get("version"))) for e in shipped}
+    have: set[tuple[str, str]] = set()
     for d in sorted(dll_dir.glob("*.dll")):
         m = DLL_RE.match(d.name)
         if m:
-            have[(m["id"], m["ver"])] = d.stat().st_size
+            have.add((m["id"], m["ver"]))
     ids_in_dir = {i for (i, _v) in have}
     drift = []
-    for (cid, cver), csize in sorted(want.items()):
+    for cid, cver in sorted(want):
         if cid in ids_in_dir and (cid, cver) not in have:
             in_dir = "/".join(sorted(v for (i, v) in have if i == cid))
             drift.append(f"{cid}: 清单写 {cver}，目录里却是 {in_dir}")
-        elif (cid, cver) in have and isinstance(csize, int) and csize != have[(cid, cver)]:
-            drift.append(f"{cid} {cver}: 清单写 {csize} 字节，实际 {have[(cid, cver)]} 字节")
     only_catalog = sorted(f"{i} {v}" for (i, v) in want if i not in ids_in_dir)
     only_dir = sorted(f"{i} {v}" for (i, v) in have if (i, v) not in want)
     return drift, only_catalog, only_dir
@@ -344,12 +412,13 @@ def selftest() -> int:
     )
     d, _oc, _od = catalog_drift(root / "decoders.json", root / "decoders")
     checks.append(("版本漂移会红", len(d) == 1 and d[0].startswith("common")))
-    # 3) 版本对上、字节数不同 ⇒ 红
+    # 3) 版本对上、字节数不同 ⇒ **不红**（2026-11-04 用户裁定：只认版本与名称）。
+    #    真机现场：doc 解码器同版本重编一次，PDB GUID 换了 ⇒ 字节变了，清单却没错。
     write_catalog(
         root / "decoders.json", [{"id": "common", "version": "0.2.4", "size": 999}]
     )
     d, _oc, _od = catalog_drift(root / "decoders.json", root / "decoders")
-    checks.append(("字节漂移会红", len(d) == 1 and "字节" in d[0]))
+    checks.append(("字节漂移不红（只认 id+version）", d == []))
     # 4) 清单里有、目录里没有 = 正常的"可下载未随包"，不许红
     write_catalog(
         root / "decoders.json",
@@ -411,6 +480,59 @@ def selftest() -> int:
     checks.append(("放错许可证全文会红", len(r) == 1 and "放错了" in r[0]))
     lic_names = [n for n, _ in checks if "许可" in n]
     checks.append(("许可档装上 4 条（少一条＝新判据没接进夹具）", len(lic_names) == 4))
+    # 10)~11) 本机路径门禁：真形状要红，remap 之后的相对路径不许误报
+    checks.append(
+        (
+            "本机路径会红（用户目录 + 盘符源码路径）",
+            host_path_hits(b"\x00C:\\Users\\someone\\.rustup\\toolchains\\x\\lib.rs\x00") != []
+            and host_path_hits(b"\x00E:\\tmp\\proj\\main\\src\\canvas.rs\x00") != []
+            # 盘符开头但不是源码、也不是用户目录 ⇒ 判据窄到只抓上面两类，不冤枉它
+            and host_path_hits(b"\x00D:\\work\\main\\Cargo.toml\x00") == [],
+        )
+    )
+    checks.append(
+        (
+            "remap 后的相对路径不误报",
+            host_path_hits(b"\x00.\\src\\lib.rs\x00\x00./src/ui/canvas.rs\x00") == []
+            and host_path_hits(b"\x00src/core/pixels.rs\x00") == [],
+        )
+    )
+    # 12)~15) 随包产物（解码器 DLL + 插件 ZIP 内层）——只看 exe 漏的就是 2026-11-02 那 8 枚 DLL
+    ship = root / "ship"
+    for sub in ("decoders", "docs"):
+        shutil.rmtree(ship / sub, ignore_errors=True)
+    (ship / "decoders").mkdir(parents=True)
+    (ship / "docs").mkdir(parents=True)
+    dirty = b"\x00E:\\tmp\\proj\\abi\\src\\lib.rs\x00"
+    clean = b"\x00.\\abi\\src\\lib.rs\x00~\\.rustup\\toolchains\\x\\kit.rs\x00"
+    (ship / "decoders" / "common_0.2.6.dll").write_bytes(dirty)
+    hits, n = shipped_path_hits(ship)
+    checks.append(
+        (
+            "随包 DLL 带本机路径会红并点名",
+            len(hits) == 1 and "common_0.2.6.dll" in hits[0] and n == 1,
+        )
+    )
+    (ship / "decoders" / "common_0.2.6.dll").write_bytes(clean)
+    checks.append(("随包 DLL remap 后不误报", shipped_path_hits(ship) == ([], 1)))
+    # ★ 这枚 ZIP 用 DEFLATE 存：整份文件的字节里**看不见**路径明文。红证的意义在此——
+    #   谁把这条判据改成"拿 zip 原始字节扫"，下面那条的 `host_path_hits(raw_zip) == []`
+    #   这个前提照样成立、而它自己那一半立刻变假绿。
+    with zipfile.ZipFile(ship / "docs" / "scan_0.1.0.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("scan.exe", dirty)
+        z.writestr("README.md", "许可与源码位置见本节")
+    raw_zip = (ship / "docs" / "scan_0.1.0.zip").read_bytes()
+    hits2, n2 = shipped_path_hits(ship)
+    checks.append(
+        (
+            "随包 ZIP 内层会红（不解压看不见，内层也计入扫描数）",
+            host_path_hits(raw_zip) == []
+            and any("scan_0.1.0.zip!scan.exe" in h for h in hits2)
+            and n2 == 2,
+        )
+    )
+    path_names = [name for name, _ in checks if name.startswith("随包")]
+    checks.append(("随包产物门禁装上 3 条（少一条＝新判据没接进夹具）", len(path_names) == 3))
     bad = [n for n, ok in checks if not ok]
     for n, ok in checks:
         print(f"  {'ok  ' if ok else 'FAIL'} {n}")
@@ -449,6 +571,19 @@ def main() -> int:
             "而且用户报障时问不出是哪一版（.symbols 只能靠大小+时间配对）"
         )
     print(f"  version : RT_VERSION {note}")
+
+    # ── 本机路径门禁 ──────────────────────────────────────────────
+    # 兜住"有人绕过 4_build.bat 直接 cargo build"：那种产物会把作者的
+    # `C:\Users\<名字>\...` 与工程目录一起发给所有下载者（2026-11-02 实测过的原状）。
+    hp = host_path_hits(data)
+    if hp:
+        return fail(
+            "host path gate: 产物里还留着本机绝对路径 —— "
+            + " / ".join(hp)
+            + "\n         RUSTFLAGS 的 --remap-path-prefix 没生效？直接 cargo build 会绕过"
+            " build/_common.bat，请用 build\\4_build.bat"
+        )
+    print("  paths   : 本机绝对路径 0 处")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -567,7 +702,7 @@ def main() -> int:
                 + "\n         修法：重出清单（RuPix-Decoder\\scripts\\make_index.py）后再部署，"
                   "**不要手改** .build\\docs\\decoders.json"
             )
-        print(f"  catalogue check: 同 id 同版本同字节（{len(dlls)} 枚 DLL）")
+        print(f"  catalogue check: 同 id 同版本（不比字节，{len(dlls)} 枚 DLL）")
         if only_catalog:
             print(f"            只在清单里（可下载、未随包）: {', '.join(only_catalog)}")
         if only_dir:
@@ -580,6 +715,20 @@ def main() -> int:
             print(f"  [WARNING] 旧插件包删不掉（正被占用？）：{s}")
         if removed:
             print(f"  pruned stale plugin zips: {', '.join(removed)}")
+
+    # ── 随包产物的本机路径（判据本体见 shipped_path_hits）──────────────────
+    # exe 上面那一步已单独查过；这里管的是**不经宿主构建链**的那两份：随包 DLL 与插件 ZIP。
+    shipped, n_scanned = shipped_path_hits(OUT_DIR)
+    if shipped:
+        return fail(
+            "host path gate: 发布目录里的随包产物还带着本机绝对路径：\n         "
+            + "\n         ".join(shipped[:8])
+            + ("\n         （只报了前 8 条）" if len(shipped) > 8 else "")
+            + "\n         修法 = 用带 remap 的入口**重编那一份**：宿主 build\\4_build.bat /"
+              " 解码器 RuPix-Decoder\\build.ps1 / 插件 RuPix-Plugin\\build.ps1。"
+              "改构建脚本不等于改产物——只换 .build 里的副本或只改脚本都会留这一格"
+        )
+    print(f"  paths   : 随包 {n_scanned} 枚 PE（含 ZIP 内层）本机绝对路径 0 处")
 
     # ── 许可与署名随发布物到达（m182；判据与四条红证见 license_gate / --selftest）──
     # 两个子仓的包形都是「产物 + 许可全文 + 许可与源码位置说明」，宿主的发布物是这一整目录，

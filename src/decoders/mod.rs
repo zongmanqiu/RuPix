@@ -148,6 +148,15 @@ pub fn is_disabled(id: &str) -> bool {
     disabled_guard().contains(id)
 }
 
+/// 追加一个停用 id（2026-11-04 挂死熔断用）。
+///
+/// 与 [`set_disabled`] 的区别是**只增不覆盖**：熔断发生在运行期，此时那把全局表已经
+/// 装着用户勾掉的那些 id，整表覆盖会把它们悄悄放回来。
+pub fn add_disabled(id: &str) {
+    let mut g = disabled_guard();
+    g.insert(id.to_string());
+}
+
 /// 各扩展名的**用户显式首选**解码器（`扩展名 → 解码器 id` 稀疏表；全局：UI 线程写、
 /// 解码线程读）。设置窗「解码」页是唯一写入方，启动时按配置灌入。
 static PREFERRED: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();

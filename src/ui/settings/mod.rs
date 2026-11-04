@@ -19,7 +19,7 @@ use windui::signal::{signal, Signal};
 
 use crate::core::config::{
     clamp_window_size, opacity_to_slider, slider_to_opacity, Config, CtrlWheel, DblClick,
-    InitWindow, SourceId, Wheel,
+    InitWindow, SourceId, UiTheme, Wheel,
 };
 use crate::core::hotkey::{Action, Hotkey};
 use crate::core::util::fmt_bytes;
@@ -110,6 +110,12 @@ pub struct Handles {
     pub to_tray: Signal<bool>,
     /// 空格预览总开关（ini 键 space_preview 的 UI 写点）。默认关：抢占空格是强行为。
     pub space_preview: Signal<bool>,
+    /// 左键拖动的分工（ini 键 drag_image 的 UI 写点）。默认开 = 画布里拖图片、
+    /// 标题栏拖窗口；判据本体在 `ui::canvas::left_drag`。
+    pub drag_image: Signal<bool>,
+    /// 多开开关（ini 键 allow_multiple 的 UI 写点）。默认关 = 单窗口（二次启动就地换图）；
+    /// 开 = 二次启动在同一进程里新开一扇窗口，进程与托盘仍只有一个。
+    pub allow_multiple: Signal<bool>,
     pub opacity: Signal<f32>,
     pub opacity_label: Signal<String>,
     pub tab: Signal<usize>,
@@ -157,6 +163,11 @@ pub struct Handles {
     /// 下载地址（`RemoteEntry::download_url`）。改动走 [`Handles::sync`] 的差分轮询落盘；
     /// **切来源不联网**（同一份清单两列地址都在，只重算显示与按钮）。
     pub download_source: Signal<usize>,
+    /// 看图窗口配色（下拉：0 = 深色 / 1 = 浅色）。
+    ///
+    /// 改动走 [`Handles::sync`] 的差分落盘；**生效不需要重建窗口**——`runtime` 每帧
+    /// 把 `config.ui_theme` 推给渲染令牌（[`crate::ui::tokens::set_theme`]），变化即重绘。
+    pub ui_theme: Signal<usize>,
     /// 「可下载」状态行**显示**文案（派生：清单摘要 + 搜索时的匹配数）。
     pub remote_status: Signal<String>,
     /// 「插件」页的全部信号（已安装 / 可下载 / 来源 / 状态 / 进度）。
@@ -250,6 +261,8 @@ impl Handles {
         set(&mut dirty, &mut c.prefetch, self.prefetch.get());
         set(&mut dirty, &mut c.close_to_tray, self.to_tray.get());
         set(&mut dirty, &mut c.space_preview, self.space_preview.get());
+        set(&mut dirty, &mut c.drag_image, self.drag_image.get());
+        set(&mut dirty, &mut c.allow_multiple, self.allow_multiple.get());
         let op = slider_to_opacity(self.opacity.get());
         if c.opacity != op {
             c.opacity = op;
@@ -298,6 +311,13 @@ impl Handles {
         });
         if preferred_dirty {
             crate::decoders::set_preferred(c.decoders_preferred.clone());
+        }
+        // ini 键：ui_theme（选项页「界面主题」，0 = 深色 / 1 = 浅色）。
+        // 只管看图窗口的浮层配色，设置页本身不受影响；写进 config 后由 runtime 推给令牌层。
+        let th = UiTheme::from_ui_index(self.ui_theme.get());
+        if c.ui_theme != th {
+            c.ui_theme = th;
+            dirty = true;
         }
         // ini 键：download_source（选项页「下载源」，0 = Gitee / 1 = GitHub）。
         // ★ 2026-10-30：**一个来源，两张卡共用**（解码器清单 / 插件清单 / 将来的本体更新）。
@@ -353,6 +373,7 @@ impl Handles {
         put_u(&self.wheel, c.wheel.index() as usize);
         put_u(&self.ctrl_wheel, c.ctrl_wheel.index() as usize);
         put_u(&self.init_win, c.init_window.ui_index());
+        put_u(&self.ui_theme, c.ui_theme.ui_index());
         put_u(&self.download_source, c.download_source.ui_index());
         // 插件卡也要跟上（它的 source 是 config 的**投影**：界面上已经没有自己的下拉了）。
         if self.plugin.source.get() != c.download_source.ui_index() {
@@ -362,6 +383,8 @@ impl Handles {
         put_b(&self.prefetch, c.prefetch);
         put_b(&self.to_tray, c.close_to_tray);
         put_b(&self.space_preview, c.space_preview);
+        put_b(&self.drag_image, c.drag_image);
+        put_b(&self.allow_multiple, c.allow_multiple);
         if self.opacity.get() != opacity_to_slider(c.opacity) {
             self.opacity.set(opacity_to_slider(c.opacity));
         }
@@ -661,6 +684,8 @@ pub(crate) fn settings_window(config: &Rc<RefCell<Config>>, hub: &Hub) -> Window
             prefetch: sig(c.prefetch),
             to_tray: sig(c.close_to_tray),
             space_preview: sig(c.space_preview),
+            drag_image: sig(c.drag_image),
+            allow_multiple: sig(c.allow_multiple),
             opacity: signal(opacity_to_slider(c.opacity)),
             opacity_label: signal(format!("{}%", c.opacity)),
             tab: signal(TAB_OPTIONS),
@@ -689,6 +714,7 @@ pub(crate) fn settings_window(config: &Rc<RefCell<Config>>, hub: &Hub) -> Window
             card_mouse: sig(true),
             card_plugins: sig(true),
 
+            ui_theme: signal(c.ui_theme.ui_index()),
             download_source: signal(c.download_source.ui_index()),
         };
         drop(c);
@@ -1009,6 +1035,8 @@ mod tests {
             prefetch: signal(false),
             to_tray: sig(false),
             space_preview: sig(false),
+            drag_image: sig(false),
+            allow_multiple: sig(false),
             opacity: signal(0.75),
             opacity_label: signal(String::new()),
             tab: signal(0),
@@ -1035,6 +1063,7 @@ mod tests {
             card_mouse: sig(true),
             card_plugins: sig(true),
 
+            ui_theme: signal(0),
             download_source: signal(0),
             plugin: PluginUi::new(&Config::default()),
         };
