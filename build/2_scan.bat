@@ -49,7 +49,7 @@ setlocal enabledelayedexpansion
 
 call "%~dp0_common.bat"
 if %ERRORLEVEL% neq 0 (
-    pause
+    if not "!RUPIX_CHAINED!"=="1" pause
     exit /b 1
 )
 

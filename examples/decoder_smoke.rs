@@ -1,7 +1,7 @@
 //! 解码器端到端冒烟：从 `.build/decoders` 加载**真 DLL**，把宿主侧 ABI 消费路径走一遍。
 //!
 //! 与单元测试的区别：单元测试在解码器 crate 内部自测解码；本探针站在**宿主的位置**
-//! 用 `libloading` 装载 DLL——`rupix_lib::core::abi`（即 `RuPix-Decoder/abi` 真源）
+//! 用 `libloading` 装载 DLL——`rupix_lib::core::abi`（宿主侧快照 `vendor/rupix-abi`）
 //! 的结构体与 DLL 里的手写 ABI 是否逐字节对齐、两阶段调用是否自洽，只有这一步
 //! 才能证明。跨 DLL 边界的任何布局漂移在这里直接现形。
 //!
@@ -29,7 +29,7 @@ fn cstr(p: *const c_char) -> String {
     unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
 }
 
-/// 2×2 纯红 QOI（与 RuPix-Decoder/workspace/singles/qoi 单元测试同款字节串）。
+/// 2×2 纯红 QOI（与解码器侧 qoi 单测同款字节串）。
 const QOI_2X2_RED: &[u8] = &[
     0x71, 0x6f, 0x69, 0x66, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x04, 0x00, 0xfe, 0xff,
     0x00, 0x00, 0xc2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,

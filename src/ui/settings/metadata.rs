@@ -4,6 +4,7 @@
 //!   本文件是其中**一页/一窗**的纯搬动切片——不改行为、不改文案、不改版式。
 //!   父模块 `settings` 留 `Handles`（信号句柄与差分同步）、窗口装配与页序常量。
 use super::*;
+use std::collections::HashMap;
 
 /// 属性窗的实时文本信号。窗口内容用 `Element::label_signal` 绑定它们；图片切换
 /// （翻页 / 打开新图 / 解码完成上屏）时由 [`refresh_metadata`] 更新。windui 的
@@ -34,18 +35,23 @@ pub struct MetaSignals {
 }
 
 thread_local! {
-    static META: RefCell<Option<MetaSignals>> = const { RefCell::new(None) };
-    /// 上次读取 EXIF 的文件路径；路径变化才重新读盘（翻页/打开新图时变）。
-    /// 与 MetaSignals 分开存放——`Signal` 是共享句柄 clone 语义，而 `RefCell<PathBuf>`
-    /// 需要唯一权威源，独立 thread_local 最简单。
-    static EXIF_LAST_PATH: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
+    /// **每扇主窗一份**属性窗信号集（键 = `singleton::window_scope`）。
+    ///
+    /// ★ 从 `Option<MetaSignals>` 改成按窗分格（m232）：多开之后两扇窗可以各开一扇
+    /// 属性窗，共用一份信号集的话后刷新的那扇会把前一扇覆盖掉——用户看到的是"我没动
+    /// 那扇窗，它的属性却跟着变了"。窗口关闭时 `forget_window` 把这一格摘掉。
+    static META: RefCell<HashMap<usize, MetaSignals>> = RefCell::new(HashMap::new());
+    /// 上次读取 EXIF 的文件路径（每窗一份）；路径变化才重新读盘（翻页/打开新图时变）。
+    /// 与 MetaSignals 分开存放——`Signal` 是共享句柄 clone 语义，而路径需要唯一权威源。
+    static EXIF_LAST_PATH: RefCell<HashMap<usize, std::path::PathBuf>> = RefCell::new(HashMap::new());
 }
 
-/// 取（首次则初始化）属性窗信号集的副本。`Signal` 是全局句柄，复制即可跨闭包引用。
-pub fn meta_signals() -> MetaSignals {
+/// 取（首次则初始化）**这一扇窗**的属性窗信号集。`Signal` 是全局句柄，复制即可跨闭包引用。
+pub fn meta_signals(scope: usize) -> MetaSignals {
     META.with(|m| {
         m.borrow_mut()
-            .get_or_insert_with(|| MetaSignals {
+            .entry(scope)
+            .or_insert_with(|| MetaSignals {
                 filename: signal(String::new()),
                 kind: signal(String::new()),
                 location: signal(String::new()),
@@ -78,18 +84,33 @@ pub fn meta_signals() -> MetaSignals {
 /// ★ 每个 `set` 都走 [`set`] 助手（值没变不写）：同尺寸同类型的两张图翻页时
 ///   文案一字不差，没必要为此踢一次全 App 重绘。
 pub fn refresh_open_metadata(viewer: &Rc<RefCell<Viewer>>) {
-    // META 会跨关窗保留；观看者必须以框架的单例窗口登记表为准。
-    if windui::event::window_open("metadata") {
+    // 观看者以框架的单例窗口登记表为准，**且要认是哪一扇窗的属性窗**（键带 scope）。
+    let scope = super::super::singleton::window_scope(viewer);
+    if windui::event::window_open(&super::super::singleton::scoped("metadata", scope)) {
         refresh_metadata(viewer);
     }
 }
 
+/// 主窗关掉时摘掉它那一格信号与 EXIF 记账（`WinRt::close` 调）。
+///
+/// 摘掉之后 [`refresh_metadata`] 对这一格直接收工，不再读盘——"窗口没了还每帧 stat
+/// 一个文件、写十几个信号"是最容易被忽略的一类浪费。
+pub fn forget_window(scope: usize) {
+    META.with(|m| {
+        m.borrow_mut().remove(&scope);
+    });
+    EXIF_LAST_PATH.with(|e| {
+        e.borrow_mut().remove(&scope);
+    });
+}
+
 pub fn refresh_metadata(viewer: &Rc<RefCell<Viewer>>) {
     let gen = viewer.borrow().image_gen();
+    let scope = super::super::singleton::window_scope(viewer);
     META.with(|m| {
-        let mut st = m.borrow_mut();
-        // 上面那句注释里的「从未开过」：没有信号集就没有观看者，直接收工。
-        let Some(st) = st.as_mut() else {
+        let mut map = m.borrow_mut();
+        // 上面那句注释里的「从未开过」：这一扇窗没有信号集就没有观看者，直接收工。
+        let Some(st) = map.get_mut(&scope) else {
             return;
         };
         if st.last_gen.get() == gen {
@@ -112,7 +133,9 @@ pub fn refresh_metadata(viewer: &Rc<RefCell<Viewer>>) {
             set(&st.exposure, String::new());
             set(&st.focal, String::new());
             set(&st.gps, String::new());
-            EXIF_LAST_PATH.with(|e| *e.borrow_mut() = None);
+            EXIF_LAST_PATH.with(|e| {
+                e.borrow_mut().remove(&scope);
+            });
             return;
         };
         let meta = std::fs::metadata(&p).ok();
@@ -167,7 +190,8 @@ pub fn refresh_metadata(viewer: &Rc<RefCell<Viewer>>) {
 
         // EXIF 读取只在**路径变化**时进行——翻页/打开新图触发，缩放/平移等
         // 让 image_gen 变化的操作不重复读盘。
-        let need_exif = EXIF_LAST_PATH.with(|e| e.borrow().as_deref() != Some(p.as_path()));
+        let need_exif = EXIF_LAST_PATH
+            .with(|e| e.borrow().get(&scope).map(|x| x.as_path()) != Some(p.as_path()));
         if need_exif {
             let info = crate::platform::exif::read_exif(&p);
             set(&st.capture_time, info.capture_time);
@@ -176,23 +200,28 @@ pub fn refresh_metadata(viewer: &Rc<RefCell<Viewer>>) {
             set(&st.exposure, info.exposure);
             set(&st.focal, info.focal);
             set(&st.gps, info.gps);
-            EXIF_LAST_PATH.with(|e| *e.borrow_mut() = Some(p.clone()));
+            EXIF_LAST_PATH.with(|e| {
+                e.borrow_mut().insert(scope, p.clone());
+            });
         }
     });
 }
 
 pub fn open_metadata(ctx: &mut EventCtx, viewer: &Rc<RefCell<Viewer>>) {
+    let scope = super::super::singleton::window_scope(viewer);
     // 没有打开图片：弹一个静态提示窗（没数据可跟随）。
     if viewer.borrow().current_path().is_none() {
         ctx.open_window(
             Window::new("属性", 360, 120)
+                // 信息窗客户区恒白（标题栏由系统绘制，不在其内）。
+                .bg(to_color(BG))
                 .fit_content(120, 400)
                 .resizable(false)
                 .centered(true)
                 .owned(true)
                 // ★ 不能与真正的属性窗共用 single key：windui 对已开的单例窗只聚焦、
                 //   不重建 content，于是空态窗会永久挡住之后的真实属性窗。
-                .single("metadata-empty")
+                .single(super::super::singleton::scoped("metadata-empty", scope))
                 .content(|| {
                     Element::col()
                         .padding(20)
@@ -204,7 +233,7 @@ pub fn open_metadata(ctx: &mut EventCtx, viewer: &Rc<RefCell<Viewer>>) {
     // 有图：文本用信号绑定，属性窗跟随当前图（翻页 / 打开新图 / 解码完成都会刷新）。
     // 顺序是**先建信号集、再刷**：`refresh_metadata` 只刷已经存在的信号集（没人看
     // 时不读盘），首刷就得由这里把信号集立起来。
-    let sig = meta_signals();
+    let sig = meta_signals(scope);
     refresh_metadata(viewer);
     let anim = sig.anim;
     let capture_time = sig.capture_time;
@@ -228,11 +257,13 @@ pub fn open_metadata(ctx: &mut EventCtx, viewer: &Rc<RefCell<Viewer>>) {
     // 固定宽量一次自然高再夹进 [200, 1100]，未来加字段无需重算窗口尺寸。
     ctx.open_window(
         Window::new("属性", 480, 280)
+            // 信息窗客户区恒白（标题栏由系统绘制，不在其内）。
+            .bg(to_color(BG))
             .fit_content(200, 1100)
             .resizable(true)
             .centered(true)
             .owned(true)
-            .single("metadata")
+            .single(super::super::singleton::scoped("metadata", scope))
             .content(move || {
                 Element::scroll()
                     .fill()
@@ -373,16 +404,56 @@ pub mod tests {
             Rc::new(crate::core::decode::Decoder::spawn_with(tx)),
             cfg,
         )));
-        assert!(!windui::event::window_open("metadata"));
-        let sig = meta_signals();
+        let scope = super::super::super::singleton::window_scope(&viewer);
+        let key = super::super::super::singleton::scoped("metadata", scope);
+        assert!(!windui::event::window_open(&key));
+        let sig = meta_signals(scope);
         sig.filename.set("retained".into());
-        META.with(|m| m.borrow().as_ref().unwrap().last_gen.set(u64::MAX));
+        META.with(|m| m.borrow().get(&scope).unwrap().last_gen.set(u64::MAX));
         refresh_open_metadata(&viewer);
         assert_eq!(sig.filename.get(), "retained");
         // 首刷仍可在窗口尚未登记时执行。
         refresh_metadata(&viewer);
         assert_eq!(sig.filename.get(), "（无图片）");
-        META.with(|m| *m.borrow_mut() = None);
+        META.with(|m| {
+            m.borrow_mut().remove(&scope);
+        });
+    }
+
+    /// 两扇窗各有一份属性信号集：刷新这一扇不许动那一扇（m232）。
+    #[test]
+    fn each_window_refreshes_only_its_own_metadata() {
+        let (tx1, _r1) = std::sync::mpsc::channel();
+        let (tx2, _r2) = std::sync::mpsc::channel();
+        let cfg = Rc::new(RefCell::new(Config::default()));
+        let a = Rc::new(RefCell::new(Viewer::new(
+            Rc::new(crate::core::decode::Decoder::spawn_with(tx1)),
+            cfg.clone(),
+        )));
+        let b = Rc::new(RefCell::new(Viewer::new(
+            Rc::new(crate::core::decode::Decoder::spawn_with(tx2)),
+            cfg,
+        )));
+        let sa = super::super::super::singleton::window_scope(&a);
+        let sb = super::super::super::singleton::window_scope(&b);
+        assert_ne!(sa, sb, "两扇活着的窗不可能共用一个作用域");
+        let sig_a = meta_signals(sa);
+        let sig_b = meta_signals(sb);
+
+        refresh_metadata(&a);
+        assert_eq!(sig_a.filename.get(), "（无图片）");
+        assert_eq!(sig_b.filename.get(), "", "另一扇窗的信号一个字都不许被写");
+
+        forget_window(sa);
+        assert!(
+            META.with(|m| m.borrow().get(&sa).is_none()),
+            "关窗后这一格要摘掉（否则每帧还在为一个没人看的窗口读盘）"
+        );
+        assert!(
+            META.with(|m| m.borrow().get(&sb).is_some()),
+            "别人的格子不许动"
+        );
+        forget_window(sb);
     }
 
     #[test]

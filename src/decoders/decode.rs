@@ -226,6 +226,11 @@ impl Host {
                 }
                 (l.sym.probe, l.desc.id.clone())
             };
+            // 同一枚 DLL 的调用权（`dll_lock` 模块头）：拿不到就跳过这一枚——
+            // "别人正在用"不是"这枚坏了"，不许记成故障。
+            let Ok(_dll) = super::dll_lock::enter(&k, &id) else {
+                continue;
+            };
             // NULL 扩展名嗅探（解码器按内容认领）。
             match invoke(|| unsafe { probe(data.as_ptr(), data.len(), std::ptr::null()) }) {
                 Ok(c) if c > 0 => ranked.push((c, k)),
@@ -318,6 +323,8 @@ impl Host {
                 "解码器「{id}」不支持裸数据参数化解码（缺少 iv_render_raw 导出）"
             ));
         };
+        // 同一枚 DLL 的调用权（见 `dll_lock` 模块头）。
+        let _dll = super::dll_lock::enter(key, &id)?;
         let mapped = std::fs::File::open(path)
             .ok()
             .and_then(|f| unsafe { memmap2::Mmap::map(&f).ok() });
@@ -453,12 +460,14 @@ impl Host {
         self.refresh_catalog();
         // 候选：认领该后缀 **且** 实现了 `iv_render_region`。按 id 排序 ⇒ 多枚认领
         // 同一后缀时结果可复现（与矢量导出那条同规）。
+        // 候选表带上 DLL 路径：区域重渲同样要拿"这一枚 DLL"的调用权（见 `dll_lock`）。
         let mut cands: Vec<(
+            PathBuf,
             String,
             crate::core::abi::IvRenderRegionFn,
             unsafe extern "C" fn(*mut c_char, usize) -> i32,
         )> = Vec::new();
-        for l in self.loaded.values() {
+        for (k, l) in self.loaded.iter() {
             if !l.active || is_disabled(&l.desc.id) || self.blacklist.contains(&l.desc.id) {
                 continue;
             }
@@ -473,12 +482,12 @@ impl Host {
             let Some(f) = l.sym.render_region else {
                 continue;
             };
-            cands.push((l.desc.id.clone(), f, l.sym.last_error));
+            cands.push((k.clone(), l.desc.id.clone(), f, l.sym.last_error));
         }
         if cands.is_empty() {
             return None;
         }
-        cands.sort_by(|a, b| a.0.cmp(&b.0));
+        cands.sort_by(|a, b| a.1.cmp(&b.1));
 
         // 画布 = 区域 × 密度；超硬顶就降密度（与内置 resvg 的区域路线同一条口径：
         // 宁可略糊，也不要失败或越界）。画布恒 ≈ 一屏大小，所以平时根本碰不到硬顶。
@@ -515,7 +524,10 @@ impl Host {
         let ext_c = std::ffi::CString::new(ext).ok();
 
         let mut last_err = String::new();
-        for (id, f, last_error) in cands {
+        for (key, id, f, last_error) in cands {
+            let Ok(_dll) = super::dll_lock::enter(&key, &id) else {
+                continue;
+            };
             match region_roundtrip(f, last_error, data, &req, ext_c.as_ref()) {
                 Ok((mut bitmap, aw, _ah, icc, info)) => {
                     self.clear_strikes(&id);
@@ -593,6 +605,10 @@ impl Host {
                 "解码器「{id}」本次会话已因超时停用"
             )));
         }
+        // ★ 同一枚 DLL 的调用权（2026-11-05 裁决，见 `dll_lock` 模块头与 `docs/待办.md` §28）：
+        //   多开之后两条 worker 真的会同时进来，而 ABI 只承诺"可重入、不必 MT-safe"。
+        //   拿不到 = "现在忙"，不是"这枚坏了" ⇒ `Unsupported`（换下一家还有救），不是 `Hard`。
+        let _dll = super::dll_lock::enter(key, &id).map_err(Fail::Unsupported)?;
         // 读文件走 mmap：省掉 12MB 级的堆分配+拷贝（解码器只读，切片直给）。
         // 文件极小/被独占等 mmap 不可用时回退整读。Windows 下文件在解码途中被
         // 外部替换的理论风险由每次 FFI 的 catch_unwind + 三振黑名单兜底。

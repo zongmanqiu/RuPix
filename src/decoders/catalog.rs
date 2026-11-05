@@ -22,19 +22,19 @@
 //!
 //! # 诚实的边界：止损，不是沙箱
 //!
-//! 解码器与宿主同进程（方案 v2 §四 路线 A）。`catch_unwind` 接得住 Rust panic；
+//! 解码器与宿主同进程（in-proc 路线）。`catch_unwind` 接得住 Rust panic；
 //! 访问违规、非法指令、特权指令、读页错误、**栈溢出**这些 SEH 硬故障由
 //! [`crate::platform::seh`] 的 C 隔离层（`__try/__except`）拦下，折算成
 //! `SehFault` / `MediaFault`，不再把主程序一起带走。但这只是**止损**：
 //! 解码器仍与宿主共享地址空间，读得到宿主内存、改得坏宿主状态。真正的隔离要上
-//! 路线 B（独立解码进程），本轮不做。见 [`crate::decoders`] 模块头。
+//! 另一条路（独立解码进程），本轮不做。见 [`crate::decoders`] 模块头。
 
 use std::path::{Path, PathBuf};
 
 /// 解码器目录名（相对 exe 目录）。改它等于改所有解码器的约定。
 pub const DIR_NAME: &str = "decoders";
 
-/// 解码器目录的绝对路径。**不依赖 CWD**（方案 v2 §12.5：从快捷方式启动时 CWD 不是
+/// 解码器目录的绝对路径。**不依赖 CWD**（从快捷方式启动时 CWD 不是
 /// exe 目录，写相对路径必然炸）。
 ///
 /// 环境变量 `RUPIX_DECODERS_DIR` 可整体覆盖（绝对路径）——仅供探针/基准等开发场景
@@ -79,8 +79,8 @@ pub struct Scan {
 
 /// 扫当前进程的解码器目录。
 ///
-/// 只在用户打开「设置 → 解码器」时被调用；**不进启动关键路径**（方案 v2 §12.2，
-/// 一切为了冷启动 < 100ms）。
+/// 只在用户打开「设置 → 解码器」时被调用；**不进启动关键路径**
+/// （启动那一截不许扫目录，读数走 `build/startup_probe.ps1`）。
 pub fn scan() -> Scan {
     let Some(dir) = dir() else {
         return Scan::default();

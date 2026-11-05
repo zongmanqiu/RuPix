@@ -145,6 +145,11 @@ fn watch_loop(raw: usize, tx: Sender<DirEvent>, stop: Arc<AtomicBool>) {
             // 句柄被 `Drop` 关掉（目录被删 / 重臂）都会走到这——正常退出。
             break;
         }
+        // 物理变化的**唯一**信号点：让清单缓存作废（`core::gallery::note_dir_change`）。
+        // 放在 `send` 之前——先作废再通知，避免某扇窗收到事件后按旧代次命中缓存。
+        // ★ N 扇窗就有 N 个 watcher，于是这里一次变化会递增 N 次；这是**故意**的：
+        //   代次只需要单调，而"多推几次"只会让缓存更早失效（偏保守），不会让它更晚。
+        crate::core::gallery::note_dir_change();
         if tx.send(DirEvent::Changed).is_err() {
             break; // 接收端（runtime）已走，自然退出。
         }

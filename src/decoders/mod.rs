@@ -11,8 +11,9 @@
 //!
 //! # 生命周期：懒加载，不碰冷启动
 //!
-//! 方案 v2 §12.2 的红线是冷启动 < 100ms。所以这里**不在启动时扫描或加载任何 DLL**：
-//! 第一次遇到"WIC 解不开、但扩展名有解码器认领"的图，才去扫 `decoders/` 并加载候选 DLL。
+//! 启动那一截不许碰磁盘扫描与 `LoadLibrary`（双击→首帧的实测账走 `build/startup_probe.ps1`）。
+//! 所以这里**不在启动时扫描或加载任何 DLL**：解码线程上第一次
+//! 走到 `Host::refresh_catalog`（`catalog_gen` 从 0 起，首访必触发）才扫 `decoders/` 并加载候选 DLL。
 //!
 //! # 热加载
 //!
@@ -33,11 +34,12 @@
 //!
 //! # 诚实的边界：in-proc 路线是"止损"，不是"沙箱"
 //!
-//! 解码器与宿主**同进程**（方案 v2 §四 路线 A）。Rust panic 早已被 `catch_unwind` 隔离；
+//! 解码器与宿主**同进程**（in-proc 路线）。Rust panic 早已被 `catch_unwind` 隔离；
 //! **访问违规（SEH）现在也被宿主侧的 C 隔离层（`seh_shim.c`，见 [`invoke`]）拦下**——
 //! 解码器里一句 `std::ptr::null_mut::<u8>().write_volatile(1)` 不再连主程序一起带走，而是
 //! 降级成一次失败、计入三振。但被写花的进程内存仍在，所以这是"止损"不是"零污染沙箱"：
-//! 真正每字节都干净的隔离要上路线 B（独立解码进程）。文档与 UI 文案都不许把三振说成沙箱。
+//! 真正每字节都干净的隔离要换独立解码进程（宪章 §5.1 判它不划算，见 `docs/产品定位与边界.md`）。
+//! 文档与 UI 文案都不许把三振说成沙箱。
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{c_char, CStr};
@@ -59,6 +61,7 @@ use crate::platform::seh::invoke;
 
 mod backend;
 mod decode;
+mod dll_lock;
 mod dllmeta;
 mod host;
 mod output;

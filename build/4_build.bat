@@ -17,7 +17,7 @@ setlocal enabledelayedexpansion
 
 call "%~dp0_common.bat"
 if %ERRORLEVEL% neq 0 (
-    pause
+    if not "!RUPIX_CHAINED!"=="1" pause
     exit /b 1
 )
 
@@ -29,7 +29,7 @@ echo.
 cd /d "%MAIN_DIR%"
 if !ERRORLEVEL! neq 0 (
     echo   [ERROR] cannot cd to %MAIN_DIR%
-    pause
+    if not "!RUPIX_CHAINED!"=="1" pause
     exit /b 1
 )
 
@@ -42,7 +42,7 @@ cargo build --release %RUPIX_CARGO_ARGS%
 if !ERRORLEVEL! neq 0 (
     echo.
     echo   [ERROR] build failed
-    pause
+    if not "!RUPIX_CHAINED!"=="1" pause
     exit /b 1
 )
 

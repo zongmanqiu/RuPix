@@ -31,7 +31,7 @@ impl Health {
 
 /// 从 DLL 文件名 `<id>_<ver>.dll` 解析出版本号。
 ///
-/// 文件名只带 **id + 版本**（`RuPix-Decoder/build.ps1` 的命名约定）。
+/// 文件名只带 **id + 版本**（解码器发布时的命名约定）。
 /// **ABI 号不在名字里**：宿主接受的是区间（`MIN_ABI_VERSION..=IV_ABI_VERSION`），
 /// 写成 `-abi4` 既判断不了"能不能用"，又成了第二份会漂的真源——它读自解码器自述的
 /// `iv_abi_version()`，落在 [`DecoderEntry::abi`]。
@@ -192,7 +192,9 @@ pub fn declared_exts() -> HashSet<String> {
 ///
 /// 它与 [`declared_exts`] 同源同批算出：把某个实现 `iv_render_raw` 的解码器删掉或关掉，
 /// 它认领的后缀就不再走参数窗而是回到常规解码路径，不存在"清单说要参数、实际没人接"的错位。
-/// 宿主因此**不再手写**一张裸数据后缀表（`core::decode` 里那份已删）。
+/// 这里的并集是**路由用的**；`core::decode::HEADERLESS_EXTS` 是另一回事——它标"哪些后缀
+/// **真的没有文件头、必须由用户给宽/高/布局**"（`is_headerless_ext`，11 个），读者是参数窗
+/// （`ui/raw_dialog.rs`）与空格预览的推断分支（`platform/spacehook.rs`）。两张表各判各的。
 pub fn declared_raw_exts() -> HashSet<String> {
     install_format_source();
     declared_cached().1

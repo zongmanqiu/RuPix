@@ -14,7 +14,7 @@ use crate::core::pixels::Bitmap;
 // ── EXIF 方向补转（宿主侧）──────────────────────────────────────
 
 /// 按 EXIF 方向（1–8）重排像素：解码器上报 `already_oriented=0` 时宿主负责补转
-/// （ABI 契约见 `RuPix-Decoder/abi`：raw/av 上报未应用状态，jxl 已应用）。
+/// （契约以宿主快照 `vendor/rupix-abi` 为准：raw/av 上报未应用状态，jxl 已应用）。
 /// 方向 1 或非法值原样返回——不认识的方向宁可躺平也不猜。
 pub fn oriented(rgba: Vec<u8>, w: u32, h: u32, o: i32) -> (Vec<u8>, u32, u32) {
     // 每个方向：输出像素 (x, y) 采样自输入的哪个 (sx, sy)。

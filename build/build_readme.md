@@ -1,43 +1,70 @@
 # RuPix 构建流水线（main/build/）
 
 > `main\build\` 是**源码**（属于项目树）；发布的二进制去 `<项目>\.build\`——上一级、仓库外。
-> 一切编译中间产物在 `<项目>\.temp\`（`main\.cargo\config.toml` 与 `RuPix-Decoder/workspace/.cargo/config.toml`
-> 分别钉死 `target-dir`，写在 `[package]` 下的 `target-dir` 是无效键）。
+> 一切编译中间产物在 `<项目>\.temp\`：宿主这一侧由 `main\.cargo\config.toml` 的
+> `[build] target-dir` 钉死（写在 `[package]` 下的 `target-dir` 是无效键，cargo 会警告并回落到
+> `./target`）；解码器那一侧由它自己仓库里的 `.cargo/config.toml` 钉到同一个 `.temp\`，
+> 宿主这边的脚本不替它做这件事。
 
 ## 六步流水线（`full.bat` 一键编排，失败即停）
 
 | 步 | 脚本 | 干什么 | 失败行为 |
 |---|---|---|---|
-| ① | `1_check_env.bat` | 只读工具链体检：cargo/rustc host 必须 msvc；python/powershell 必须在；`.3rd/windui` 缺失 = ERROR（本地副本，无下载步可修复） | ERROR → exit 1 |
-| ② | `2_scan.bat` | **五条静态门禁**：`layering_scan.py`（五层方向 + 禁引 crate）+ `hygiene_scan.py`（硬编路径/调试残留/未完成标记/FFI 边界无解/生产区 panic 源）+ `cargo fmt --check`（宿主格式）+ `cargo clippy --all-targets --release -- -D warnings`（第一方 lint）+ `structure_gen.py --check`（结构文档的数字与符号索引必须等于 `src/` 现状）。违规即红；fmt 步 2026-10-17 补入——§九 早就写明要 exit 0，但此前无任何脚本执行，漂移无人拦；结构文档门禁同日补入，因为它的手工计数已经漂到 46/18,234（磁盘 45/19,108）；clippy 步 2026-10-19 补入，同一个"列而不行"毛病，且**必须带 `-D warnings`**（不带时 clippy 有 warning 也退 0，见 K69） | exit 1 |
-| ③ | `3_build_ext.bat` | `RuPix-Decoder/build.ps1`：**fmt 检查** + 编译 + 测试 + 发布 DLL 到仓库外 `../.temp/decoder-dist/`（并同步 `.build/decoders`）（格式或测试失败不发布） | exit 1 |
+| ① | `1_check_env.bat` | 只读工具链体检：cargo/rustc host 必须 msvc；python/powershell 必须在；`.3rd\wind-ui-rust-0.23.0` 缺失 = ERROR（本地 path 依赖，无下载步可修复）；解码器 workspace 缺失 = ERROR。`.3rd\usvg-0.48.1` 缺失 = ERROR（`Cargo.toml` 的 `[patch.crates-io]` 那一份，同样没有下载步可修复） | ERROR → exit 1 |
+| ② | `2_scan.bat` | **六道静态门禁**，按 `[1/6]`…`[6/6]` 逐道打点：`layering_scan.py`（五层方向 + 各层禁引 crate + decoders/extensions 禁互引）→ `hygiene_scan.py`（13 查，见下）→ `cargo fmt --check` → `cargo clippy --all-targets --release -- -D warnings` → `structure_gen.py --check`（结构文档的数字与符号索引必须等于 `src/` 现状）→ `dump_sym.py --selftest`（崩溃取证解析器自己的断言：发布名 → CodeView pdb 名、报告解析）。违规即红。★ 三条判据的牙齿各在何处：fmt 与 clippy 要的是 exit 0，而 **clippy 不带 `-D warnings` 时有 warning 照样退 0**（那就是假绿，见 K69）；结构文档这一步只读，漂移的正解是 `--write` 重生成、**不是手改数字**（手工计数漂过一截，所以这六道里它是唯一由生成器写文档的门）；`dump_sym.py --selftest` 不需要符号归档与崩溃夹具，一秒内跑完，为的是"最后一环的工具不能只靠信任" | exit 1 |
+| ③ | `3_build_ext.bat` | 调解码器仓库自己的 `build.ps1`：**fmt 检查** + 编译 + 测试 + 发布 DLL 到 `<项目>\.temp\decoder-dist\`（并同步 `.build\decoders`）（格式或测试失败不发布） | exit 1 |
 | ④ | `4_build.bat` | `cd main` + `CARGO_INCREMENTAL=0` + `cargo build --release`；不拷贝任何东西 | exit 1 |
 | ⑤ | `5_test.bat` | **真门禁**两层：`cargo test --release`（集成，含 docs_consistency）→ `--lib`（单元）；均 `--test-threads=1`（杀软锁新链接二进制会假死） | 任一层失败 → exit 1 |
-| ⑥ | `6_deploy.bat` | `deploy.py`：**两道 PE 硬门禁**（RT_GROUP_ICON 档位表 + RT_VERSION 键与版本值须等于 `Cargo.toml`）→ exe 原子换名部署 + MD5/SIZE 对账 + 符号归档 + 解码器清单核对 + 随包 `docs/decoders.json`（从解码器仓 `decoders.json` 复制）；**解码器或本地清单缺失 = 不可分发 = exit 1**。★ 这两道不可省：两份 `.rc` 都走 `manifest_optional()`，资源编不进只降级成一条 cargo 警告（K70） | exit 1 |
+| ⑥ | `6_deploy.bat` | `deploy.py`：**两道 PE 硬门禁**（RT_GROUP_ICON 档位表 + RT_VERSION 键与版本值须等于 `Cargo.toml`）+ **许可门禁** `license_gate`（`LICENSE` 全文与 `THIRD-PARTY-NOTICES.md` 必须随包落到 `.build\`，三问都查：在不在、够不够长（`LICENSE` ≥ 30,000 B、清单 ≥ 1,000 B）、标志串对不对（`LICENSE` 要见 `GNU AFFERO GENERAL PUBLIC LICENSE`，清单要写明 `AGPL-3.0`）——空壳与误拷别人的许可证都会拦下）→ exe 原子换名部署 + MD5/SIZE 对账 + 符号归档 + 解码器清单核对 + 随包 `docs/decoders.json`（从解码器仓库的发布清单复制）；**解码器或本地清单缺失 = 不可分发 = exit 1**。★ 这两道 PE 门禁不可省：两份 `.rc` 都走 `manifest_optional()`，资源编不进只降级成一条 cargo 警告（K70）——deploy 这两道是唯一的硬拦截点 | exit 1 |
 
 环境开关：`RUPIX_SKIP_TESTS=1`（跳过第⑤步）/ `RUPIX_CARGO_ARGS`（第④步附加参数）。
 
 工具链：`_common.bat` 在 `RUSTUP_TOOLCHAIN` 未定义时钉 `stable-x86_64-pc-windows-msvc`（本机 rustup
-**没有默认工具链**，K31；不覆盖调用方已有的值，也不改全局 `rustup default`）。第①步原先裸调 cargo
-会抓到空版本串仍打 `[OK]`、再判非 MSVC 而 rc=1——现在空串一律 `[ERROR]`。
+**没有默认工具链**，K31；不覆盖调用方已有的值，也不改全局 `rustup default`）。第①步遇到
+"cargo 只给出空版本串"一律打 `[ERROR]`——空串 = 工具链根本选不出来，不能让它带着 `[OK]` 走进后面五步。
 
-`build.bat` 是历史兼容入口，现等价于 `full.bat`。
+`build.bat` 是留在原地的旧入口名，跑的就是 `full.bat` 这一条六步流水线。
 
 ## 两条静态体检（只读，可单独跑）
 
 ```
-python build/layering_scan.py [--json]    # 五层依赖方向 + 各层禁引 crate
-python build/hygiene_scan.py [--json]     # 五查：绝对路径 / 调试残留 / TODO 真标记 / FFI 边界无解 / 生产区 panic 源（§八.1 红线，豁免要就地写 `红线豁免:`）
+python build/layering_scan.py [--json|--selftest]   # 五层依赖方向 + 各层禁引 crate + decoders/extensions 禁互引
+python build/hygiene_scan.py  [--json|--selftest]   # 十三查，逐类见下表
 ```
 
+两条都由第②步执行，也各自带 `--selftest`（合成样例命中验证——门禁的牙齿，`tests/docs_consistency.rs`
+的 j7 / j8 跑的就是这两支）。判据都是**总数 = 0** 才算过，退出码 0 = 无违规、1 = 有违规。
+
 - **分层规则**（`layering_scan.py` 的 `LAYER_ORDER` / `BARRED` 表是机器判定的唯一来源，
-  与 `AGENTS.md` 第三节、`目录结构说明.md` 三方一致）：
-  - 方向：`core(0) → platform(1) → decoders(2) → ui(3) → runtime(4)`，低层不得 `use` 高层。
-  - 禁引：core 禁 `windui`/`windows`；platform 禁 `windui`；decoders 禁 `windui`/`windows`；ui 禁 `windows`。
-  - 禁引检查覆盖 `use X::` 与**裸路径** `X::`（注释行豁免）——裸路径检查是本项目对
-    CurSeen 的补强：`main.rs` 曾直调 `windui::…::svg_warm_fonts` 而无 use 语句。
-- **异味规则**（cfg(test) 之后按测试桩豁免；生产代码在前、`mod tests` 在文件末尾是**硬性**惯例）：
-  - `src/main.rs` 对 stdout 打印有唯一豁免（`--probe-decode` 探针的存在意义就是打印）。
+  与 `AGENTS.md` §一、`目录结构说明.md` §一 三方一致）：
+  - 层序：`core(0) → platform(1) → {decoders(2), extensions(2)} → ui(3) → runtime(4)`，低层不得 `use` 高层。
+  - 禁引（`BARRED`）：core 禁 `windui`/`windows`；platform 禁 `windui`；decoders 禁 `windui`/`windows`；
+    **extensions 禁 `windui`/`windows`**；ui 禁 `windows`。
+  - 同层禁互引（`FORBIDDEN_PEERS`）：`decoders ↔ extensions` 双向禁——扩展不参与解码路由，
+    解码器也不调用扩展。
+  - 禁引检查覆盖 `use X::` 与**裸路径** `X::`（注释行豁免）——裸路径那一路是对 CurSeen 的补强：
+    正文里直接写 `windui::…::svg_warm_fonts` 而不带 use 语句的形态，use-only 扫描抓不到。
+- **卫生十三查**（`hygiene_scan.py` 的 `CATEGORIES`，按它的固定顺序；打印与 `--json` 都按这十三档分别报数）：
+
+| # | 分类名 | 判据 | 扫描域 |
+|---|---|---|---|
+| 1 | `abs_path` | 硬编码绝对路径 `[A-Z]:\`（换台电脑就失效） | `src/**/*.rs`（`#[cfg(test)]` 之后豁免） |
+| 2 | `debug_macro` | 调试残留 `println!` / `eprintln!` / `print!` / `eprint!` / `dbg!` | 同上 |
+| 3 | `marker` | 未完成标记 `TODO:` / `TODO(` / `FIXME` / `XXX`（只认真标记） | 同上 |
+| 4 | `boundary_doc` | FFI 边界（`unsafe fn` / `extern "C" fn` / `#[no_mangle]`）上方没有紧邻注释 | 同上 |
+| 5 | `panic_source` | 生产区 `unwrap` / `expect` / `panic!` / `todo!`（`AGENTS.md` §八.1 红线；就地豁免要写 `红线豁免:`） | 同上 |
+| 6 | `config_last_mile` | 每个 ini 键既要有 **UI 入口**、也要有**行为读者**；`CONFIG_ONLY_KEYS` 登记者只豁免"入口" | `src/**` |
+| 7 | `patch_parity` | 第三方补丁两问：`patches/PATCHES.md`（windui 卷）的每个 `## 补丁 NN` 章节 ↔ `.3rd/wind-ui-rust-0.23.0` 里的 `★ RuPix 补丁 NN` 标记对得上。★ 覆盖面：本查只认 windui 这一卷，`patches/usvg-0.48.1/PATCHES.md` 不在它的扫描范围里；"归档 ↔ 工作副本逐字节"那一格由集成门禁 j13 守 | `main/patches/PATCHES.md` + `.3rd/wind-ui-rust-0.23.0` |
+| 8 | `control_char` | 文本里的不可见控制字符（只放行 09/0a/0d）——脚本改文件时反斜杠转义会吃掉一个字母，锚点静默损坏 | `main/**` 的第一方文本 |
+| 9 | `ps1_ascii` | `.ps1` 必须纯 ASCII（PowerShell 5.1 按 ANSI 读无 BOM 文件，中文注释会坏到邻近语句上，K27） | `main/**/*.ps1` |
+| 10 | `literal_color` | 字面色值 `Color::rgb(` / `Color::rgba(` 只许出现在 `ui/tokens.rs` | `src/ui/**` |
+| 11 | `ui_super_path` | ui 层内跨模块引用一律经 `super::`，禁 `crate::ui::`（中枢在 `ui/mod.rs`） | `src/ui/**` |
+| 12 | `secret` | 无密钥 / 无隐私：私钥块、访问令牌、URL 内嵌凭据、口令字面量、私人邮箱、含真名的本机路径 | `main/**` |
+| 13 | `single_window_key` | 单例窗不许同一个键既 `close_window` 又 `single`（关窗是投递、开窗是即时，K196） | `src/ui/**` |
+
+  豁免（第十三查以外的通用形状）：`#[cfg(test)]` 之后按测试桩处理（整篇是测试模块的 `tests.rs` 文件
+  也算），**生产代码在前、`mod tests` 在文件末尾**是硬性惯例；`src/main.rs` 对 stdout 打印有唯一豁免
+  （`--probe-decode` 探针的存在意义就是打印）。
 
 ## 体积账（只读，按需跑）
 
@@ -72,6 +99,45 @@ python build/gate.py run all
 真硬件/真 DLL 探针放 `tests/probes/`：Cargo **不递归发现** `tests/` 子目录，
 不显式登记 `[[test]]` 就完全不参与默认编译——省的是编译时间（实测差 26 秒，
 一个断言都没跑）。需要时临时登记再跑，跑完还原。
+
+## 探针脚本清单（`build/*.ps1`，**不参与 `full.bat`**）
+
+`build\` 下现在有 **12 枚** PowerShell 探针，六步流水线一枚都不调用它们（被流水线调用的
+`.ps1` 只有第③步里解码器仓库自己的 `build.ps1`，那是构建不是取证），
+所以它们是**人工按需跑**的那一层：真机读数、红绿对照、验证一个肉眼分不清的现象。
+共同的规矩写在各文件头里：`.ps1` 纯 ASCII（`ps1_ascii` 那查会拦）、私有 exe 根 + 钉死的 ini +
+私有 `temp\`（`-Private` 那一族）、只关**自己启动的那一枚**子进程（先 `WM_CLOSE`，
+万不得已才 `Stop-Process` 自己的 PID）。
+
+| 脚本 | 它验什么（一句话） |
+|---|---|
+| `flip_probe.ps1` | 固定节奏翻页并只读**本轮追加**的日志字节：数 `[main-latency]` 的行数 = 上屏次数、数 `src=prefetch` = 预读命中（详见下一节） |
+| `crash_probe.ps1` | 让**发布版** `rupix.exe` 真崩一次（经 `RUPIX_DECODERS_DIR` 送一枚测试专用 DLL），收它留下的崩溃报告与 `.dmp`，再交 `dump_sym.py` 解（详见再下一节） |
+| `hang_probe.ps1` | 换一枚 `iv_render` 里睡 30 秒的解码 DLL：解码线程卡住时宿主**有没有话对用户说**（隔离栈只拦崩、不拦卡，这条只能实测） |
+| `drag_probe.ps1` | `drag_image` 开关的效果：左键在画布里拖 → 像素变了而**窗口矩形不动**；再加一臂"按 `1` 原尺寸"当对照，防止把"没变化"误读成"抓帧死了" |
+| `pan_probe.ps1` | WASD 平移端到端：竖向渐变图 + 亮度 oracle（W 看顶最暗、S 看底最亮、中间居中），一条序不对就是平移坏了 |
+| `picker_probe.ps1` | 取色器：纯色图 + **系统剪贴板文本**当 oracle——`K` 进模式、左键复制该点 HEX、第二击不再复制、`K` 后 `Esc` 只退模式不关窗 |
+| `rotate_probe.ps1` | `R` / `M` 在大图上让 UI 线程停多久（oracle = `SendMessageTimeout(WM_NULL)`：忙着的线程答不了 sent message） |
+| `stall_probe.ps1` | 不按键也采样：开图、原图档落地、翻页各自把 UI 线程压住多久——整条时间线都量，不盯某一个键 |
+| `startup_probe.ps1` | "双击 → 窗口出现 → 第一帧"这段的读数：秒表在 `Start-Process` 之前起，同时盯 Win32 窗口 oracle 与产品自己的日志行 |
+| `pill_probe.ps1` | 底部浮条"在闪"到底是**整条显隐**还是**宽度随状态文本抖**：逐帧取那一行五个点的 ARGB |
+| `key_dispatch_probe.ps1` | 一次按下的字符键触发几个动作：黑白交替、帧延迟 300 s 的 GIF 当夹具，配合 `RUST_LOG=trace` 分辨 WM_KEYDOWN 与 WM_CHAR 双派发 |
+| `probe_tray_clear.ps1` | "关进托盘再唤醒 → 旧图必须已经清空"：唤醒不带文件应当是空窗（截图小）、带文件应当有图（截图大），且工作集与线程数不随轮次上涨 |
+| `multi_window_probe.ps1` | 多开是"每次启动一扇新窗"还是"就地换图"：私有根连开 N 次，数本进程顶层窗 + 读日志里上屏的文件 |
+| `dll_serial_probe.ps1` | 两（三）扇窗迎面翻同一批图，`[dll-serial]` 记每笔的 `wait`/`run`；`-CloseMidway` 在解码在飞时关掉一扇，`-HoldSec` 让进程在驱动之后再活 N 秒（跨过看门狗 10 s 首报阈值，才验得了"没有假告警"） |
+| `dll_serial_analyze.py` | 上一条的判据：持锁区间零重叠、等待上界随窗口数缩放、跨解码器重叠是**并行**的正面证据；退出码 0/1/2（2 = 没测到争用 ⇒ 结论不成立） |
+| `raw_dialog_probe.ps1` | 多开时**每扇窗各弹一个**裸数据参数窗（两个无整数几何的 `.bgra` 造夹具，数顶层窗：主窗 + 各自的对话框） |
+| `metadata_probe.ps1` | 同上，验属性窗：ini 里 `hotkeys=props:F2`，`PostMessage` 往每扇窗投 F2，数标题不是主窗标题的窗 |
+| `decoder_inuse_probe.ps1` | 卸载一个**本会话已加载**的解码器会怎样：私有解码器目录只放 `common`，开着 `.jpg` 时把 DLL 送回收站（外壳真实路径，不是原地改名）⇒ 期望失败；关进程后再试 ⇒ 期望成功。附带一条方法论：原地改名**不是**回收站的替身 |
+| `dir_rescan_probe.ps1` | 多窗盯同一个大目录时**一次文件变动的重扫成本**：造 N 项夹具、开 N 扇窗、加/删一个文件，读 `[dir-rescan]` 数 `scanned`（真读盘）与 `reused`（复用别人的扫描）。判定 `scanned` 恒为 1 才算同批只扫一次 |
+
+> `_common.bat` **不是探针**：它是六个编号步骤各自 `call` 的公共前置——算出
+> `MAIN_DIR` / `PROJECT_ROOT` / `TEMP_DIR` / `TARGET_DIR` / `OUTPUT_DIR` / `DECODER_DIR` /
+> `EXT_DIR` 这些位置，找 `python` 与 `powershell`，并在调用方没给时钉
+> `RUSTUP_TOOLCHAIN=stable-x86_64-pc-windows-msvc`（本机 rustup 没有默认工具链，K31）
+> 与 `RUSTFLAGS`（`+crt-static` 加 `--remap-path-prefix`，产物字节里不留本机路径）。
+> ★ `RUSTFLAGS` 是**整条覆盖** `.cargo/config.toml` 的 rustflags 而不是追加，所以手工跑
+> cargo 时这两条得自己带上（与上面《体积账》那条硬口径同一条道理）。
 
 ## 翻页取证驱动（`build/flip_probe.ps1`）
 
@@ -116,7 +182,7 @@ panic 那条通道另有对等探针：`cargo run --release --example panic_prob
 它走 Rust `panic!`、不经过 SEH，两条通道互不覆盖——改这块时两条都要跑。
 
 **解码器那一帧**（`crashplug.dll+0x1221` 这种）从 `.temp\symbols\decoders\<id>.pdb` 解——
-由 `RuPix-Decoder\build.ps1` 在发布时归档（发布名是 `<id>_<ver>`，CodeView 名是编译期 `<id>.pdb`，
+由解码器仓库自己的 `build.ps1` 在发布时归档（发布名是 `<id>_<ver>`，CodeView 名是编译期 `<id>.pdb`，
 脚本自己换算，见 K137）。解码器 dll 不在 exe 旁边时用 `--decoders DIR` 指出它在哪
 （夹具目录就是这种情形）。解不出来时会**分两种说**：`(no pdb archived for this decoder)`
 = 该去归档，`(archived pdb is another build)` = 归档里那枚是另一版，不给行是对的。

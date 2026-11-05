@@ -1088,3 +1088,217 @@ fn doc_natural_query_only_for_self_rendered_region_vectors() {
         "宿主内置 svg 走自己的 resvg，根本不经过解码器层"
     );
 }
+
+// ── 按 DLL 串行（m229，`dll_lock` 模块头）──────────────────────────────────
+//
+// 这四条钉的是"契约里那句串行现在有机器把关"：两个线程抢同一枚 DLL 必须排队、
+// 同一线程重入不许自锁、占着不放要给可读裁决而不是陪卡、不同 DLL 不许互相牵连。
+// 用假的 `Z:\` 路径：锁表只按路径分格，碰不到真 DLL。
+
+/// 两线程抢同一枚 DLL ⇒ 严格排队（B 的"进"排在 A 的"出"之后）。
+#[test]
+fn dll_lock_serializes_two_threads_on_the_same_dll() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    let key = std::path::PathBuf::from(r"Z:\rupix-dll-lock\same\a.dll");
+    let log = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+
+    let inner = Arc::clone(&log);
+    let k = key.clone();
+    let first = std::thread::spawn(move || {
+        let _g = super::dll_lock::enter_within(&k, "bridge", Duration::from_secs(2))
+            .expect("第一笔应先拿到锁");
+        inner.lock().unwrap().push("A-in");
+        std::thread::sleep(Duration::from_millis(80));
+        inner.lock().unwrap().push("A-out");
+    });
+
+    // 让第一笔先跑起来，否则下面那句可能抢在它前面（这条用例要的是"排队"，不是赛跑）。
+    std::thread::sleep(Duration::from_millis(15));
+    {
+        let _g = super::dll_lock::enter_within(&key, "bridge", Duration::from_secs(2))
+            .expect("第二笔应等到第一笔松开");
+        log.lock().unwrap().push("B-in");
+    }
+    first.join().expect("第一笔线程不该崩");
+
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec!["A-in", "A-out", "B-in"],
+        "同一枚 DLL 的两笔必须串行，不许交叠"
+    );
+}
+
+/// 同一线程重入不抢锁（`decode_with` → `query_natural_only` 就是这种嵌套）。
+#[test]
+fn dll_lock_is_reentrant_on_one_thread() {
+    use std::time::Duration;
+
+    let key = std::path::PathBuf::from(r"Z:\rupix-dll-lock\reentrant\b.dll");
+    // 预算给到 5 ms：真去抢锁的话必然超时，用例就会在第二层失败而不是吊死。
+    let outer =
+        super::dll_lock::enter_within(&key, "doc", Duration::from_millis(5)).expect("外层应先拿到");
+    assert!(super::dll_lock::held_here(&key));
+    let inner = super::dll_lock::enter_within(&key, "doc", Duration::from_millis(5))
+        .expect("同线程重入不该抢锁");
+    drop(inner);
+    assert!(super::dll_lock::held_here(&key), "内层走了，外层还在");
+    drop(outer);
+    assert!(!super::dll_lock::held_here(&key), "外层走了要清干净");
+    // 清干净之后别的线程/下一次调用还能拿到。
+    super::dll_lock::enter_within(&key, "doc", Duration::from_millis(50))
+        .expect("释放后应可再次获取");
+}
+
+/// 占着不放 ⇒ 有界等待后交一条可读裁决，不是无限等。
+#[test]
+fn dll_lock_gives_up_with_a_readable_verdict() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let key = std::path::PathBuf::from(r"Z:\rupix-dll-lock\busy\c.dll");
+    let (tx, rx) = mpsc::channel();
+    let k = key.clone();
+    let holder = std::thread::spawn(move || {
+        let _g = super::dll_lock::enter_within(&k, "slow", Duration::from_secs(2))
+            .expect("占锁方应先拿到");
+        tx.send(()).expect("通知主线程");
+        std::thread::sleep(Duration::from_millis(200));
+    });
+    rx.recv_timeout(Duration::from_secs(2))
+        .expect("等占锁方就位");
+
+    let started = Instant::now();
+    let err = match super::dll_lock::enter_within(&key, "waiter", Duration::from_millis(60)) {
+        Ok(_) => panic!("锁被占着，不该拿到"),
+        Err(e) => e,
+    };
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(55),
+        "不许立刻放弃（要真等一会儿），实际 {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(1),
+        "有界等待必须真的收口，实际 {waited:?}"
+    );
+    assert!(err.contains("waiter"), "裁决要点名是哪个解码器：{err}");
+    assert!(err.contains("占用"), "裁决要说人话：{err}");
+    holder.join().expect("占锁方线程不该崩");
+}
+
+/// 不同 DLL 各解各的（粒度是"这一枚"，不是全局）。
+#[test]
+fn dll_lock_does_not_couple_two_different_dlls() {
+    use std::time::Duration;
+
+    let a = std::path::PathBuf::from(r"Z:\rupix-dll-lock\apart\a.dll");
+    let b = std::path::PathBuf::from(r"Z:\rupix-dll-lock\apart\b.dll");
+    let _ga = super::dll_lock::enter_within(&a, "one", Duration::from_secs(1)).expect("拿 A");
+    let gb =
+        super::dll_lock::enter_within(&b, "two", Duration::from_millis(20)).expect("拿 B 不该等 A");
+    drop(gb);
+    assert!(super::dll_lock::held_here(&a));
+    assert!(!super::dll_lock::held_here(&b));
+}
+
+/// 先来先得：后到的 C 不许插队到已排队 40 ms 的 B 前面。
+///
+/// 这条钉的是真机抓到的反例（`wait=5313.7ms`）：旧实现用 `try_lock` 轮询，持有者一笔解完
+/// 立刻回来抢下一笔（周转 <1 ms），而等待者睡在 4 ms 的间隔里 ⇒ 输家连输 5 笔。
+#[test]
+fn dll_lock_serves_waiters_in_arrival_order() {
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
+
+    let key = std::path::PathBuf::from(r"Z:\rupix-dll-lock\fair\a.dll");
+    let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let holder =
+        super::dll_lock::enter_within(&key, "holder", Duration::from_secs(2)).expect("持锁方先拿");
+
+    let (tx, rx) = mpsc::channel();
+    let b = {
+        let key = key.clone();
+        let order = Arc::clone(&order);
+        std::thread::spawn(move || {
+            tx.send(()).expect("报告即将入队");
+            let _g =
+                super::dll_lock::enter_within(&key, "B", Duration::from_secs(5)).expect("B 应拿到");
+            order.lock().unwrap().push("B");
+        })
+    };
+    rx.recv_timeout(Duration::from_secs(2)).expect("等 B 就位");
+    // 60 ms 足够 B 走完"领票 + 入队"；留得太短会让这条用例在慢机器上偶发假红。
+    std::thread::sleep(Duration::from_millis(60));
+    let c = {
+        let key = key.clone();
+        let order = Arc::clone(&order);
+        std::thread::spawn(move || {
+            let _g =
+                super::dll_lock::enter_within(&key, "C", Duration::from_secs(5)).expect("C 应拿到");
+            order.lock().unwrap().push("C");
+        })
+    };
+    std::thread::sleep(Duration::from_millis(40));
+    drop(holder);
+    b.join().expect("B 线程不该崩");
+    c.join().expect("C 线程不该崩");
+
+    assert_eq!(
+        *order.lock().unwrap(),
+        vec!["B", "C"],
+        "先入队者先拿锁（旧实现会退化成 B、C 赛跑）"
+    );
+}
+
+/// 放弃的等待者必须把票摘走，否则队伍会卡在一张没人认领的票上。
+#[test]
+fn dll_lock_abandoned_waiter_does_not_block_the_queue() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let key = std::path::PathBuf::from(r"Z:\rupix-dll-lock\abandon\a.dll");
+    // 持锁方必须在**另一条线程**上：同一线程再进一次是"重入"，压根不会去抢锁，
+    // 这条用例就变成了自证重入（第一版就是这么写错的，被自己抓到）。
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let holder = {
+        let key = key.clone();
+        std::thread::spawn(move || {
+            let _g = super::dll_lock::enter_within(&key, "holder", Duration::from_secs(2))
+                .expect("持锁方先拿");
+            ready_tx.send(()).expect("报告已持锁");
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        })
+    };
+    ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("等持锁方就位");
+
+    // B 预算 50 ms，注定超时；它的票此时排在队首。
+    let err = match super::dll_lock::enter_within(&key, "B", Duration::from_millis(50)) {
+        Ok(_) => panic!("锁被占着，B 不该拿到"),
+        Err(e) => e,
+    };
+    assert!(err.contains("占用"), "裁决要说人话：{err}");
+
+    // C 排在 B 后面（B 已放弃）。若 B 的票没摘掉，C 会一路等到自己 2 s 预算耗尽。
+    let started = Instant::now();
+    let c = {
+        let key = key.clone();
+        std::thread::spawn(move || {
+            let _g = super::dll_lock::enter_within(&key, "C", Duration::from_secs(2))
+                .expect("C 应拿到：队首那张票已经被摘掉");
+        })
+    };
+    std::thread::sleep(Duration::from_millis(30));
+    release_tx.send(()).expect("通知持锁方放手");
+    c.join().expect("C 线程不该崩");
+    holder.join().expect("持锁方线程不该崩");
+    let waited = started.elapsed();
+    assert!(
+        waited < Duration::from_secs(1),
+        "C 只该等持锁方放手（~30 ms），实际 {waited:?}"
+    );
+}

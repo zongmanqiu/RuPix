@@ -62,6 +62,7 @@ pub mod plugin_settings;
 pub mod raw_dialog;
 pub mod recovery_hint;
 pub mod settings;
+pub mod singleton;
 pub mod svg;
 pub mod text_window;
 pub mod tray;

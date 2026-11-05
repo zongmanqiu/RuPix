@@ -7,7 +7,7 @@
 //! Then it exercises the **dynamic hotkey** path: the plugin is copied into the
 //! exe-adjacent `plugins/` directory (that is where the host discovers plugins),
 //! and the same plugin is started again through its manifest-declared shortcut.
-//! This is a probe, not a hosted extension; the plugin source lives in RuPix-Plugin.
+//! This is a probe, not a hosted extension; plugin sources live in another repo.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

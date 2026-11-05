@@ -424,6 +424,16 @@ pub(super) struct Drag {
     pub(super) origin: (f32, f32),
 }
 
+/// 目录重扫的取证开关（`RUPIX_DIR_TRACE=1`），只问系统一次。
+///
+/// 为什么要有这个闸：重扫发生在 UI 线程上，而多开之后**每扇窗各自扫一遍同一目录**——
+/// 这行的作用就是让"N 扇窗 ⇒ N 条、总耗时 N 倍"从推断变成读数（见 `build/dir_rescan_probe.ps1`）。
+/// 平时关着：目录批量变动时它会是每 50 ms 一条，默认日志里全是噪音。
+pub(super) fn dir_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RUPIX_DIR_TRACE").is_some())
+}
+
 mod edited;
 mod nav;
 mod overlay;

@@ -561,11 +561,44 @@ impl Queue {
         self.closed.store(1, Ordering::Relaxed);
         self.have.notify_all();
     }
+
+    /// 关闭**并丢掉还没开始的请求**。
+    ///
+    /// 窗口关掉之后没有人会收这些结果：留着它们，监督者会一笔一笔解完（几十秒的 CPU），
+    /// 而且同格式的**其它窗口**得陪它排队——m230 的 S3 臂就是这么抓到的：关掉一扇窗后，
+    /// 队列里还剩 4 条，看门狗在 10 s 后仍报 `pending=4 run_ms=-1 phase=idle`。
+    ///
+    /// 与 [`Queue::close`] 分开是有意的：`close` 的语义只是"不再收新请求、排空即退出"，
+    /// 好几条队列用例依赖它；"连没开始的也不要"只发生在句柄真的没了的时候。
+    fn discard_pending(&self) -> usize {
+        // 先清队列再关闭：`close` 会唤醒等着的监督者，反过来写的话它醒来可能先取走一条
+        // 本该丢掉的请求（窗口已经没了，谁也收不到那个结果）。
+        //
+        // 这里逐笔 `note_done`；**正在解的那一笔**由 `Decoder::drop` 按 owner 一次销账
+        // （那一笔已经出队，队列里找不着它）。
+        let dropped: Vec<u64> = {
+            let mut q = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let seqs: Vec<u64> = q.iter().map(|r| r.seq).collect();
+            q.clear();
+            seqs
+        };
+        for &seq in &dropped {
+            crate::core::decode_watchdog::note_done(seq);
+        }
+        self.close();
+        dropped.len()
+    }
 }
+
+/// 每份 `Decoder`（= 每扇窗）一个进程内编号：看门狗账是全局表，靠它分格
+/// （窗口关掉时按 owner 一次销账，见 `decode_watchdog::forget_owner`）。
+static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 
 /// 解码器句柄（UI 线程侧）。廉价可克隆，放进 `Rc` 共享。
 pub struct Decoder {
     queue: Arc<Queue>,
+    /// 本句柄（= 本窗口）在看门狗账上的编号。
+    owner: u64,
     next_seq: Cell<u64>,
     /// 最新主画面 `Main` 请求的 seq。decode_loop 见到 `Main`/`Prefetch` 且
     /// seq 小于此值即作废（早退发 Err Done），避免过期请求排全量解码队。
@@ -575,9 +608,21 @@ pub struct Decoder {
 
 impl Drop for Decoder {
     /// 句柄没了 = 不会再有人发请求，让解码线程从 `wait` 上醒来自收（否则它永远
-    /// 挂着，线程与队列成进程内的僵尸）。
+    /// 挂着，线程与队列成进程内的僵尸）。**未开始的那几条一并丢掉**：窗口都关了，
+    /// 解完也没人收，而同格式的其它窗口还要陪它们排队（m230 S3 实测）。
     fn drop(&mut self) {
-        self.queue.close();
+        let dropped = self.queue.discard_pending();
+        // 还挂在账上的只剩**正在解的那一笔**：它的结果发给一个已经关掉的通道，没人
+        // 收得着 `note_done`，所以按窗口销账（m232）。不摘它，看门狗 10 s 后就为一张
+        // "窗口都关了的图"报警——纯噪声最坏的后果是教人学会忽略真告警。
+        let forgotten = crate::core::decode_watchdog::forget_owner(self.owner);
+        log::info!(
+            "[queue-discard] owner={} dropped={} forgotten={} rest={}",
+            self.owner,
+            dropped,
+            forgotten,
+            crate::core::decode_watchdog::pending_count()
+        );
     }
 }
 
@@ -605,6 +650,7 @@ impl Decoder {
             .unwrap_or_else(|e| panic!("启动解码线程失败：{e}"));
         Self {
             queue,
+            owner: NEXT_OWNER.fetch_add(1, Ordering::Relaxed),
             next_seq: Cell::new(1),
             main_floor,
         }
@@ -742,7 +788,7 @@ impl Decoder {
         } else {
             // 看门狗登记（P1.1 C1）：这笔在途要等一个回包，回包不到就是"卡住了"的
             // 现场证据。销账在 `drain_decode`（回包的唯一消费口）。
-            crate::core::decode_watchdog::note_sent(seq, kind, &path);
+            crate::core::decode_watchdog::note_sent(seq, kind, &path, self.owner);
         }
         seq
     }
@@ -981,7 +1027,10 @@ pub fn set_decode_timeout(secs: u64) {
 }
 
 /// 当前单笔解码超时。`None` = 关掉了恢复机制（无限等）。
-fn decode_timeout() -> Option<Duration> {
+///
+/// 解码器 DLL 那把"同一枚串行"的锁也读它（`decoders::dll_lock`）：宿主对"一次解码最多等多久"
+/// 只该有一个定义，两处各写一个数就是第二正本。
+pub fn decode_timeout() -> Option<Duration> {
     match DECODE_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed) {
         0 => None,
         ms => Some(Duration::from_millis(ms)),
@@ -1558,6 +1607,29 @@ mod tests {
         }
         q.close();
         q
+    }
+
+    /// 关窗（`Decoder` 释放）后，队列里**还没开始**的请求要一起丢掉。
+    ///
+    /// m230 的 S3 臂实测：关掉一扇窗之后仍有 4 条请求卡在队列里，看门狗 10 s 后还在报
+    /// `pending=4 run_ms=-1 phase=idle`——没人收结果，同格式的另一扇窗还得陪它们排。
+    #[test]
+    fn discarding_a_closed_queue_drops_queued_requests() {
+        let q = Arc::new(Queue::new());
+        let before = crate::core::decode_watchdog::pending_count();
+        for (seq, kind) in [(1u64, ReqKind::Main), (2, ReqKind::Prefetch)] {
+            let r = req(seq, kind);
+            // 入队时 `Decoder::send` 会记这一笔；这里手工记，模拟"已经进了看门狗账"。
+            crate::core::decode_watchdog::note_sent(r.seq, r.kind, &r.path, 0);
+            assert!(q.push(r), "关窗前入队必须成功");
+        }
+        q.discard_pending();
+        assert!(q.pop().is_none(), "关窗后不该再解没人要的图");
+        assert_eq!(
+            crate::core::decode_watchdog::pending_count(),
+            before,
+            "丢弃的请求必须同时从看门狗账上销掉（否则 10 s 后会为关掉的窗口报警）"
+        );
     }
 
     /// 主画面插队：先塞两张缩略图，随后到的 `Main` 必须先被取走。

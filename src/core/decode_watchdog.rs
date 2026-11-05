@@ -57,6 +57,12 @@ pub struct Pending {
     pub seq: u64,
     pub kind: ReqKind,
     pub path: PathBuf,
+    /// 发这笔的那扇窗（`Decoder` 的进程内编号）。
+    ///
+    /// 窗口关掉时按它一次性销账（[`forget_owner`]）：关掉的窗没有接收端，最后一笔的
+    /// `Err Done` 没人收，账会一直挂到 10 s 后报警——m231 的 S3 臂实测到的那条
+    /// `pending=1 run_ms=-1 phase=idle` 就是它。0 = 不属于任何窗口（测试 / 无主）。
+    pub owner: u64,
     /// 发出时刻。
     pub at: Instant,
     /// **解码线程把它取走**的时刻（`None` = 还在队里排着）。
@@ -89,8 +95,8 @@ pub struct WatchdogReport {
 /// 才可能被别的线程看见——所以用 Mutex，但持有时间极短）。
 static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
 
-/// 登记一笔在途请求（`Decoder::send` 调）。
-pub fn note_sent(seq: u64, kind: ReqKind, path: &std::path::Path) {
+/// 登记一笔在途请求（`Decoder::send` 调）。`owner` = 哪扇窗发的（见 [`Pending::owner`]）。
+pub fn note_sent(seq: u64, kind: ReqKind, path: &std::path::Path, owner: u64) {
     let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
     if g.len() >= MAX_PENDING {
         // 丢最老的一笔：它多半已经报过了，留着只会让 pending 计数虚高。
@@ -100,6 +106,7 @@ pub fn note_sent(seq: u64, kind: ReqKind, path: &std::path::Path) {
         seq,
         kind,
         path: path.to_path_buf(),
+        owner,
         at: Instant::now(),
         begin: None,
         reported: 0,
@@ -120,6 +127,21 @@ pub fn note_done(seq: u64) {
     if let Some(i) = g.iter().position(|p| p.seq == seq) {
         g.remove(i);
     }
+}
+
+/// 按窗口销账：把这扇窗名下**所有**在途都摘掉，返回摘了几条。
+///
+/// 只用于「窗口没了」这一种情形（`Decoder::drop`）。平时一笔一笔走 [`note_done`]：
+/// 那条路是"收到回包"，这里是"永远不会有回包了"。
+///
+/// ★ 与 [`Queue::discard_pending`](crate::core::decode::Queue) 的分工：那边清的是
+/// **还没开始**的请求，这边连**正在解的那一笔**一起摘——它的结果会发给一个已经关掉的
+/// 通道，谁也收不着，账不摘掉就只能在 10 s 后变成一条假告警。
+pub fn forget_owner(owner: u64) -> usize {
+    let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    let before = g.len();
+    g.retain(|p| p.owner != owner);
+    before - g.len()
 }
 
 /// 当前在途条数（诊断用）。
@@ -216,6 +238,8 @@ mod tests {
             seq,
             kind: ReqKind::Main,
             path: PathBuf::from(format!("C:\\{seq}.png")),
+            // 无主（0）：这些用例只验判定，不管窗口归属。
+            owner: 0,
             at: now - Duration::from_millis(age_ms),
             // 已被取走 → 全部记在解码耗时上；排队那一段另有 `run_ms=None` 的用例。
             begin: Some(now - Duration::from_millis(age_ms)),
@@ -275,6 +299,7 @@ mod tests {
             seq: 7,
             kind: ReqKind::Main,
             path: PathBuf::from("q.png"),
+            owner: 0,
             at: now - Duration::from_millis(12_000),
             begin: None,
             reported: 0,
@@ -287,7 +312,7 @@ mod tests {
     /// 取件之后才开始算解码耗时：同一笔在 `note_picked` 之后必须报出 `run_ms`。
     #[test]
     fn note_picked_starts_the_decode_clock() {
-        note_sent(9003, ReqKind::Main, std::path::Path::new("y.png"));
+        note_sent(9003, ReqKind::Main, std::path::Path::new("y.png"), 0);
         {
             let g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
             let p = g.iter().find(|p| p.seq == 9003).expect("应已登记");
@@ -305,12 +330,27 @@ mod tests {
     /// 销账即停：登记 → 销账 → 不再报。
     #[test]
     fn done_clears_the_entry() {
-        note_sent(9001, ReqKind::Main, std::path::Path::new("C:\\x.png"));
+        note_sent(9001, ReqKind::Main, std::path::Path::new("C:\\x.png"), 0);
         assert!(pending_count() >= 1);
         note_done(9001);
         // 销账后这张图不该再被报出来。
         let threshold = Duration::from_millis(10_000);
         let mut v: Vec<Pending> = Vec::new();
         assert!(watchdog_due(&mut v, threshold, Instant::now()).is_none());
+    }
+
+    /// 关窗销账：只清这一扇窗的，别人的一条都不许动。
+    #[test]
+    fn forget_owner_clears_only_that_window() {
+        note_sent(9101, ReqKind::Main, std::path::Path::new("a.png"), 77);
+        note_sent(9102, ReqKind::Prefetch, std::path::Path::new("b.png"), 77);
+        note_sent(9103, ReqKind::Main, std::path::Path::new("c.png"), 88);
+        assert_eq!(forget_owner(77), 2, "77 号窗的两笔都要销掉");
+        {
+            let g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(g.iter().all(|p| p.owner != 77), "77 号窗不该再留账");
+            assert!(g.iter().any(|p| p.seq == 9103), "88 号窗的那笔必须还在");
+        }
+        note_done(9103);
     }
 }

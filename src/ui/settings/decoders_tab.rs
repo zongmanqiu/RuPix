@@ -442,6 +442,8 @@ pub fn open_decoder_info(
     // 内容，也不因固定高留大片空白。仍 `.resizable(true)`，用户可手动改。
     ctx.open_window(
         Window::new("解码器信息", 520, 400)
+            // 信息窗客户区恒白（标题栏由系统绘制，不在其内）：与插件信息窗同款。
+            .bg(to_color(BG))
             .fit_content(260, 1100)
             .resizable(true)
             .centered(true)
@@ -534,6 +536,10 @@ pub mod tests {
             card_keys: sig(true),
             card_mouse: sig(true),
             card_plugins: sig(true),
+            card_appearance: sig(true),
+            card_window: sig(true),
+            card_browse: sig(true),
+            card_system: sig(true),
 
             ui_theme: signal(0),
             download_source: signal(0),

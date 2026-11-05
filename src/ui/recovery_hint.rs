@@ -35,6 +35,8 @@ use std::path::PathBuf;
 use windui::core::EventCtx;
 use windui::prelude::*;
 
+use super::tokens::{to_color, BG};
+
 /// 会话戳残留时的启动提示。`log_path` 允许为 `None`（只读介质下崩溃钩子写不进日志，
 /// 但会话戳本身也写不进——真到那一步 `take_prior_aborted` 也返回 false，这里进不来）。
 pub fn show(ctx: &mut EventCtx, log_path: Option<PathBuf>) {
@@ -59,6 +61,8 @@ pub fn show(ctx: &mut EventCtx, log_path: Option<PathBuf>) {
     // 上次会话那两行"变化，写死的高度要么截掉线索要么留一大片空白。
     ctx.open_window(
         Window::new("RuPix 上次异常退出", 460, 200)
+            // 信息窗客户区恒白（标题栏由系统绘制，不在其内）。
+            .bg(to_color(BG))
             .resizable(false)
             .centered(true)
             .owned(true)

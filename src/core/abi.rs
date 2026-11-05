@@ -6,7 +6,7 @@
 //!
 //! 1. **不要在宿主这边改 `vendor/rupix-abi/src/lib.rs`**。改了下次同步被覆盖，
 //!    而解码器侧仍是旧布局——表现是宿主按错误长度分配像素缓冲、解码器越界写。
-//!    下面 `abi_snapshot_matches_upstream_when_present` 会把这种漂移跑成测试红灯。
+//!    下面 `abi_snapshot_matches_upstream_when_configured` 会把这种漂移跑成测试红灯。
 //! 2. 要改契约，去解码器仓库改 `abi/src/lib.rs`，然后**把那一份文件整份复制**到这里：
 //!    `main/vendor/rupix-abi/src/lib.rs`（覆盖、不编辑），并按 ABI 冻结规则决定是否 bump
 //!    `IV_ABI_VERSION`（bump 必须用户拍板）。宿主侧不写同步脚本，解码器仓库的实际位置由维护者掌握。

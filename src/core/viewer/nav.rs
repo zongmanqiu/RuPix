@@ -194,9 +194,41 @@ impl Viewer {
         let Some(g) = self.gallery.as_ref() else {
             return false;
         };
-        let old_current = g.current().cloned();
-        let old_len = g.len();
-        let rescan = g.rescan();
+        let started = Instant::now();
+        let res = g.rescan();
+        self.apply_rescan(res, false, started)
+    }
+
+    /// 事件驱动的重扫：同一次文件变动会被**每扇窗各报一次**，这里只让第一扇窗真读盘。
+    ///
+    /// 为什么不把复用直接塞进 [`Self::rescan_dir`]：那个函数的语义是"现在去看这个目录"，
+    /// 一批既有用例直接调它来验"删掉文件后清单跟着变"。缓存只在**明确知道这是同一批事件**
+    /// 的这条路上生效，两条路互不污染（`rescan_never_serves_a_stale_batch` 钉着这一点）。
+    pub fn rescan_dir_shared(&mut self) -> bool {
+        let Some(g) = self.gallery.as_ref() else {
+            return false;
+        };
+        let started = Instant::now();
+        let dir = g.dir().to_path_buf();
+        let (res, shared) = match crate::core::gallery::listing_for_event(&dir) {
+            Ok((files, scanned)) => (g.rescan_from(files), !scanned),
+            Err(e) => (Err(e), false),
+        };
+        self.apply_rescan(res, shared, started)
+    }
+
+    /// 两个入口共用的一段：拿新清单比对旧清单，决定要不要通知 UI 重绘 / 重解码。
+    ///
+    /// `shared` 只用于取证行（这次是复用了别人的扫描，还是自己读的盘）。
+    fn apply_rescan(
+        &mut self,
+        rescan: crate::core::error::ViewResult<Gallery>,
+        shared: bool,
+        started: Instant,
+    ) -> bool {
+        // 旧值必须在 `self.gallery = Some(rebuilt)` 之前取。
+        let old_current = self.gallery.as_ref().and_then(|g| g.current().cloned());
+        let old_len = self.gallery.as_ref().map_or(0, |g| g.len());
         let rebuilt = match rescan {
             Ok(g) => g,
             // 目录还在、但一张图都没有了：不能继续显示已经删掉的那张（标题/分母/
@@ -225,6 +257,23 @@ impl Viewer {
             self.prefetch_stopped = false;
             self.request_prefetch();
             self.bump_image_gen();
+        }
+        // 一行取证（闸见 `viewer::dir_trace`）：多开时**每扇窗各来一条**，条数就是重扫次数，
+        // `shared=1` 表示这一条没有读盘。`total` 含本窗自己的比较/预取重排。
+        if super::dir_trace() {
+            let dir = self
+                .gallery
+                .as_ref()
+                .map(|g| g.dir().display().to_string())
+                .unwrap_or_default();
+            log::info!(
+                "[dir-rescan] dir={} files={} total={:.2}ms changed={} shared={}",
+                dir,
+                self.gallery.as_ref().map_or(0, |g| g.len()),
+                started.elapsed().as_secs_f64() * 1000.0,
+                u8::from(list_changed),
+                u8::from(shared)
+            );
         }
         list_changed
     }

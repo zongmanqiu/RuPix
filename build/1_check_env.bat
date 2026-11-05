@@ -9,6 +9,8 @@ REM   powershell     - step 3 runs RuPix-Decoder\build.ps1
 REM   .3rd\windui    - the local path dependency. MISSING IS AN ERROR here
 REM                    (unlike CurSeen: our .3rd is a checked-in local copy,
 REM                    there is no download step to repair it).
+REM   .3rd\usvg      - same rule; it reaches cargo via [patch.crates-io],
+REM                    so a missing copy fails as a patch error, not a path error.
 REM   RuPix-Decoder\     - the decoder workspace; missing members fail step 3.
 REM
 REM This script changes NOTHING on disk. It only reports.
@@ -21,7 +23,7 @@ setlocal enabledelayedexpansion
 
 call "%~dp0_common.bat"
 if %ERRORLEVEL% neq 0 (
-    pause
+    if not "!RUPIX_CHAINED!"=="1" pause
     exit /b 1
 )
 
@@ -93,6 +95,16 @@ if exist "%PROJECT_ROOT%\.3rd\wind-ui-rust-0.23.0\Cargo.toml" (
 ) else (
     echo   [ERROR] missing .3rd\wind-ui-rust-0.23.0 - main\Cargo.toml path
     echo           dependency cannot resolve; restore it from a snapshot
+    set "ENV_FAIL=1"
+)
+
+REM ---- usvg (patched crate, [patch.crates-io]) -----------------------------
+if exist "%PROJECT_ROOT%\.3rd\usvg-0.48.1\Cargo.toml" (
+    echo   [OK] .3rd\usvg-0.48.1
+) else (
+    echo   [ERROR] missing .3rd\usvg-0.48.1 - main\Cargo.toml patches
+    echo           this crate via [patch.crates-io]; a stale copy shows up as
+    echo           a patch error, not a missing path. Restore from a snapshot
     set "ENV_FAIL=1"
 )
 

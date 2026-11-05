@@ -1,11 +1,11 @@
 //! 真实打开路径的解码基准：文件 → `decode::probe_decode`（解码器优先）→ RGBA。
 //!
-//! 与 `bench_core`（RuPix-Decoder 里，库函数直调）互补：这个量的是用户真正
+//! 与解码器侧的 `bench_core`（库函数直调）互补：这个量的是用户真正
 //! 花掉的时间——目录扩展名认领、DLL 自述路由、两阶段 ABI 调用全算在内。
 //!
 //! 跑法（从 main 目录）：
 //! ```text
-//! cargo run --release --example gen_samples -- ../.temp/samples   # 在 RuPix-Decoder 下
+//! # 样本先由解码器侧的 gen_samples 生成到工作区临时区（那个 example 不在本仓）
 //! cargo run --release --example bench_decode -- ..\.temp\samples\bench.*
 //! ```
 //!

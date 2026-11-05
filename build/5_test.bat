@@ -26,7 +26,7 @@ setlocal enabledelayedexpansion
 
 call "%~dp0_common.bat"
 if %ERRORLEVEL% neq 0 (
-    pause
+    if not "!RUPIX_CHAINED!"=="1" pause
     exit /b 1
 )
 
@@ -58,14 +58,14 @@ python "%~dp0layering_scan.py"
 if !ERRORLEVEL! neq 0 (
     echo.
     echo   [ERROR] layering scan failed
-    pause
+    if not "!RUPIX_CHAINED!"=="1" pause
     exit /b 1
 )
 python "%~dp0hygiene_scan.py"
 if !ERRORLEVEL! neq 0 (
     echo.
     echo   [ERROR] hygiene scan failed
-    pause
+    if not "!RUPIX_CHAINED!"=="1" pause
     exit /b 1
 )
 
@@ -75,7 +75,7 @@ cargo test --release -- --test-threads=1
 if !ERRORLEVEL! neq 0 (
     echo.
     echo   [ERROR] tests failed
-    pause
+    if not "!RUPIX_CHAINED!"=="1" pause
     exit /b 1
 )
 

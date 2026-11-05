@@ -1,6 +1,6 @@
 # RuPix 宿主（main）项目规则（AGENTS.md）
 
-本文件对 `E:\tmp\AI.Agent\RuPix\main` 工作文件夹生效。任何 AI 工具在此文件夹工作时必须遵守。
+本文件对宿主仓 `main/` 工作文件夹生效（只用相对路径书写，不写任何本机的绝对路径）。任何 AI 工具在此文件夹工作时必须遵守。
 
 > 解码器工作区是独立 cargo workspace，规则与文档都在它自己的仓库内，不在本文件展开。
 > 宿主只认 `vendor/rupix-abi` 这份逐字节快照；快照更新由维护者从解码器仓库人工复制，宿主不在代码或文档里链接解码器仓库。
@@ -80,6 +80,7 @@ python build\hygiene_scan.py      # 硬编路径 / 调试残留 / TODO 真标记
                                   # `.ps1` 必须纯 ASCII（PS 5.1 按 ANSI 读无 BOM 的 .ps1，中文注释会坏到邻近语句上，K27）/
                                   # ui 层色值只认 `ui/tokens.rs`（禁字面色值 `Color::rgb(`/`rgba(`）/
                                   # ui 层内跨模块引用一律经 `super::`（禁 `crate::ui::`，中枢在 `ui/mod.rs`）/
+                                  # 单例窗不许同键既关又开（close_window 是投递、open_window 是即时，K196）/
                                   # 无密钥/无隐私（私钥块 / 访问令牌 / URL 内嵌凭据 / 口令字面量 / 私人邮箱 / 含真名的本机路径）；
                                   # violations: 0 才算过。★ 写 `.ps1` 注释一律英文；解码器仓同款判据在
                                   # 解码器仓库的 `check_docs.py`
@@ -125,7 +126,7 @@ python build\hygiene_scan.py      # 硬编路径 / 调试残留 / TODO 真标记
 > **禁止**把 `main/` 文件复制到 `.3rd/`；反向也不允许（第三方库的修改要先登记补丁再重放：
 > windui 见 `patches/PATCHES.md`，usvg 见 `patches/usvg-0.48.1/PATCHES.md`，编号只增）。
 > ★ 解码器侧也有一个补丁副本：`.3rd/emfsdk-0.2.0`（只服务 `doc` 解码器的 `doc-emf` 成员，
-> 与插件通道无关）。它的公开登记在解码器仓 `RuPix-Decoder/patches/emfsdk-0.2.0/`，
+> 与插件通道无关）。它的公开登记在解码器侧仓库自己的 `patches/emfsdk-0.2.0/`（那份登记不在本仓），
 > 不归本文件的 `patches/` 管——宿主仓只记"它在、谁在用"；上游核对日期由解码器仓
 > `tools/check_patches.py` 每 90 天逼一次（只核补丁结构与路径，不记哈希）。
 
@@ -179,7 +180,7 @@ RuPix/
 └─ .temp/              ★ **构建期**临时与编译中间产物（宿主 `target/`、解码器 `decoder-target/`、日志 / 探针 / 样本）；运行时缓存不落这里（见下便携铁律）
 ```
 
-**便携铁律**：不往外部（`%APPDATA%` 等）写任何文件；持久化唯一落点 = exe 同级（`core::paths` 的 `OnceLock`）——**用户会打开看的**留根目录（`rupix.ini`、`decoders/`），**只用来取证的**收进 exe 旁的 `temp\`（按天命名、7 天清理）：运行日志 `rupix-<YYYY-MM-DD>.log`、崩溃报告 `crash-<YYYY-MM-DD>.log`、转储 `crash-<YYYY-MM-DD-HHMMSS>.dmp`、会话戳 `rupix.run`；诊断物一律**按天命名**，启动时删掉**文件名日期**早于 7 天前的（`core::paths::KEEP_DAYS`，认不出日期的名字一律不删；**硬删、不进回收站**——回收站只兜用户自己的资产，见 `platform::recycle`）；**纯提速件**（丢了只损失速度、不损失证据，如 SVG 字体索引缓存 `cache\svg-fonts.bin`）收进 exe 旁的 `cache\`（`core::paths::cache_dir`；2026-11-01 用户裁定不得混进 temp；不参与按天清理）；**解码结果只在内存，不落盘**（磁盘解码缓存 2026-10-19 撤除，理由见 `HISTORY.md` 与 K68）；写失败 = 只读介质 → 静默降级为纯内存会话（只 warn）。仓库根 `.temp/` 是**构建期**临时区，与这里的运行时落点是两回事。
+**便携铁律**：不往外部（`%APPDATA%` 等）写任何文件；持久化唯一落点 = exe 同级（`core::paths` 的 `OnceLock`）——**用户会打开看的**留根目录（`rupix.ini`、`decoders/`、`plugins/`、随包的 `docs/decoders.json` 与 `docs/plugins.json`），**只用来取证的**收进 exe 旁的 `temp\`（按天命名、7 天清理）：运行日志 `rupix-<YYYY-MM-DD>.log`、崩溃报告 `crash-<YYYY-MM-DD>.log`、转储 `crash-<YYYY-MM-DD-HHMMSS>.dmp`、会话戳 `rupix.run`；诊断物一律**按天命名**，启动时删掉**文件名日期**早于 7 天前的（`core::paths::KEEP_DAYS`，认不出日期的名字一律不删；**硬删、不进回收站**——回收站只兜用户自己的资产，见 `platform::recycle`）；**纯提速件**（丢了只损失速度、不损失证据，如 SVG 字体索引缓存 `cache\svg-fonts.bin`）收进 exe 旁的 `cache\`（`core::paths::cache_dir`；2026-11-01 用户裁定不得混进 temp；不参与按天清理）；**解码结果只在内存，不落盘**（磁盘解码缓存 2026-10-19 撤除，理由见 `HISTORY.md` 与 K68）；写失败 = 只读介质 → 静默降级为纯内存会话（只 warn）。仓库根 `.temp/` 是**构建期**临时区，与这里的运行时落点是两回事。
 
 **桌面诊断铁律**（总纲元原理 E：进程跑在别人机器上，没有运维也没有 stdout）：
 `temp\rupix-<今天>.log` 每次启动必须由 `platform::env_report::startup_preamble()` 先写一段会话头
@@ -213,7 +214,7 @@ cost=…ms bitmap=…`、`[decode-req] kind=… tier=… verdict=…`、`[close]
   由 ini 的 `decoder_index_gitee` / `decoder_index_github` 决定（默认值见
   `crate::core::config::SourceId::index_url`，**别在别处再写一遍**）。★ **两个 owner 不同**
   （Gitee `qiuzongman` / GitHub `zongmanqiu`），清单 URL 各自写死；★ **仓库名是复数
-  `RuPix-Decoders`**（本地目录仍是单数 `RuPix-Decoder/`，2026-10-28 实测单数地址两个镜像都 404）。
+  `RuPix-Decoders`**（本地工作区的目录名是单数，两者不是一回事；2026-10-28 实测单数地址两个镜像都 404）。
   下载列由清单的 `gitee` / `github` 两列提供（`make_index.py` 推导时主机名与 owner **一起换**）。
   GitHub release 资产要单独上传；上传前 GitHub 下载列会 404，`check_urls.py` 会如实报错；
 - 选哪个来源**同时决定两件事**（用户 2026-10-26 方案）：去哪拉清单，以及每枚 DLL 用清单里哪一列
@@ -283,9 +284,9 @@ cost=…ms bitmap=…`、`[decode-req] kind=… tier=… verdict=…`、`[close]
 ## 五、解码器 ABI 契约（硬性，勿擅改）
 
 - **ABI 现行 v6，v5 是签名冻结下界**（2026-10-26 拍板术语清理 = v5 冻结点，v4 及更早拒载；2026-10-28 拍板 v6 区域渲染 = 加法式：只新增可选导出 `iv_render_region` + 新结构体 `IvRegionReq` + 能力位 `CAP_REGION`，v5 的导出签名与结构体布局逐字节未动）。宿主只认 `vendor/rupix-abi` 这份逐字节快照；快照更新由维护者从解码器仓库人工复制覆盖（两边都不放同步脚本）。结构体布局靠编译期 `size_of` 断言钉死。
-- 导出：必需 `iv_abi_version` / `iv_decoder_info` / `iv_probe` / `iv_render` / `iv_last_error`；可选（`GetProcAddress` 探测，缺席 = 缺能力，不是错误）`iv_render_raw` / `iv_caps` / `iv_metadata` / `iv_export_svg` / `iv_render_region`。C-ABI、cdylib、`#[repr(C)]`。
+- 导出：必需 `iv_abi_version` / `iv_decoder_info` / `iv_probe` / `iv_render` / `iv_last_error`；可选（`GetProcAddress` 探测，缺席 = 缺能力，不是错误）`iv_render_raw` / `iv_caps` / `iv_metadata` / `iv_render_region`。★ `iv_export_svg` **已退役**（矢量导出的那条路线整条撤了）：符号按冻结规矩留在契约里，但宿主不再探测、不再调用，它归 `core::abi::ABI_RETIRED_SYMBOLS`，生产代码里再出现这个名字 = 依赖面冻结测试判红。C-ABI、cdylib、`#[repr(C)]`。
 - **版本区间判定**：`MIN_ABI_VERSION(=5) ≤ 解码器 ≤ IV_ABI_VERSION(=6)`。低于下界和高出宿主一律拒载。**兼容是单向的**：v5 老 DLL 在 v6 宿主上照常收载（下界锁死不许抬），v6 DLL 在只认到 v5 的旧宿主上被拒。
-- ★ **兼容性立约（永久条款，2026-10-28 用户拍板）**：**ABI 永远兼容旧版本 DLL，新 ABI 不得影响旧 DLL 的运行** ⇒ 宿主升级后，用户机器上的旧 DLL **不需要重新编译、不需要重新上传**。可判决的五条：(a) 已发布导出名 / 参数顺序 / 返回类型、`#[repr(C)]` 结构体字段名·类型·顺序、`ERR_*` / `PF_*` / `CAP_*` / `REQ_*` 编号**只增不改号**；(b) 新能力只走「新可选导出 + 新结构体 + 新位 / 新枚举值」，宿主 `GetProcAddress` 探测、缺席 = 缺能力不是错误；(c) `MIN_ABI_VERSION` **永不抬**（现 5），`IV_ABI_VERSION` 只增不减；(d) 宿主不得因升级改变既有导出的调用语义（默认 `flags` / `req`、`target=0`、`out=NULL` 冻结）；(e) **"改结构体再 bump"这条路禁止**——v5 改名是唯一历史断点，之后不许再有。契约仓侧机器守约 = `tools/check_abi_freeze.py` 比对冻结指纹 `tools/abi_freeze.txt`（已接进解码器仓 `workspace/build.ps1`，改既有条目即红灯）。
+- ★ **兼容性立约（永久条款，2026-10-28 用户拍板）**：**ABI 永远兼容旧版本 DLL，新 ABI 不得影响旧 DLL 的运行** ⇒ 宿主升级后，用户机器上的旧 DLL **不需要重新编译、不需要重新上传**。可判决的五条：(a) 已发布导出名 / 参数顺序 / 返回类型、`#[repr(C)]` 结构体字段名·类型·顺序、`ERR_*` / `PF_*` / `CAP_*` / `REQ_*` 编号**只增不改号**；(b) 新能力只走「新可选导出 + 新结构体 + 新位 / 新枚举值」，宿主 `GetProcAddress` 探测、缺席 = 缺能力不是错误；(c) `MIN_ABI_VERSION` **永不抬**（现 5），`IV_ABI_VERSION` 只增不减；(d) 宿主不得因升级改变既有导出的调用语义（默认 `flags` / `req`、`target=0`、`out=NULL` 冻结）；(e) **"改结构体再 bump"这条路禁止**——v5 改名是唯一历史断点，之后不许再有。契约仓侧的冻结指纹门禁在它自己仓里（不在本仓、宿主不参与）；**本仓的机器凭据是本地两条**：`core::abi` 的依赖面冻结测试（`iv_*` 只能减不能加）+ 快照比对用例。
 - **宿主分配像素缓冲、解码器只写入**：彻底规避跨 DLL 释放崩溃。
 - **ext=NULL 嗅探约定**：`ext == NULL` 时解码器**只能按内容（魔数）认领**；无魔数格式（TGA）应返回 0。
 - **解码类型路由（v4 引入、v5/v6 继续保留的可选导出 `iv_caps`，2026-10-18）**：宿主选解码器的判据是
@@ -341,7 +342,7 @@ cost=…ms bitmap=…`、`[decode-req] kind=… tier=… verdict=…`、`[close]
   症状是「数据到了、行也重建了，就是看不见」（2026-10-12 解码器页实测）。
 - 正解：页面本体 `col().fill() … .child(list.weight(1.0))`，让 `list_signal` 自带的
   内部滚动去滚；重建子树含 weight 正文（表格）时换 `host_signal`。
-- 回归测试：`ui::settings::tests::decoders_page_rows_survive_layout`（无头 Tree 验高度）。
+- 回归测试：`ui::settings::decoders::tests::decoders_page_cards_survive_layout_and_scroll`（无头 Tree 验高度）。
 
 ### ★ windui：水平轴上的 `fill()` 会算进前面定宽的兄弟（K156）
 - `row` 里放 `[标签 width(208), 控件 fill()]`：控件量到的是**整条主轴**可用宽（不减标签那一格），
@@ -447,6 +448,17 @@ cost=…ms bitmap=…`、`[decode-req] kind=… tier=… verdict=…`、`[close]
      **移进回收站**（可还原、且解码器以后可联网重下）之后，确认态与说明行整段删掉。
      二次确认是"后果不可逆"的补丁；后果能撤，就别拿它烦用户。
    - 删提示前必查：删掉后该操作会不会变成"点了完全没反应"？若是，先把信息挪到常驻位置。
+8. **状态行纪律**（2026-10-29 用户裁定，解码器页与插件页共用同一套）：设置页两张下载卡的
+   红字状态行**只许下面这些句子**，其余一切细节（包名、来源名、错误码、错误原文、
+   "后台进行 / 装好自动启用"、跳过项计数）**只进日志**：
+   `N 个可下载` / `N 个可下载 · M 个可升级` / `匹配 K 个` / `已更新` / `更新中…` /
+   `更新失败` / `下载中…` / `下载失败` / `清单异常，请「刷新」`。
+   - 刷新只有成败两态：取到清单但写不进本地文件 = **失败**（不立"取到了没落盘"的第三态）。
+   - 默认 640px 设置窗里这一格只有 ≈392px（≈28 个汉字宽），长句会被 `truncate(End)` 吃掉；
+     `正在下载「包名」…（后台进行，装好自动启用）` 这类句子禁止再出现（2026-10-29 撤）。
+9. **对话框按钮纪律**（2026-10-29 用户裁定）：窗口底部按钮行必须 `flex_spacer` 右对齐、
+   **取消在最右**、按钮之间留 8px 间距（正本 `ui/raw_dialog.rs`：`[确定] [取消]`）。
+   禁止无间距并排、禁止把「取消」放在主按钮左边。
 
 ---
 
@@ -456,8 +468,8 @@ cost=…ms bitmap=…`、`[decode-req] kind=… tier=… verdict=…`、`[close]
 |---|---|---|---|
 | 1 | 分层体检 | `cd main` → `python build\layering_scan.py` | `violations: 0` |
 | 2 | 卫生体检 | `python build\hygiene_scan.py` | `violations: 0` |
-| 3 | 格式化 | `cargo fmt --check` | exit 0（**已被 `build\2_scan.bat` 第 [3/3] 步强制执行**；此前列而不行，2026-10-17 补） |
-| 4 | 静态检查 | `cargo clippy --all-targets --release -- -D warnings` | exit 0。★ **必须带 `-D warnings`**：不带的话 clippy 有 warning 也退 0，"exit 0" 就是假绿。此列曾长期"列而不行"（与第 3 行 fmt 同一个毛病），2026-10-19 起由 `build\2_scan.bat` 第 [4/5] 步强制执行 |
+| 3 | 格式化 | `cargo fmt --check` | exit 0（**已被 `build\2_scan.bat` 第 [3/6] 步强制执行**；此前列而不行，2026-10-17 补。★ 那一步一共 6 道：[1/6] 分层、[2/6] 卫生、[3/6] fmt、[4/6] clippy、[5/6] 结构文档新鲜度、[6/6] `dump_sym.py --selftest`） |
+| 4 | 静态检查 | `cargo clippy --all-targets --release -- -D warnings` | exit 0。★ **必须带 `-D warnings`**：不带的话 clippy 有 warning 也退 0，"exit 0" 就是假绿。此列曾长期"列而不行"（与第 3 行 fmt 同一个毛病），2026-10-19 起由 `build\2_scan.bat` 第 [4/6] 步强制执行 |
 | 5 | 宿主单测 | `cargo test --lib -- --test-threads=1` | 全部 passed |
 | 6 | 集成门禁 | `cargo test --release -- --test-threads=1` | 全部 passed（含 docs_consistency） |
 | 7 | 解码器构建 | 在解码器仓库根运行它自己的 `build.ps1` | 编译 + 测试 + 发布 DLL 全过 |

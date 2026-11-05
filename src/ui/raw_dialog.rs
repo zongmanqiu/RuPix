@@ -66,7 +66,12 @@ pub fn menu_enabled(path: Option<&Path>) -> bool {
     path.is_some_and(is_headerless_path)
 }
 
-static PENDING: std::sync::Mutex<VecDeque<PathBuf>> = std::sync::Mutex::new(VecDeque::new());
+/// 待弹参数窗的裸数据路径，**按主窗分格**：`(scope, path)`。
+///
+/// ★ 多开（m230 起）之后必须分格：一张全局队列会让"拖进 A 窗的裸文件"被 B 窗的轮询
+/// 先取走——参数确认后图开在 B 窗，用户看到的是"我拖进这扇窗，图却跑到另一扇"。
+static PENDING: std::sync::Mutex<VecDeque<(usize, PathBuf)>> =
+    std::sync::Mutex::new(VecDeque::new());
 
 /// 显式打开入口（命令行 / 拖拽 / 右键打开共用）。
 ///
@@ -99,7 +104,7 @@ pub fn open_path(viewer: &Rc<RefCell<Viewer>>, config: &Rc<RefCell<Config>>, pat
     PENDING
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push_back(path.to_path_buf());
+        .push_back((super::singleton::window_scope(viewer), path.to_path_buf()));
     let _ = config; // 与 open_params_window 共用签名；预填在弹窗时读。
 }
 
@@ -109,18 +114,28 @@ pub fn poll_pending(
     viewer: &Rc<RefCell<Viewer>>,
     config: &Rc<RefCell<Config>>,
 ) {
-    // 参数窗单实例（.single("raw-params")）：窗开着就先不取——取了也开不出第二个
-    // 窗，那条路径就永久丢了（旧实现无此守卫，连拖多个裸文件必丢中间的）。等关
-    // 窗后下一轮再弹；windui 对已登记的单窗如实报告开合状态。
-    if windui::event::window_open("raw-params") {
+    let scope = super::singleton::window_scope(viewer);
+    // 参数窗**每窗一份**（m232）：键带窗口标识，否则 B 窗的「RAW 参数…」会命中 A 窗
+    // 已经开着的那扇（平台对已登记的单例键只聚焦），用户点了像没反应。
+    //
+    // 单实例语义仍然成立：**本窗**参数窗开着就先不取——取了也开不出第二个窗，那条
+    // 路径就永久丢了（旧实现无此守卫，连拖多个裸文件必丢中间的）。等关窗后下一轮再弹。
+    if windui::event::window_open(&super::singleton::scoped("raw-params", scope)) {
         return;
     }
-    let next = PENDING
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .pop_front();
+    // 只取**自己窗**排的那条：别的窗排的队由它自己弹。
+    let next = {
+        let mut q = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        q.iter()
+            .position(|(s, _)| *s == scope)
+            .and_then(|i| q.remove(i))
+            .map(|(_, p)| p)
+    };
     if let Some(path) = next {
-        open_params_window(ctx, viewer, config, &path);
+        // 一行现场：参数窗是"被问出来的"，用户看不见它弹出来时，先要能分清是没排队、
+        // 被别的窗弹走了，还是排上了但没建出窗。
+        log::info!("[raw-dialog] ask scope={} file={}", scope, path.display());
+        open_params_window(ctx, viewer, config, &path, scope);
     }
 }
 
@@ -141,10 +156,11 @@ pub fn open_current_params(
         ctx.toast_err("当前格式有文件头，不需要裸数据参数");
         return;
     }
-    if windui::event::window_open("raw-params") {
+    let scope = super::singleton::window_scope(viewer);
+    if windui::event::window_open(&super::singleton::scoped("raw-params", scope)) {
         return;
     }
-    open_params_window(ctx, viewer, config, &path);
+    open_params_window(ctx, viewer, config, &path, scope);
 }
 
 /// 参数窗本体（单实例：连拖多个裸文件只留一个窗）。
@@ -153,6 +169,7 @@ fn open_params_window(
     viewer: &Rc<RefCell<Viewer>>,
     config: &Rc<RefCell<Config>>,
     path: &Path,
+    scope: usize,
 ) {
     // 预填优先级：本会话已确认值 > 本轮自动推断 > 上次使用值 > 空。
     // 布局再优先按后缀纠正——`noise.bgra` 不能因为上次开的是 RGBA8 就按 RGBA8 解。
@@ -220,7 +237,7 @@ fn open_params_window(
             .fit_content(DIALOG_FIT_MIN, 360)
             // 归属主窗：主窗置顶时参数窗不会被盖住（与设置窗同款处理）。
             .owned(true)
-            .single("raw-params")
+            .single(super::singleton::scoped("raw-params", scope))
             .content(move || {
                 let confirm = confirm.clone();
                 Element::col()
@@ -251,9 +268,42 @@ fn open_params_window(
     );
 }
 
+/// 主窗关掉时清掉它那一格的待办（`WinRt::close` 调）。
+///
+/// 不清会留一条**孤儿路径**：再也没有窗口会去弹它，而 scope 是 `Rc` 地址——将来若有
+/// 新窗恰好落到同一地址，一开窗就会平白弹出一个参数窗。窗口/队列那点内存不值得省，
+/// 这种"关掉的窗留下的动作"才是要防的。
+pub(crate) fn forget_window(scope: usize) {
+    let mut q = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    q.retain(|(s, _)| *s != scope);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 待办队列按窗口分格：清一扇窗的那格，另一扇窗的一条都不许动（m232）。
+    #[test]
+    fn pending_raw_queue_is_per_window_and_forgettable() {
+        PENDING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back((11, PathBuf::from("a.bgra")));
+        PENDING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back((22, PathBuf::from("b.bgra")));
+        forget_window(11);
+        let q = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            q.iter().all(|(s, _)| *s != 11),
+            "11 号窗关掉后它的待办要清干净（否则新窗可能捡到别人的图）"
+        );
+        assert!(
+            q.iter().any(|(s, _)| *s == 22),
+            "22 号窗还在排队，不许被别人的清理带走"
+        );
+    }
 
     #[test]
     fn menu_is_enabled_only_for_headerless_files() {

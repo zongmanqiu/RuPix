@@ -22,7 +22,7 @@ setlocal enabledelayedexpansion
 
 call "%~dp0_common.bat"
 if %ERRORLEVEL% neq 0 (
-    pause
+    if not "!RUPIX_CHAINED!"=="1" pause
     exit /b 1
 )
 
@@ -34,7 +34,7 @@ echo.
 cd /d "%EXT_DIR%"
 if !ERRORLEVEL! neq 0 (
     echo   [ERROR] cannot cd to %EXT_DIR%
-    pause
+    if not "!RUPIX_CHAINED!"=="1" pause
     exit /b 1
 )
 
@@ -42,7 +42,7 @@ if !ERRORLEVEL! neq 0 (
 if !ERRORLEVEL! neq 0 (
     echo.
     echo   [ERROR] RuPix-Decoder build/test/publish failed
-    pause
+    if not "!RUPIX_CHAINED!"=="1" pause
     exit /b 1
 )
 

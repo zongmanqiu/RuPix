@@ -238,11 +238,12 @@ pub fn show(ctx: &mut EventCtx, ext: &Extension, config: &Rc<RefCell<Config>>) {
     let hk_texts = hotkey_texts.clone();
     let cap = capturing;
     let bounds_ui = bounds.clone();
-    // ★ 先关旧窗： 只聚焦、**不重建**内容——快捷键页上改过值之后再点齿轮，
-    //   留在屏幕上的会是开窗那一刻的旧值（用户 2026-10-31 实测两处没同步就是这个）。
-    //   与 `text_window::show` 同一句、同一理由：单例窗的内容只能来自这一次的读盘。
-    let win_key = format!("plugin-settings:{id}");
-    ctx.close_window(win_key.clone());
+    // ★ 先关旧窗再开新窗，但**两个键必须不同**：`single` 已开时只聚焦、不重建内容
+    //   （快捷键页改过值之后再点齿轮，留在屏幕上的会是开窗那一刻的旧值）；而关窗是
+    //   投递、开窗是即时，同键既关又开会让滞留的 WM_CLOSE 把刚开出来的新窗收走
+    //   —— 2026-11-04 用户实测「齿轮点不动，窗闪一下就没了」。见 `singleton::recycle`。
+    let (old_key, win_key) = super::singleton::recycle(&format!("plugin-settings:{id}"));
+    ctx.close_window(old_key);
     ctx.open_window(
         Window::new(title, DIALOG_W, 300)
             .bg(to_color(BG))

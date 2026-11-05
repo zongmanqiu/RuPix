@@ -121,7 +121,7 @@ impl RemoteEntry {
 
     /// 下载落盘时的文件名：`<id>_<version>.dll`。
     ///
-    /// 与 `RuPix-Decoder/build.ps1` 的产物命名同一套约定——装进来的文件因此和手工拷进去的
+    /// 与解码器发布产物的命名同一套约定——装进来的文件因此和手工拷进去的
     /// 长得一样，`parse_dll_version` 也就认得出它的版本。
     pub fn file_name(&self) -> String {
         format!("{}_{}.dll", self.id, self.version)
@@ -266,7 +266,7 @@ fn is_safe_stem(s: &str) -> bool {
 /// 过渡兼容（2026-10-26 起，2026-10-28 补仓库改名）：线上旧清单有两个历史包袱——
 /// 把 Gitee 的 owner `qiuzongman` 带进了 GitHub 地址；以及仓库名还是单数 `RuPix-Decoder`。
 ///
-/// 现实名字是 **`RuPix-Decoders`（两个镜像都复数，本地目录仍叫单数 `RuPix-Decoder/`）**。
+/// 现实名字是 **`RuPix-Decoders`（两个镜像都复数；本地工作区的目录名是单数，两者不是一回事）**。
 /// 只在这几个已知前缀上改写，其它地址原样保留；新清单本来就是对的，替换幂等。
 ///
 /// 为什么还留着：用户机器上缓存过的旧清单会一直用到下次刷新，**下载按钮不能因为
@@ -370,7 +370,7 @@ pub const INDEX_FILE: &str = "decoders.json";
 
 /// 本地清单路径：`<exe 目录>/docs/decoders.json`。
 ///
-/// 发布包自带这一份（`deploy.py` 从 `RuPix-Decoder/decoders.json` 复制），用户点「刷新」
+/// 发布包自带这一份（`deploy.py` 从解码器发布清单复制），用户点「刷新」
 /// 时才联网覆盖。取不到 exe 目录时返回 `None`（调用方按"本次会话没有本地清单"处理）。
 pub fn local_path() -> Option<PathBuf> {
     Some(crate::core::paths::docs_dir()?.join(INDEX_FILE))

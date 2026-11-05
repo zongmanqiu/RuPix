@@ -61,16 +61,18 @@ pub fn height_for(text: &str) -> i32 {
 
 /// 打开（或聚焦）一扇纯文本窗。
 ///
-/// `key` 是单例键：同一个键再次打开会先关旧窗，保证内容是最新一次，而不是残影。
+/// `key` 是单例键的**前缀**：每次开窗换一个新键、先关掉上一次那扇，保证内容是
+/// 最新一次而不是残影。
 /// `title` 走系统标题栏（任务栏 / Alt+Tab 也认得）。
 pub fn show(ctx: &mut EventCtx, key: &str, title: &str, text: &str) {
     let body = text.to_string();
     let h = height_for(text);
     let sig = signal(body);
-    let key = key.to_string();
     let title = title.to_string();
-    // single 窗已存在时只聚焦、不重建内容；先关旧窗，保证看到的是这一次的文本。
-    ctx.close_window(key.clone());
+    // 关旧窗与开新窗不能用同一个键：关窗是投递、开窗是即时，同键会让滞留的
+    // WM_CLOSE 把刚开出来的新窗收走（窗闪一下就没了）。见 `singleton::recycle`。
+    let (old_key, win_key) = super::singleton::recycle(key);
+    ctx.close_window(old_key);
     ctx.open_window(
         Window::new(title, W, h)
             // 纯白底：文本区 frameless 后露出的就是这层底（对齐 CurSeen 信息档）。
@@ -79,7 +81,7 @@ pub fn show(ctx: &mut EventCtx, key: &str, title: &str, text: &str) {
             .min_size(MIN_W, MIN_H)
             .centered(true)
             .owned(true)
-            .single(key)
+            .single(win_key)
             .content(move || {
                 Element::text_input(sig, "")
                     .multiline()

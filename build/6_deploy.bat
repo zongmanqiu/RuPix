@@ -25,7 +25,7 @@ setlocal enabledelayedexpansion
 
 call "%~dp0_common.bat"
 if %ERRORLEVEL% neq 0 (
-    pause
+    if not "!RUPIX_CHAINED!"=="1" pause
     exit /b 1
 )
 
@@ -37,7 +37,7 @@ echo.
 if not defined PY_EXE (
     echo   [ERROR] python not found - cannot run deploy.py
     echo           install python and put it on PATH, then re-run this step
-    pause
+    if not "!RUPIX_CHAINED!"=="1" pause
     exit /b 1
 )
 
@@ -46,7 +46,7 @@ cd /d "%MAIN_DIR%"
 "%PY_EXE%" "%SCRIPT_DIR%deploy.py"
 if !ERRORLEVEL! neq 0 (
     echo   [ERROR] deploy.py failed - see the report above
-    pause
+    if not "!RUPIX_CHAINED!"=="1" pause
     exit /b 1
 )
 

@@ -14,7 +14,7 @@
 //!
 //! 用法（在 main 目录下）：
 //! ```text
-//! set RUPIX_DECODERS_DIR=E:\tmp\AI.Agent\RuPix\.build\decoders
+//! set RUPIX_DECODERS_DIR=<工作区根>\.build\decoders
 //! cargo run --example space_probe
 //! ```
 

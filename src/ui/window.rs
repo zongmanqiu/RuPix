@@ -22,7 +22,6 @@ pub(crate) fn build_root(
     chrome: &Rc<Chrome>,
     config: &Rc<RefCell<Config>>,
     hub: &Hub,
-    new_window: super::canvas::NewWindowFn,
 ) -> Element {
     Element::stack()
         .fill()
@@ -42,12 +41,12 @@ pub(crate) fn build_root(
         .child(
             Element::col()
                 .fill()
-                .widget(
-                    ImageCanvas::new(viewer.clone(), chrome.clone(), config.clone(), hub.clone())
-                        // 「新建窗口」的落地由 runtime 注入：画布不建窗口，它只把用户的
-                        // 这一次点击交出去（见 `ImageCanvas` 的同名字段）。
-                        .with_new_window(new_window),
-                )
+                .widget(ImageCanvas::new(
+                    viewer.clone(),
+                    chrome.clone(),
+                    config.clone(),
+                    hub.clone(),
+                ))
                 .autofocus(),
         )
 }

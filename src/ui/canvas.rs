@@ -126,13 +126,7 @@ pub struct ImageCanvas {
     /// 条是常驻的一块地（不是盖在画面上的浮层），所以摆图、缩放锚点、鸟瞰几何
     /// 都用这一份；悬浮工具栏那一层仍用完整的 `last`（它本来就是浮层）。
     last_work: Cell<Rect>,
-    /// 「新建窗口」的落地：由 `runtime` 注入（画布不知道窗口怎么建——那要解码线程、
-    /// 目录监视、一整套运行期状态）。`None` = 单窗口场景（测试 / 示例），菜单里不出现。
-    new_window: Option<NewWindowFn>,
 }
-
-/// 「新建窗口」的回调签名（`runtime` 注入给画布，见 [`ImageCanvas::with_new_window`]）。
-pub type NewWindowFn = Rc<dyn Fn(&mut EventCtx)>;
 
 /// 滚轮翻页档每张图需要的增量（一格 WHEEL_DELTA）。
 const WHEEL_STEP: i32 = 120;
@@ -338,14 +332,7 @@ impl ImageCanvas {
             strip_hover: Cell::new(None),
             strip: Strip::new(),
             last_work: Cell::new(Rect::new(0, 0, 1, 1)),
-            new_window: None,
         }
-    }
-
-    /// 注入「新建窗口」的落地（见字段说明）。装配期调一次，`None` 时菜单不出现该项。
-    pub fn with_new_window(mut self, f: NewWindowFn) -> Self {
-        self.new_window = Some(f);
-        self
     }
 
     fn center(&self) -> (f32, f32) {
@@ -516,7 +503,6 @@ impl ImageCanvas {
     ///
     /// ```text
     /// 打开…
-    /// 新建窗口                   ← 多开开启时才出现
     /// RAW 参数…                 ← 常驻；仅无头裸像素可点（相机 RAW / 普通图片置灰）
     /// 复制 ▸                    画面 PNG / 原文件 / 文件路径
     /// ─────
@@ -528,7 +514,7 @@ impl ImageCanvas {
     /// 幻灯片放映 / 停止放映
     /// 左键拖图（勾选）
     /// ─────
-    /// 设置…（「关于」不再单列，已收编为设置窗的第三个标签）
+    /// 设置…（「关于」不再单列，它是设置窗五页里的最后一项，见 `settings::rows::NAV_LABELS`）
     /// ```
     ///
     /// 「窗口 ▸」收的是**改变窗口长什么样**的三项（2026-11-04 用户口径）：装饰显隐、
@@ -584,16 +570,11 @@ impl ImageCanvas {
             it
         });
 
-        // ── 新建窗口（多开开启时才出现）──
+        // ── 新建窗口：**不做**（2026-11-05 用户裁定）──
         //
-        // 多开的口径是「窗口可以有多个，进程与托盘都只有一个」：这一项开的还是同一个
-        // 进程里的另一扇窗，不是第二个 rupix.exe。关着多开时它不出现——菜单里摆一个
-        // 点了就违反当前约定的项，比没有更糟。
-        if self.config.borrow().allow_multiple {
-            if let Some(f) = self.new_window.clone() {
-                items.push(MenuItem::run("新建窗口", move |ctx| f(ctx), false));
-            }
-        }
+        // 多开开启时这里曾多出一项「新建窗口」，但它的产物是一扇**没有图**的空窗：
+        // 想再开一张图，直接双击/拖放本来就会新开一扇（`allow_multiple` 的语义），
+        // 所以这一项是绕远路。托盘菜单里那一项保留——它在零窗口时是唯一入口。
 
         // 裸数据参数：**常驻**，只有当前文件确实是无头裸像素时才可点。
         // 相机 RAW（CR2/NEF…）有完整文件头，参数窗对它们没有意义，所以同样置灰；

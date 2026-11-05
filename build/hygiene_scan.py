@@ -5,8 +5,9 @@ r"""
   python build/hygiene_scan.py --json     # 机器可读
   python build/hygiene_scan.py --selftest # 规则自检（合成样例命中验证，门禁的牙齿）
 
-十查（1–6 只扫第一方 Rust 源码 `main/src/**/*.rs`；第 7 查按登记要求跨到 `main/patches/` 与 `.3rd/`，**不碰归档**；
-第 8 查扫 `main/**` 的全部第一方文本文件；第 10 查只扫 `main/src/ui/**`）：
+十三查（1–6 只扫第一方 Rust 源码 `main/src/**/*.rs`；第 7 查按登记要求跨到 `main/patches/` 与 `.3rd/`，**不碰归档**；
+第 8 查扫 `main/**` 的全部第一方文本文件；第 9 查只扫 `main/**/*.ps1`；第 10、11、13 查只扫 `main/src/ui/**`；
+第 12 查扫 `main/**` 找凭据形状）：
 
   1. 硬编码绝对路径  `[A-Z]:\`  —— 换台电脑就失效
   2. 调试残留        `println!` / `eprintln!` / `print!` / `eprint!` / `dbg!`
@@ -89,9 +90,15 @@ r"""
   一定被人加白名单加到失效。三方署名里的上游邮箱豁免（`THIRD-PARTY-NOTICES.md` / `LICENSE`，
   法律要求归属）。解码器仓的同源判据是它自己的 `scripts/check_secrets.py`（两仓各自自包含）。
 
+十三查 `single_window_key`（2026-11-04，K196）：`src/ui/**` 里同一个文件若
+  `close_window(X)` 与 `.single(Y)` 用了**同一个变量**，即同键既关又开。windui 的关窗是
+  投递到应用级旁路队列（下一次定时器/热键收尾才按 key 找窗投 `WM_CLOSE`），开窗是窗口
+  回调收尾时立即建窗——那条滞留的关窗请求会找到刚开出来的新窗把它收走，用户看到
+  「窗闪一下就没了」。正确写法是 `singleton::recycle` 给出的两个不同键。
+
 分类计数：违规按 `abs_path` / `debug_macro` / `marker` / `boundary_doc` / `panic_source` /
 `config_last_mile` / `patch_parity` / `control_char` / `ps1_ascii` / `literal_color` /
-`ui_super_path` / `secret` 十二档分别报数（见 [`CATEGORIES`]）。**判定门限仍是「总数 = 0」**——分类只为趋势可见（哪一类在动），
+`ui_super_path` / `secret` / `single_window_key` 十三档分别报数（见 [`CATEGORIES`]）。**判定门限仍是「总数 = 0」**——分类只为趋势可见（哪一类在动），
 不引入基线冻结；RuPix 违规历史 = 0，加基线等于给满分项目开小抄通道。
 退出码：0 = 「违规 0 处」；1 = 有违规。
 
@@ -127,6 +134,10 @@ LITERAL_COLOR = re.compile(r"Color::(?:rgba|rgb)\s*\(")
 # 第 11 查：ui 层内跨模块引用。平铺模块之间直接写 `crate::ui::<兄弟>::` 会让依赖长成网，
 # 一律经父模块（`use super::{Chrome, Hub}` / `super::<模块>::名字`）——中枢在 src/ui/mod.rs。
 UI_SIBLING_PATH = re.compile(r"crate::ui::")
+# 十三查：关窗与开窗各自吃的那个键。只认裸标识符——`close_window(win_key.clone())`
+# 与 `.single(win_key)` 取的正是同一个名字，这正是要拦的写法。
+CLOSE_WINDOW_ARG = re.compile(r"\bclose_window\(\s*([A-Za-z_][A-Za-z0-9_]*)")
+SINGLE_WINDOW_ARG = re.compile(r"\.single\(\s*([A-Za-z_][A-Za-z0-9_]*)")
 
 # 第 12 查：两仓都要能原样公开（2026-10-26 用户口径）——密钥 / 口令 / 私人联系方式 /
 # 含真名的本机路径，一条都不许进源码目录。宁可少报也不误报到没人看：只认高置信写法。
@@ -198,7 +209,7 @@ CFG_FIELD = re.compile(r"\bcfg\.([a-z_][a-z0-9_]*)")
 # 与上面"九查"顺序一一对应；新增分类请**尾追**（头插会打乱旧日志三段布局）。
 CATEGORIES = ("abs_path", "debug_macro", "marker", "boundary_doc", "panic_source", "config_last_mile",
               "patch_parity", "control_char", "ps1_ascii", "literal_color",
-              "ui_super_path", "secret")
+              "ui_super_path", "secret", "single_window_key")
 
 
 def is_comment(line: str) -> bool:
@@ -530,6 +541,60 @@ def detect_ui_super_path(src_dir: pathlib.Path) -> list[str]:
     return bad
 
 
+# ── 十三查（2026-11-04）：单例窗「同键既关又开」 ────────────────────────
+def single_window_clash(rel: str, lines: list[str]) -> list[str]:
+    """判一个文件里 `close_window(X)` 与 `.single(X)` 是否共用同一个变量。
+
+    扫描与 selftest 共用这一份判据（不许"自检验正则、实际跑另一套代码"）。
+    """
+    in_test = bool(TEST_ONLY.search(rel))
+    close_vars: dict[str, int] = {}
+    single_vars: dict[str, int] = {}
+    for i, line in enumerate(lines, 1):
+        if CFG_TEST.match(line):
+            in_test = True
+        if in_test or is_comment(line):
+            continue
+        m = CLOSE_WINDOW_ARG.search(line)
+        if m:
+            close_vars.setdefault(m.group(1), i)
+        m = SINGLE_WINDOW_ARG.search(line)
+        if m:
+            single_vars.setdefault(m.group(1), i)
+    bad = []
+    for name, at in sorted(close_vars.items(), key=lambda kv: kv[1]):
+        if name in single_vars:
+            bad.append(
+                f"single_window_key: {rel}:{at} close_window({name}) 与 "
+                f".single({name})（{rel}:{single_vars[name]}）共用同一个键 -- "
+                "关窗是投递、开窗是即时，滞留的 WM_CLOSE 会把刚开出的新窗收走；"
+                "改用 singleton::recycle 拿两个不同的键"
+            )
+    return bad
+
+
+def detect_single_window_key(src_dir: pathlib.Path) -> list[str]:
+    """`src/ui/**` 里 `close_window(X)` 与 `.single(X)` 不许共用同一个变量。
+
+    为什么值得一条硬门禁：K196 现场是「插件页齿轮点不动，窗闪一下就没了」——看起来
+    完全无害的「先关旧窗再开新窗」写成了同一个单例键，而框架的关窗是**延迟投递**、
+    开窗是**即时建窗**，滞留的 WM_CLOSE 会认错对象。静态扫同名变量即可挡住这一类；
+    换成 `super::singleton::recycle` 给出的两个不同键就合法。
+    """
+    ui_dir = src_dir / "ui"
+    bad: list[str] = []
+    scanned = 0
+    for p in sorted(ui_dir.rglob("*.rs")):
+        if not p.is_file():
+            continue
+        scanned += 1
+        rel = p.relative_to(src_dir.parent).as_posix()
+        bad.extend(single_window_clash(rel, p.read_text(encoding="utf-8", errors="replace").splitlines()))
+    if scanned == 0:
+        return ["single_window_key: ui/ 下一个 .rs 都没扫到（目录形状变了，本查失明）"]
+    return bad
+
+
 # ── 十二查（2026-10-26）：无密钥 / 无隐私 ──────────────────────────────
 def detect_secrets(root_dir: pathlib.Path) -> list[str]:
     """`main/**` 里不许出现密钥、令牌、口令字面量、私人邮箱、含真名的本机路径。
@@ -604,6 +669,48 @@ def selftest() -> int:
     expect(bool(UI_SIBLING_PATH.search("use crate::ui::chrome::Chrome;")), "ui 内全路径应命中")
     expect(UI_SIBLING_PATH.search("use super::{Chrome, Hub};") is None, "super:: 写法不该命中")
     expect(UI_SIBLING_PATH.search("super::raw_dialog::open_path(p);") is None, "super:: 函数调用不该命中")
+
+    # single_window_key（十三查：同键既关又开的单例窗，K196）
+    expect(
+        CLOSE_WINDOW_ARG.search("ctx.close_window(win_key.clone());").group(1) == "win_key",
+        "close_window 取裸变量名（带 .clone() 也还是同一个键）",
+    )
+    expect(
+        SINGLE_WINDOW_ARG.search(".single(win_key)").group(1) == "win_key",
+        "single 取裸变量名",
+    )
+    expect(
+        len(single_window_clash("src/ui/plugin_settings.rs", [
+            'let win_key = format!("plugin-settings:{id}");',
+            "ctx.close_window(win_key.clone());",
+            "Window::new(title, 480, 300)",
+            ".single(win_key)",
+        ])) == 1,
+        "同键既关又开必须命中（K196 现场写法）",
+    )
+    expect(
+        single_window_clash("src/ui/plugin_settings.rs", [
+            'let (old_key, win_key) = super::singleton::recycle("x");',
+            "ctx.close_window(old_key);",
+            ".single(win_key)",
+        ]) == [],
+        "两个不同的键不该误报",
+    )
+    expect(
+        single_window_clash("src/ui/plugin_settings.rs", [
+            "// ctx.close_window(win_key); 说明性注释",
+            ".single(win_key)",
+        ]) == [],
+        "注释里的旧写法不算调用",
+    )
+    expect(
+        single_window_clash("src/ui/plugin_settings.rs", [
+            "#[cfg(test)]",
+            "ctx.close_window(win_key);",
+            ".single(win_key)",
+        ]) == [],
+        "测试区不算生产代码",
+    )
 
     # TEST_ONLY —— 文件级测试模块（`#[cfg(test)] mod tests;`）整篇算测试区；
     # 判据只看文件名，所以生产文件名必须一条都不命中（否则 panic 红线会被悄悄绕开）。
@@ -884,6 +991,10 @@ def main():
     # secret：无密钥 / 无隐私（见模块头十二查与 detect_secrets）。
     for msg in detect_secrets(ROOT_DIR):
         violations.append(("secret", msg))
+
+    # single_window_key：单例窗同键既关又开（见模块头十三查与 detect_single_window_key）。
+    for msg in detect_single_window_key(SRC):
+        violations.append(("single_window_key", msg))
 
     by_cat = {c: 0 for c in CATEGORIES}
     for cat, _ in violations:

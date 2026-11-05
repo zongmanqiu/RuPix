@@ -30,7 +30,7 @@
 //!
 //! ```text
 //! cd ../.temp/target/release/examples
-//! RUPIX_DECODERS_DIR=E:/tmp/AI.Agent/RuPix/.build/decoders \
+//! RUPIX_DECODERS_DIR=<工作区根>\.build\decoders \
 //!   ./mem_chain_probe.exe <big.tif> [邻居大图]
 //! ```
 

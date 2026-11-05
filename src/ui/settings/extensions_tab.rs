@@ -439,7 +439,7 @@ fn installed_row(ext: Extension, config: Rc<RefCell<Config>>, ui: PluginUi) -> E
     if let Some(gear) = settings_gear(&ext, config.clone()) {
         info = info.child(gear);
     }
-    info = info.child(btn("!").on_click(show_info));
+    info = info.child(info_btn().on_click(show_info));
     let (name, version) = (ext.manifest.name.clone(), ext.manifest.version.clone());
     row_shell(
         &name,
@@ -447,6 +447,23 @@ fn installed_row(ext: Extension, config: Rc<RefCell<Config>>, ui: PluginUi) -> E
         info,
         action_slot(enable_switch(&ext, config, enabled)),
     )
+}
+
+/// 行尾那颗「!」按钮（详情窗）。盒子钉死成 `ICON_BTN_W/H`——它是两颗小按钮的**标尺**，
+/// 齿轮按它来（见 [`tokens::ICON_BTN_W`]）。两张卡（「已安装」/「可下载」）共用这一颗。
+fn info_btn() -> Element {
+    btn("!").width(ICON_BTN_W).height(ICON_BTN_H)
+}
+
+/// 设置齿轮按钮：Segoe MDL2 的设置字形（PUA 码位 U+E713）。
+///
+/// 盒子与 [`info_btn`] 同款——图标字形天然比正文字形宽一圈，不钉死就会宽出 9 px、
+/// 矮 4 px（2026-11-05 用户报障）。图标在框里居中（windui 按钮居中画）。
+fn gear_btn() -> Element {
+    btn("\u{E713}")
+        .font_family("Segoe MDL2 Assets")
+        .width(ICON_BTN_W)
+        .height(ICON_BTN_H)
 }
 
 /// 设置齿轮（仅 `settings_ui` 插件）。判据只看"现在能不能开"：停用 / 隔离 /
@@ -460,9 +477,7 @@ fn settings_gear(ext: &Extension, config: Rc<RefCell<Config>>) -> Option<Element
     }
     let usable = ext.enabled && !ext.isolated && !ext.blocked;
     let ext = ext.clone();
-    let b = btn("\u{E713}")
-        .font_family("Segoe MDL2 Assets")
-        .disabled(!usable);
+    let b = gear_btn().disabled(!usable);
     let cfg_gear = config;
     Some(if usable {
         b.on_click(move |ctx: &mut EventCtx| {
@@ -515,7 +530,11 @@ struct PluginFacts {
     license: String,
     released: String,
     description: String,
-    /// 大小值（带口径：已安装 = 解压后占用；可下载 = ZIP 包）。
+    /// 大小值（已安装 = 目录占用；可下载 = ZIP 包）。
+    ///
+    /// ★ 只写数字，不加括号注释（2026-11-05 用户裁定）：口径两窗本来就不同，
+    ///   括号反而把两种写法摆到台面上；解码器信息窗的「大小」同样只有数字，
+    ///   两套系统外观必须一致。
     size: String,
 }
 
@@ -595,7 +614,7 @@ fn open_installed_info(
         released: ext.manifest.released.clone(),
         description: ext.manifest.description.clone(),
         size: crate::extensions::dir_size(&ext.dir)
-            .map(|n| format!("{}（解压后占用）", fmt_bytes(n)))
+            .map(fmt_bytes)
             .unwrap_or_else(|| "（未知）".to_string()),
     };
     let iconfig = ext.clone();
@@ -629,6 +648,8 @@ fn open_installed_info(
     let key = format!("plugin-info-{id}");
     ctx.open_window(
         Window::new(title, 520, 360)
+            // 信息窗客户区恒白（标题栏由系统绘制，不在其内）：与解码器信息窗同款。
+            .bg(to_color(BG))
             .fit_content(240, 900)
             .resizable(true)
             .centered(true)
@@ -669,11 +690,13 @@ fn open_available_info(ctx: &mut EventCtx, e: AvailablePlugin) {
         license: e.license.clone(),
         released: e.released.clone(),
         description: e.description.clone(),
-        size: format!("{}（ZIP 包）", fmt_bytes(e.size)),
+        size: fmt_bytes(e.size),
     };
     let key = format!("plugin-info-available-{}", e.id);
     ctx.open_window(
         Window::new(format!("插件信息 · {}", e.name), 520, 400)
+            // 信息窗客户区恒白（标题栏由系统绘制，不在其内）：与解码器信息窗同款。
+            .bg(to_color(BG))
             .fit_content(240, 900)
             .resizable(true)
             .centered(true)
@@ -700,7 +723,9 @@ fn available_row(entry: AvailablePlugin, ui: PluginUi) -> Element {
     let (label, tone) = action_of(&entry, state, src, local_ok);
     let info = {
         let entry = entry.clone();
-        btn("!").on_click(move |ctx| open_available_info(ctx, entry.clone()))
+        // 与「已安装」那张卡的「!」同一颗（`info_btn`）：两张卡的行尾按钮必须同款，
+        // 否则同一列上下对不齐。
+        info_btn().on_click(move |ctx| open_available_info(ctx, entry.clone()))
     };
     let caption = ui.progress.map({
         let id = entry.id.clone();
@@ -973,5 +998,58 @@ mod tests {
         let cfg = Rc::new(RefCell::new(Config::default()));
         let ui = PluginUi::new(&cfg.borrow());
         let _ = extensions_page(&cfg, &ui);
+    }
+
+    /// 行尾两颗小按钮（「!」详情 / 设置齿轮）必须是**同一个盒子**。
+    ///
+    /// 2026-11-05 用户报障「齿轮按钮宽度和高度都不对」：按钮盒子 = 字形度量 +
+    /// Medium 内边距（左右 32 / 上下 18，windui 侧写死），而齿轮是 MDL2 图标字形
+    /// （14×14）、「!」是正文字形（5×18）——不钉死就长成 46×32 vs 37×36。
+    ///
+    /// 这里用**真实 DirectWrite** 量：①「!」的自然盒子必须等于钉死的 `ICON_BTN_W/H`
+    /// （FONT_MD 或界面字体变了就红，提示重订）；②两颗按钮排出来的实际盒子必须一致。
+    #[test]
+    fn info_row_icon_buttons_share_one_box() {
+        use tiny_skia::Pixmap;
+        use windui::core::Tree;
+        use windui::geometry::Size;
+        use windui::render::{Canvas, SkiaCanvas};
+        use windui::text::{DWriteEngine, TextEngine, TextStyle};
+
+        // ① 「!」的自然盒子（字形 + Medium 内边距 32/18）。
+        let (bw, bh) = {
+            let mut pm = Pixmap::new(8, 8).expect("画布");
+            let mut eng = DWriteEngine::new();
+            eng.set_scale(1.0);
+            let mut cx = SkiaCanvas::with_text(&mut pm, &mut eng, 1.0);
+            let s = cx.measure_text("!", &TextStyle::new(FONT_MD));
+            (s.w, s.h)
+        };
+        assert_eq!(
+            (bw + 32, bh + 18),
+            (ICON_BTN_W, ICON_BTN_H),
+            "「!」的自然盒子变了（{bw}×{bh}）：FONT_MD 或界面字体改了，ICON_BTN_W/H 要跟着重订"
+        );
+
+        // ② 两颗按钮排一次，比实际盒子。
+        let row = Element::row()
+            .spacing(6)
+            .child(gear_btn())
+            .child(info_btn());
+        let mut tree = Tree::new();
+        let root = row.build(&mut tree);
+        tree.root = Some(root);
+        let mut eng = DWriteEngine::new();
+        eng.set_scale(1.0);
+        tree.layout_root(Size::new(200, 60), &mut eng);
+        let kids = &tree.get(root).expect("行").children;
+        let gear = tree.get(kids[0]).expect("齿轮").bounds;
+        let bang = tree.get(kids[1]).expect("感叹号").bounds;
+        assert_eq!(
+            (gear.w, gear.h),
+            (bang.w, bang.h),
+            "齿轮与「!」不同款：齿轮 {gear:?} / 「!」 {bang:?}"
+        );
+        assert_eq!((gear.w, gear.h), (ICON_BTN_W, ICON_BTN_H));
     }
 }

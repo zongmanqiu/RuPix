@@ -58,7 +58,7 @@ pub const PLUGIN_DIR: &str = "plugins";
 /// 随包数据子目录名（exe 同级之下）：目前放解码器清单 `decoders.json`。
 ///
 /// 它**不是** `main/docs/`（那是源码仓的长期文档）：这是发布包里的数据，由
-/// `deploy.py` 从 `RuPix-Decoder/decoders.json` 复制过来，「刷新」按钮就地覆盖。
+/// `deploy.py` 从解码器发布清单复制过来，「刷新」按钮就地覆盖。
 pub const DOCS_DIR: &str = "docs";
 
 /// 崩溃报告文件名前缀（`crash-<YYYY-MM-DD>.log`）。

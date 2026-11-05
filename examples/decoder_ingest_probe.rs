@@ -17,18 +17,16 @@ use std::path::{Path, PathBuf};
 
 use rupix_lib::core::decode::probe_decode;
 
-/// 样本目录（默认：解码器仓的 golden 夹具）。
-const DEFAULT_SAMPLES: &str = r"E:\tmp\AI.Agent\RuPix\RuPix-Decoder\testdata\golden";
-
+/// 样本目录 = 命令行第一参数。★ **不写死本机绝对路径**：样本在别的仓里，写死等于把这台机器的
+/// 目录结构编进探针——换台机器就指到空目录，还一路"看着正常"地报 0 个样本。
 fn main() {
     rupix_lib::platform::logging::install_logging();
     rupix_lib::install_decode_stack();
 
-    let args: Vec<String> = std::env::args().collect();
-    let dir = args
-        .get(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_SAMPLES));
+    let Some(dir) = std::env::args().nth(1).map(PathBuf::from) else {
+        println!("用法：cargo run --release --example decoder_ingest_probe -- <样本目录>");
+        return;
+    };
 
     // ── 1. 接入面 ────────────────────────────────────────────────
     let entries = rupix_lib::decoders::list_decoders();

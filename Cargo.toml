@@ -91,7 +91,7 @@ flate2 = "1"
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 
 # ── 解码器 ABI 契约（宿主侧快照）──
-# 真源在解码器仓库 `RuPix-Decoder/abi`（独立 workspace，将来的 rupix-decoder）。
+# 真源在解码器仓的 abi crate（另一个仓、独立 workspace，本仓构建时看不见它）。
 # 这里是一份逐字节副本；同步唯一动作 = 把上游 abi/src/lib.rs 整份复制覆盖本目录的 src/lib.rs
 # 守卫测试见 `src/core/abi.rs`（两份内容不一致 → 宿主测试跑红）。
 # 结构体布局仍靠编译期 size_of 断言钉死；快照机制换掉的是「宿主构建必须能看见解码器仓库」。

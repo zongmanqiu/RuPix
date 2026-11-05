@@ -22,8 +22,8 @@
 //!
 //! 解码线程在窗口内容树建好之前就必须起好（`Viewer` 构造要它），而结果通道先建；
 //! 每个窗口一条解码线程、一份回程（`DecodeSink`：Meta 通道 + 唤醒），互不串台。
-//! 多窗口下**解码器调用仍然串行**：`core::decode` 的后端是一把全局 Mutex，两条线程
-//! 在这里排队——ABI 要求的是"宿主串行调用"，不是"只有一条线程"。
+//! ★ **契约边界（2026-11-05 裁决：按 DLL 串行，m229 落地）**：每 worker 一份私有后端 ⇒ 多开时
+//! 两窗真并行解；同一枚 DLL 靠 per-DLL 有界等待的锁收口。正本 `docs/架构总览.md` §二。
 //!
 //! ★ 已知代价：m90 那条"回包直接叫醒一帧"的加速在常驻模式下用不了——`App::channel`
 //! 的回调拿到的 `EventCtx` 背后没有具体窗口（零主窗），`mark_dirty` 无处可落。回包改由
@@ -449,7 +449,6 @@ impl WinRt {
         let close = self.clone();
         let content = self.clone();
         let activation = self.clone();
-        let shared_for_new = self.shared.clone();
         let id = self.id;
         let request = Window::new(TITLE, w.max(100), h.max(100))
             .frameless(true)
@@ -475,7 +474,6 @@ impl WinRt {
                 &content.chrome,
                 &content.shared.config,
                 &content.shared.hub,
-                Rc::new(move |ctx: &mut EventCtx| open_window(&shared_for_new, ctx, None)),
             )
         })
     }
@@ -536,8 +534,6 @@ impl WinRt {
             shared.hint_pending.set(false);
             crate::ui::recovery_hint::show(ctx, crate::platform::panic_guard::log_path());
         }
-        // 拖拽/命令行打开的裸数据：在这里补弹参数窗（那些入口没有 EventCtx）。
-        crate::ui::raw_dialog::poll_pending(ctx, &self.viewer, &config);
         // 抓手光标按显示器 DPI 复核（脏读一次系统度量，代价可忽略）。
         crate::ui::hand_cursor::refresh_for_dpi();
         // 插件后台调用完成：UI 线程只取结果，不参与启动/等待/终止。
@@ -691,6 +687,12 @@ impl WinRt {
     /// 窗口段：本窗口自己的一切。
     fn window_tick(&self, ctx: &mut EventCtx) {
         let config = self.shared.config.clone();
+        // 拖拽/命令行打开的裸数据：在这里补弹参数窗（那些入口没有 EventCtx）。
+        //
+        // ★ 必须放在**窗口段**而不是全局段（m232）：参数窗现在按窗口分格，全局段只有
+        //   "活动的那一扇"在跑——于是后台窗口排的裸数据会一直等到它被点中才弹窗，
+        //   用户看到的是"我拖进来的文件没反应"。窗口段每扇窗都跑，各取各的队。
+        crate::ui::raw_dialog::poll_pending(ctx, &self.viewer, &config);
         // 启动置顶 / 全屏：一次只发一个，发完出队（见 `StartOp` 的说明）。
         let op = {
             let mut q = self.startup_ops.borrow_mut();
@@ -841,7 +843,9 @@ impl WinRt {
                 }
                 if dirty {
                     self.last_dir_rescan.set(now);
-                    if v.rescan_dir() {
+                    // `_shared`：同一次文件变动会被每扇窗各报一次，只让第一扇窗真读盘
+                    // （清单缓存在 `core::gallery::listing_for_event`，按代次失效）。
+                    if v.rescan_dir_shared() {
                         dir_changed = true;
                     }
                 }
@@ -970,6 +974,16 @@ impl WinRt {
     }
 
     /// 关窗裁决。返回 `true` = 放行关闭。
+    /// 这扇窗真的要走了：把它名下「每窗一份」的东西清掉（m232）。
+    ///
+    /// 现在只有两处：待弹的裸数据参数（`raw_dialog`）与属性窗信号格（`metadata`）。
+    /// 都按 `singleton::window_scope` 分格，所以清理是"摘掉这一格"，不碰别人的。
+    fn release_window_scoped(&self) {
+        let scope = crate::ui::singleton::window_scope(&self.viewer);
+        crate::ui::raw_dialog::forget_window(scope);
+        crate::ui::settings::forget_metadata_window(scope);
+    }
+
     fn close(&self, ctx: &mut EventCtx) -> bool {
         let config = self.shared.config.clone();
         crate::core::config::flush_save(&config.borrow());
@@ -995,7 +1009,10 @@ impl WinRt {
             CloseAction::Cancel => false,
             // 还有别的窗口 / 关到托盘：关这一扇，进程不动。托盘图标由
             // `close_to_tray` 决定在不在（显隐在应用级轮询里跟随配置）。
-            CloseAction::Close => true,
+            CloseAction::Close => {
+                self.release_window_scoped();
+                true
+            }
             // 最后一扇且没开「关闭到托盘」：连进程一起退。
             // ★ 走补丁 025 的 `quit_app`——常驻模式没有主窗可 `request_close`，
             //   这条是应用级退出的唯一入口（与托盘「退出」同一条路）。

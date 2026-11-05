@@ -5,6 +5,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::core::error::{ViewError, ViewResult};
 use crate::core::formats;
@@ -201,7 +203,18 @@ impl Gallery {
     /// 与 [`Gallery::from_file`] 同源的枚举 + 过滤 + 自然序排序，保证"重扫出来的
     /// 清单"和"初次打开的清单"完全一致，不会因实现分叉出现顺序漂移。
     pub fn rescan(&self) -> ViewResult<Self> {
-        let mut files = listing(&self.dir)?;
+        self.rescan_with(listing(&self.dir)?)
+    }
+
+    /// 用**别处刚扫出来的**清单重建（[`listing_for_event`] 的复用分支走这里）。
+    ///
+    /// 克隆一份 `Vec` 而不共享 `Arc`：`rescan_with` 可能要往里插锚点（[`ensure_listed`]），
+    /// 而缓存里那份要留给后面的窗口。1200 项实测克隆 ~30 µs，比一次 `read_dir` 便宜两个量级。
+    pub fn rescan_from(&self, files: std::sync::Arc<Vec<PathBuf>>) -> ViewResult<Self> {
+        self.rescan_with((*files).clone())
+    }
+
+    fn rescan_with(&self, mut files: Vec<PathBuf>) -> ViewResult<Self> {
         let old_index = self.index;
         let anchor = self.current().cloned();
         // 锚点可能是"用户显式点开的那一个"，未必带图片后缀（见 [`ensure_listed`]）：
@@ -271,6 +284,78 @@ fn listing(dir: &Path) -> ViewResult<Vec<PathBuf>> {
     // 同名时数字位数少的在前（`img2` < `img02` < `img10`）。
     sort_natural(&mut files);
     Ok(files)
+}
+
+// ── 事件驱动重扫的"同批只扫一次" ─────────────────────────────────────────────
+//
+// 为什么需要：每扇看图窗都有自己的 `DirWatcher`，所以一次文件变动会被**每扇窗各报一次**，
+// 同一次变动在同一瞬间被重扫 N 遍，全落在同一条 UI 线程上。实测 1200 项目录、5 扇窗：
+// 5 条重扫合计 8.25 ms（`build/dir_rescan_probe.ps1`）；按 3401 项 3.5 ms/次
+// （`examples/bench_dir_listing.rs`）外推，1 万项目录 5 扇窗就是 ~50 ms——一次可见的顿挫。
+//
+// ★ 只服务**事件驱动**那条路（`Viewer::rescan_dir_shared`）。`Gallery::rescan` 与
+//   `from_file` 照旧真读盘：它们的语义是"现在去看这个目录"。第一版把缓存塞进了枚举函数
+//   本身，四条既有用例当场把它抓出来（删掉文件后 `rescan` 看不见，等于凭空造陈旧）——
+//   收藏别人的扫描结果可以，冒充自己的扫描结果不行。
+//
+// 失效判据只有一条：**代次**。任何物理变化由 watcher 线程递增（[`note_dir_change`]），
+// 所以"上一批事件的结果"绝不会被下一批复用。不需要时间窗：这一格只在重扫被调用时读，
+// 而重扫只由事件触发。
+
+/// 「某个被监控的目录变了」的进程级代次，由 [`note_dir_change`] 递增。
+static DIR_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// 真实枚举次数（复用不计数）。只服务取证行 `[dir-rescan] shared=`：让"这次是复用还是
+/// 真扫"从推断变成读数。
+static SCAN_COUNT: AtomicU64 = AtomicU64::new(0);
+
+struct BatchListing {
+    epoch: u64,
+    dir: PathBuf,
+    files: Arc<Vec<PathBuf>>,
+}
+
+static BATCH: Mutex<Option<BatchListing>> = Mutex::new(None);
+
+/// 叫一声"这个进程里某个被监控的目录变了"。**只由 `DirWatcher` 的监控线程调用**。
+///
+/// N 扇窗就有 N 个 watcher，于是一次变化会在这里递增 N 次。这是故意的：代次只需单调，
+/// 多推几次只会让复用更早失效（偏保守），不会更晚。
+pub fn note_dir_change() {
+    DIR_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 进程内已发生的真实枚举次数。
+pub fn scan_count() -> u64 {
+    SCAN_COUNT.load(Ordering::Relaxed)
+}
+
+/// 事件驱动重扫的清单来源：本代次里已经有人扫过这个目录就把那份交出来，否则真扫并登记。
+///
+/// 返回的第二项 = "这次真的读了盘"（取证行用它区分复用与真扫）。
+pub fn listing_for_event(dir: &Path) -> ViewResult<(Arc<Vec<PathBuf>>, bool)> {
+    // 代次在枚举**之前**读：万一枚举期间来了新事件，登记进去的是旧代次，后面的窗口会
+    // 重扫一遍（偏保守）。反过来写会让"扫到一半、变了一半"的结果被当成最新的一份。
+    let epoch = DIR_EPOCH.load(Ordering::Relaxed);
+    {
+        let guard = BATCH.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(b) = guard.as_ref() {
+            if b.epoch == epoch && b.dir == dir {
+                return Ok((Arc::clone(&b.files), false));
+            }
+        }
+    }
+    // 锁只护着那一格，不护读盘本身：单 UI 线程下没有竞争者，而将来若把打开图片挪到
+    // 后台线程，也不会有人被堵在别人的 `read_dir` 上。
+    let files = Arc::new(listing(dir)?);
+    SCAN_COUNT.fetch_add(1, Ordering::Relaxed);
+    let mut guard = BATCH.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(BatchListing {
+        epoch,
+        dir: dir.to_path_buf(),
+        files: Arc::clone(&files),
+    });
+    Ok((files, true))
 }
 
 /// 保证 `file` 在清单里：不在（无后缀 / 后缀没人认领 / 根本不是图片）就插进去再重排。
@@ -379,6 +464,110 @@ fn same_path(a: &Path, b: &Path) -> bool {
 mod tests {
     use super::*;
 
+    /// 一次性临时目录（名字带 pid + 纳秒，跑多少轮都不撞）。
+    fn scratch(tag: &str) -> PathBuf {
+        let p = crate::core::paths::test_scratch_root().join(format!(
+            "rupix-listing-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&p).expect("临时目录要能建");
+        p
+    }
+
+    /// 同代次里两扇窗的重扫只该真读一次盘，第二扇拿到的是**同一份**清单。
+    ///
+    /// 这是多开那条优化的核心：一次文件变动会被每扇窗各报一次，而它们看的是同一张目录表。
+    #[test]
+    fn one_event_batch_is_scanned_once() {
+        let dir = scratch("same");
+        std::fs::write(dir.join("a.svg"), b"<svg/>").expect("写夹具");
+        note_dir_change(); // 让此前任何登记作废，起点干净
+        let before = scan_count();
+        let (a, scanned_a) = listing_for_event(&dir).expect("第一扇窗要能枚举");
+        let (b, scanned_b) = listing_for_event(&dir).expect("第二扇窗也要能");
+        assert!(scanned_a, "第一扇窗必须真扫");
+        assert!(!scanned_b, "第二扇窗该复用，不该再读盘");
+        assert_eq!(scan_count() - before, 1, "同一代次只该真扫一次");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "复用要拿到同一份清单，不许有第二份内存"
+        );
+        assert_eq!(a.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 来了新事件就必须重扫——复用的是"这一批的结果"，不是"永远的结果"。
+    #[test]
+    fn a_new_event_forces_a_fresh_scan() {
+        let dir = scratch("fresh");
+        std::fs::write(dir.join("a.svg"), b"<svg/>").expect("写夹具");
+        note_dir_change();
+        let before = scan_count();
+        let (a, _) = listing_for_event(&dir).expect("先扫一次");
+        // 物理变化：新文件 + 代次递增（生产里由 DirWatcher 的监控线程做这两件事）。
+        std::fs::write(dir.join("b.svg"), b"<svg/>").expect("写新夹具");
+        note_dir_change();
+        let (b, scanned) = listing_for_event(&dir).expect("再扫一次");
+        assert!(scanned, "新事件之后必须真扫");
+        assert!(!Arc::ptr_eq(&a, &b), "新事件之后不许复用旧清单");
+        assert_eq!(scan_count() - before, 2);
+        assert_eq!(b.len(), 2, "新扫必须看见刚加进去的那个文件");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 不同目录各算各的：这一格按整条路径匹配，不许把一个目录的清单借给另一个。
+    #[test]
+    fn two_directories_do_not_share_a_batch() {
+        let d1 = scratch("d1");
+        let d2 = scratch("d2");
+        std::fs::write(d1.join("only-in-one.svg"), b"<svg/>").expect("写夹具");
+        std::fs::write(d2.join("only-in-two.svg"), b"<svg/>").expect("写夹具");
+        note_dir_change();
+        let before = scan_count();
+        let (a, _) = listing_for_event(&d1).expect("扫第一个");
+        let (b, scanned_b) = listing_for_event(&d2).expect("扫第二个");
+        assert!(scanned_b, "换了目录就得真扫");
+        assert_eq!(scan_count() - before, 2, "两个目录就是两次枚举");
+        assert_eq!(
+            a[0].file_name().map(|n| n.to_owned()),
+            Some("only-in-one.svg".into())
+        );
+        assert_eq!(
+            b[0].file_name().map(|n| n.to_owned()),
+            Some("only-in-two.svg".into())
+        );
+        let _ = std::fs::remove_dir_all(&d1);
+        let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    /// ★ 回归钉子：`Gallery::rescan`（"现在去看这个目录"）**永远不许**拿上一批的清单。
+    ///
+    /// 第一版把复用塞进了枚举函数本身，四条既有用例当场红（删掉文件后 `rescan` 看不见）。
+    /// 这条把那个形态单独钉死，免得以后又"顺手"把缓存下沉一层。
+    #[test]
+    fn rescan_never_serves_a_stale_batch() {
+        let dir = scratch("nostale");
+        let f = dir.join("a.svg");
+        std::fs::write(&f, b"<svg/>").expect("写夹具");
+        std::fs::write(dir.join("b.svg"), b"<svg/>").expect("写夹具");
+        let g = Gallery::from_file(&f).expect("先建清单");
+        assert_eq!(g.len(), 2);
+        // 让事件那条路先扫一遍，并把它登记在本代次里……
+        note_dir_change();
+        let _ = listing_for_event(&dir).expect("事件路径扫一次");
+        // ……然后磁盘变了（生产里 watcher 会 bump；这里直接调 rescan 模拟"就是现在"）。
+        std::fs::remove_file(dir.join("b.svg")).expect("删夹具");
+        let g2 = g.rescan().expect("重扫");
+        assert_eq!(g2.len(), 1, "rescan 必须看见磁盘现状，不许拿上一批的清单");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 内存里的假清单（不碰磁盘），给纯逻辑用例用。
     fn gallery(n: usize) -> Gallery {
         Gallery {
             dir: PathBuf::from("."),

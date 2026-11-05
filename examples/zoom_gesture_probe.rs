@@ -9,7 +9,7 @@
 //! 跑法（在 `main/` 下；给样本路径当参数，默认那块 100 MB TIFF）：
 //!
 //! ```text
-//! RUPIX_DECODERS_DIR=E:/tmp/AI.Agent/RuPix/.build/decoders \
+//! RUPIX_DECODERS_DIR=<工作区根>\.build\decoders \
 //!   cargo run --release --example zoom_gesture_probe -- ../.temp/big-samples/tiff/100M/tiff_100M.tif
 //! ```
 //!

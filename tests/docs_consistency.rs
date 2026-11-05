@@ -86,11 +86,10 @@ fn j1_manifest_registered_files_exist() {
             continue;
         }
         let rel = tok.trim_start_matches("../");
-        let candidates = [
-            main_dir().join(rel),
-            main_dir().join("docs").join(rel),
-            main_dir().parent().unwrap().join(rel),
-        ];
+        // 登记簿只管 `main/` 内的文档：仓根或 `docs/` 之下任一位置命中即算存在。
+        // ★ 以前这里还试 `main/` 的父目录，为的是能把第三方源码池里的 README 也登记进来——
+        //   那等于让宿主文档体系去认领一份不在本仓、也不会随宿主一起克隆的文件。
+        let candidates = [main_dir().join(rel), main_dir().join("docs").join(rel)];
         if !candidates.iter().any(|c| c.is_file()) {
             missing.push(tok.to_string());
         }
@@ -312,7 +311,9 @@ fn j5_doc_line_limits() {
         .map(|f| main_dir().join(f))
         .collect();
     walk_files(&main_dir().join("docs"), "md", &mut targets);
-    targets.push(main_dir().parent().unwrap().join("RuPix-Decoder/AGENTS.md"));
+    // ★ 本门禁只管 `main/` 自己的文档。以前这里还塞进解码器仓的 `AGENTS.md` 一起量行数，
+    //   那是让宿主测试去读隔壁仓的文件：换了机器、或那仓没跟着克隆，这条判据就静默少一格
+    //   （`read_to_string` 失败直接 `continue`）。各仓的文档上限归各仓自己的门禁。
     let mut over = Vec::new();
     for p in &targets {
         let Ok(text) = fs::read_to_string(p) else {

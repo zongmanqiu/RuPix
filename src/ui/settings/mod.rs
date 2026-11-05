@@ -49,7 +49,7 @@ pub(crate) use decoders_tab::*;
 pub(crate) use extensions_tab::*;
 pub use exts::ExtRow;
 pub(crate) use exts::*;
-pub use metadata::{open_metadata, refresh_open_metadata};
+pub use metadata::{forget_window as forget_metadata_window, open_metadata, refresh_open_metadata};
 pub(crate) use options::*;
 pub(crate) use rows::{
     action_slot, btn, btn_action, btn_danger, check_row, choice_row, divider, info_row, nav_rail,
@@ -192,6 +192,15 @@ pub struct Handles {
     pub card_mouse: Signal<bool>,
     /// 「插件快捷键」卡（第三张，2026-10-31 用户点名）。
     pub card_plugins: Signal<bool>,
+    /// 「选项」页四张卡的展开态（m224）：外观 / 窗口 / 看图与操作 / 系统与网络。
+    ///
+    /// ★ 与上面六张一样是**会话态**：默认全展开、关窗即忘、不写 ini。
+    ///   `docs/待办.md` m168 记着「展开态落盘、默认全收、一个 `ui_cards` 键」尚未开工；
+    ///   真要做时这十张卡得一起定，别只给新加的四张单独落盘。
+    pub card_appearance: Signal<bool>,
+    pub card_window: Signal<bool>,
+    pub card_browse: Signal<bool>,
+    pub card_system: Signal<bool>,
 }
 
 /// 解析「固定尺寸 (宽, 高)」组合输入（`,`／`，`／`x`／`×` 皆可作分隔，宽松容错）。
@@ -312,7 +321,7 @@ impl Handles {
         if preferred_dirty {
             crate::decoders::set_preferred(c.decoders_preferred.clone());
         }
-        // ini 键：ui_theme（选项页「界面主题」，0 = 深色 / 1 = 浅色）。
+        // ini 键：ui_theme（选项页「主题色」，0 = 深色 / 1 = 浅色）。
         // 只管看图窗口的浮层配色，设置页本身不受影响；写进 config 后由 runtime 推给令牌层。
         let th = UiTheme::from_ui_index(self.ui_theme.get());
         if c.ui_theme != th {
@@ -713,6 +722,10 @@ pub(crate) fn settings_window(config: &Rc<RefCell<Config>>, hub: &Hub) -> Window
             card_keys: sig(true),
             card_mouse: sig(true),
             card_plugins: sig(true),
+            card_appearance: sig(true),
+            card_window: sig(true),
+            card_browse: sig(true),
+            card_system: sig(true),
 
             ui_theme: signal(c.ui_theme.ui_index()),
             download_source: signal(c.download_source.ui_index()),
@@ -938,6 +951,60 @@ pub fn open_settings(ctx: &mut EventCtx, config: &Rc<RefCell<Config>>, hub: &Hub
 mod tests {
     use super::*;
 
+    /// 布局用例共用的一套信号：取值与真实配置无关，只用来把整页的 widget 树建出来。
+    fn test_handles() -> Handles {
+        let (ext_rows_all, ext_filter, ext_view) = decode_signals();
+        Handles {
+            stay: sig(false),
+            minimal_mode: sig(false),
+            checker: sig(false),
+            long_fit: sig(false),
+            dcb: signal(0),
+            slide_secs: signal("3".into()),
+            wheel: signal(0),
+            ctrl_wheel: signal(0),
+            init_win: signal(0),
+            win_size: signal(String::new()),
+            prefetch: signal(false),
+            to_tray: sig(false),
+            space_preview: sig(false),
+            drag_image: sig(false),
+            allow_multiple: sig(false),
+            opacity: signal(0.75),
+            opacity_label: signal(String::new()),
+            tab: signal(0),
+            decoder_count: signal(String::new()),
+            decoder_state: signal(String::new()),
+            decoders: signal(Vec::<DecoderEntry>::new()),
+            decoder_view: signal(Vec::<DecoderEntry>::new()),
+            decoder_filter: signal(String::new()),
+            decoders_seen: sig(false),
+            remote: signal(Vec::new()),
+            remote_state: signal(String::new()),
+            install_progress: signal(None),
+            remote_filter: signal(String::new()),
+            remote_view: signal(Vec::new()),
+            remote_status: signal(String::new()),
+            ext_rows_all,
+            ext_view,
+            ext_count: signal(0),
+            ext_filter,
+            card_installed: sig(true),
+            card_download: sig(true),
+            card_preferred: sig(true),
+            card_keys: sig(true),
+            card_mouse: sig(true),
+            card_plugins: sig(true),
+            card_appearance: sig(true),
+            card_window: sig(true),
+            card_browse: sig(true),
+            card_system: sig(true),
+            ui_theme: signal(0),
+            download_source: signal(0),
+            plugin: PluginUi::new(&Config::default()),
+        }
+    }
+
     #[test]
     fn host_audit_plugin_install_without_hub_enables_and_reports() {
         let cfg = Rc::new(RefCell::new(Config::default()));
@@ -1020,53 +1087,7 @@ mod tests {
         use windui::text::NullTextEngine;
 
         let config = Rc::new(RefCell::new(Config::default()));
-        let (ext_rows_all, ext_filter, ext_view) = decode_signals();
-        let h = Handles {
-            stay: sig(false),
-            minimal_mode: sig(false),
-            checker: sig(false),
-            long_fit: sig(false),
-            dcb: signal(0),
-            slide_secs: signal("3".into()),
-            wheel: signal(0),
-            ctrl_wheel: signal(0),
-            init_win: signal(0),
-            win_size: signal(String::new()),
-            prefetch: signal(false),
-            to_tray: sig(false),
-            space_preview: sig(false),
-            drag_image: sig(false),
-            allow_multiple: sig(false),
-            opacity: signal(0.75),
-            opacity_label: signal(String::new()),
-            tab: signal(0),
-            decoder_count: signal(String::new()),
-            decoder_state: signal(String::new()),
-            decoders: signal(Vec::<DecoderEntry>::new()),
-            decoder_view: signal(Vec::<DecoderEntry>::new()),
-            decoder_filter: signal(String::new()),
-            decoders_seen: sig(false),
-            remote: signal(Vec::new()),
-            remote_state: signal(String::new()),
-            install_progress: signal(None),
-            remote_filter: signal(String::new()),
-            remote_view: signal(Vec::new()),
-            remote_status: signal(String::new()),
-            ext_rows_all,
-            ext_view,
-            ext_count: signal(0),
-            ext_filter,
-            card_installed: sig(true),
-            card_download: sig(true),
-            card_preferred: sig(true),
-            card_keys: sig(true),
-            card_mouse: sig(true),
-            card_plugins: sig(true),
-
-            ui_theme: signal(0),
-            download_source: signal(0),
-            plugin: PluginUi::new(&Config::default()),
-        };
+        let h = test_handles();
         let (capturing, texts) = shortcuts_ui();
         let pages: Vec<Element> = vec![
             options_page(&h),
@@ -1123,5 +1144,68 @@ mod tests {
                 size.w - tree.abs_bounds(scroll_id).right()
             );
         }
+    }
+
+    /// 「选项」页 m224 分组：四张卡、15 行一项不少、折叠是活开关。
+    ///
+    /// ★ 折叠判据落在**卡片自己**的高度上（`CARD_HEADER_H`），不落在正文 bounds：
+    ///   windui 的 `visible_when(false)` 只把节点从可见子表里摘掉，上一帧量到的
+    ///   bounds 原样留着（与 shortcuts 页那条折叠用例同一口径）。
+    #[test]
+    fn options_page_four_cards_hold_all_rows_and_collapse() {
+        use windui::core::Tree;
+        use windui::text::NullTextEngine;
+
+        let h = test_handles();
+        let ui = options_page(&h).fill();
+        let mut tree = Tree::new();
+        let root = ui.build(&mut tree);
+        tree.root = Some(root);
+        let size = Size::new(640, 480);
+        tree.layout_root(size, &mut NullTextEngine);
+
+        let inner = tree.get(root).expect("scroll").children[0];
+        let cards = tree.get(inner).expect("页 col").children.clone();
+        assert_eq!(
+            cards.len(),
+            4,
+            "选项页应有四张卡：外观 / 窗口 / 看图与操作 / 系统与网络"
+        );
+        let want = [4, 5, 4, 2];
+        let mut rows = 0;
+        for (i, (card, n)) in cards.iter().zip(want).enumerate() {
+            let node = tree.get(*card).expect("卡");
+            assert_eq!(
+                node.children.len(),
+                2,
+                "卡 {i} 应为「标题条 + 正文」两个子节点"
+            );
+            let body = node.children[1];
+            let got = tree.get(body).expect("正文").children.len();
+            assert_eq!(got, n, "卡 {i} 行数不对（分组串位了？）");
+            rows += got;
+        }
+        assert_eq!(rows, 15, "15 项一项都不能在分组里丢");
+
+        let expanded_card_h = tree.get(cards[1]).expect("窗口卡").bounds.h;
+        let expanded_content_h = tree.get(root).expect("页面").content_h;
+        h.card_window.set(false);
+        tree.layout_root(size, &mut NullTextEngine);
+        assert_eq!(
+            tree.get(cards[1]).expect("窗口卡").bounds.h,
+            CARD_HEADER_H,
+            "收起「窗口」后卡片应只剩标题条那么高"
+        );
+        assert!(
+            tree.get(root).expect("页面").content_h < expanded_content_h,
+            "收起一张卡后整页内容高度应下降"
+        );
+        h.card_window.set(true);
+        tree.layout_root(size, &mut NullTextEngine);
+        assert_eq!(
+            tree.get(cards[1]).expect("窗口卡").bounds.h,
+            expanded_card_h,
+            "再点「窗口」应展开回原高"
+        );
     }
 }

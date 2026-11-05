@@ -58,17 +58,27 @@ pub fn about_page() -> Element {
         )
         .cross(Align::Center);
 
-    let repo_row = |name: &str, text: &str, url: &'static str| {
-        Element::row()
-            .child(
-                Element::label(name)
-                    .font_size(FONT_MD)
-                    .fg(to_color(TEXT_SECONDARY)),
-            )
-            .child(Element::leaf().width(6))
-            .child(Element::link(text).url(url).font_size(FONT_MD))
-            .cross(Align::Center)
-    };
+    // 两个仓库合成一行（2026-11-05 用户口径）：名字就是链接，省掉两行「×× 仓库：URL」。
+    // 位置感不由文案承担——Gitee 在前（主源）、GitHub 在后（镜像），与文档里的口径一致。
+    let repo_row = Element::row()
+        .spacing(6)
+        .child(
+            Element::label("仓库：")
+                .font_size(FONT_MD)
+                .fg(to_color(TEXT_SECONDARY)),
+        )
+        .child(Element::link("Gitee").url(HOMEPAGE).font_size(FONT_MD))
+        .child(
+            Element::label("|")
+                .font_size(FONT_MD)
+                .fg(to_color(TEXT_SECONDARY)),
+        )
+        .child(
+            Element::link("GitHub")
+                .url(GITHUB_MIRROR)
+                .font_size(FONT_MD),
+        )
+        .cross(Align::Center);
 
     let info_card = Element::col()
         .spacing(6)
@@ -83,8 +93,7 @@ pub fn about_page() -> Element {
                 .font_size(FONT_MD)
                 .fg(to_color(TEXT_SECONDARY)),
         )
-        .child(repo_row("Gitee 仓库：", HOMEPAGE, HOMEPAGE))
-        .child(repo_row("GitHub 镜像：", GITHUB_MIRROR, GITHUB_MIRROR))
+        .child(repo_row)
         .padding(card_pad)
         .bg(card_bg)
         .corner(card_radius);
