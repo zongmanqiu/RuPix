@@ -130,6 +130,7 @@ python build/gate.py run all
 | `metadata_probe.ps1` | 同上，验属性窗：ini 里 `hotkeys=props:F2`，`PostMessage` 往每扇窗投 F2，数标题不是主窗标题的窗 |
 | `decoder_inuse_probe.ps1` | 卸载一个**本会话已加载**的解码器会怎样：私有解码器目录只放 `common`，开着 `.jpg` 时把 DLL 送回收站（外壳真实路径，不是原地改名）⇒ 期望失败；关进程后再试 ⇒ 期望成功。附带一条方法论：原地改名**不是**回收站的替身 |
 | `dir_rescan_probe.ps1` | 多窗盯同一个大目录时**一次文件变动的重扫成本**：造 N 项夹具、开 N 扇窗、加/删一个文件，读 `[dir-rescan]` 数 `scanned`（真读盘）与 `reused`（复用别人的扫描）。判定 `scanned` 恒为 1 才算同批只扫一次 |
+| `tray_wake_probe.ps1` | 点托盘「显示窗口」（等价于再次启动不带参数的 `rupix.exe`）时，多开的窗口是不是**全部**回到前面：开 N 扇，拿一个无关窗口把它们盖住，读 z 序（同一次 `EnumWindows` 里算 index）。`-Bin` 指被测 exe（新旧对照要传两个不同的二进制，**不能**叫 `-Exe`：PowerShell 变量名不分大小写，会被脚本里的 `$exe` 顶掉）；`-Cover 0` 改走"最小化 + 读 IsIconic"的老判据，`-SkipWake 1` 是不唤回的对照臂（证明恢复确实由唤回触发，而不是系统自己还原） |
 
 > `_common.bat` **不是探针**：它是六个编号步骤各自 `call` 的公共前置——算出
 > `MAIN_DIR` / `PROJECT_ROOT` / `TEMP_DIR` / `TARGET_DIR` / `OUTPUT_DIR` / `DECODER_DIR` /

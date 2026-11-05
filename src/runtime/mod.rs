@@ -311,6 +311,20 @@ impl Shared {
             .find(|w| w.id == id)
     }
 
+    /// 全部活着的窗口，按建窗顺序（先建的在前）。多开时托盘「显示窗口」逐扇唤回要用它。
+    ///
+    /// ★ 与 [`newest`](Self::newest) 同源：`Weak::upgrade` 成功才算活着。正在关闭的窗口
+    /// 此刻仍能升级出来（框架回调还持有它），所以它也会被算进来——这与 `newest` 的既有
+    /// 口径一致，不在这里另立判据。
+    fn alive(&self) -> Vec<Rc<WinRt>> {
+        self.prune();
+        self.wins
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect()
+    }
+
     /// 最近的窗口：优先 `active`，其次注册表里最后一个（`wins` 按建窗顺序追加）。
     fn newest(&self) -> Option<Rc<WinRt>> {
         self.prune();
@@ -1100,13 +1114,18 @@ pub fn run(initial: Option<PathBuf>) {
             {
                 let shared = shared.clone();
                 Rc::new(move |tctx: &mut TrayCtx| {
-                    tctx.open_window(wake_request(&shared, false, None))
+                    // 多开时逐扇唤回（最近在用的那扇压最上），单窗时就是那一条。
+                    for req in wake_requests(&shared, false, None) {
+                        tctx.open_window(req);
+                    }
                 })
             },
             {
                 let shared = shared.clone();
                 Rc::new(move |tctx: &mut TrayCtx| {
-                    tctx.open_window(wake_request(&shared, true, None))
+                    for req in wake_requests(&shared, true, None) {
+                        tctx.open_window(req);
+                    }
                 })
             },
         ));
@@ -1138,7 +1157,9 @@ pub fn run(initial: Option<PathBuf>) {
                 }
                 None => {
                     log::info!("二次启动：未带文件，仅唤回窗口");
-                    ctx.open_window(wake_request(&shared, false, None));
+                    for req in wake_requests(&shared, false, None) {
+                        ctx.open_window(req);
+                    }
                 }
             }
         }
@@ -1208,18 +1229,47 @@ pub fn run(initial: Option<PathBuf>) {
     crate::platform::spacehook::set_enabled(false);
 }
 
-/// 托盘 / 二次启动要的那份窗口请求。
+/// 托盘 / 二次启动要的那批窗口请求。
 ///
-/// - `force_new == false` 且已有窗口 → 返回**那扇窗**的请求：`.single` 键命中时平台
-///   只把它激活到前台、丢弃配置（`WindowRequest` 里那份 `FnOnce` 内容构建器随之作废，
-///   不会重建窗口、也不会丢掉窗口状态）。这是"点托盘回到我在看的那扇窗"。
-/// - 否则 → 新建一扇。
-fn wake_request(shared: &Rc<Shared>, force_new: bool, initial: Option<PathBuf>) -> WindowRequest {
-    if !force_new {
-        if let Some(w) = shared.newest() {
-            return w.request();
-        }
+/// - `force_new == true` → 只有一条：**新建**一扇。
+/// - 否则 → 把手上**所有**窗口各提交一次。每条的 `.single` 键（`viewer-{id}`）在平台
+///   登记表里命中时只把它 `show_and_activate` 到前台，配置被丢弃（`FnOnce` 内容构建器
+///   随之作废），不会重建窗口、也不会丢窗口状态。最近在用的那扇排在**最后一笔**，于是
+///   它是最后被激活的，压在最上层。
+/// - 一个窗口都没有时退化成新建一扇：零窗口常驻里这是唯一入口。
+///
+/// ★ 多开之前这里只返回 `newest()` 一条，多开后点托盘只回得来最近那一扇，其余窗口
+/// 仍被盖着——用户读到的是"我的窗丢了"。改为逐扇唤回后行为与单窗/零窗口一脉相承：
+/// 点托盘 = 手上的图都回来。
+fn wake_requests(
+    shared: &Rc<Shared>,
+    force_new: bool,
+    initial: Option<PathBuf>,
+) -> Vec<WindowRequest> {
+    if force_new {
+        return vec![new_window_request(shared, initial)];
     }
+    let mut wins = shared.alive();
+    if wins.is_empty() {
+        return vec![new_window_request(shared, initial)];
+    }
+    // 最近在用的那扇挪到最后一笔：平台按批内顺序逐个 `show_and_activate`，
+    // 最后一笔落地 = 最上层（用户期待的"回到我在看的那扇"）。
+    let top = shared.active.get();
+    if let Some(i) = wins.iter().position(|w| w.id == top) {
+        let w = wins.remove(i);
+        wins.push(w);
+    }
+    log::info!(
+        "唤回窗口 {} 扇（最上一扇 id={}）",
+        wins.len(),
+        wins.last().map(|w| w.id).unwrap_or(0)
+    );
+    wins.iter().map(|w| w.request()).collect()
+}
+
+/// 新建一扇并交出它的开窗请求。
+fn new_window_request(shared: &Rc<Shared>, initial: Option<PathBuf>) -> WindowRequest {
     let w = WinRt::create(shared.clone(), initial);
     log::info!("新开看图窗口 id={}（现有 {} 个）", w.id, shared.prune());
     w.request()
@@ -1240,7 +1290,7 @@ fn start_window_request(shared: &Rc<Shared>, initial: Option<PathBuf>) -> Window
 
 /// 开一个新的看图窗口（不看注册表，永远新建）。
 fn open_window(shared: &Rc<Shared>, ctx: &mut EventCtx, initial: Option<PathBuf>) {
-    ctx.open_window(wake_request(shared, true, initial));
+    ctx.open_window(new_window_request(shared, initial));
 }
 
 #[cfg(test)]
