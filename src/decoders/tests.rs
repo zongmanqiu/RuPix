@@ -1107,8 +1107,13 @@ fn dll_lock_serializes_two_threads_on_the_same_dll() {
     let inner = Arc::clone(&log);
     let k = key.clone();
     let first = std::thread::spawn(move || {
-        let _g = super::dll_lock::enter_within(&k, "bridge", Duration::from_secs(2))
-            .expect("第一笔应先拿到锁");
+        let _g = super::dll_lock::enter_within(
+            &k,
+            "bridge",
+            Duration::from_secs(2),
+            super::dll_lock::Class::Urgent,
+        )
+        .expect("第一笔应先拿到锁");
         inner.lock().unwrap().push("A-in");
         std::thread::sleep(Duration::from_millis(80));
         inner.lock().unwrap().push("A-out");
@@ -1117,8 +1122,13 @@ fn dll_lock_serializes_two_threads_on_the_same_dll() {
     // 让第一笔先跑起来，否则下面那句可能抢在它前面（这条用例要的是"排队"，不是赛跑）。
     std::thread::sleep(Duration::from_millis(15));
     {
-        let _g = super::dll_lock::enter_within(&key, "bridge", Duration::from_secs(2))
-            .expect("第二笔应等到第一笔松开");
+        let _g = super::dll_lock::enter_within(
+            &key,
+            "bridge",
+            Duration::from_secs(2),
+            super::dll_lock::Class::Urgent,
+        )
+        .expect("第二笔应等到第一笔松开");
         log.lock().unwrap().push("B-in");
     }
     first.join().expect("第一笔线程不该崩");
@@ -1137,18 +1147,33 @@ fn dll_lock_is_reentrant_on_one_thread() {
 
     let key = std::path::PathBuf::from(r"Z:\rupix-dll-lock\reentrant\b.dll");
     // 预算给到 5 ms：真去抢锁的话必然超时，用例就会在第二层失败而不是吊死。
-    let outer =
-        super::dll_lock::enter_within(&key, "doc", Duration::from_millis(5)).expect("外层应先拿到");
+    let outer = super::dll_lock::enter_within(
+        &key,
+        "doc",
+        Duration::from_millis(5),
+        super::dll_lock::Class::Urgent,
+    )
+    .expect("外层应先拿到");
     assert!(super::dll_lock::held_here(&key));
-    let inner = super::dll_lock::enter_within(&key, "doc", Duration::from_millis(5))
-        .expect("同线程重入不该抢锁");
+    let inner = super::dll_lock::enter_within(
+        &key,
+        "doc",
+        Duration::from_millis(5),
+        super::dll_lock::Class::Urgent,
+    )
+    .expect("同线程重入不该抢锁");
     drop(inner);
     assert!(super::dll_lock::held_here(&key), "内层走了，外层还在");
     drop(outer);
     assert!(!super::dll_lock::held_here(&key), "外层走了要清干净");
     // 清干净之后别的线程/下一次调用还能拿到。
-    super::dll_lock::enter_within(&key, "doc", Duration::from_millis(50))
-        .expect("释放后应可再次获取");
+    super::dll_lock::enter_within(
+        &key,
+        "doc",
+        Duration::from_millis(50),
+        super::dll_lock::Class::Urgent,
+    )
+    .expect("释放后应可再次获取");
 }
 
 /// 占着不放 ⇒ 有界等待后交一条可读裁决，不是无限等。
@@ -1161,8 +1186,13 @@ fn dll_lock_gives_up_with_a_readable_verdict() {
     let (tx, rx) = mpsc::channel();
     let k = key.clone();
     let holder = std::thread::spawn(move || {
-        let _g = super::dll_lock::enter_within(&k, "slow", Duration::from_secs(2))
-            .expect("占锁方应先拿到");
+        let _g = super::dll_lock::enter_within(
+            &k,
+            "slow",
+            Duration::from_secs(2),
+            super::dll_lock::Class::Urgent,
+        )
+        .expect("占锁方应先拿到");
         tx.send(()).expect("通知主线程");
         std::thread::sleep(Duration::from_millis(200));
     });
@@ -1170,7 +1200,12 @@ fn dll_lock_gives_up_with_a_readable_verdict() {
         .expect("等占锁方就位");
 
     let started = Instant::now();
-    let err = match super::dll_lock::enter_within(&key, "waiter", Duration::from_millis(60)) {
+    let err = match super::dll_lock::enter_within(
+        &key,
+        "waiter",
+        Duration::from_millis(60),
+        super::dll_lock::Class::Urgent,
+    ) {
         Ok(_) => panic!("锁被占着，不该拿到"),
         Err(e) => e,
     };
@@ -1195,9 +1230,20 @@ fn dll_lock_does_not_couple_two_different_dlls() {
 
     let a = std::path::PathBuf::from(r"Z:\rupix-dll-lock\apart\a.dll");
     let b = std::path::PathBuf::from(r"Z:\rupix-dll-lock\apart\b.dll");
-    let _ga = super::dll_lock::enter_within(&a, "one", Duration::from_secs(1)).expect("拿 A");
-    let gb =
-        super::dll_lock::enter_within(&b, "two", Duration::from_millis(20)).expect("拿 B 不该等 A");
+    let _ga = super::dll_lock::enter_within(
+        &a,
+        "one",
+        Duration::from_secs(1),
+        super::dll_lock::Class::Urgent,
+    )
+    .expect("拿 A");
+    let gb = super::dll_lock::enter_within(
+        &b,
+        "two",
+        Duration::from_millis(20),
+        super::dll_lock::Class::Urgent,
+    )
+    .expect("拿 B 不该等 A");
     drop(gb);
     assert!(super::dll_lock::held_here(&a));
     assert!(!super::dll_lock::held_here(&b));
@@ -1214,8 +1260,13 @@ fn dll_lock_serves_waiters_in_arrival_order() {
 
     let key = std::path::PathBuf::from(r"Z:\rupix-dll-lock\fair\a.dll");
     let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
-    let holder =
-        super::dll_lock::enter_within(&key, "holder", Duration::from_secs(2)).expect("持锁方先拿");
+    let holder = super::dll_lock::enter_within(
+        &key,
+        "holder",
+        Duration::from_secs(2),
+        super::dll_lock::Class::Urgent,
+    )
+    .expect("持锁方先拿");
 
     let (tx, rx) = mpsc::channel();
     let b = {
@@ -1223,8 +1274,13 @@ fn dll_lock_serves_waiters_in_arrival_order() {
         let order = Arc::clone(&order);
         std::thread::spawn(move || {
             tx.send(()).expect("报告即将入队");
-            let _g =
-                super::dll_lock::enter_within(&key, "B", Duration::from_secs(5)).expect("B 应拿到");
+            let _g = super::dll_lock::enter_within(
+                &key,
+                "B",
+                Duration::from_secs(5),
+                super::dll_lock::Class::Urgent,
+            )
+            .expect("B 应拿到");
             order.lock().unwrap().push("B");
         })
     };
@@ -1235,8 +1291,13 @@ fn dll_lock_serves_waiters_in_arrival_order() {
         let key = key.clone();
         let order = Arc::clone(&order);
         std::thread::spawn(move || {
-            let _g =
-                super::dll_lock::enter_within(&key, "C", Duration::from_secs(5)).expect("C 应拿到");
+            let _g = super::dll_lock::enter_within(
+                &key,
+                "C",
+                Duration::from_secs(5),
+                super::dll_lock::Class::Urgent,
+            )
+            .expect("C 应拿到");
             order.lock().unwrap().push("C");
         })
     };
@@ -1249,6 +1310,74 @@ fn dll_lock_serves_waiters_in_arrival_order() {
         *order.lock().unwrap(),
         vec!["B", "C"],
         "先入队者先拿锁（旧实现会退化成 B、C 赛跑）"
+    );
+}
+
+/// 后台预取不许挡在用户请求前面（m237）。
+///
+/// 同一条队里：预取先到（`Background`），用户请求后到（`Urgent`）。放手后**用户先拿到**，
+/// 预取仍等着——这就是"用户那一笔不该为没人等的下一张排队"。
+#[test]
+fn dll_lock_urgent_overtakes_a_waiting_background_request() {
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
+
+    let key = std::path::PathBuf::from(r"Z:\rupix-dll-lock\overtake\a.dll");
+    let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let holder = super::dll_lock::enter_within(
+        &key,
+        "holder",
+        Duration::from_secs(2),
+        super::dll_lock::Class::Urgent,
+    )
+    .expect("持锁方先拿");
+
+    // 预取先入队，但它不该因此占住队首。
+    let (bg_tx, bg_rx) = mpsc::channel();
+    let bg = {
+        let key = key.clone();
+        let order = Arc::clone(&order);
+        std::thread::spawn(move || {
+            bg_tx.send(()).expect("报告即将入队");
+            let _g = super::dll_lock::enter_within(
+                &key,
+                "prefetch",
+                Duration::from_secs(5),
+                super::dll_lock::Class::Background,
+            )
+            .expect("预取最终也应拿到（用户队列空了之后）");
+            order.lock().unwrap().push("prefetch");
+        })
+    };
+    bg_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("等预取就位");
+    // 60 ms 足够它走完"领票 + 入队"；太短会让这条用例在慢机器上偶发假红。
+    std::thread::sleep(Duration::from_millis(60));
+
+    let urgent = {
+        let key = key.clone();
+        let order = Arc::clone(&order);
+        std::thread::spawn(move || {
+            let _g = super::dll_lock::enter_within(
+                &key,
+                "user",
+                Duration::from_secs(5),
+                super::dll_lock::Class::Urgent,
+            )
+            .expect("用户请求应拿到");
+            order.lock().unwrap().push("user");
+        })
+    };
+    std::thread::sleep(Duration::from_millis(40));
+    drop(holder);
+    urgent.join().expect("用户线程不该崩");
+    bg.join().expect("预取线程不该崩");
+
+    assert_eq!(
+        *order.lock().unwrap(),
+        vec!["user", "prefetch"],
+        "后到的用户请求必须先拿到锁（只有一档的旧实现会先给预取）"
     );
 }
 
@@ -1266,8 +1395,13 @@ fn dll_lock_abandoned_waiter_does_not_block_the_queue() {
     let holder = {
         let key = key.clone();
         std::thread::spawn(move || {
-            let _g = super::dll_lock::enter_within(&key, "holder", Duration::from_secs(2))
-                .expect("持锁方先拿");
+            let _g = super::dll_lock::enter_within(
+                &key,
+                "holder",
+                Duration::from_secs(2),
+                super::dll_lock::Class::Urgent,
+            )
+            .expect("持锁方先拿");
             ready_tx.send(()).expect("报告已持锁");
             let _ = release_rx.recv_timeout(Duration::from_secs(5));
         })
@@ -1277,7 +1411,12 @@ fn dll_lock_abandoned_waiter_does_not_block_the_queue() {
         .expect("等持锁方就位");
 
     // B 预算 50 ms，注定超时；它的票此时排在队首。
-    let err = match super::dll_lock::enter_within(&key, "B", Duration::from_millis(50)) {
+    let err = match super::dll_lock::enter_within(
+        &key,
+        "B",
+        Duration::from_millis(50),
+        super::dll_lock::Class::Urgent,
+    ) {
         Ok(_) => panic!("锁被占着，B 不该拿到"),
         Err(e) => e,
     };
@@ -1288,8 +1427,13 @@ fn dll_lock_abandoned_waiter_does_not_block_the_queue() {
     let c = {
         let key = key.clone();
         std::thread::spawn(move || {
-            let _g = super::dll_lock::enter_within(&key, "C", Duration::from_secs(2))
-                .expect("C 应拿到：队首那张票已经被摘掉");
+            let _g = super::dll_lock::enter_within(
+                &key,
+                "C",
+                Duration::from_secs(2),
+                super::dll_lock::Class::Urgent,
+            )
+            .expect("C 应拿到：队首那张票已经被摘掉");
         })
     };
     std::thread::sleep(Duration::from_millis(30));

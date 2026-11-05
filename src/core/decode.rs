@@ -826,6 +826,15 @@ pub trait DecodeBackend: Send {
         allow_scaled: bool,
     ) -> Result<Decoded, String>;
 
+    /// 本次请求是**后台预取**还是用户正等的那一笔（m237）。
+    ///
+    /// 只影响一件事：跨窗共用同一枚解码器 DLL 时，排队拿调用权站哪一档（见
+    /// `decoders::dll_lock::Class`）。预取必须让位——否则"没人等的下一张"会挡在
+    /// "用户正等的那张"前面，实测能多等一整笔（26.7 MP ≈ 0.95 s）。
+    ///
+    /// 默认实现什么都不做：这条只有解码器层（有跨窗共享 DLL 的那层）需要关心。
+    fn set_background(&mut self, _on: bool) {}
+
     /// 区域渲染（**ABI v6**）：把文档的**指定区域**按目标密度直接光栅化。
     ///
     /// 这是"矢量图放大到 4000% 也无损"的通道：画布恒为一屏大小，倍率再高也
@@ -1304,6 +1313,10 @@ fn decode_loop(
 ///   2026-10-25 又整层删掉——三段历史都不改"兜底永远不做"这条底线。）
 fn decode_one(req: &Req) -> Result<Decoded, String> {
     set_phase(PHASE_OPEN);
+    // 排队优先级（m237）：预取让位给用户正等的那一笔——跨窗共用同一枚 DLL 时，
+    // "没人等的下一张"不该挡在前面。后端实例是长驻的，所以**每次请求都要设**。
+    // 拿不到后端（未装配 / 正在重启）就算了：后面那次调用自己会报错。
+    let _ = with_backend(|b| b.set_background(req.kind == ReqKind::Prefetch));
     // 0 字节没有可解码的字节：在路由之前直说。交给后端的话，解码器探测只会答
     // 「不认识这个文件」——把"文件是空的"说成"格式不认"，排查方向就反了。
     if std::fs::metadata(&req.path).is_ok_and(|m| m.len() == 0) {

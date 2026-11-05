@@ -19,7 +19,7 @@
 # run marker removed at the end.
 
 param(
-    [Parameter(Position = 0)][ValidateSet('single', 'dual', 'triple')][string]$Arm = 'dual',
+    [Parameter(Position = 0)][ValidateSet('single', 'dual', 'triple', 'idle')][string]$Arm = 'dual',
     [Parameter(Position = 1)][int]$N = 40,
     [Parameter(Position = 2)][int]$IntervalMs = 250,
     [string]$Tag = 'dual',
@@ -33,6 +33,14 @@ param(
     [string]$CDir = '',
     # S3 arm: close window B halfway through the cadence (decode in flight) and keep driving A.
     [switch]$CloseMidway,
+    # 0 (default, keeps the m229/m230 arms reproducible) / 1 = the SHIPPED default.
+    # This matters: with prefetch on, every idle window decodes its neighbours through the
+    # SAME per-DLL lock, so a user's own turn can queue behind somebody else's prefetch.
+    [int]$Prefetch = 0,
+    # Binary under test. Empty = the deployed .build\rupix.exe; pass a path to A/B two builds
+    # (named -Bin, not -Exe: PS variable names are case-insensitive and $exe is the private
+    # copy this script launches).
+    [string]$Bin = '',
     [int]$SettleSec = 6,
     [int]$HoldSec = 0,
     [int]$WindowW = 900,
@@ -97,7 +105,7 @@ function Get-Hwnds {
 }
 
 $build = 'E:\tmp\AI.Agent\RuPix\.build'
-$srcExe = Join-Path $build 'rupix.exe'
+$srcExe = if ($Bin -ne '') { $Bin } else { Join-Path $build 'rupix.exe' }
 if (-not (Test-Path $srcExe)) { Write-Output 'NO_EXE'; exit 1 }
 
 function Pick-Pair {
@@ -126,7 +134,7 @@ $env:RUPIX_DECODERS_DIR = Join-Path $build 'decoders'
 $env:RUST_LOG = 'info,fontdb=error'
 $env:RUPIX_DECODE_TRACE = '1'
 @(
-    'allow_multiple=1', 'prefetch=0', 'close_to_tray=0', 'minimal_mode=0',
+    'allow_multiple=1', ("prefetch={0}" -f $Prefetch), 'close_to_tray=0', 'minimal_mode=0',
     'decoders_preferred=', 'decoders_disabled=',
     ("window_w={0}" -f $WindowW), ("window_h={0}" -f $WindowH), 'init_window=0',
     'opacity=100', 'filmstrip=0', 'checker=0', 'stay_on_top=0'
@@ -192,7 +200,10 @@ $right = 39
 $left = 37
 $taps = 0
 $t0 = Get-Date
-if ($Arm -eq 'single') {
+if ($Arm -eq 'single' -or $Arm -eq 'idle') {
+    # 'idle': a second window is open but NEVER driven - it sits there prefetching its
+    # neighbours. That is the case the user actually hits ("one window flips, another is
+    # just open"), and the one where a background prefetch can stand in the user's way.
     for ($i = 0; $i -lt $N; $i++) {
         [DS]::Tap($hA, $right); $taps++
         Start-Sleep -Milliseconds $IntervalMs

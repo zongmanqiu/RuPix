@@ -124,7 +124,7 @@ python build/gate.py run all
 | `key_dispatch_probe.ps1` | 一次按下的字符键触发几个动作：黑白交替、帧延迟 300 s 的 GIF 当夹具，配合 `RUST_LOG=trace` 分辨 WM_KEYDOWN 与 WM_CHAR 双派发 |
 | `probe_tray_clear.ps1` | "关进托盘再唤醒 → 旧图必须已经清空"：唤醒不带文件应当是空窗（截图小）、带文件应当有图（截图大），且工作集与线程数不随轮次上涨 |
 | `multi_window_probe.ps1` | 多开是"每次启动一扇新窗"还是"就地换图"：私有根连开 N 次，数本进程顶层窗 + 读日志里上屏的文件 |
-| `dll_serial_probe.ps1` | 两（三）扇窗迎面翻同一批图，`[dll-serial]` 记每笔的 `wait`/`run`；`-CloseMidway` 在解码在飞时关掉一扇，`-HoldSec` 让进程在驱动之后再活 N 秒（跨过看门狗 10 s 首报阈值，才验得了"没有假告警"） |
+| `dll_serial_probe.ps1` | 两（三）扇窗迎面翻同一批图，`[dll-serial]` 记每笔的 `wait`/`run`；`-CloseMidway` 在解码在飞时关掉一扇，`-HoldSec` 让进程在驱动之后再活 N 秒（跨过看门狗 10 s 首报阈值，才验得了"没有假告警"）。`-Arm idle` = 第二扇窗只开不驱动（**用户真实场景**：一窗翻页、另一窗只是开着并在后台预取）；`-Prefetch 0/1` 开关邻图预读（默认 0 保持 m229/m230 的臂可复跑，要测真实体验必须给 1）；`-Bin` 指定被测二进制做 A/B（旧名 `-Exe` 会被脚本里的 `$exe` 顶掉，PS 变量名不分大小写） |
 | `dll_serial_analyze.py` | 上一条的判据：持锁区间零重叠、等待上界随窗口数缩放、跨解码器重叠是**并行**的正面证据；退出码 0/1/2（2 = 没测到争用 ⇒ 结论不成立） |
 | `raw_dialog_probe.ps1` | 多开时**每扇窗各弹一个**裸数据参数窗（两个无整数几何的 `.bgra` 造夹具，数顶层窗：主窗 + 各自的对话框） |
 | `metadata_probe.ps1` | 同上，验属性窗：ini 里 `hotkeys=props:F2`，`PostMessage` 往每扇窗投 F2，数标题不是主窗标题的窗 |

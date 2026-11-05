@@ -228,7 +228,7 @@ impl Host {
             };
             // 同一枚 DLL 的调用权（`dll_lock` 模块头）：拿不到就跳过这一枚——
             // "别人正在用"不是"这枚坏了"，不许记成故障。
-            let Ok(_dll) = super::dll_lock::enter(&k, &id) else {
+            let Ok(_dll) = super::dll_lock::enter(&k, &id, self.class()) else {
                 continue;
             };
             // NULL 扩展名嗅探（解码器按内容认领）。
@@ -324,7 +324,7 @@ impl Host {
             ));
         };
         // 同一枚 DLL 的调用权（见 `dll_lock` 模块头）。
-        let _dll = super::dll_lock::enter(key, &id)?;
+        let _dll = super::dll_lock::enter(key, &id, self.class())?;
         let mapped = std::fs::File::open(path)
             .ok()
             .and_then(|f| unsafe { memmap2::Mmap::map(&f).ok() });
@@ -525,7 +525,7 @@ impl Host {
 
         let mut last_err = String::new();
         for (key, id, f, last_error) in cands {
-            let Ok(_dll) = super::dll_lock::enter(&key, &id) else {
+            let Ok(_dll) = super::dll_lock::enter(&key, &id, self.class()) else {
                 continue;
             };
             match region_roundtrip(f, last_error, data, &req, ext_c.as_ref()) {
@@ -608,7 +608,7 @@ impl Host {
         // ★ 同一枚 DLL 的调用权（2026-11-05 裁决，见 `dll_lock` 模块头与 `docs/待办.md` §28）：
         //   多开之后两条 worker 真的会同时进来，而 ABI 只承诺"可重入、不必 MT-safe"。
         //   拿不到 = "现在忙"，不是"这枚坏了" ⇒ `Unsupported`（换下一家还有救），不是 `Hard`。
-        let _dll = super::dll_lock::enter(key, &id).map_err(Fail::Unsupported)?;
+        let _dll = super::dll_lock::enter(key, &id, self.class()).map_err(Fail::Unsupported)?;
         // 读文件走 mmap：省掉 12MB 级的堆分配+拷贝（解码器只读，切片直给）。
         // 文件极小/被独占等 mmap 不可用时回退整读。Windows 下文件在解码途中被
         // 外部替换的理论风险由每次 FFI 的 catch_unwind + 三振黑名单兜底。

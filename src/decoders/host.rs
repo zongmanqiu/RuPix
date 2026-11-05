@@ -18,6 +18,12 @@ pub struct Host {
     pub(super) strikes: HashMap<String, u32>,
     /// 会话黑名单：三振出局。
     pub(super) blacklist: HashSet<String>,
+    /// 本次请求是不是**后台预取**（由 `core::decode::decode_one` 每次请求置位）。
+    ///
+    /// 只影响一件事：排队拿 DLL 调用权时站哪一档（见 `dll_lock::Class`）。预取不许挡在
+    /// 用户正等的那一笔前面。用状态位而不是加参数，是为了不改
+    /// `DecodeBackend::decode` 那条每层都要跟一遍的签名链。
+    pub(super) bg: bool,
 }
 
 impl Host {
@@ -32,6 +38,16 @@ impl Host {
             catalog_gen: 0,
             strikes: HashMap::new(),
             blacklist: HashSet::new(),
+            bg: false,
+        }
+    }
+
+    /// 本次请求排队时站哪一档（见 [`Host::bg`] 与 `dll_lock::Class`）。
+    pub(super) fn class(&self) -> super::dll_lock::Class {
+        if self.bg {
+            super::dll_lock::Class::Background
+        } else {
+            super::dll_lock::Class::Urgent
         }
     }
 

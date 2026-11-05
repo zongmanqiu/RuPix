@@ -65,15 +65,37 @@ fn next_ticket() -> u64 {
 ///
 /// `waiters` 是票号队列，`held` 表示调用权在谁手里。判据只有一条：**队首 + 没人持有**。
 /// 这样"刚放手的持有者立刻回来抢下一笔"不能插队——它得排到队尾，与别人同规矩。
+///
+/// # 两档：用户的一笔在前，后台预取在后（m237）
+///
+/// 跨窗共用同一枚 DLL 时，两种请求在这里相遇。此前只有一档先来先得，于是"没人等的下一张"
+/// 可以挡在"用户正等的那张"前面。真机实测（26.7 MP × 12 张、双窗各 250 ms 翻页）：
+/// 用户那一笔 `wait` 稳定 ~950 ms（= 一整笔解码），首帧 p95 从单窗的 1025 ms 涨到 2871 ms。
+/// 现在 `Urgent` 只排在 `Urgent` 后面，`Background` 还要等 `Urgent` 全空——用户最多等
+/// **正在跑的那一笔**（不可抢占），不再为别人的预取排队。
+///
+/// ★ 预取会不会饿死：不会长期。用户翻页有间隔，`Urgent` 一空 `Background` 立刻放行；
+/// 而且预取本来就可以不做（[`super::decode`] 的判断只把它当"空闲时消耗 CPU"）。
 struct Cell {
     state: Mutex<CellState>,
     cv: Condvar,
 }
 
+/// 排队档位。`Urgent` = 用户此刻在等的那一笔（主画面解压、区域重渲、RAW 参数）；
+/// `Background` = 邻图预取（`ReqKind::Prefetch`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Class {
+    Urgent,
+    Background,
+}
+
 #[derive(Default)]
 struct CellState {
     held: bool,
-    waiters: VecDeque<u64>,
+    /// 用户请求的票号，队首先放行。
+    urgent: VecDeque<u64>,
+    /// 后台预取的票号，**只在 `urgent` 全空时**放行。
+    background: VecDeque<u64>,
 }
 
 impl Cell {
@@ -91,19 +113,28 @@ impl Cell {
     }
 
     /// 排队拿调用权；`false` = 预算耗尽（票已摘掉，队伍不会被卡住）。
-    fn acquire(&self, ticket: u64, budget: Duration) -> bool {
+    fn acquire(&self, ticket: u64, budget: Duration, class: Class) -> bool {
         let started = Instant::now();
         let mut st = self.lock_state();
-        st.waiters.push_back(ticket);
+        match class {
+            Class::Urgent => st.urgent.push_back(ticket),
+            Class::Background => st.background.push_back(ticket),
+        }
         loop {
-            if !st.held && st.waiters.front() == Some(&ticket) {
-                st.waiters.pop_front();
+            if !st.held && Self::is_next(&st, ticket, class) {
+                match class {
+                    Class::Urgent => st.urgent.pop_front(),
+                    Class::Background => st.background.pop_front(),
+                };
                 st.held = true;
                 return true;
             }
             let left = budget.saturating_sub(started.elapsed());
             if left.is_zero() {
-                st.waiters.retain(|t| *t != ticket);
+                match class {
+                    Class::Urgent => st.urgent.retain(|t| *t != ticket),
+                    Class::Background => st.background.retain(|t| *t != ticket),
+                }
                 drop(st);
                 // 我可能就是队首：摘掉之后必须叫醒后面那位，否则队伍停在"队首没人认领"上。
                 self.cv.notify_all();
@@ -114,6 +145,14 @@ impl Cell {
                 .wait_timeout(st, left)
                 .unwrap_or_else(|e| e.into_inner());
             st = g;
+        }
+    }
+
+    /// 这一张票现在轮到了吗。后台票必须等**用户队列全空**，这是两档的全部差别。
+    fn is_next(st: &CellState, ticket: u64, class: Class) -> bool {
+        match class {
+            Class::Urgent => st.urgent.front() == Some(&ticket),
+            Class::Background => st.urgent.is_empty() && st.background.front() == Some(&ticket),
         }
     }
 
@@ -229,13 +268,18 @@ impl Drop for Guard {
 }
 
 /// 拿这枚 DLL 的调用权（预算 = 宿主的单笔解码超时）。
-pub(super) fn enter(key: &Path, id: &str) -> Result<Guard, String> {
+pub(super) fn enter(key: &Path, id: &str, class: Class) -> Result<Guard, String> {
     let budget = crate::core::decode::decode_timeout().unwrap_or(FALLBACK_WAIT);
-    enter_within(key, id, budget)
+    enter_within(key, id, budget, class)
 }
 
 /// 同 [`enter`]，但预算由调用方给（单测用它把等待压到毫秒级）。
-pub(super) fn enter_within(key: &Path, id: &str, budget: Duration) -> Result<Guard, String> {
+pub(super) fn enter_within(
+    key: &Path,
+    id: &str,
+    budget: Duration,
+    class: Class,
+) -> Result<Guard, String> {
     if held_here(key) {
         HELD.with(|h| *h.borrow_mut().entry(key.to_path_buf()).or_insert(0) += 1);
         return Ok(Guard::new(key.to_path_buf(), None, id, Duration::ZERO));
@@ -243,7 +287,7 @@ pub(super) fn enter_within(key: &Path, id: &str, budget: Duration) -> Result<Gua
 
     let cell = cell_for(key);
     let started = Instant::now();
-    if !cell.acquire(next_ticket(), budget) {
+    if !cell.acquire(next_ticket(), budget, class) {
         let ms = started.elapsed().as_millis();
         log::warn!(
             "[dll-lock] decoder={id} path={} 等待 {ms} ms 未拿到调用权，本次放弃",

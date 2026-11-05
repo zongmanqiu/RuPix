@@ -42,6 +42,11 @@ pub fn install_format_source() {
 // 现役解码器里只有 `jpeg` 声明了它，所以 PNG/TIFF/GIF 的表现与昨天逐字节相同。
 
 impl crate::core::decode::DecodeBackend for Host {
+    /// 后台预取标志：只改排队档位，不动解码行为（见 `Host::bg`）。
+    fn set_background(&mut self, on: bool) {
+        self.bg = on;
+    }
+
     /// 区域渲染（**ABI v6**）：认领该后缀、且实现了 `iv_render_region` 的解码器，
     /// 按"只渲看得见的那一块"出图。
     ///
