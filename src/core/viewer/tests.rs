@@ -2221,8 +2221,7 @@ fn anim_schedule_chases_the_deadline_not_the_arrival() {
 /// 信息条格式自检：「第几张/共几张 · 缩放百分比」——2026-10-12 用户拍板条上
 /// 只留这两样（尺寸、动画帧数这类细节交给「文件信息」）。
 fn is_count_and_percent(s: &str) -> bool {
-    // 格式：{pos} · {pct}% · 帧/页 {index}{/count}（静态图落 1/1）
-    // 旧格式只有前两段，新格式多一段进度；两段都要过。
+    // 格式：{pos} · {pct}% [({index}{/count})]（没有帧/页号时只有前两段）。
     let Some((first, rest)) = s.split_once(" · ") else {
         return false;
     };
@@ -2240,7 +2239,7 @@ fn is_count_and_percent(s: &str) -> bool {
 }
 
 /// 信息条只报「数量 · 百分比 · 帧/页 N/M」（动图播放中也报张号——计数器在跳
-/// 就是自动播的证据，2026-11-02 用户拍板"否则用户看不出来"）。
+/// 就是自动播的证据；静态位图不报第三段，见下一条）。
 #[test]
 fn status_is_count_and_zoom_percent() {
     use crate::core::pixels::{Anim, Bitmap};
@@ -2298,11 +2297,52 @@ fn status_static_has_no_animation_tag() {
     assert!(v.install(pa.clone(), still));
     let s = v.status();
     assert!(!s.contains("动画"), "静态图状态栏不应标动画，实际：{s}");
+    assert!(!s.contains("(1/1)"), "静态位图没有帧/页号，实际：{s}");
+    assert!(is_count_and_percent(&s), "基础信息必须在，实际：{s}");
+    assert!(!v.has_index(), "静态位图不该挂播放组");
+}
+
+/// ★ 用户 2026-11-06 口径：帧/页进度与逐帧按钮只给「真有第二张」的格式。
+/// 判据吃解码器回填的多张语义，不按扩展名维护第二份白名单——那十几二十种格式
+/// 的解码器才会报 `count>1` / `delay_ms>0` / `paged`。
+#[test]
+fn frame_progress_reserved_for_real_multi_image_formats() {
+    use crate::core::pixels::Anim;
+    // 静态位图 / 单张 SVG / 单页 PDF：只有一张，不给进度也不给按钮。
+    assert!(!Anim::STATIC.has_index(), "静态图恒为一张，不该报进度");
+    assert!(
+        !Anim {
+            count: 1,
+            ..Anim::STATIC
+        }
+        .has_index(),
+        "单张就是静态"
+    );
+    // 真动图：帧数或延时任一成立；总数未知的畸形 GIF 靠延时进来。
+    assert!(Anim {
+        count: 4,
+        delay_ms: 0,
+        ..Anim::STATIC
+    }
+    .has_index());
+    assert!(Anim {
+        count: 0,
+        delay_ms: 100,
+        ..Anim::STATIC
+    }
+    .has_index());
+    // 多页文档：`paged` 单独也是充分条件（页间隔由宿主给）。
+    assert!(Anim {
+        count: 3,
+        paged: true,
+        ..Anim::STATIC
+    }
+    .has_index());
 }
 
 /// ★ m50-C 的承重判据：静图上按 `P` / `,` / `.` **必须有话说**，而且不许挂出
-/// 假暂停态。旧写法是 `step_anim` 无声 `return`、`toggle_anim_pause` 连守卫都没有
-/// （⇒ `anim_paused` 被翻成 true 还去开环形缓存）；把两条守卫还原，本条立刻红。
+/// 假暂停态。★ 用户 2026-11-06：这句话走顶部消息窗（取走 `note`），状态格的
+/// 「数量 · 百分比」一个字都不许被替换。把两条守卫还原，本条立刻红。
 #[test]
 fn still_image_anim_keys_say_why() {
     use crate::core::pixels::{Anim, Bitmap, Decoded};
@@ -2328,7 +2368,13 @@ fn still_image_anim_keys_say_why() {
     ));
     // ① 逐帧键：说得出"为什么没反应"，且不动任何帧状态。
     v.step_anim(1);
-    assert_eq!(v.status(), NOTE_STILL, "按 `,` `.` 之后浮条要给出那句话");
+    assert_eq!(v.take_note(), Some(NOTE_STILL), "按 `,` `.` 要给出那句话");
+    assert_eq!(v.take_note(), None, "同一句只许弹一次");
+    assert!(
+        is_count_and_percent(&v.status()),
+        "提示不许顶替基础信息，实际：{}",
+        v.status()
+    );
     assert_eq!(
         v.loaded.as_ref().map(|l| l.anim.index),
         Some(0),
@@ -2340,10 +2386,11 @@ fn still_image_anim_keys_say_why() {
         !v.anim_paused(),
         "静图不该有暂停态——那是个屏幕上看不见的假状态"
     );
-    assert_eq!(v.status(), NOTE_STILL);
+    assert_eq!(v.take_note(), Some(NOTE_STILL));
+    assert!(is_count_and_percent(&v.status()), "状态格仍是基础信息");
     // ③ 翻一页就作废：提示说的是上一张图，别赖在新图上。
     v.step(1);
-    assert_ne!(v.status(), NOTE_STILL, "换图后旧提示必须作废");
+    assert_eq!(v.take_note(), None, "换图后旧提示必须作废");
     assert!(
         is_count_and_percent(&v.status()),
         "应回到「x/x · N%」，实际：{}",
@@ -2351,9 +2398,9 @@ fn still_image_anim_keys_say_why() {
     );
 }
 
-/// 提示过期后浮条自己回落（不靠计时器去擦：浮条每帧重算，比对一下就行）。
+/// 过期的一句不许再弹；状态格始终只有基础信息。
 #[test]
-fn note_expires_back_to_the_normal_line() {
+fn expired_note_is_never_shown() {
     use crate::core::pixels::{Anim, Bitmap, Decoded};
     let (_dir, [pa, _pb, _pc]) = gallery_dir();
     let (tx, _rx) = std::sync::mpsc::channel::<Done>();
@@ -2380,9 +2427,10 @@ fn note_expires_back_to_the_normal_line() {
         NOTE_STILL,
         Instant::now() - NOTE_TTL - Duration::from_millis(1),
     ));
+    assert_eq!(v.take_note(), None, "过期的一句不许弹出来");
     assert!(
         is_count_and_percent(&v.status()),
-        "过期后该回到正常行，实际：{}",
+        "状态格始终是「x/x · N%」，实际：{}",
         v.status()
     );
 }

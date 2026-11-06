@@ -340,12 +340,11 @@ pub struct Chrome {
     /// 锁定后整窗交互封锁，只留锁住按钮解锁——语义与拦截地图见
     /// `docs/superpowers/specs/2026-10-12-titlebar-topmost-lock-design.md`。
     pub locked: Cell<bool>,
-    /// 当前图**有没有帧/页号**（`anim.count >= 1`）。由 canvas 每帧回写，**决定浮条上
-    /// 有没有播放组那三颗**（[`Chrome::row`]）。
+    /// 当前图**有没有帧/页号**（`Anim::has_index()`）。由 canvas 每帧回写，**决定浮条上
+    /// 有没有播放组那三颗**（[`Chrome::row`]）；「操作▸」菜单读同一份。
     ///
-    /// ★ 语义是"有没有号"，不是"是不是动图"：动图/分页文档/静态位图都为真
-    /// （契约规定解码器回填 `frame_count = 1 / page_count = 1`），只有"总数未知"
-    /// 的畸形文件为假。静态图因此也挂那一组（用户 2026-11-02"单帧也显示、按钮栏也出现"）。
+    /// ★ 静态位图 / 单张 SVG 恒为假：没有第二张就不给 `(1/1)`，也不给逐帧按钮；
+    ///   只有真动图与多页文档为真（判据在 `core::pixels::Anim::has_index`）。
     pub anim: Cell<bool>,
     /// 动画当前是否暂停。只影响 [`Btn::PlayPause`] 的字形（双状态按钮要能读出当前态）。
     pub paused: Cell<bool>,
@@ -897,9 +896,11 @@ impl Chrome {
             .name("save-png".into())
             .spawn(move || {
                 // 只带走像素快照，保存成功/失败都不能清掉 viewer 的编辑覆盖。
-                let out = crate::platform::clipboard::encode_png(w, h, &rgba).and_then(|bytes| {
-                    std::fs::write(&dest, bytes).map_err(|e| format!("写入失败：{e}"))
-                });
+                // 另存是后台线程，不必为速度让体积（见 `encode_png_compact` 的注释）。
+                let out =
+                    crate::platform::clipboard::encode_png_compact(w, h, &rgba).and_then(|bytes| {
+                        std::fs::write(&dest, bytes).map_err(|e| format!("写入失败：{e}"))
+                    });
                 match &out {
                     Ok(()) => log::info!("[plugin-edit] verdict=saved file={}", dest.display()),
                     Err(e) => log::warn!(
@@ -907,7 +908,7 @@ impl Chrome {
                         dest.display()
                     ),
                 }
-                let _ = tx.send(out.map_err(|e| format!("另存涂鸦失败：{e}")));
+                let _ = tx.send(out.map_err(|e| format!("另存为失败：{e}")));
             });
         match spawned {
             Ok(_) => *self.save_rx.borrow_mut() = Some(rx),
@@ -1191,7 +1192,8 @@ impl Chrome {
 
     // ── 几何 ────────────────────────────────────────────────────
 
-    /// 这一帧浮条上的按钮（顺序即槽位）：静态图不给播放组；**窗口窄到放不下
+    /// 这一帧浮条上的按钮（顺序即槽位）：没有帧/页号的图不给播放组（判据
+    /// `Anim::has_index()`，静态位图一律没有）；**窗口窄到放不下
     /// "满组 + 状态格"时也不给**——快捷键 `,` `.` `P` 一直有效，而把按钮挤出窗口是
     /// 既点不着又难看，状态格又比按钮金贵（用户 2026-10-18 拍板"并进浮条"）。
     ///
@@ -1460,6 +1462,21 @@ fn clip_text(canvas: &mut dyn Canvas, text: &str, ts: &TextStyle, avail_w: f32) 
     format!("{kept}{ELL}")
 }
 
+/// 顶条（自绘标题栏 + 5 颗窗口按钮）这一帧画不画。**m238**。
+///
+/// ★ 全屏时**默认不画**——用户口径「全屏不该还留着标题栏」。但顶缘悬停仍能把它
+///   唤出：与极简模式共用同一份 `hover_title`，而那位由 `in_title_strip` 的几何
+///   独立算出，不看这一帧画没画，所以不会「收了就唤不回」。全屏下 5 颗窗口按钮
+///   （置顶 / 锁定 / 最小化 / 最大化 / 关闭）因此仍然可达。
+/// ★ 非全屏的判据一字未动：传统模式常驻，极简模式只靠悬停。
+fn title_visible(fullscreen_on: bool, minimal_mode: bool, hover_title: bool) -> bool {
+    if fullscreen_on {
+        hover_title
+    } else {
+        !minimal_mode || hover_title
+    }
+}
+
 /// 画悬浮层：箭头 + 工具栏 + 信息小条。
 ///
 /// `view` 是画布摆图/悬浮层共用的视口矩形 (x, y, w, h)；`info` 是右侧信息文本（"3/12 · 100%"）；
@@ -1493,7 +1510,7 @@ pub fn paint(
     let text_ts = TextStyle::new(16.0);
 
     // 计算各元素是否显示
-    let show_title = !minimal_mode || chrome.hover_title.get();
+    let show_title = title_visible(fullscreen_on, minimal_mode, chrome.hover_title.get());
     // 悬停信息条也算"在浮条上"：整行档（窄窗）就住在那儿。不认它的后果是极简模式下
     // 指针停在状态那一行 2 秒后整组消失、且再也悬不回来（`info_rect` 只有画出来才非零）。
     // 三条来源取或：常驻（传统模式）／指针在浮条上（`activity` 现算）／状态刚变
@@ -1825,6 +1842,50 @@ mod tests {
     use super::*;
     use windui::geometry::Color;
 
+    /// ★ 用户 2026-11-06：静态位图没有帧/页号 ⇒ 浮条与「操作▸」菜单都不挂播放组。
+    #[test]
+    fn play_group_only_when_the_image_has_an_index() {
+        let wide = FULL_ROW_MIN_W + 200.0;
+        let (head, tail) = Chrome::row(false, wide);
+        let shown: Vec<Btn> = head.iter().chain(tail.unwrap_or(&[])).copied().collect();
+        assert!(!shown.contains(&Btn::FrameBack), "没有号就不给上一帧");
+        assert!(!shown.contains(&Btn::PlayPause), "没有号就不给播放");
+        assert!(!shown.contains(&Btn::FrameFwd), "没有号就不给下一帧");
+        let (head, tail) = Chrome::row(true, wide);
+        let shown: Vec<Btn> = head.iter().chain(tail.unwrap_or(&[])).copied().collect();
+        assert!(
+            shown.contains(&Btn::FrameBack)
+                && shown.contains(&Btn::PlayPause)
+                && shown.contains(&Btn::FrameFwd),
+            "真动图 / 多页文档三颗齐全"
+        );
+    }
+
+    /// m238：全屏默认收起顶条、顶缘悬停仍唤得出；非全屏行为一字不变。
+    /// 八个组合全列出来，防止日后有人把某个分支「顺手简化」掉。
+    #[test]
+    fn title_visible_fullscreen_hides_but_hover_recalls() {
+        // 全屏：默认不画，悬停才画（极简与否都一样）。
+        assert!(
+            !title_visible(true, false, false),
+            "全屏+传统：不该还留顶条"
+        );
+        assert!(
+            title_visible(true, false, true),
+            "全屏+顶缘悬停：要能唤回按钮"
+        );
+        assert!(!title_visible(true, true, false), "全屏+极简：也不该有顶条");
+        assert!(
+            title_visible(true, true, true),
+            "全屏+极简+悬停：同样唤得回"
+        );
+        // 非全屏：与改动前的 `!minimal_mode || hover_title` 逐项一致。
+        assert!(title_visible(false, false, false), "传统模式常驻");
+        assert!(title_visible(false, false, true), "传统模式悬停也仍画");
+        assert!(!title_visible(false, true, false), "极简模式平时收起");
+        assert!(title_visible(false, true, true), "极简模式悬停唤出");
+    }
+
     #[test]
     fn host_audit_save_error_is_reported_separately_from_copy() {
         let c = Chrome::new(false);
@@ -1916,11 +1977,8 @@ mod tests {
         let mut cx = SkiaCanvas::with_text(&mut pm, &mut eng, 1.0);
         let ts = TextStyle::new(13.0);
         for worst in [
-            "1234/1234 · 100% · 帧 1234/1234",
+            "1234/1234 · 100% (1234/1234)",
             "1234/1234 · 4000×3000 · 载入中…",
-            // m50-C 的一次性提示也走这条浮条，文案在 `core::viewer::NOTE_STILL`——
-            // 直接引常量而不是抄一遍，改文案时这里跟着量。
-            crate::core::viewer::NOTE_STILL,
         ] {
             let w = cx.measure_text(worst, &ts).w as f32;
             assert!(

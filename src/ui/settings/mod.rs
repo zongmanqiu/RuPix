@@ -53,7 +53,8 @@ pub use metadata::{forget_window as forget_metadata_window, open_metadata, refre
 pub(crate) use options::*;
 pub(crate) use rows::{
     action_slot, btn, btn_action, btn_danger, check_row, choice_row, divider, info_row, nav_rail,
-    option_row, search_box, section_card, slider_row, version_cell, ActionTone, OnSwitch,
+    option_row, option_row_inset, search_box, section_card, slider_row, version_cell, ActionTone,
+    OnSwitch,
 };
 pub(crate) use shortcuts::*;
 

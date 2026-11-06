@@ -6,7 +6,16 @@
 use super::*;
 
 /// 统一的「标签 + 控件」行：左侧标签固定宽度，右侧控件左对齐，行高固定，垂直居中。
+///
+/// 设置页的页面容器已有 16 留白，所以这里再内缩 16，标签落在「页 16 + 行 16 = 32」；
+/// **对话框**的容器本身就是 `DIALOG_PAD`(16)，要用 [`option_row_inset`] 给 0，
+/// 才能让标签与底栏按钮落在同一条竖线上（见 `docs/界面版式规范.md` §2）。
 pub fn option_row(label: &str, control: Element) -> Element {
+    option_row_inset(label, control, 16)
+}
+
+/// 同 [`option_row`]，行内左右内缩由调用方给（对话框传 0）。
+pub fn option_row_inset(label: &str, control: Element, inset: i32) -> Element {
     Element::row()
         .child(
             Element::label(label)
@@ -18,7 +27,7 @@ pub fn option_row(label: &str, control: Element) -> Element {
         .child(Element::flex_spacer())
         .cross(Align::Center)
         .height(ROW_H)
-        .padding_xy(16, 0)
+        .padding_xy(inset, 0)
 }
 
 /// 统一的「标签 + 下拉」行。

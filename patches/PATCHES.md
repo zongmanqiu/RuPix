@@ -1378,6 +1378,43 @@ windui 0.23.0 是破坏性重构（托盘子系统重写、跨平台 win32/macos
 新托盘 API（`TrayCtx`/`TrayAction::Toggle`/`hide_on_close`）完全兼容，`runtime/mod.rs`
 的 16ms 轮询接线不变。
 
+## 补丁 026 —— 全屏时关掉 Win11 系统圆角（`set_fullscreen_corner`）
+
+- 编号：026
+- 涉及上游文件：`wind-ui-rust-0.23.0/src/platform/win32/mod.rs`
+  （`Dwm` import 补 `DWMWCP_DEFAULT` / `DWMWCP_DONOTROUND`；新增
+  `set_fullscreen_corner`；`toggle_fullscreen` 的 ① 段多读 `frameless`、末尾按切换后状态调用一次）
+- 应用侧接线：无（全在 windui 内部闭环，`WindowOp::ToggleFullscreen` 不变）
+
+### 问题（用户实机，2026-11-05）
+W1（m238 收起全屏顶条）之后用户看到的仍是「假全屏」：**边角是圆的**。
+不是自绘顶条没修好，是整扇窗的四角被 DWM 裁圆、露出桌面。
+
+### 根因（源码定位，非推测）
+建窗 frameless 分支显式 `DwmSetWindowAttribute(..., DWMWCP_ROUND)`
+（`mod.rs:1967-1985`，那段注释还专门写了「显式声明比赌默认行为可靠」）。
+该属性是**窗口级**的，改 `GWL_STYLE` 与 `SetWindowPos` 都不会把它清掉；
+补丁 04 的 `toggle_fullscreen` 只做「换 `WS_POPUP` + 按 `rcMonitor` 铺满」，
+没有重设圆角 ⇒ 全屏后 DWM 继续按 ROUND 裁角。
+
+### 修复
+1. 新增 `set_fullscreen_corner(hwnd, fullscreen, frameless)`：全屏 →
+   `DWMWCP_DONOTROUND`；退出 → frameless 恢复 `DWMWCP_ROUND`、普通窗恢复
+   `DWMWCP_DEFAULT`。Win10 不认属性号 33，返回值丢弃即得到想要的降级。
+2. `toggle_fullscreen` ① 段一并读出 `frameless`（纯查询段，不碰 `state_from`
+   借用），末尾用 `!fs`（切换后的状态）调用一次 —— 进入 / 退出两条分支共用一处，
+   不新增状态正本。
+
+### 判据
+真机：F11 进全屏后四角是**直角且铺满显示器**，不再露出桌面；F11 退出后
+普通窗的圆角恢复（与进全屏前一致）。Win10 上属性调用失败被忽略，本来就没有
+系统圆角，行为不变。
+
+### 门禁行
+本轮读数见 `.plan/优化阶段-执行计划.md` §六与停机交付说明。
+
+---
+
 ### 门禁行（迁移完成后）
 `cargo check --all-targets` 0 error 0 warning · `cargo clippy --all-targets` 0 warning ·
 `cargo fmt` 无差异 · layering_scan `violations: 0` · hygiene_scan `violations: 0` ·

@@ -17,13 +17,9 @@ impl Viewer {
             Some(g) if !g.is_empty() => format!("{}/{}", g.position(), g.len()),
             _ => return "没有打开图片".to_string(),
         };
-        // 一次性提示优先（m50-C）：它是"刚刚那一下按键"的答复，比 `3/9 · 100%` 更要紧；
-        // 过期就当没有——浮条每帧重算，不需要计时器去擦它。
-        if let Some((s, at)) = self.note {
-            if at.elapsed() < NOTE_TTL {
-                return s.to_string();
-            }
-        }
+        // ★ 状态格只放基础信息：图片进度 + 缩放百分比（有帧/页号时再加 `(i/n)`）。
+        //   一次性提示由 `window_tick` 取走 `note` 后走顶部消息窗，绝不顶替这一格——
+        //   用户 2026-11-06：「数量进度和缩放百分比应该永远都不会被替换」。
         // 换图等太久（m71 / 待办 §18 ⑥）：说清"在等什么、等了多久"，而不是继续
         // 拿旧图的数量/百分比冒充当前状态——卡住时那是谎话。3 s 以下的正常解码
         // 不打扰（见 [`WAIT_NOTICE_AFTER`]）。
@@ -37,13 +33,13 @@ impl Viewer {
         }
         match self.loaded.as_ref() {
             Some(l) if l.anim.has_index() => {
-                // 报张号：**这些格式一律报**，哪怕是 1/1。
+                // 报张号：**只有真动图 / 多页文档到这里**（判据 `Anim::has_index()`）。
                 //
-                // ★ 2026-11-02 用户拍板后的终态：
+                // ★ 用户 2026-11-06 口径：
                 // - 格式 `x/y · a% (c/d)`：x/y=图片进度、a%=缩放百分比、c/d=帧/页进度；
                 // - 动图**播放中也报**（计数器在跳就是"在自动播"的证据）；
                 // - 分页文档一直报（164 页的 PDF 靠它对齐）；
-                // - 静态位图也报，落 `(1/1)`（契约规定解码器回填 `frame_count=1 / page_count=1`）。
+                // - 静态位图 / 单张 SVG 没有第二张 ⇒ 只落 `x/y · a%`。
                 let pct = (self.scale() * 100.0).round() as i32;
                 let total = if l.anim.count > 0 {
                     format!("/{}", l.anim.count)

@@ -341,9 +341,18 @@ impl Viewer {
         self.set_anim_paused(on);
     }
 
-    /// 挂一句一次性提示（浮条优先显示，[`NOTE_TTL`] 后自动回落；见 `note` 字段注释）。
+    /// 挂一句一次性提示：窗口段取走后走顶部消息窗，状态格不受影响（见 `note` 字段）。
     pub(super) fn set_note(&mut self, s: &'static str) {
         self.note = Some((s, Instant::now()));
+    }
+
+    /// 取走一次性提示（取走即清空，同一句只弹一次）。
+    ///
+    /// ★ 窗口段每 16 ms 跑一次，不清空就会每拍弹一条消息窗；过期的一句直接作废，
+    ///   它说的是很久以前那一下按键。由 `runtime::window_tick` 交给 `ctx.toast`。
+    pub fn take_note(&mut self) -> Option<&'static str> {
+        let (s, at) = self.note.take()?;
+        (at.elapsed() < NOTE_TTL).then_some(s)
     }
 
     /// 设暂停态。**它同时是逐帧环形缓存的开关**：进暂停才开始收帧，出暂停立刻整份
@@ -452,11 +461,11 @@ impl Viewer {
         self.loaded.as_ref().is_some_and(|l| l.anim.is_animated())
     }
 
-    /// 当前文件**有没有"第几张"这个概念**（按钮栏要不要挂那一组 + 状态行写不写进度）。
+    /// 当前文件**有没有"第几张"可切**（按钮栏要不要挂那一组 + 状态行写不写进度）。
     ///
-    /// ★ 与 [`Viewer::is_animated`] 分开：动图/分页文档/静态位图都返回真
-    /// （契约规定解码器回填 `frame_count = 1 / page_count = 1`），只有"总数未知"
-    /// 的畸形文件返回假。用户 2026-11-02 拍板"单帧也显示、按钮栏也出现"。
+    /// ★ 与 [`Viewer::is_animated`] 分开：静态位图 / 单张 SVG 返回假（不给 `1/1`、
+    ///   不给逐帧按钮），只有真动图与多页文档返回真；判据见
+    ///   `core::pixels::Anim::has_index`。
     pub fn has_index(&self) -> bool {
         self.loaded.as_ref().is_some_and(|l| l.anim.has_index())
     }

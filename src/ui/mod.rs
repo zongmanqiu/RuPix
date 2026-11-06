@@ -53,6 +53,7 @@ pub(crate) mod tokens;
 pub mod brand;
 pub mod canvas;
 pub mod chrome;
+pub mod dialog_footer;
 pub mod filmstrip;
 /// 抓手光标（松手 / 抓手）的 SVG 光栅化与切换。
 pub mod hand_cursor;

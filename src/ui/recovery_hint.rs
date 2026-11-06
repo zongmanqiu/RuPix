@@ -69,32 +69,31 @@ pub fn show(ctx: &mut EventCtx, log_path: Option<PathBuf>) {
             .single("recovery-hint")
             .fit_content(180, 420)
             .content(move || {
-                let mut col = Element::col()
-                    .fill()
-                    .padding(16)
-                    .spacing(10)
-                    .child(
-                        Element::label("RuPix 检测到上次运行未正常结束。")
-                            .font_size(13.5)
-                            .fg_role(Role::Text),
+                // 版式全交给 `dialog_footer::shell`（见 `docs/界面版式规范.md` §2）：
+                // 这里只排内容行，四边留白 / 行间距 / 按钮位不再自己写。
+                let mut rows: Vec<Element> = vec![
+                    Element::label("RuPix 检测到上次运行未正常结束。")
+                        .font_size(13.5)
+                        .fg_role(Role::Text),
+                    Element::label(
+                        "如果反复闪退，可以先临时禁用所有解码器继续看图（下次启动会自动恢复）。",
                     )
-                    .child(
-                        Element::label(
-                            "如果反复闪退，可以先临时禁用所有解码器继续看图（下次启动会自动恢复）。",
-                        )
-                        .font_size(12.5)
-                        .fg_role(Role::TextMuted),
-                    );
+                    .font_size(12.5)
+                    .fg_role(Role::TextMuted),
+                ];
                 for n in &notes {
-                    col = col.child(Element::label(n.clone()).font_size(12.0).fg_role(Role::TextMuted));
+                    rows.push(
+                        Element::label(n.clone())
+                            .font_size(12.0)
+                            .fg_role(Role::TextMuted),
+                    );
                 }
-                col.child(Element::flex_spacer()).child(
-                    Element::row()
-                        .spacing(8)
-                        .cross(Align::Center)
-                        .child(Element::flex_spacer())
-                        .child(Element::button("继续使用").on_click(keep))
-                        .child(Element::button("禁用所有解码器").on_click(disable)),
+                super::dialog_footer::shell(
+                    rows,
+                    vec![
+                        super::dialog_footer::action("继续使用", keep),
+                        super::dialog_footer::action("禁用所有解码器", disable),
+                    ],
                 )
             }),
     );

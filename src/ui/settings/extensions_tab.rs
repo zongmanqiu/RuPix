@@ -471,17 +471,23 @@ fn gear_btn() -> Element {
 fn settings_gear(ext: &Extension, config: Rc<RefCell<Config>>) -> Option<Element> {
     // 两条路：声明了 `settings` schema ⇒ 宿主自己渲染一扇设置窗（[`crate::ui::plugin_settings`]）；
     // 只有 `settings_ui` 的老插件 ⇒ 仍以 `action=settings` 拉起插件、由插件画自己的界面。
-    let has_schema = !ext.manifest.settings.is_empty();
+    //
+    // ★ 齿轮是**底层设置**的入口，不是运行参数窗。实时参数型插件（声明 `preview`）的
+    //   六条滑块归运行时那一扇，齿轮只留"非参数项"（快捷键之类）；一项都不剩就不给
+    //   齿轮——2026-11-06 用户实测「点齿轮出来的居然是数值调整窗口」，那是把两扇窗
+    //   合并成同一份渲染的后果。
+    let has_schema = ext.manifest.has_settings_beyond_live();
     if !ext.manifest.settings_ui && !has_schema {
         return None;
     }
     let usable = ext.enabled && !ext.isolated && !ext.blocked;
+    let has_settings = has_schema;
     let ext = ext.clone();
     let b = gear_btn().disabled(!usable);
     let cfg_gear = config;
     Some(if usable {
         b.on_click(move |ctx: &mut EventCtx| {
-            if !ext.manifest.settings.is_empty() {
+            if has_settings {
                 super::super::plugin_settings::show(ctx, &ext, &cfg_gear);
                 return;
             }
@@ -661,7 +667,7 @@ fn open_installed_info(
                 items.push({
                     let mut parts = Vec::new();
                     if isolated_now {
-                        parts.push(Element::button("解除隔离").on_click(unisolate));
+                        parts.push(btn("解除隔离").on_click(unisolate));
                     }
                     parts.push(Element::flex_spacer());
                     parts.push(btn_danger("卸载").on_click(uninstall));

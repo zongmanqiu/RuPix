@@ -26,7 +26,7 @@ use crate::core::decode::RawParams;
 use crate::core::pixels::MAX_EDGE;
 use crate::core::viewer::Viewer;
 
-use super::tokens::{to_color, BG, DIALOG_FIT_MIN, DIALOG_PAD};
+use super::tokens::{to_color, BG, DIALOG_FIT_MIN};
 
 /// 「宽 / 高」输入框的解析：只认 `1…MAX_EDGE` 的整数，别的（空、负号、字母、超大值）
 /// 一律 `None` 交给调用方去说明——不猜、不静默、不悄悄夹到边界值。
@@ -239,31 +239,21 @@ fn open_params_window(
             .owned(true)
             .single(super::singleton::scoped("raw-params", scope))
             .content(move || {
-                let confirm = confirm.clone();
-                Element::col()
-                    .fill()
-                    .padding(DIALOG_PAD)
-                    .spacing(10)
-                    .child(Element::field(
-                        "宽度",
-                        Element::text_input(w_sig, "如 1920"),
-                    ))
-                    .child(Element::field(
-                        "高度",
-                        Element::text_input(h_sig, "如 1080"),
-                    ))
-                    .child(Element::field(
-                        "像素布局",
-                        Element::dropdown(LAYOUT_LABELS.to_vec(), layout_sig),
-                    ))
-                    .child(
-                        Element::row()
-                            .cross(Align::Center)
-                            .spacing(8)
-                            .child(Element::flex_spacer())
-                            .child(Element::button("确定").on_click(confirm))
-                            .child(Element::button("取消").on_click(cancel)),
-                    )
+                // 版式全交给 `dialog_footer::shell`（见 `docs/界面版式规范.md` §2）。
+                super::dialog_footer::shell(
+                    vec![
+                        Element::field("宽度", Element::text_input(w_sig, "如 1920")),
+                        Element::field("高度", Element::text_input(h_sig, "如 1080")),
+                        Element::field(
+                            "像素布局",
+                            Element::dropdown(LAYOUT_LABELS.to_vec(), layout_sig),
+                        ),
+                    ],
+                    vec![
+                        super::dialog_footer::action("确定", confirm),
+                        super::dialog_footer::action("取消", cancel),
+                    ],
+                )
             }),
     );
 }

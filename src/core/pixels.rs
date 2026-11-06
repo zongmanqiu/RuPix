@@ -121,19 +121,20 @@ impl Anim {
         self.delay_ms > 0
     }
 
-    /// 这类文件**有没有"第几张"这个概念**（决定状态行写不写进度、按钮栏挂不挂那一组）。
+    /// 这类文件**有没有"第几张"可切**（决定状态行写不写帧/页进度、按钮栏挂不挂播放组）。
     ///
-    /// ★ 与 [`Anim::is_animated`] 是两件事，别拿它当播放判据：
-    /// - 动图（GIF/WebP/APNG）有帧号 → `count ≥ 1`；
-    /// - 分页文档（PDF/TIFF/MPO）有页号 → `count ≥ 1`；
-    /// - **静态位图**（JPEG/PNG/BMP…）也有 → 契约规定解码器回填
-    ///   `frame_count = 1 / page_count = 1`（"单页静态图恒 = 1"）。
+    /// ★ 判据只认解码器回填的**多张语义**（用户 2026-11-06 口径）：静态位图恒为
+    ///   [`Anim::STATIC`]（`count=1 / delay_ms=0 / paged=false`），没有第二张，
+    ///   不许给它 `(1/1)`，也不许给逐帧按钮。能进来的只有：
+    ///   - 真动图：报了帧延时（`delay_ms > 0`）或不止一帧（`count > 1`）；
+    ///   - 多页文档：`paged = true`（页间隔由宿主给，见 [`Anim::PAGE_DELAY_MS`]）。
     ///
-    /// 所以判据是 `count ≥ 1 || delay_ms > 0`：静态图落 `1/1`，动图总数未知
-    /// （`count = 0` 但有延时）也显示 N（不写分母）。用户 2026-11-02 拍板
-    /// "单帧也显示、按钮栏也出现"。
+    /// 总数未知的畸形 GIF（`count = 0`）靠延时那一半进来，状态行仍只写分子。
+    ///
+    /// ★ 与 [`Anim::is_animated`] 是两件事：后者只管要不要挂播放调度；
+    ///   本方法管"有没有号可报"。`is_animated()` 为真时本方法必为真。
     pub fn has_index(self) -> bool {
-        self.count >= 1 || self.delay_ms > 0
+        self.count > 1 || self.delay_ms > 0 || self.paged
     }
 
     /// 进度文案的量词（状态行用）：页与帧在宿主里是同一个号，文案只差这一个词。
@@ -455,5 +456,142 @@ mod tests {
         }
         let out = to_rgba8(flat, 2, 1, PF_GRAY16, 16).unwrap();
         assert_eq!(out[0], 0);
+    }
+}
+
+/// 通道线性变换的恒等参数：三通道增益 100%、偏置 0。
+pub const CHANNEL_NEUTRAL: [i32; 6] = [100, 100, 100, 0, 0, 0];
+
+/// 声明式 op `channel-linear`：R/G/B 各自 `out = clamp(in * gain/100 + bias)`。
+///
+/// ★ 与 `channels` 插件的正式回写**逐字节同源**：中间值走 i64、整除向零截断、
+/// alpha 与每像素第 4 字节原样复制。改任何一边都要同步改另一边，端到端判据
+/// `channel_linear_matches_the_plugin_formula` 钉着这一点。
+pub fn channel_linear(rgba: &[u8], gain: [i32; 3], bias: [i32; 3]) -> Vec<u8> {
+    let mut out = rgba.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        for c in 0..3 {
+            let n = px[c] as i64 * gain[c] as i64 / 100 + bias[c] as i64;
+            px[c] = n.clamp(0, 255) as u8;
+        }
+    }
+    out
+}
+
+/// `channel_linear` 的查表版：主窗整图每帧都要跟着滑块变，逐像素做三次 i64 除法
+/// 太贵。输入只有 0..=255 共 256 种，先按同一公式把三张 256 项表算出来，之后
+/// 每像素三次查表 + 一次 alpha 复制。**输出与 [`channel_linear`] 逐字节相同**
+/// （`lut_matches_the_reference_formula` 钉着），不是"看起来差不多"的近似。
+pub fn channel_linear_lut(rgba: &[u8], gain: [i32; 3], bias: [i32; 3]) -> Vec<u8> {
+    let mut tables = [[0u8; 256]; 3];
+    for c in 0..3 {
+        for (v, slot) in tables[c].iter_mut().enumerate() {
+            let n = v as i64 * gain[c] as i64 / 100 + bias[c] as i64;
+            *slot = n.clamp(0, 255) as u8;
+        }
+    }
+    let [r, g, b] = tables;
+    let mut out = rgba.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        px[0] = r[px[0] as usize];
+        px[1] = g[px[1] as usize];
+        px[2] = b[px[2] as usize];
+        // px[3]（alpha / 行尾填充）原样不动，与参考实现一致。
+    }
+    out
+}
+
+/// 最近邻缩略图（保持比例，不放大）：参数窗预览只算十万级像素，拖滑块才不会卡。
+pub fn nearest_thumb(rgba: &[u8], w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32, Vec<u8>) {
+    if w == 0 || h == 0 || rgba.len() < w as usize * h as usize * 4 {
+        return (0, 0, Vec::new());
+    }
+    let scale = (max_w as f64 / w as f64)
+        .min(max_h as f64 / h as f64)
+        .min(1.0);
+    let tw = (w as f64 * scale).round().max(1.0) as u32;
+    let th = (h as f64 * scale).round().max(1.0) as u32;
+    let mut out = vec![0u8; tw as usize * th as usize * 4];
+    for y in 0..th as usize {
+        let sy = (y as u64 * h as u64 / th as u64) as usize;
+        for x in 0..tw as usize {
+            let sx = (x as u64 * w as u64 / tw as u64) as usize;
+            let si = (sy * w as usize + sx) * 4;
+            let di = (y * tw as usize + x) * 4;
+            out[di..di + 4].copy_from_slice(&rgba[si..si + 4]);
+        }
+    }
+    (tw, th, out)
+}
+
+#[cfg(test)]
+mod preview_pixel_tests {
+    use super::*;
+
+    #[test]
+    fn channel_linear_matches_the_plugin_formula() {
+        // 插件 W7 的硬编码期望：0,127,255,77 经三通道 -100/255 => 255,128,0,77。
+        let src = [0u8, 127, 255, 77];
+        assert_eq!(
+            channel_linear(&src, [-100, -100, -100], [255, 255, 255]),
+            vec![255, 128, 0, 77]
+        );
+        // 恒等变换逐字节不变（含 alpha 与尾部字节）。
+        let src2: Vec<u8> = (0..32).map(|i| (i * 7) as u8).collect();
+        assert_eq!(channel_linear(&src2, [100, 100, 100], [0, 0, 0]), src2);
+        // 每通道独立 + 越界夹取。
+        assert_eq!(
+            channel_linear(&[100, 50, 200, 128], [200, 100, 0], [10, 0, 0]),
+            vec![210, 50, 0, 128]
+        );
+    }
+
+    #[test]
+    fn lut_matches_the_reference_formula() {
+        // 含负增益、大偏置、每通道不同：一张表必须对得上逐像素公式。
+        let src: Vec<u8> = (0..256u32)
+            .flat_map(|i| [i as u8, (255 - i) as u8, (i / 2) as u8, 0xA5])
+            .collect();
+        for (gain, bias) in [
+            ([-100, 100, 200], [255, 0, 40]),
+            ([100, 100, 100], [0, 0, 0]),
+            ([-400, 0, 400], [-255, 128, 255]),
+            ([37, -63, 141], [7, -9, 11]),
+        ] {
+            assert_eq!(
+                channel_linear_lut(&src, gain, bias),
+                channel_linear(&src, gain, bias),
+                "LUT 与参考公式在 {gain:?}/{bias:?} 上分叉"
+            );
+        }
+        let alpha: Vec<u8> = channel_linear_lut(&src, [-100, -100, -100], [255, 255, 255]);
+        assert!(
+            alpha.chunks_exact(4).all(|p| p[3] == 0xA5),
+            "第 4 字节不许改"
+        );
+    }
+
+    #[test]
+    fn neutral_parameters_are_a_no_op() {
+        let src: Vec<u8> = (0..64).map(|i| (i * 13) as u8).collect();
+        assert_eq!(channel_linear_lut(&src, [100, 100, 100], [0, 0, 0]), src);
+        assert_eq!(CHANNEL_NEUTRAL, [100, 100, 100, 0, 0, 0]);
+    }
+
+    #[test]
+    fn nearest_thumb_keeps_aspect_and_samples_the_source() {
+        let src = [
+            10u8, 20, 30, 255, 40, 50, 60, 255, //
+            70, 80, 90, 255, 100, 110, 120, 255,
+        ];
+        let (w, h, px) = nearest_thumb(&src, 2, 2, 1, 1);
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(px, vec![10, 20, 30, 255]);
+        // 不放大：小图仍是原尺寸。
+        let (w2, h2, px2) = nearest_thumb(&src, 2, 2, 8, 8);
+        assert_eq!((w2, h2), (2, 2));
+        assert_eq!(px2, src.to_vec());
+        // 源数据长度不够时明确返回空，别让 UI 拿一段残缺像素去建 Image。
+        assert!(nearest_thumb(&[0u8; 4], 2, 2, 8, 8).2.is_empty());
     }
 }

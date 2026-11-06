@@ -614,10 +614,9 @@ impl WinRt {
                             orient.0,
                             orient.1
                         );
-                        ctx.toast_ok(format!(
-                            "已应用「{}」的编辑（原图未覆盖；插件菜单可另存/还原）",
-                            job.plugin
-                        ));
+                        // 出口位置由插件自己决定（run_ui 在参数窗、老插件在右键菜单），
+                        // 这里不指路，免得指错。
+                        ctx.toast_ok(format!("已应用「{}」的编辑（原图未覆盖）", job.plugin));
                     } else {
                         log::warn!(
                             "[plugin-edit] id={} file={} verdict=dropped（图已关闭）",
@@ -707,6 +706,12 @@ impl WinRt {
         //   "活动的那一扇"在跑——于是后台窗口排的裸数据会一直等到它被点中才弹窗，
         //   用户看到的是"我拖进来的文件没反应"。窗口段每扇窗都跑，各取各的队。
         crate::ui::raw_dialog::poll_pending(ctx, &self.viewer, &config);
+        // 一次性提示走顶部消息窗，不占浮条的状态格：那一格只放「图片进度 · 缩放百分比
+        // [· 帧/页号]」，被一句话顶掉就丢了基础信息（用户 2026-11-06）。取走即清空，
+        // 下一拍不会重复弹；每窗一份 Viewer，多开时各弹各的。
+        if let Some(s) = self.viewer.borrow_mut().take_note() {
+            ctx.toast(s);
+        }
         // 启动置顶 / 全屏：一次只发一个，发完出队（见 `StartOp` 的说明）。
         let op = {
             let mut q = self.startup_ops.borrow_mut();
@@ -978,6 +983,9 @@ impl WinRt {
         // 注：`ShortcutCtx` 只有"交还焦点/请求关闭"两个动作，开不了文件对话框，
         // 故 Ctrl+O 那类要弹窗的入口放在画布右键菜单里。
         handle_key(
+            None,
+            // 窗口级兜底没有画布那份 `LiveState`：实时型插件的热键在这里退回"起进程"，
+            // 主路径是画布聚焦时的 `on_event`（正常看图就在那里）。
             None,
             &self.viewer,
             &self.chrome,

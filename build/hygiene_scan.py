@@ -5,8 +5,8 @@ r"""
   python build/hygiene_scan.py --json     # 机器可读
   python build/hygiene_scan.py --selftest # 规则自检（合成样例命中验证，门禁的牙齿）
 
-十三查（1–6 只扫第一方 Rust 源码 `main/src/**/*.rs`；第 7 查按登记要求跨到 `main/patches/` 与 `.3rd/`，**不碰归档**；
-第 8 查扫 `main/**` 的全部第一方文本文件；第 9 查只扫 `main/**/*.ps1`；第 10、11、13 查只扫 `main/src/ui/**`；
+十四查（1–6 只扫第一方 Rust 源码 `main/src/**/*.rs`；第 7 查按登记要求跨到 `main/patches/` 与 `.3rd/`，**不碰归档**；
+第 8 查扫 `main/**` 的全部第一方文本文件；第 9 查只扫 `main/**/*.ps1`；第 10、11、13、14 查只扫 `main/src/ui/**`；
 第 12 查扫 `main/**` 找凭据形状）：
 
   1. 硬编码绝对路径  `[A-Z]:\`  —— 换台电脑就失效
@@ -96,9 +96,18 @@ r"""
   回调收尾时立即建窗——那条滞留的关窗请求会找到刚开出来的新窗把它收走，用户看到
   「窗闪一下就没了」。正确写法是 `singleton::recycle` 给出的两个不同键。
 
+十四查 `footer_buttons`（2026-11-06，用户点名）：`main/src/ui/**` 的非测试代码里，
+  `Element::button(` 只许出现在 `settings/rows.rs`（`btn` 的实现本身）。其余一律走
+  `btn(...)` 或 `dialog_footer::action(...)`，整扇对话框走 `dialog_footer::shell`。
+  起因是三扇对话框各写一套四边留白 / 行间距 / 按钮位：插件设置窗 `spacing(0)` 再在按钮行
+  加一层 16、裸数据参数窗 `spacing(10)` 且按钮不贴底、恢复提示窗 `spacing(10)` 自己顶一颗
+  spacer——用户看到的是「通道调色的快捷键窗按钮和其它插件不一样」。版式正本见
+  `docs/界面版式规范.md` §2：四边 16（`DIALOG_PAD`）、行间距与按钮间距 8（`GAP`）、
+  行高 40（`ROW_H`）、按钮右对齐且贴底。
+
 分类计数：违规按 `abs_path` / `debug_macro` / `marker` / `boundary_doc` / `panic_source` /
 `config_last_mile` / `patch_parity` / `control_char` / `ps1_ascii` / `literal_color` /
-`ui_super_path` / `secret` / `single_window_key` 十三档分别报数（见 [`CATEGORIES`]）。**判定门限仍是「总数 = 0」**——分类只为趋势可见（哪一类在动），
+`ui_super_path` / `secret` / `single_window_key` / `footer_buttons` 十四档分别报数（见 [`CATEGORIES`]）。**判定门限仍是「总数 = 0」**——分类只为趋势可见（哪一类在动），
 不引入基线冻结；RuPix 违规历史 = 0，加基线等于给满分项目开小抄通道。
 退出码：0 = 「违规 0 处」；1 = 有违规。
 
@@ -209,7 +218,7 @@ CFG_FIELD = re.compile(r"\bcfg\.([a-z_][a-z0-9_]*)")
 # 与上面"九查"顺序一一对应；新增分类请**尾追**（头插会打乱旧日志三段布局）。
 CATEGORIES = ("abs_path", "debug_macro", "marker", "boundary_doc", "panic_source", "config_last_mile",
               "patch_parity", "control_char", "ps1_ascii", "literal_color",
-              "ui_super_path", "secret", "single_window_key")
+              "ui_super_path", "secret", "single_window_key", "footer_buttons")
 
 
 def is_comment(line: str) -> bool:
@@ -541,6 +550,50 @@ def detect_ui_super_path(src_dir: pathlib.Path) -> list[str]:
     return bad
 
 
+# ── 十四查（2026-11-06）：按钮创建点只留两处 ────────────────────────────
+# 底栏按钮 = `dialog_footer::action`，普通按钮 = `settings::rows::btn`。两者内部都落到
+# `Element::button`，而那**只能**出现在 `btn` 的实现里——否则「统一版式」就只是自觉。
+BUTTON_CTOR = re.compile(r"\bElement::button\s*\(")
+BUTTON_CTOR_ALLOWED = {"src/ui/settings/rows.rs"}
+
+
+def detect_footer_buttons(src_dir: pathlib.Path) -> list[str]:
+    """`src/ui/**` 里除 `settings/rows.rs` 之外不许出现 `Element::button(`。
+
+    为什么值得一条硬门禁：2026-11-06 之前三扇对话框各写一套四边留白/行间距/按钮位，
+    用户一眼看出「通道调色的快捷键窗按钮和其它插件不一样」。事后靠人盯是盯不住的——
+    新开一扇窗的人只会照抄眼前那扇。把创建点收到两处，`dialog_footer` 的几何判据
+    （340/480/640 三种窗宽量右缘、底缘、间距）才有意义：它量的就是**所有人**的按钮行。
+    """
+    ui_dir = src_dir / "ui"
+    bad: list[str] = []
+    scanned = 0
+    for p in sorted(ui_dir.rglob("*.rs")):
+        if not p.is_file():
+            continue
+        scanned += 1
+        rel = p.relative_to(src_dir.parent).as_posix()
+        if rel in BUTTON_CTOR_ALLOWED:
+            continue
+        in_test = bool(TEST_ONLY.search(rel))
+        for i, line in enumerate(
+            p.read_text(encoding="utf-8", errors="replace").splitlines(), 1
+        ):
+            if CFG_TEST.match(line):
+                in_test = True
+            if in_test or is_comment(line):
+                continue
+            if BUTTON_CTOR.search(line):
+                bad.append(
+                    f"footer_buttons: {rel}:{i} 自己造按钮 -- {line.strip()[:80]}"
+                    "（普通按钮走 `btn(..)`、底栏按钮走 `dialog_footer::action(..)`，"
+                    "整扇窗走 `dialog_footer::shell`；版式正本 docs/界面版式规范.md §2）"
+                )
+    if scanned == 0:
+        return ["footer_buttons: ui/ 下一个 .rs 都没扫到（目录形状变了，本查失明）"]
+    return bad
+
+
 # ── 十三查（2026-11-04）：单例窗「同键既关又开」 ────────────────────────
 def single_window_clash(rel: str, lines: list[str]) -> list[str]:
     """判一个文件里 `close_window(X)` 与 `.single(X)` 是否共用同一个变量。
@@ -669,6 +722,21 @@ def selftest() -> int:
     expect(bool(UI_SIBLING_PATH.search("use crate::ui::chrome::Chrome;")), "ui 内全路径应命中")
     expect(UI_SIBLING_PATH.search("use super::{Chrome, Hub};") is None, "super:: 写法不该命中")
     expect(UI_SIBLING_PATH.search("super::raw_dialog::open_path(p);") is None, "super:: 函数调用不该命中")
+
+    # footer_buttons（十四查：按钮创建点）—— 裸 `Element::button` 必须命中，两条正路不许碰
+    expect(
+        bool(BUTTON_CTOR.search('Element::button("确定").on_click(f)')),
+        "裸 Element::button 应命中",
+    )
+    expect(BUTTON_CTOR.search('btn("确定").on_click(f)') is None, "btn 不该命中")
+    expect(
+        BUTTON_CTOR.search('super::dialog_footer::action("确定", f)') is None,
+        "dialog_footer::action 不该命中",
+    )
+    expect(
+        detect_footer_buttons(SRC) == [],
+        "本仓 ui 层不该有第二处按钮创建点（有就说明有人绕开了 dialog_footer）",
+    )
 
     # single_window_key（十三查：同键既关又开的单例窗，K196）
     expect(
@@ -995,6 +1063,10 @@ def main():
     # single_window_key：单例窗同键既关又开（见模块头十三查与 detect_single_window_key）。
     for msg in detect_single_window_key(SRC):
         violations.append(("single_window_key", msg))
+
+    # footer_buttons：按钮创建点只留两处（见模块头十四查与 detect_footer_buttons）。
+    for msg in detect_footer_buttons(SRC):
+        violations.append(("footer_buttons", msg))
 
     by_cat = {c: 0 for c in CATEGORIES}
     for cat, _ in violations:

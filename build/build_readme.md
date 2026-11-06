@@ -132,6 +132,7 @@ python build/gate.py run all
 | `dir_rescan_probe.ps1` | 多窗盯同一个大目录时**一次文件变动的重扫成本**：造 N 项夹具、开 N 扇窗、加/删一个文件，读 `[dir-rescan]` 数 `scanned`（真读盘）与 `reused`（复用别人的扫描）。判定 `scanned` 恒为 1 才算同批只扫一次 |
 | `tray_wake_probe.ps1` | 点托盘「显示窗口」（等价于再次启动不带参数的 `rupix.exe`）时，多开的窗口是不是**全部**回到前面：开 N 扇，拿一个无关窗口把它们盖住，读 z 序（同一次 `EnumWindows` 里算 index）。`-Bin` 指被测 exe（新旧对照要传两个不同的二进制，**不能**叫 `-Exe`：PS 变量名不分大小写，会被脚本里的 `$exe` 顶掉）；`-Cover 0` 改走"最小化 + 读 IsIconic"的老判据，`-SkipWake 1` 是不唤回的对照臂（证明恢复确实由唤回触发，而不是系统自己还原） |
 | `multi_window_mem_probe.ps1` | 多开一扇窗要多少内存：同一张大图造 N 个硬链接（磁盘只占一份）、逐窗打开、读进程级 `PrivateMemorySize64` / `WorkingSet64` / `PeakWorkingSet64`，给出每窗边际增量。`-Burst 1` 让第 2..N 扇**不留间隔地连发**，解码才会真的撞在一起——峰值只有在这一臂才有意义（逐窗开时解码是串行的，峰值必然不涨）。★ 判据用私有提交与峰值，别用瞬时工作集：它随时可能被系统裁到 1 MB 级 |
+| `fullscreen_corner_probe.ps1` | 全屏是不是**真全屏**的 DWM 属性判据：私有根起一窗（`init_window=0`），`DwmGetWindowAttribute(hwnd, 33)` 读回 `DWMWA_WINDOW_CORNER_PREFERENCE`（`2=ROUND` / `1=DONOTROUND`），投 F11 进全屏、再投一次退出，期望 `2 → 1 → 2`。`-Bin` 传旧 exe 做对照臂（补丁 026 之前全屏仍读回 `2` ⇒ FAIL）。★ 判据取**属性读回**而不是像素：圆角是 DWM 合成层裁切，截图会被壁纸 / 图片内容干扰；窗口按 PID 枚举（`FindWindowW` 按标题不可靠）；开头 `taskkill` 清场、结尾连 `temp/rupix.run` 一起删，全 ASCII。★ 探针另发一次**模拟顶缘拖动**并量窗口矩形，但新旧 exe 都读回 `0,0` —— 模拟输入没能触发系统移动循环，**该读数只作诊断、不参与 PASS/FAIL**；「全屏禁拖窗」由 `ui/canvas.rs::left_drag_never_moves_the_window_in_fullscreen` 单测钉住，视觉判据留实机 |
 
 > `_common.bat` **不是探针**：它是六个编号步骤各自 `call` 的公共前置——算出
 > `MAIN_DIR` / `PROJECT_ROOT` / `TEMP_DIR` / `TARGET_DIR` / `OUTPUT_DIR` / `DECODER_DIR` /

@@ -24,7 +24,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Dwm::{
     DwmExtendFrameIntoClientArea, DwmGetWindowAttribute, DwmSetWindowAttribute,
-    DWMWA_VISIBLE_FRAME_BORDER_THICKNESS, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DWMWA_VISIBLE_FRAME_BORDER_THICKNESS, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT,
+    DWMWCP_DONOTROUND, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, ClientToScreen, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject,
@@ -3567,6 +3568,32 @@ unsafe fn set_window_opacity(hwnd: HWND, percent: u8) {
     let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
+/// ★ RuPix 补丁 026 —— 全屏时关掉 Win11 系统圆角。
+///
+/// 建窗对 frameless 窗**显式**设了 `DWMWCP_ROUND`（见 WM_NCCREATE 附近那段注释）；
+/// 那是**窗口级 DWM 属性**，改 `GWL_STYLE` / `SetWindowPos` 并不会把它清掉。
+/// 补丁 04 只换样式 + 按 `rcMonitor` 铺满，于是全屏之后 DWM 仍按 ROUND 裁掉四角，
+/// 四角露出桌面 —— 用户看到的就是「全屏了但边角还是圆的，像假全屏」。
+///
+/// 进入设 `DONOTROUND`；退出按 frameless 恢复到建窗时的值（frameless → ROUND，
+/// 普通窗 → DEFAULT 交回系统策略）。Win10 不认属性号 33，
+/// `DwmSetWindowAttribute` 返回 `E_INVALIDARG`，丢弃即得到想要的降级，无需版本判断。
+unsafe fn set_fullscreen_corner(hwnd: HWND, fullscreen: bool, frameless: bool) {
+    let pref = if fullscreen {
+        DWMWCP_DONOTROUND
+    } else if frameless {
+        DWMWCP_ROUND
+    } else {
+        DWMWCP_DEFAULT
+    };
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_WINDOW_CORNER_PREFERENCE,
+        &pref as *const _ as *const c_void,
+        size_of_val(&pref) as u32,
+    );
+}
+
 /// ★ RuPix 补丁 04 —— 进入 / 退出无边框全屏（`WindowOp::ToggleFullscreen`）。
 ///
 /// 进入：记下当前 `GWL_STYLE` 与窗口矩形，样式换成 `WS_POPUP | WS_VISIBLE` 并铺满
@@ -3585,9 +3612,9 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
         ..Default::default()
     };
     let _ = GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi);
-    let (fs, saved) = state_from(hwnd)
-        .map(|s| (s.fullscreen, s.saved_placement))
-        .unwrap_or((false, None));
+    let (fs, saved, frameless) = state_from(hwnd)
+        .map(|s| (s.fullscreen, s.saved_placement, s.frameless))
+        .unwrap_or((false, None, false));
 
     if fs {
         // ② 退出：恢复进全屏前的样式与矩形。
@@ -3625,6 +3652,9 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
             s.saved_placement = Some((style, win_rect));
         }
     }
+    // ★ 补丁 026：`fs` 是切换**前**的全屏位，取反即切换后的状态。放在 SetWindowPos
+    // 之后（样式 / 尺寸已落地），且不持有任何 state_from 借用。
+    set_fullscreen_corner(hwnd, !fs, frameless);
     let _ = InvalidateRect(Some(hwnd), None, false);
     push_window_state(hwnd);
 }

@@ -30,6 +30,9 @@
 //! | Ctrl+左键拖动 / 中键拖动            | 平移图片（兜底手势，不看开关）         |
 //! | 右键                                | 上下文菜单                             |
 //!
+//! ★ **真全屏例外**（m238 修复轮）：窗口铺满显示器后不许被拖走 —— 画布里照常平移
+//! 图片，顶条那一条与空窗一律不响应（判据见 [`left_drag`] 的 `fullscreen` 分支）。
+//!
 //! `drag_image` **关** = 回到 2026-10-08 那套：任意位置左键拖 = 移动窗口，
 //! 平移图片只剩 Ctrl+左键、中键与鸟瞰三条。判据本体是 [`left_drag`]（纯函数，有单测）。
 //!
@@ -67,6 +70,7 @@ use crate::core::pixels::MAX_TEXTURE_SIDE;
 // 鸟瞰 / 浮层的配色取自全 ui 共用的令牌（[`crate::ui::tokens`]），本文件不自带色值。
 // 别名引入：跟随主题那组是函数，名字短（`empty_bg` / `hint_text`），逐个 import 易撞名。
 use super::chrome::{self, Arrow, Btn, Press, TitleBtn};
+use super::plugin_settings::{LiveState, RunPrompt};
 use super::tokens as tk;
 use super::{filmstrip, settings};
 use super::{to_key_input, Chrome, Hub, Strip};
@@ -110,6 +114,11 @@ pub struct ImageCanvas {
     main_img: RefCell<ImageCache>,
     /// 鸟瞰缩略位图的上屏纹理缓存。
     nav_img: RefCell<ImageCache>,
+    /// 实时调色状态（每窗一份）：参数窗写、本画布 paint 读。
+    live: LiveState,
+    /// 施加调色后的主图 / 鸟瞰纹理，按 (源 gen, 六个参数) 判脏。
+    tint_main: RefCell<TintCache>,
+    tint_nav: RefCell<TintCache>,
 
     // ── 底部缩略图条 ──
     /// 条的开关从 `chrome.filmstrip` 读；这里存**上一帧算出的格子几何**，供事件
@@ -170,6 +179,8 @@ enum LeftDrag {
     Window,
     /// 平移图片（`Viewer::begin_drag` 开局，Move 里跟手）。
     PanImage,
+    /// 不响应：**真全屏**里窗口铺满且固定，这一拖既不搬窗口也不搬图。
+    None,
 }
 
 /// 分工规则（ini 键 `drag_image`，默认开）。三条**全部**满足才拖图片，任一不满足
@@ -182,7 +193,18 @@ enum LeftDrag {
 ///   与"视口还没量出来"两种——那时那一按留着拖窗口，**不许把拖窗口这条路堵死**。
 /// - `!in_title`：指针不在顶部标题栏那一条里——**标题栏永远带走窗口**（判据单一来源
 ///   见 [`Chrome::in_title_strip`]）。
-fn left_drag(drag_image: bool, can_pan: bool, in_title: bool) -> LeftDrag {
+fn left_drag(drag_image: bool, can_pan: bool, in_title: bool, fullscreen: bool) -> LeftDrag {
+    // ★ m238 修复轮（用户 2026-11-05 实机）：真全屏时窗口铺满显示器且**不许被拖走**。
+    // 收起顶条只改了绘制、关掉系统圆角只改了 DWM 属性，都没动这条手势判据 —— 于是
+    // 顶缘按下仍会把全屏窗拖离显示器，看起来还是「假全屏」。全屏时：画布里照常平移
+    // 图片，顶条那一条与「拖不动图的空窗」一律不响应，不留「能拖」的假象。
+    if fullscreen {
+        return if drag_image && can_pan && !in_title {
+            LeftDrag::PanImage
+        } else {
+            LeftDrag::None
+        };
+    }
     if drag_image && can_pan && !in_title {
         LeftDrag::PanImage
     } else {
@@ -269,6 +291,51 @@ impl ImageCache {
     }
 }
 
+/// 实时调色纹理：键 = (源位图 gen, 六个参数)，变一次才重算一次 + 重新上传。
+///
+/// 只变换**已经派生到显示档**的那份位图（视口尺寸量级），原图/base 一字节不动：
+/// 8 MP 整图每帧重算会卡住拖动，而显示档在适应窗口时通常不到 2 MP；查表版变换
+/// 又比逐像素除法快一个量级。原图档放大到 100% 以上时才等于整图，那时一帧仍只算一次。
+struct TintCache {
+    key: Option<(u64, [i32; 6])>,
+    img: Option<RgbaImage>,
+    upload: ImageCache,
+}
+
+impl TintCache {
+    const fn new() -> Self {
+        Self {
+            key: None,
+            img: None,
+            upload: ImageCache::new(),
+        }
+    }
+
+    /// 主窗用：>100% 放大时保持硬边，与未调色那一档的 `pixelated` 一致，
+    /// 否则一开滤镜像素格就糊成一片，看着像"换了一张图"。
+    const fn new_pixelated() -> Self {
+        Self {
+            key: None,
+            img: None,
+            upload: ImageCache::new().pixelated(),
+        }
+    }
+
+    fn obtain(&mut self, src: &RgbaImage, v: [i32; 6]) -> Option<&Image> {
+        if self.key != Some((src.gen, v)) {
+            let px = crate::core::pixels::channel_linear_lut(
+                &src.rgba,
+                [v[0], v[1], v[2]],
+                [v[3], v[4], v[5]],
+            );
+            self.img = Some(RgbaImage::new(src.width, src.height, px));
+            self.key = Some((src.gen, v));
+        }
+        let img = self.img.as_ref()?;
+        self.upload.obtain(img)
+    }
+}
+
 /// core 的 [`RectI`] → windui `Rect`（同构 1:1 转换）。
 fn to_rect(r: RectI) -> Rect {
     Rect::new(r.x, r.y, r.w, r.h)
@@ -309,6 +376,90 @@ fn nav_draw_rect(inner: Rect, idst: Rect, dst: Rect) -> Rect {
     Rect::new(l, t, r - l, b - t)
 }
 
+/// 「另存为…」的默认文件名：原图主名 + `.png`。
+///
+/// 以前写死「涂鸦.png」，用户每存一张都要自己重命名一遍——原图叫
+/// `IMG_1234.jpg` 时那个默认名一点信息量都没有。
+fn default_png_name(cur: &std::path::Path) -> String {
+    let stem = cur
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "涂鸦".to_string());
+    format!("{stem}.png")
+}
+
+/// 编辑态的两个出口（另存为 / 还原）。
+///
+/// 三处共用同一份实现：右键菜单（老插件）、运行参数窗（`run_ui` 插件）、插件热键。
+/// 造在这里而不是参数窗里，是因为参数窗不该认识 `Viewer` / `Chrome`。
+fn edit_actions(
+    viewer: &Rc<RefCell<Viewer>>,
+    chrome: &Rc<Chrome>,
+    live: &LiveState,
+    cur: &std::path::Path,
+) -> super::plugin_settings::RunActions {
+    let v = viewer.clone();
+    let ch = chrome.clone();
+    let live_save = live.clone();
+    // 闭包要求 'static：把路径搬成 owned，别把函数的引用带进去。
+    let cur_owned = cur.to_path_buf();
+    let cur_save = cur_owned.clone();
+    let save: Rc<dyn Fn(&mut EventCtx)> = Rc::new(move |ctx| {
+        // 另存拿到的是**屏上朝向**那一份，与主菜单里的老入口同款。
+        let Some(edit) = v.borrow().whole_image_for_plugin() else {
+            ctx.toast_err("屏上没有可另存的整图（切片态或未载入）");
+            return;
+        };
+        let (w, h, rgba) = (edit.width, edit.height, edit.rgba.clone());
+        // 实时调色只在显示层，没进 base_rgba：另存必须把同一组参数算进整图，
+        // 否则存出去的还是没调过的原图（用户看到的是调过的）。
+        let t = live_save
+            .tint
+            .get()
+            .filter(|t| !t.is_neutral() && edit.path == t.path);
+        let out = match t {
+            Some(t) => Arc::new(crate::core::pixels::channel_linear_lut(
+                rgba.as_slice(),
+                t.gain(),
+                t.bias(),
+            )),
+            None => rgba,
+        };
+        let ch = ch.clone();
+        let name = default_png_name(&cur_save);
+        ctx.request_save_file(
+            windui::prelude::PickDialog::new()
+                .title("另存为 PNG")
+                .file_name(name),
+            move |dest| ch.start_save_png(dest, w, h, out),
+        );
+    });
+    let v2 = viewer.clone();
+    let cur_r = cur_owned;
+    let live_revert = live.clone();
+    let revert: Rc<dyn Fn(&mut EventCtx)> = Rc::new(move |ctx| {
+        // 两个来源一起还原：显示层调色 + 插件正式写回的编辑覆盖。
+        let had_tint = live_revert.tint.get().is_some();
+        live_revert.tint.set(None);
+        let r = live_revert.reset.get();
+        live_revert.reset.set(r + 1);
+        let restored = v2.borrow_mut().revert_edited(&cur_r);
+        if had_tint || restored {
+            log::info!(
+                "[plugin-edit] verdict=reverted file={} tint={} overlay={}",
+                cur_r.display(),
+                had_tint,
+                restored
+            );
+            ctx.toast_ok("已还原");
+        } else {
+            ctx.toast_ok("当前没有需要还原的编辑");
+        }
+    });
+    super::plugin_settings::RunActions { save, revert }
+}
+
 impl ImageCanvas {
     pub fn new(
         viewer: Rc<RefCell<Viewer>>,
@@ -327,6 +478,9 @@ impl ImageCanvas {
             wheel_acc: Cell::new(0),
             main_img: RefCell::new(ImageCache::new().pixelated()),
             nav_img: RefCell::new(ImageCache::new()),
+            live: LiveState::new(),
+            tint_main: RefCell::new(TintCache::new_pixelated()),
+            tint_nav: RefCell::new(TintCache::new()),
             strip_items: RefCell::new(Vec::new()),
             strip_pressed: Cell::new(None),
             strip_hover: Cell::new(None),
@@ -605,11 +759,11 @@ impl ImageCanvas {
 
         items.push(MenuItem::separator());
 
-        // ── 操作：底部按钮栏的全部动作，改成菜单项的样子 ──
+        // ── 操作：浮条按钮全集，菜单恒列；没有帧/页号时那三颗变灰 ──
         items.push(MenuItem::submenu("操作", self.ops_items(ws)));
 
         // ── 工具：宿主内置的低频辅助（m217）──
-        // 夹在「操作」（严格等于浮条 Btn::ALL 的对账）与「插件」（外部进程）之间。
+        // 夹在「操作」（恒列 `Btn::ALL`，与浮条按宽度/帧页号的裁剪不同）与「插件」之间。
         // 这组只进菜单不进浮条——用户口径「一排按钮已经很多了，太占空间」。
         items.push(MenuItem::submenu("工具", self.tool_items(has_image)));
 
@@ -822,6 +976,18 @@ impl ImageCanvas {
             .borrow()
             .whole_image_for_plugin()
             .filter(|x| crate::extensions::run::pixels_within_limit(x.width, x.height));
+        // 另存 / 还原的两份动作只实现一次：右键菜单、运行参数窗、插件热键三条路共用。
+        // 参数窗本身不认识 Viewer / Chrome，所以两颗闭包造在这里（见 [`edit_actions`]）。
+        let edit_actions: Option<super::plugin_settings::RunActions> = path
+            .as_ref()
+            .map(|cur| edit_actions(&self.viewer, &self.chrome, &self.live, cur));
+        // `run_ui` 编辑插件把两个出口收进了自己的参数窗，右键不再重复挂。
+        let ui_managed = list.iter().any(|e| {
+            e.enabled
+                && !e.blocked
+                && e.manifest.run_ui
+                && matches!(e.manifest.kind, crate::core::ext::Kind::Editor)
+        });
         let mut out = Vec::new();
         for ext in list.into_iter().filter(|e| e.enabled) {
             let name = ext.manifest.name.clone();
@@ -864,9 +1030,18 @@ impl ImageCanvas {
                     out.push(it);
                 }
                 crate::core::ext::Kind::Editor => {
-                    // 编辑型（P0.4）：要有当前整图（非切片）且在上限内——上面筛过一次，
-                    // 这里只看有没有那一份。交出去的是**屏上朝向**，orient 一路带到落地。
-                    let Some(edit) = whole.clone() else {
+                    // 声明 `run_ui` 的插件：点菜单弹宿主渲染的参数窗。
+                    // 有 `preview` 声明 = 拖动时看图窗本尊实时变、不起进程；
+                    // 老插件（无声明）仍按「应用」起进程，加法式字段不翻旧账。
+                    let run_ui = ext.manifest.run_ui && !ext.manifest.settings.is_empty();
+                    let has_live_op = run_ui && ext.manifest.preview.is_some();
+                    // ★ 8 MP 闸只为「整图经共享内存发给插件进程」（32 MB 映射）而设。
+                    //   实时型只改显示层、一个像素都不出进程，拿这道闸拦它会让
+                    //   4080×4080 这类图整个菜单项灰掉——2026-11-06 用户报的
+                    //   「调完就变灰、无法继续调整」正是这道闸错位：整图与上屏位图
+                    //   不是一回事，实时调色只吃上屏那一份。
+                    let edit = whole.clone();
+                    if !has_live_op && edit.is_none() {
                         // 上限数字从 `EDITOR_MAX_PIXELS` 算，不写死：写死的那一份没有任何
                         // 机器读过，改数时只会留下菜单在撒谎（run.rs 的报错串本来就是算的）。
                         let cap = crate::extensions::run::EDITOR_MAX_PIXELS / 1_000_000;
@@ -875,16 +1050,64 @@ impl ImageCanvas {
                         it.enabled = false;
                         out.push(it);
                         continue;
-                    };
-                    out.push(MenuItem::run(
-                        name.clone(),
-                        move |ctx| match crate::extensions::start_editor(ext.clone(), edit.clone())
-                        {
-                            Ok(()) => ctx.toast_ok(format!("已打开涂鸦：{name}")),
-                            Err(e) => ctx.toast_err(e),
-                        },
-                        false,
-                    ));
+                    }
+                    let ext_ui = ext.clone();
+                    let ext_launch = ext.clone();
+                    let edit_launch = edit.clone();
+                    let launch: Rc<dyn Fn(&mut EventCtx) -> bool> = Rc::new(move |ctx| {
+                        // 实时型不该走到这里；真走到了说明有入口误接「应用」，
+                        // 如实拒绝，别拿一张空图去起插件进程。
+                        let Some(edit) = edit_launch.clone() else {
+                            ctx.toast_err("这张图超过 8 MP，整图编辑不可用");
+                            return false;
+                        };
+                        match crate::extensions::start_editor(ext_launch.clone(), edit) {
+                            // 成功不弹 toast：提示与关窗抢同一帧是「秒退」最可疑的一环，
+                            // 而且图变了本身就是最好的回执。失败留在窗里可重试。
+                            Ok(()) => true,
+                            Err(e) => {
+                                ctx.toast_err(e);
+                                false
+                            }
+                        }
+                    });
+                    let launch_menu = launch.clone();
+                    if run_ui {
+                        let cfg = self.config.clone();
+                        let actions = edit_actions.clone();
+                        let live = self.live.clone();
+                        let cur_path = path.clone().unwrap_or_default();
+                        let legacy_launch = launch.clone();
+                        out.push(MenuItem::run(
+                            name.clone(),
+                            move |ctx| {
+                                super::plugin_settings::show_run_prompt(
+                                    ctx,
+                                    &ext_ui,
+                                    &cfg,
+                                    RunPrompt {
+                                        state: live.clone(),
+                                        path: cur_path.clone(),
+                                        on_apply: if has_live_op {
+                                            None
+                                        } else {
+                                            Some(legacy_launch.clone())
+                                        },
+                                        actions: actions.clone(),
+                                    },
+                                );
+                            },
+                            false,
+                        ));
+                    } else {
+                        out.push(MenuItem::run(
+                            name.clone(),
+                            move |ctx| {
+                                launch_menu(ctx);
+                            },
+                            false,
+                        ));
+                    }
                 }
                 crate::core::ext::Kind::Command => {
                     let needs_image = ext
@@ -900,64 +1123,69 @@ impl ImageCanvas {
                     // 菜单尾随列：插件自报的热键（动态热键的可见面）。
                     // 闭包会把 `ext` 搬走，所以这行要在搬之前取好。
                     let hotkey_label = ext.manifest.hotkey.map(|h| h.pretty());
-                    let mut it = MenuItem::run(
-                        name.clone(),
-                        move |ctx| match crate::extensions::start_command(
+                    let run_ui = ext.manifest.run_ui && !ext.manifest.settings.is_empty();
+                    let ext_ui = ext.clone();
+                    let launch: Rc<dyn Fn(&mut EventCtx) -> bool> = Rc::new(move |ctx| {
+                        match crate::extensions::start_command(
                             ext.clone(),
                             img.clone(),
                             None,
                             pixels.clone(),
                         ) {
-                            Ok(()) => ctx.toast_ok(format!("已启动插件：{name}")),
-                            Err(e) => ctx.toast_err(e),
-                        },
-                        false,
-                    );
+                            Ok(()) => true,
+                            Err(e) => {
+                                ctx.toast_err(e);
+                                false
+                            }
+                        }
+                    });
+                    let launch_menu = launch.clone();
+                    let mut it = if run_ui {
+                        let cfg = self.config.clone();
+                        MenuItem::run(
+                            name.clone(),
+                            move |ctx| {
+                                super::plugin_settings::show_run_prompt(
+                                    ctx,
+                                    &ext_ui,
+                                    &cfg,
+                                    RunPrompt {
+                                        state: LiveState::new(),
+                                        path: std::path::PathBuf::new(),
+                                        on_apply: Some(launch.clone()),
+                                        actions: None,
+                                    },
+                                );
+                            },
+                            false,
+                        )
+                    } else {
+                        MenuItem::run(
+                            name.clone(),
+                            move |ctx| {
+                                launch_menu(ctx);
+                            },
+                            false,
+                        )
+                    };
                     it.enabled = can_run;
                     it.shortcut = hotkey_label;
                     out.push(it);
                 }
             }
         }
-        // 当前图有未保存的编辑覆盖：给出另存/还原（编辑结果只存内存，
-        // 这两项是它的唯一出口——沉默会让用户误以为涂鸦已写回原文件）。
+        // 当前图有未保存的编辑覆盖：给出另存/还原（编辑结果只存内存）。
+        // ★ `run_ui` 编辑插件的这两个出口已经收进它自己的参数窗，右键不再重复挂
+        //   —— 用户 2026-11-06 裁决「确定应用后多出来这两个，是错的」。
         if let Some(cur) = self.viewer.borrow().current_path() {
             let edited = self.viewer.borrow().is_edited(&cur);
-            if edited {
-                let v = self.viewer.clone();
-                let chrome = self.chrome.clone();
-                out.push(MenuItem::run(
-                    "另存涂鸦（PNG）…",
-                    move |ctx| {
-                        // 另存拿到的是**屏上朝向**那一份：用户屏幕上看到什么构图就存什么
-                        // （朝向对调时宽高一起换，`start_save_png` 收的是尺寸+像素，不用改）。
-                        let Some(edit) = v.borrow().whole_image_for_plugin() else {
-                            return;
-                        };
-                        let (w, h, rgba) = (edit.width, edit.height, edit.rgba.clone());
-                        // 保存对话框走 windui 的异步请求（同步 rfd 会钉住 UI 线程）。
-                        let chrome = chrome.clone();
-                        ctx.request_save_file(
-                            windui::prelude::PickDialog::new()
-                                .title("另存涂鸦为 PNG")
-                                .file_name("涂鸦.png"),
-                            move |dest| chrome.start_save_png(dest, w, h, rgba),
-                        );
-                    },
-                    false,
-                ));
-                let v = self.viewer.clone();
-                let cur = cur.clone();
-                out.push(MenuItem::run(
-                    "还原原图",
-                    move |ctx| {
-                        if v.borrow_mut().revert_edited(&cur) {
-                            log::info!("[plugin-edit] verdict=reverted file={}", cur.display());
-                            ctx.toast_ok("已还原原图");
-                        }
-                    },
-                    false,
-                ));
+            if edited && !ui_managed {
+                if let Some(a) = &edit_actions {
+                    let save = a.save.clone();
+                    let revert = a.revert.clone();
+                    out.push(MenuItem::run("另存为（PNG）…", move |ctx| save(ctx), false));
+                    out.push(MenuItem::run("还原", move |ctx| revert(ctx), false));
+                }
             }
         }
         if out.is_empty() {
@@ -1068,12 +1296,12 @@ impl ImageCanvas {
     }
 
     fn ops_items(&self, ws: WindowState) -> Vec<MenuItem> {
+        // ★ 菜单**恒列** `Btn::ALL`：浮条为了美观把没有帧/页号的播放组藏起来，
+        //   菜单不需要美观，缺项只会让人以为功能被删了（用户 2026-11-06）。
+        //   从 Viewer 现算，不读 `chrome.anim`（那是绘制时回灌的 Cell，可能慢一帧）。
+        let has_index = self.viewer.borrow().has_index();
         let mut out = Vec::with_capacity(Btn::ALL.len());
-        // 与浮条同一份 `Chrome::row`：`chrome.anim` 装的是 `has_index()`（有没有帧/页号），
-        // 静态位图也有 1/1 ⇒ 菜单里同样出现那一组（点下去给"静态图"提示，不是静默）。
-        let vw = self.work_tuple().2;
-        let (head, tail) = Chrome::row(self.chrome.anim.get(), vw);
-        for b in head.iter().chain(tail.unwrap_or(&[])).copied() {
+        for (b, enabled) in ops_row(has_index) {
             let mut it = MenuItem::run(
                 b.name(),
                 {
@@ -1088,6 +1316,7 @@ impl ImageCanvas {
                 },
                 false,
             );
+            it.enabled = enabled;
             if let Some(sc) = b.shortcut(&self.config.borrow().hotkeys) {
                 it.shortcut = Some(sc);
             }
@@ -1104,10 +1333,23 @@ impl ImageCanvas {
             out.push(it);
         }
         // ★「幻灯片放映」**不在这里**（2026-11-02 用户要求）：它留在顶层，要随手可及。
-        //   这个子菜单的唯一职责就是"底部按钮栏有什么，这里就有什么"——多一项就破坏了那条
-        //   对账，用户看到的就是"菜单里的操作和浮条不一致"。
+        //   菜单恒列 `Btn::ALL` 全量；浮条另按 `Chrome::row` 裁剪，两者允许不一致——
+        //   差集只是"变灰"，不是"消失"。
         out
     }
+}
+
+/// 「操作 ▸」的项序与启用态：菜单**恒列** [`Btn::ALL`]，不随窗口宽或播放组显隐删项；
+/// 只有当前图没有帧/页号时，播放组那三颗变灰（`enabled=false`，框架保证不可点击）。
+///
+/// ★ 与 [`Chrome::row`] 的分工：浮条按美观裁剪，菜单按"功能永远找得到"列全。
+///   两边读同一份 `has_index()`，表现不同是刻意的产品裁决（用户 2026-11-06）。
+fn ops_row(has_index: bool) -> Vec<(Btn, bool)> {
+    Btn::ALL
+        .iter()
+        .copied()
+        .map(|b| (b, !b.is_anim() || has_index))
+        .collect()
 }
 
 /// 让右键菜单**每一级**都留出同一条勾选列，标签左沿才对得齐。
@@ -1317,6 +1559,14 @@ impl Widget for ImageCanvas {
         }
 
         // ② 图 + 空场提示 / 错误。
+        // 实时调色只对声明的那张图生效：换图后 `path` 对不上，效果自动失效，
+        // 不用定时器清，也不会串到另一扇窗（每窗一份 `LiveState`）。
+        let live = {
+            let v = self.viewer.borrow();
+            self.live.tint.get().filter(|t| {
+                !t.is_neutral() && v.current_path().as_deref() == Some(t.path.as_path())
+            })
+        };
         let hint_ts = TextStyle::new(14.0);
         let mut nav: Option<(Rect, Rect)> = None;
         {
@@ -1331,7 +1581,13 @@ impl Widget for ImageCanvas {
                 // 目标矩形已经是我们算好的等比尺寸，故用 `Fill` 直铺即可（不会拉伸变形）。
                 // gen 代号没变就不重新上传纹理（未变换的翻页/缩放零成本命中缓存）。
                 let mut cache = self.main_img.borrow_mut();
-                if let Some(img) = cache.obtain(src) {
+                let mut tinted = self.tint_main.borrow_mut();
+                let shown = if let Some(t) = &live {
+                    tinted.obtain(src, t.values)
+                } else {
+                    cache.obtain(src)
+                };
+                if let Some(img) = shown {
                     canvas.draw_image(img, to_rect(idst), Fit::Fill, 0.0, 1.0);
                 } else if src.width > MAX_TEXTURE_SIDE || src.height > MAX_TEXTURE_SIDE {
                     // ★ 显卡放不下这张图 ⇒ **给一句人话**，而不是留一片空白。
@@ -1344,6 +1600,7 @@ impl Widget for ImageCanvas {
                     let slot = Rect::new(work.x + z, work.y, (work.w - 2 * z).max(60), work.h);
                     canvas.draw_text(&msg, slot, tk::error_text(), Align::Center, &hint_ts);
                 }
+                drop(tinted);
                 drop(cache);
                 // 鸟瞰缩略图（菠萝 NavigatorView）：显示尺寸超出视口时出现。
                 // 几何锚在**整图** dst 上（位图是切片时映射关系也不变，见 viewer 的
@@ -1427,7 +1684,13 @@ impl Widget for ImageCanvas {
                 let (idst, dst) = (to_rect(idst), to_rect(dst));
                 let draw = nav_draw_rect(inner, idst, dst);
                 let mut cache = self.nav_img.borrow_mut();
-                if let Some(img) = cache.obtain(src) {
+                let mut tinted = self.tint_nav.borrow_mut();
+                let shown = if let Some(t) = &live {
+                    tinted.obtain(src, t.values)
+                } else {
+                    cache.obtain(src)
+                };
+                if let Some(img) = shown {
                     canvas.draw_image(img, draw, Fit::Fill, 0.0, 1.0);
                 }
             }
@@ -1474,9 +1737,8 @@ impl Widget for ImageCanvas {
         // 就在标脏之后发生，再标一次是空转。
         //
         // ★ `chrome.anim` 的语义是"**有没有帧/页号**"（= `has_index()`），不是"是不是
-        //   动图"（= `is_animated()`）。静态位图也有 1/1（契约规定解码器回填），
-        //   所以播放组一律出现（用户 2026-11-02"单帧也显示、按钮栏也出现"）。
-        //   字形仍按真实播放态走：静态图 → ▶（没在播），动图 → ⏸/▶ 按 `anim_paused`。
+        //   动图"（= `is_animated()`）。静态位图没有号 ⇒ 播放组整组不出现；只有真动图
+        //   与多页文档才挂。字形仍按真实播放态走：没在播 → ▶，动图 → ⏸/▶ 按 `anim_paused`。
         let has_index = v.has_index();
         let anim = v.is_animated();
         let paused = if anim { v.anim_paused() } else { true };
@@ -1607,6 +1869,7 @@ impl Widget for ImageCanvas {
                 // 先给用户绑定的动作让路：Esc 若被绑到某动作，handle_key 命中并消费执行。
                 let handled = handle_key(
                     Some(ctx),
+                    Some(&self.live),
                     &self.viewer,
                     &self.chrome,
                     &self.config,
@@ -1682,10 +1945,13 @@ impl ImageCanvas {
             self.config.borrow().drag_image,
             self.viewer.borrow().can_pan(),
             Chrome::in_title_strip(pos, view),
+            window_state().fullscreen,
         );
         if ctrl || mode == LeftDrag::PanImage {
             self.viewer.borrow_mut().begin_drag(pos);
-        } else {
+        } else if mode == LeftDrag::Window {
+            // 只有这一支会记待定拖窗位；全屏的 `None` 什么都不记，Move 里
+            // 也就不会有那一记 `start_window_drag()`。
             self.lmb_pending.set(Some(pos));
         }
     }
@@ -1715,10 +1981,15 @@ impl ImageCanvas {
         }
         let in_title = Chrome::in_title_strip(pos, self.work_tuple());
         let can_pan = self.viewer.borrow().can_pan();
-        let mode = left_drag(self.config.borrow().drag_image, can_pan, in_title);
+        let mode = left_drag(
+            self.config.borrow().drag_image,
+            can_pan,
+            in_title,
+            window_state().fullscreen,
+        );
         super::hand_cursor::apply(match mode {
             LeftDrag::PanImage => Some(false),
-            LeftDrag::Window => None,
+            LeftDrag::Window | LeftDrag::None => None,
         });
     }
 
@@ -2065,7 +2336,10 @@ impl ImageCanvas {
 /// `ctx` 仅在「全屏」这类需要改窗口态的动作里用到，故用 `Option`：测试里没有
 /// `EventCtx` 时传 `None`，此时全屏动作静默放行（交给框架默认处理），不影响其它动作。
 pub fn handle_key(
-    ctx: Option<&mut EventCtx>,
+    mut ctx: Option<&mut EventCtx>,
+    // 每窗一份的实时调色状态：热键打开参数窗时要和看图窗共用同一份（`None` 只出现在
+    // 没有画布上下文的兜底路径与测试里，此时退回"起进程"的老路）。
+    live: Option<&LiveState>,
     viewer: &Rc<RefCell<Viewer>>,
     chrome: &Rc<Chrome>,
     cfg: &Rc<RefCell<Config>>,
@@ -2103,11 +2377,44 @@ pub fn handle_key(
         None => {
             // 动态（插件）热键：插件在 manifest 里声明的快捷键。
             // 内置快捷键优先——上面已经没命中，才轮到插件。
-            let claimed = crate::extensions::hotkey_table(&cfg.borrow())
-                .match_plugin(&ki)
-                .is_some();
-            if !claimed {
+            // 借用只在这一个块里：把插件 id 复制出来，后面还要再借 cfg / viewer。
+            let plugin_id = {
+                let c = cfg.borrow();
+                crate::extensions::hotkey_table(&c)
+                    .match_plugin(&ki)
+                    .map(|e| e.plugin_id.clone())
+            };
+            let Some(plugin_id) = plugin_id else {
                 return false;
+            };
+            // ★ 实时参数型编辑插件：热键与右键菜单走同一条路——打开它自己的参数窗。
+            //   `run_by_hotkey` 只会 `start_command`，对调色这类插件等于"跑一遍没有
+            //   界面的滤镜"，用户看不到任何可调的东西（2026-11-06 用户要"快捷键设置"）。
+            //   没有画布上下文（`live`/`ctx` 缺一）时退回老路，不假装开过窗。
+            if let (Some(state), Some(ctx_ref)) = (live, ctx.as_mut()) {
+                let target = crate::extensions::discover_configured(&cfg.borrow())
+                    .into_iter()
+                    .find(|e| e.manifest.id == plugin_id);
+                if let Some(ext) = target {
+                    if ext.manifest.run_ui && ext.manifest.preview.is_some() {
+                        let cur = viewer.borrow().current_path();
+                        // 另存 / 还原与右键菜单同源：从热键进来也不该少这两颗按钮。
+                        let actions = cur.as_ref().map(|c| edit_actions(viewer, chrome, state, c));
+                        super::plugin_settings::show_run_prompt(
+                            ctx_ref,
+                            &ext,
+                            cfg,
+                            RunPrompt {
+                                state: state.clone(),
+                                path: cur.unwrap_or_default(),
+                                on_apply: None,
+                                actions,
+                            },
+                        );
+                        log::info!("[plugin-hotkey] id={} verdict=ui", ext.manifest.id);
+                        return true;
+                    }
+                }
             }
             let path = viewer.borrow().current_path();
             // 快捷键拉起的那一路也要能给出整图（与右键菜单同一份判据、同一次变换）。
@@ -2475,6 +2782,59 @@ fn wasd_dir(a: Action) -> u8 {
 mod tests {
     use super::*;
 
+    /// 显示层调色只在上屏位图 gen 或六个参数变化时才重算一次，不在每帧重扫整图。
+    #[test]
+    fn tint_cache_only_recomputes_on_a_real_change() {
+        let src = RgbaImage::new(2, 1, vec![0, 10, 200, 255, 100, 50, 20, 128]);
+        let v: [i32; 6] = [-100, 100, 100, 255, 0, 0];
+        let mut cache = TintCache::new();
+        assert!(cache.obtain(&src, v).is_some());
+        assert_eq!(cache.key, Some((src.gen, v)));
+        let first = cache.img.as_ref().unwrap();
+        assert_eq!(
+            &first.rgba[..],
+            &[255, 10, 200, 255, 155, 50, 20, 128],
+            "只反相红通道，alpha 与 G/B 原样"
+        );
+        let gen = first.gen;
+
+        // 同 gen + 同参数：一次都不该重算。
+        assert!(cache.obtain(&src, v).is_some());
+        assert_eq!(cache.img.as_ref().unwrap().gen, gen);
+
+        // 参数变了：重算，且新像素按新参数来。
+        let v2: [i32; 6] = [100, 100, 100, 0, 0, 0];
+        assert!(cache.obtain(&src, v2).is_some());
+        assert_eq!(cache.key, Some((src.gen, v2)));
+        assert_ne!(cache.img.as_ref().unwrap().gen, gen);
+        assert_eq!(&cache.img.as_ref().unwrap().rgba[..], &src.rgba[..]);
+
+        // 源位图换代（翻页/缩放）：同样必须重算。
+        let next = RgbaImage::new(2, 1, vec![7, 8, 9, 255, 10, 11, 12, 255]);
+        let gen2 = cache.img.as_ref().unwrap().gen;
+        assert!(cache.obtain(&next, v2).is_some());
+        assert_eq!(cache.key, Some((next.gen, v2)));
+        assert_ne!(cache.img.as_ref().unwrap().gen, gen2);
+    }
+
+    /// ★ 用户 2026-11-06：右键「操作 ▸」的播放三颗**永远存在**；没有帧/页号时
+    /// 变灰且不可点，而不是从菜单里消失（浮条才按美观隐藏）。
+    #[test]
+    fn ops_menu_keeps_anim_buttons_but_disables_them_without_index() {
+        let row = ops_row(false);
+        assert_eq!(row.len(), Btn::ALL.len(), "菜单项不许少一颗");
+        for (b, enabled) in &row {
+            assert_eq!(*enabled, !b.is_anim(), "{b:?} 的启用态不对");
+        }
+        let live = ops_row(true);
+        assert!(live.iter().all(|(_, e)| *e), "有帧/页号时全菜单可点");
+        // 框架契约：enabled=false 的项既不响应点击，也不会被当动作派发。
+        let grey = MenuItem::run("上一帧", |_| {}, false).enabled(false);
+        assert!(!grey.is_actionable(), "灰项必须不可点");
+        let live_item = MenuItem::run("上一帧", |_| {}, false).enabled(true);
+        assert!(live_item.is_actionable(), "亮项必须可点");
+    }
+
     #[test]
     fn menu_columns_aligned_on_every_level() {
         // 纯动作列表（复制 / 插件）本来不含开关项；含开关的级不该被多余改动。
@@ -2568,6 +2928,36 @@ mod tests {
         assert!(beyond_slop(origin, (origin.0 - 20.0, origin.1 + 3.0)));
     }
 
+    /// m238 修复轮：真全屏里窗口不许被拖走（用户实机「全屏还能拖标题栏」）。
+    #[test]
+    fn left_drag_never_moves_the_window_in_fullscreen() {
+        use LeftDrag::{None as NoDrag, PanImage, Window};
+        assert_eq!(
+            left_drag(true, true, false, true),
+            PanImage,
+            "画布里仍可平移图"
+        );
+        assert_eq!(
+            left_drag(true, true, true, true),
+            NoDrag,
+            "顶条那一条不再拖窗口"
+        );
+        assert_eq!(
+            left_drag(false, true, false, true),
+            NoDrag,
+            "开关关掉也不拖窗口"
+        );
+        assert_eq!(
+            left_drag(true, false, false, true),
+            NoDrag,
+            "空窗也不拖窗口"
+        );
+        assert_eq!(left_drag(false, true, true, true), NoDrag);
+        // 非全屏回归：顶条永远带走窗口，别把旧行为改坏。
+        assert_eq!(left_drag(true, true, true, false), Window);
+        assert_eq!(left_drag(false, false, false, false), Window);
+    }
+
     /// 左键这一拖归谁：`drag_image` 开关 × 有没有可平移余量 × 是不是标题栏，**八格全钉**。
     ///
     /// 只有一格（开关开 + 拖得动 + 画布内）是本次新增的行为，其余七格一律回到拖窗口——
@@ -2579,25 +2969,29 @@ mod tests {
     fn left_drag_yields_the_window_unless_there_is_room_in_the_canvas() {
         use LeftDrag::{PanImage, Window};
         assert_eq!(
-            left_drag(true, true, false),
+            left_drag(true, true, false, false),
             PanImage,
             "本次功能的全部新行为"
         );
-        assert_eq!(left_drag(true, true, true), Window, "标题栏永远拖窗口");
         assert_eq!(
-            left_drag(true, false, false),
+            left_drag(true, true, true, false),
+            Window,
+            "标题栏永远拖窗口"
+        );
+        assert_eq!(
+            left_drag(true, false, false, false),
             Window,
             "空窗（没有图）时别堵死拖窗口"
         );
-        assert_eq!(left_drag(true, false, true), Window);
+        assert_eq!(left_drag(true, false, true, false), Window);
         assert_eq!(
-            left_drag(false, true, false),
+            left_drag(false, true, false, false),
             Window,
             "开关关掉就是 2026-10-08 那套分工"
         );
-        assert_eq!(left_drag(false, true, true), Window);
-        assert_eq!(left_drag(false, false, false), Window);
-        assert_eq!(left_drag(false, false, true), Window);
+        assert_eq!(left_drag(false, true, true, false), Window);
+        assert_eq!(left_drag(false, false, false, false), Window);
+        assert_eq!(left_drag(false, false, true, false), Window);
     }
 
     /// 接线自检：`ImageCanvas::press_left` 真的按 [`left_drag`] 的结论开局。
@@ -2864,9 +3258,9 @@ mod tests {
             alt: false,
             meta: false,
         };
-        assert!(handle_key(None, &v, &chrome, &cfg, &hub, &zero));
+        assert!(handle_key(None, None, &v, &chrome, &cfg, &hub, &zero));
         assert!(v.borrow().is_fit(), "第一次按 0 应进入适应窗口");
-        assert!(handle_key(None, &v, &chrome, &cfg, &hub, &zero));
+        assert!(handle_key(None, None, &v, &chrome, &cfg, &hub, &zero));
         assert!(
             v.borrow().is_fit(),
             "已经在适应窗口时再按 0 仍是适应窗口——按钮/菜单就是置真，键不许是 toggle"
@@ -2911,11 +3305,11 @@ mod tests {
         };
 
         // ① 第一记：当场翻（手按不该有任何延迟）。`gallery_pos` 是 1-based（"2/3"）。
-        assert!(handle_key(None, &v, &chrome, &cfg, &hub, &right()));
+        assert!(handle_key(None, None, &v, &chrome, &cfg, &hub, &right()));
         assert_eq!(v.borrow().gallery_pos(), 2, "第一记右键该翻到第二张");
 
         // ② 背靠背的第二记 = 按住自重复：消费掉（返回 true），但**不翻**，且欠着。
-        assert!(handle_key(None, &v, &chrome, &cfg, &hub, &right()));
+        assert!(handle_key(None, None, &v, &chrome, &cfg, &hub, &right()));
         assert_eq!(
             v.borrow().gallery_pos(),
             2,
@@ -2943,7 +3337,7 @@ mod tests {
         let now = Instant::now();
         chrome.key_due.set(now + chrome::KEY_PACE);
         chrome.key_last.set(now - Duration::from_millis(400));
-        assert!(handle_key(None, &v, &chrome, &cfg, &hub, &right()));
+        assert!(handle_key(None, None, &v, &chrome, &cfg, &hub, &right()));
         assert_eq!(
             v.borrow().gallery_pos(),
             1,
@@ -2978,7 +3372,7 @@ mod tests {
             alt: false,
             meta: false,
         };
-        assert!(handle_key(None, &v, &chrome, &cfg, &hub, &t_ev));
+        assert!(handle_key(None, None, &v, &chrome, &cfg, &hub, &t_ev));
         assert!(chrome.filmstrip.get());
 
         chrome.locked.set(true);
@@ -2998,7 +3392,7 @@ mod tests {
                 meta: false,
             };
             assert!(
-                handle_key(None, &v, &chrome, &cfg, &hub, &ev),
+                handle_key(None, None, &v, &chrome, &cfg, &hub, &ev),
                 "锁定时 {key:?} 应被消费"
             );
         }

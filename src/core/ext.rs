@@ -190,6 +190,9 @@ pub struct SettingSpec {
     pub choices: Vec<String>,
     /// 仅 `Choice`：给人看的标签（与 `choices` 一一对应；空 = 直接显示取值）。
     pub labels: Vec<String>,
+    /// 仅 `Int` 且声明了 `min`/`max`：宿主把这一格渲染成滑块 + 实时数值，
+    /// 而不是让人手填数字。`None` = 老行为（整数文本框）。
+    pub range: Option<(i64, i64)>,
 }
 
 impl SettingSpec {
@@ -204,6 +207,160 @@ impl SettingSpec {
             })
             .collect()
     }
+}
+
+/// 声明式显示层算子：拖参数时宿主用它在**看图窗当前显示的位图**上提前演算同一组数值。
+/// 不再是 W7c 那张窗内缩略图——效果直接落在看图窗，参数窗只放控件。
+/// 宿主解释的是"插件声明的 op"，不是某个具体插件的调色逻辑；正式整图编辑
+/// （`image.write`）仍由插件在非交互路径上完成。新增 op 要同时给宿主解释器与端到端字节判据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewOp {
+    /// `out = clamp(in * gain/100 + bias)`，R/G/B 各自一组增益与偏置。
+    ChannelLinear,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewSpec {
+    pub op: PreviewOp,
+    /// 三个增益键在 `settings` 里的 key（顺序 R/G/B）。
+    pub gain_keys: [String; 3],
+    /// 三个偏置键在 `settings` 里的 key（顺序 R/G/B）。
+    pub bias_keys: [String; 3],
+}
+
+/// 一枚声明式滤镜预设：下拉里的取值 → 六个整数（R/G/B 增益、R/G/B 偏置）。
+///
+/// 预设**不是独立特效**，只是一组写进六条滑块的数值；用户改任一条滑块就回落
+/// 「自定义」。这样"反相 = gain -100 / bias 255"这类关系只有一处定义（清单），
+/// 宿主和插件都不必各自维护一张名字表。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresetSpec {
+    pub value: String,
+    pub values: [i32; 6],
+}
+
+/// 解析 `presets`（加法式字段，缺省 = 没有预设表）。
+///
+/// 表里的键必须都出现在某个 `choice` 设置的 `choices` 里；至少留一个**不在表中**
+/// 的取值当「自定义」哨兵。六个整数按 `preview.gain` + `preview.bias` 的键序，
+/// 逐个用那条滑块声明的 `min`/`max` 校验——预设不许把滑块推到界外。
+fn parse_presets(
+    root: &Value,
+    settings: &[SettingSpec],
+    preview: Option<&PreviewSpec>,
+) -> Result<Vec<PresetSpec>, String> {
+    let table = match root.get("presets") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Obj(kv)) => kv,
+        Some(_) => return Err("presets 必须是对象".into()),
+    };
+    let spec = preview.ok_or_else(|| "presets 需要 preview 声明六个滑块键".to_string())?;
+    let keys: Vec<&str> = spec
+        .gain_keys
+        .iter()
+        .chain(spec.bias_keys.iter())
+        .map(String::as_str)
+        .collect();
+    let mut ranges = Vec::with_capacity(6);
+    for k in &keys {
+        let s = settings
+            .iter()
+            .find(|s| s.key == *k)
+            .ok_or_else(|| format!("presets: `{k}` 不在 settings 里"))?;
+        let r = s
+            .range
+            .ok_or_else(|| format!("presets: `{k}` 必须是带 min/max 的滑块"))?;
+        ranges.push(r);
+    }
+    let choices = settings
+        .iter()
+        .find(|s| s.kind == SettingKind::Choice)
+        .map(|s| s.choices.clone())
+        .ok_or_else(|| "presets 需要一个 choice 设置项".to_string())?;
+    if table.len() >= choices.len() {
+        return Err("presets 必须给 choice 留一个「自定义」取值".into());
+    }
+    let mut out = Vec::with_capacity(table.len());
+    for (name, body) in table {
+        if !choices.contains(name) {
+            return Err(format!("presets: `{name}` 不在 choice.choices 里"));
+        }
+        if name == "custom" {
+            return Err("presets: `custom` 是自定义哨兵，不许声明数值".into());
+        }
+        let mut values = [0i32; 6];
+        for (ci, field) in ["gain", "bias"].iter().enumerate() {
+            let arr = body
+                .get(field)
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("presets.{name}.{field} 必须是数组"))?;
+            if arr.len() != 3 {
+                return Err(format!("presets.{name}.{field} 必须正好 3 个数"));
+            }
+            for (i, v) in arr.iter().enumerate() {
+                let num = v
+                    .as_i64()
+                    .ok_or_else(|| format!("presets.{name}.{field}[{i}] 必须是整数"))?;
+                let num = i32::try_from(num)
+                    .map_err(|_| format!("presets.{name}.{field}[{i}] 超出 i32"))?;
+                let (lo, hi) = ranges[ci * 3 + i];
+                if !(lo..=hi).contains(&(num as i64)) {
+                    return Err(format!(
+                        "presets.{name}.{field}[{i}]={num} 越出滑块范围 {lo}..={hi}"
+                    ));
+                }
+                values[ci * 3 + i] = num;
+            }
+        }
+        out.push(PresetSpec {
+            value: name.clone(),
+            values,
+        });
+    }
+    Ok(out)
+}
+
+/// 解析 `preview`（加法式字段，缺省 = 不做显示层变换）。键名必须指向**带范围的 int** 项：
+/// 实时变换只从滑块信号取数，文本框那一格没有可监听的 0..1 归一化值。
+fn parse_preview(root: &Value, settings: &[SettingSpec]) -> Result<Option<PreviewSpec>, String> {
+    let Some(p) = root.get("preview") else {
+        return Ok(None);
+    };
+    if matches!(p, Value::Null) {
+        return Ok(None);
+    }
+    if !matches!(p, Value::Obj(_)) {
+        return Err("preview 必须是对象".into());
+    }
+    let op = get_str(p, "op").map_err(|e| format!("preview: {e}"))?;
+    if op != "channel-linear" {
+        return Err(format!("preview.op=\"{op}\" 不认识（channel-linear）"));
+    }
+    let keys = |name: &str| -> Result<[String; 3], String> {
+        let arr = get_str_array(p, name).map_err(|e| format!("preview.{name}: {e}"))?;
+        if arr.len() != 3 {
+            return Err(format!("preview.{name} 必须正好 3 个键名"));
+        }
+        let mut out: [String; 3] = Default::default();
+        for (i, k) in arr.iter().enumerate() {
+            let spec = settings
+                .iter()
+                .find(|s| &s.key == k)
+                .ok_or_else(|| format!("preview.{name}[{i}]=\"{k}\" 不在 settings 里"))?;
+            if spec.kind != SettingKind::Int || spec.range.is_none() {
+                return Err(format!(
+                    "preview.{name}[{i}]=\"{k}\" 必须是带 min/max 的 int"
+                ));
+            }
+            out[i] = k.clone();
+        }
+        Ok(out)
+    };
+    Ok(Some(PreviewSpec {
+        op: PreviewOp::ChannelLinear,
+        gain_keys: keys("gain")?,
+        bias_keys: keys("bias")?,
+    }))
 }
 
 /// 解析 `settings` 数组。缺省 = 没有 schema（插件自己画窗，走 `settings_ui` 那条老路）。
@@ -260,7 +417,14 @@ fn parse_settings(root: &Value) -> Result<Vec<SettingSpec>, String> {
                 )))
             }
         };
-        let default = normalize_default(item, kind, &choices).map_err(at)?;
+        // `type=int` 可额外给 `min`/`max`：两个键必须成对、min < max；
+        // 没给就是老的文本框。旧清单一个字段都不用改。
+        let range = if kind == SettingKind::Int {
+            parse_range(item).map_err(at)?
+        } else {
+            None
+        };
+        let default = normalize_default(item, kind, &choices, range).map_err(at)?;
         out.push(SettingSpec {
             key,
             label,
@@ -268,9 +432,32 @@ fn parse_settings(root: &Value) -> Result<Vec<SettingSpec>, String> {
             default,
             choices,
             labels,
+            range,
         });
     }
     Ok(out)
+}
+
+/// 滑块范围：两个键必须成对出现且 `min < max`；没给 = 没有范围（文本框）。
+/// 解析期拒绝坏范围，免得渲染层拿一个 0 宽轨道去画滑块。
+fn parse_range(item: &Value) -> Result<Option<(i64, i64)>, String> {
+    let num = |k: &str| -> Result<Option<i64>, String> {
+        match item.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Num(n)) if n.fract() == 0.0 => Ok(Some(*n as i64)),
+            Some(Value::Str(s)) => s
+                .parse::<i64>()
+                .map(Some)
+                .map_err(|_| format!("{k} 不是整数")),
+            Some(_) => Err(format!("{k} 不是整数")),
+        }
+    };
+    match (num("min")?, num("max")?) {
+        (None, None) => Ok(None),
+        (Some(a), Some(b)) if a < b => Ok(Some((a, b))),
+        (Some(_), None) | (None, Some(_)) => Err("min / max 必须成对出现".into()),
+        _ => Err("min 必须小于 max".into()),
+    }
 }
 
 /// 默认值归一：一律落成字符串，且**当场按类型验一遍**——一个装不进控件的默认值
@@ -279,6 +466,7 @@ fn normalize_default(
     item: &Value,
     kind: SettingKind,
     choices: &[String],
+    range: Option<(i64, i64)>,
 ) -> Result<String, String> {
     fn as_text(v: &Value) -> Option<String> {
         match v {
@@ -290,8 +478,12 @@ fn normalize_default(
     }
     let fallback = || match kind {
         SettingKind::Choice => choices.first().cloned().unwrap_or_default(),
-        // 布尔与整数的"没写默认值"都该落在"关 / 零"，而不是空串——空串在控件里是第三态。
-        SettingKind::Bool | SettingKind::Int => "0".to_string(),
+        // 有范围的整数没写默认值时落在下界：0 未必在滑块范围内。
+        SettingKind::Int => range
+            .map(|(lo, _)| lo.to_string())
+            .unwrap_or_else(|| "0".to_string()),
+        // 布尔没写默认值该落在"关"，而不是空串——空串在控件里是第三态。
+        SettingKind::Bool => "0".to_string(),
         _ => String::new(),
     };
     let Some(raw) = item.get("default") else {
@@ -307,10 +499,17 @@ fn normalize_default(
             "0" | "false" => Ok("0".into()),
             _ => Err(format!("bool 的 default=\"{text}\" 不可识别")),
         },
-        SettingKind::Int => text
-            .parse::<i64>()
-            .map(|n| n.to_string())
-            .map_err(|_| format!("int 的 default=\"{text}\" 不是整数")),
+        SettingKind::Int => {
+            let n = text
+                .parse::<i64>()
+                .map_err(|_| format!("int 的 default=\"{text}\" 不是整数"))?;
+            if let Some((lo, hi)) = range {
+                if !(lo..=hi).contains(&n) {
+                    return Err(format!("int 的 default={n} 不在 [{lo},{hi}] 里"));
+                }
+            }
+            Ok(n.to_string())
+        }
         SettingKind::Choice => {
             if choices.iter().any(|c| c == &text) {
                 Ok(text)
@@ -379,6 +578,18 @@ pub struct Manifest {
     /// 键值存在 `plugins/<id>/settings.json` 里，每次 `run` 随请求下发。
     /// `type=hotkey` 的那一项同时是插件的动态热键（见 `extensions::build_hotkey_table`）。
     pub settings: Vec<SettingSpec>,
+    /// 运行时参数窗（可选，默认 false）。声明它之后，点插件菜单打开的是一扇
+    /// **实时**参数窗：拖滑块看图窗立刻变，「完成」只保存参数并关窗，不再起进程。
+    /// 快捷键仍是用上次保存的值直接跑（快捷键不该弹窗）。
+    ///
+    /// 加法式字段：旧清单没有它 = 老行为，一点即跑。必须有 `settings`
+    /// 才有窗可弹，解析期就拒空 schema 的 `run_ui=true`。
+    pub run_ui: bool,
+    /// 声明式显示层变换（可选）：给了它，运行参数窗拖动时**看图窗本尊**实时变色。
+    /// 缺省 = 老清单行为不变（只有插件正式回写会改图）。
+    pub preview: Option<PreviewSpec>,
+    /// 声明式滤镜预设（可选，加法式）：取值 → 六条滑块的数值组。
+    pub presets: Vec<PresetSpec>,
 }
 
 impl Manifest {
@@ -503,6 +714,19 @@ impl Manifest {
             return Err("settings 里已有 type=hotkey 的项，就别再写 manifest.hotkey".into());
         }
 
+        // 运行时参数窗：可选布尔。声明了却没有 settings = 没有窗可弹，
+        // 属于坏清单（不是静默降级成一点即跑）。
+        let run_ui = match root.get("run_ui") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err("run_ui 必须是布尔值".into()),
+        };
+        if run_ui && settings.is_empty() {
+            return Err("run_ui=true 必须同时声明 settings（否则没有参数窗可弹）".into());
+        }
+        let preview = parse_preview(&root, &settings)?;
+        let presets = parse_presets(&root, &settings, preview.as_ref())?;
+
         Ok(Self {
             schema,
             id,
@@ -517,6 +741,9 @@ impl Manifest {
             platforms,
             settings_ui,
             settings,
+            run_ui,
+            preview,
+            presets,
             description: optional_str(&root, "description"),
             author: optional_str(&root, "author"),
             license: optional_str(&root, "license"),
@@ -524,6 +751,40 @@ impl Manifest {
             timeout_ms,
             hotkey,
         })
+    }
+
+    /// 声明式实时参数占用的设置项 key：`preview` 的六个数值项 + 预设那个下拉。
+    ///
+    /// `None` = 这枚插件没有"运行时实时参数"这一层（纯命令型 / 老式编辑型）。
+    /// 这份清单是**一处分界**，两扇窗都读它：运行时参数窗只渲染这些项，设置页齿轮
+    /// 只渲染**剩下**的项——齿轮点开就是调色滑块，正是把两者混成一扇窗的后果
+    /// （2026-11-06 用户裁决「数值调整窗口该在应用时激活，不是底层设置」）。
+    pub fn live_param_keys(&self) -> Option<Vec<String>> {
+        let preview = self.preview.as_ref()?;
+        let mut keys: Vec<String> = preview
+            .gain_keys
+            .iter()
+            .chain(preview.bias_keys.iter())
+            .cloned()
+            .collect();
+        // 预设下拉与六个数值是同一次编辑的入口，参数窗要一起显示。判据与 UI 建同步器
+        // 那一处相同（第一个 choice 项）：两处若各挑各的，预设会掉进设置窗。
+        if let Some(choice) = self.settings.iter().find(|s| s.kind == SettingKind::Choice) {
+            keys.push(choice.key.clone());
+        }
+        Some(keys)
+    }
+
+    /// 除实时参数之外还有没有别的设置项。没有就不给齿轮——别用一个"设置"窗
+    /// 冒充同一份参数的第二个人口。
+    pub fn has_settings_beyond_live(&self) -> bool {
+        match self.live_param_keys() {
+            None => !self.settings.is_empty(),
+            Some(keys) => self
+                .settings
+                .iter()
+                .any(|s| !keys.iter().any(|k| k == &s.key)),
+        }
     }
 
     pub fn has_capability(&self, cap: Capability) -> bool {
@@ -1053,6 +1314,304 @@ mod tests {
                 err.contains("settings[") || err.contains("settings 必须"),
                 "{err}"
             );
+            assert!(err.contains(needle), "错因没说到点子上：{err}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod range_and_run_ui_tests {
+    use super::*;
+
+    fn manifest_with(extra: &str) -> String {
+        format!(
+            r#"{{
+                "schema":1,"id":"test.channels","name":"C","version":"1.0.0",
+                "protocol":1,"min_host":"0.1.0","kind":"editor","entry":"c.exe",
+                "capabilities":["image.read","image.write","settings.read","settings.write"],
+                "platforms":["windows-x64"]{extra}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn int_range_is_parsed_and_plain_int_stays_a_text_box() {
+        let src = manifest_with(
+            r#","settings":[
+                {"key":"gain","label":"增益","type":"int","default":"100","min":-400,"max":400},
+                {"key":"plain","label":"普通","type":"int","default":"7"}
+            ]"#,
+        );
+        let m = Manifest::parse(&src).expect("valid manifest");
+        assert_eq!(m.settings.len(), 2);
+        assert_eq!(m.settings[0].range, Some((-400, 400)));
+        assert_eq!(m.settings[1].range, None, "没给范围 = 老文本框");
+        assert!(!m.run_ui, "旧清单不弹运行参数窗");
+    }
+
+    #[test]
+    fn a_range_without_an_explicit_default_lands_on_the_lower_bound() {
+        let src =
+            manifest_with(r#","settings":[{"key":"k","label":"K","type":"int","min":1,"max":9}]"#);
+        let m = Manifest::parse(&src).expect("valid manifest");
+        assert_eq!(m.settings[0].default, "1");
+    }
+
+    #[test]
+    fn bad_ranges_are_rejected_at_parse_time() {
+        // 负向验证：每一条都必须被解析期挡住，不能拖到渲染层画一条 0 宽轨道。
+        for (tail, needle) in [
+            (
+                r#"[{"key":"k","label":"K","type":"int","min":5}]"#,
+                "必须成对",
+            ),
+            (
+                r#"[{"key":"k","label":"K","type":"int","min":5,"max":5}]"#,
+                "min 必须小于 max",
+            ),
+            (
+                r#"[{"key":"k","label":"K","type":"int","min":9,"max":1}]"#,
+                "min 必须小于 max",
+            ),
+            (
+                r#"[{"key":"k","label":"K","type":"int","default":"99","min":1,"max":9}]"#,
+                "不在 [1,9]",
+            ),
+            (
+                r#"[{"key":"k","label":"K","type":"int","min":"oops","max":9}]"#,
+                "min 不是整数",
+            ),
+        ] {
+            let src = manifest_with(&format!(r#","settings":{tail}"#));
+            let err = Manifest::parse(&src).expect_err("bad range must be rejected");
+            assert!(err.contains(needle), "错因没说到点子上：{err}");
+        }
+    }
+
+    #[test]
+    fn run_ui_requires_a_non_empty_schema() {
+        let ok = manifest_with(
+            r#","run_ui":true,"settings":[{"key":"k","label":"K","type":"int","min":0,"max":10}]"#,
+        );
+        assert!(Manifest::parse(&ok).expect("valid manifest").run_ui);
+
+        let no_schema = manifest_with(r#","run_ui":true"#);
+        let err = Manifest::parse(&no_schema).expect_err("run_ui without settings");
+        assert!(err.contains("没有参数窗可弹"), "{err}");
+
+        let not_bool = manifest_with(r#","run_ui":"yes""#);
+        let err = Manifest::parse(&not_bool).expect_err("run_ui must be a bool");
+        assert!(err.contains("必须是布尔值"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod preview_spec_tests {
+    use super::*;
+
+    fn base(extra: &str) -> String {
+        format!(
+            r#"{{
+                "schema":1,"id":"test.preview","name":"P","version":"1.0.0",
+                "protocol":1,"min_host":"0.1.0","kind":"editor","entry":"p.exe",
+                "capabilities":["image.read","image.write","settings.read","settings.write"],
+                "platforms":["windows-x64"]{extra}
+            }}"#
+        )
+    }
+
+    const SETTINGS: &str = r#","settings":[
+        {"key":"g0","label":"G0","type":"int","min":-400,"max":400,"default":"100"},
+        {"key":"g1","label":"G1","type":"int","min":-400,"max":400,"default":"100"},
+        {"key":"g2","label":"G2","type":"int","min":-400,"max":400,"default":"100"},
+        {"key":"b0","label":"B0","type":"int","min":-255,"max":255,"default":"0"},
+        {"key":"b1","label":"B1","type":"int","min":-255,"max":255,"default":"0"},
+        {"key":"b2","label":"B2","type":"int","min":-255,"max":255,"default":"0"},
+        {"key":"txt","label":"T","type":"int","default":"7"}
+    ]"#;
+
+    #[test]
+    fn preview_is_optional_and_old_manifests_are_untouched() {
+        let m = Manifest::parse(&base(SETTINGS)).expect("valid");
+        assert!(m.preview.is_none());
+        assert!(!m.run_ui);
+    }
+
+    #[test]
+    fn a_valid_preview_binds_six_slider_keys() {
+        let extra = format!(
+            r#"{SETTINGS},"run_ui":true,"preview":{{"op":"channel-linear","gain":["g0","g1","g2"],"bias":["b0","b1","b2"]}}"#
+        );
+        let m = Manifest::parse(&base(&extra)).expect("valid");
+        let p = m.preview.expect("preview parsed");
+        assert_eq!(p.op, PreviewOp::ChannelLinear);
+        assert_eq!(p.gain_keys, ["g0", "g1", "g2"]);
+        assert_eq!(p.bias_keys, ["b0", "b1", "b2"]);
+    }
+
+    fn preset_base(extra: &str) -> String {
+        format!(
+            r#"{{
+                "schema":1,"id":"test.presets","name":"P","version":"1.0.0",
+                "protocol":1,"min_host":"0.1.0","kind":"editor","entry":"p.exe",
+                "capabilities":["image.read","image.write","settings.read","settings.write"],
+                "platforms":["windows-x64"],
+                "settings":[
+                  {{"key":"preset","label":"预设","type":"choice",
+                    "choices":["custom","invert","bright"],"labels":["自定义","反相","提亮"]}},
+                  {{"key":"g0","label":"G0","type":"int","min":-400,"max":400,"default":"100"}},
+                  {{"key":"g1","label":"G1","type":"int","min":-400,"max":400,"default":"100"}},
+                  {{"key":"g2","label":"G2","type":"int","min":-400,"max":400,"default":"100"}},
+                  {{"key":"b0","label":"B0","type":"int","min":-255,"max":255,"default":"0"}},
+                  {{"key":"b1","label":"B1","type":"int","min":-255,"max":255,"default":"0"}},
+                  {{"key":"b2","label":"B2","type":"int","min":-255,"max":255,"default":"0"}}
+                ],
+                "preview":{{"op":"channel-linear","gain":["g0","g1","g2"],"bias":["b0","b1","b2"]}}{extra}
+            }}"#
+        )
+    }
+
+    /// 参数窗 / 设置窗的分界：`preview` 消费掉六个数值 + 预设下拉，剩下的才归齿轮。
+    ///
+    /// 两扇窗重复渲染同一份清单，就是用户 2026-11-06 报的「点齿轮出来的居然是
+    /// 数值调整窗口」；而清单里一项都不剩时，齿轮本身也不该出现。
+    #[test]
+    fn live_params_are_carved_out_of_the_settings_window() {
+        let m = Manifest::parse(&preset_base("")).expect("valid");
+        assert_eq!(
+            m.live_param_keys().expect("声明了 preview 就有实时参数"),
+            vec!["g0", "g1", "g2", "b0", "b1", "b2", "preset"],
+            "六个数值 + 预设下拉，顺序与 preview 的键序一致"
+        );
+        assert!(
+            !m.has_settings_beyond_live(),
+            "清单里只剩实时参数 ⇒ 不给齿轮（别拿参数窗冒充设置）"
+        );
+
+        // 补一行快捷键（真实插件的形状）：齿轮该有了，参数窗仍然只拿七项。
+        let with_hotkey = preset_base("").replace(
+            r#"{"key":"b2","label":"B2","type":"int","min":-255,"max":255,"default":"0"}"#,
+            r#"{"key":"b2","label":"B2","type":"int","min":-255,"max":255,"default":"0"},
+                  {"key":"hotkey","label":"快捷键","type":"hotkey","default":""}"#,
+        );
+        let m = Manifest::parse(&with_hotkey).expect("valid");
+        assert!(m.has_settings_beyond_live(), "有快捷键行 ⇒ 齿轮该出现");
+        let keys = m.live_param_keys().expect("仍是实时型");
+        assert_eq!(keys.len(), 7, "快捷键不进参数窗");
+        assert!(keys.iter().all(|k| k != "hotkey"));
+    }
+
+    /// 没有 `preview` 的清单不是实时型：它们两扇窗的分界退回老口径
+    /// （有 schema 就给齿轮，参数窗就是设置窗）。
+    #[test]
+    fn manifests_without_a_preview_keep_the_old_settings_boundary() {
+        let plain = Manifest::parse(
+            r#"{"schema":1,"id":"t.plain","name":"P","version":"1.0.0","protocol":1,
+                "min_host":"0.1.0","kind":"command","entry":"p.exe",
+                "platforms":["windows-x64"]}"#,
+        )
+        .expect("valid");
+        assert!(
+            plain.live_param_keys().is_none(),
+            "没有 preview 就没有实时参数"
+        );
+        assert!(
+            !plain.has_settings_beyond_live(),
+            "没有 schema 就没有设置窗"
+        );
+    }
+
+    #[test]
+    fn declarative_presets_are_parsed_as_six_numbers() {
+        let m = Manifest::parse(&preset_base(
+            r#","presets":{
+                "invert":{"gain":[-100,-100,-100],"bias":[255,255,255]},
+                "bright":{"gain":[100,100,100],"bias":[40,40,40]}
+            }"#,
+        ))
+        .expect("valid");
+        assert_eq!(m.presets.len(), 2);
+        assert_eq!(m.presets[0].value, "invert");
+        assert_eq!(m.presets[0].values, [-100, -100, -100, 255, 255, 255]);
+        assert_eq!(m.presets[1].values, [100, 100, 100, 40, 40, 40]);
+        // 没有 presets 的旧清单不受影响。
+        assert!(Manifest::parse(&preset_base(""))
+            .unwrap()
+            .presets
+            .is_empty());
+    }
+
+    #[test]
+    fn bad_preset_tables_are_rejected_at_parse_time() {
+        for (extra, needle) in [
+            (r#","presets":42"#, "必须是对象"),
+            (
+                r#","presets":{"nope":{"gain":[1,2,3],"bias":[1,2,3]}}"#,
+                "不在 choice.choices",
+            ),
+            (
+                r#","presets":{"invert":{"gain":[-100,-100],"bias":[1,2,3]}}"#,
+                "正好 3 个数",
+            ),
+            (
+                r#","presets":{"invert":{"gain":[-100,-100,-100],"bias":[999,2,3]}}"#,
+                "越出滑块范围",
+            ),
+            (
+                r#","presets":{"invert":{"gain":[-100,-100,-100],"bias":["x",2,3]}}"#,
+                "必须是整数",
+            ),
+            (
+                r#","presets":{"custom":{"gain":[100,100,100],"bias":[0,0,0]}}"#,
+                "自定义哨兵",
+            ),
+            (
+                r#","presets":{"invert":{"gain":[1,2,3],"bias":[1,2,3]},"bright":{"gain":[1,2,3],"bias":[1,2,3]},"third":{"gain":[1,2,3],"bias":[1,2,3]}}"#,
+                "留一个",
+            ),
+        ] {
+            let err = Manifest::parse(&preset_base(extra)).expect_err("坏预设表必须拒");
+            assert!(err.contains(needle), "错因没说到点子上：{err}");
+        }
+    }
+
+    #[test]
+    fn presets_without_a_preview_declaration_are_rejected() {
+        let src = preset_base(
+            r#","presets":{"invert":{"gain":[-100,-100,-100],"bias":[255,255,255]}}"#,
+        )
+        .replace(
+            r#""preview":{"op":"channel-linear","gain":["g0","g1","g2"],"bias":["b0","b1","b2"]}"#,
+            r#""preview":null"#,
+        );
+        let err = Manifest::parse(&src).expect_err("没有 op 就没有键序可校验");
+        assert!(err.contains("需要 preview"), "错因没说到点子上：{err}");
+    }
+
+    #[test]
+    fn bad_preview_declarations_are_rejected_at_parse_time() {
+        // 负向验证：坏公式、坏键数、不存在的键、无滑块的 int，一条都不能拖到渲染层。
+        for (prev, needle) in [
+            (
+                r#""preview":{"op":"gamma","gain":["g0","g1","g2"],"bias":["b0","b1","b2"]}"#,
+                "不认识",
+            ),
+            (
+                r#""preview":{"op":"channel-linear","gain":["g0","g1"],"bias":["b0","b1","b2"]}"#,
+                "正好 3 个",
+            ),
+            (
+                r#""preview":{"op":"channel-linear","gain":["g0","g1","nope"],"bias":["b0","b1","b2"]}"#,
+                "不在 settings",
+            ),
+            (
+                r#""preview":{"op":"channel-linear","gain":["g0","g1","txt"],"bias":["b0","b1","b2"]}"#,
+                "带 min/max 的 int",
+            ),
+            (r#""preview":42"#, "必须是对象"),
+        ] {
+            let extra = format!("{SETTINGS},{prev}");
+            let err = Manifest::parse(&base(&extra)).expect_err("bad preview must be rejected");
             assert!(err.contains(needle), "错因没说到点子上：{err}");
         }
     }

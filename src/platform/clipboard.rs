@@ -195,6 +195,59 @@ fn dib_block(w: u32, h: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// RGBA8 → PNG，**体积优先**：给「另存为」用（后台线程，用户不在等）。
+///
+/// 与 [`encode_png`] 两处不同，都是有意的：
+/// ① `Compression::Balanced` 而不是 `Fastest`——那一档的面积代价是编码慢若干倍，
+///    换来约 12–15% 的体积（同一对夹具实测：3.31 → 3.70 MB 的反向读数见
+///    [`encode_png`] 的注释）。剪贴板等不起，另存等得起。
+/// ② 全不透明的图存 **RGB** 而不是 RGBA：PNG 里 alpha 是实打实每像素 1 字节，
+///    8 MP 图就白扔 8 MB，而照片、截图、解码器回写的位图绝大多数一个透明像素都没有。
+///    逐像素扫一遍 alpha 只要几毫秒，且在后台线程里。
+fn png_block_compact(w: u32, h: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    let opaque = rgba.chunks_exact(4).all(|p| p[3] == 255);
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.set_compression(png::Compression::Balanced);
+        if opaque {
+            enc.set_color(png::ColorType::Rgb);
+            let mut rgb = Vec::with_capacity((w as usize) * (h as usize) * 3);
+            for px in rgba.chunks_exact(4) {
+                rgb.extend_from_slice(&px[..3]);
+            }
+            let mut writer = enc
+                .write_header()
+                .map_err(|e| format!("PNG 编码失败：{e}"))?;
+            writer
+                .write_image_data(&rgb)
+                .map_err(|e| format!("PNG 编码失败：{e}"))?;
+            writer.finish().map_err(|e| format!("PNG 编码失败：{e}"))?;
+        } else {
+            enc.set_color(png::ColorType::Rgba);
+            let mut writer = enc
+                .write_header()
+                .map_err(|e| format!("PNG 编码失败：{e}"))?;
+            writer
+                .write_image_data(rgba)
+                .map_err(|e| format!("PNG 编码失败：{e}"))?;
+            writer.finish().map_err(|e| format!("PNG 编码失败：{e}"))?;
+        }
+    }
+    Ok(out)
+}
+
+/// 「另存为 PNG」：体积优先的那一档（见 [`png_block_compact`]）。
+pub fn encode_png_compact(w: u32, h: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    let (wu, hu) = (w as usize, h as usize);
+    let expect = wu.checked_mul(hu).and_then(|n| n.checked_mul(4));
+    if expect != Some(rgba.len()) || wu == 0 || hu == 0 {
+        return Err("位图尺寸与像素长度不符".into());
+    }
+    png_block_compact(w, h, rgba)
+}
+
 fn png_block(w: u32, h: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     {
@@ -329,6 +382,21 @@ pub fn copy_file(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 「另存为」的体积账：全不透明的图不该白带 alpha 通道。
+    ///
+    /// PNG 的 IHDR 第 9 个数据字节就是 color type（偏移 25），2 = RGB、6 = RGBA。
+    /// 这条不看"文件小了多少"（那依赖图像内容），只看**通道数真的少了**。
+    #[test]
+    fn compact_save_drops_the_alpha_channel_when_nothing_is_transparent() {
+        let opaque = [1u8, 2, 3, 255, 4, 5, 6, 255];
+        let bytes = encode_png_compact(2, 1, &opaque).expect("编码成功");
+        assert_eq!(bytes[25], 2, "全不透明 ⇒ color type 2（RGB）");
+
+        let with_alpha = [1u8, 2, 3, 128, 4, 5, 6, 255];
+        let bytes = encode_png_compact(2, 1, &with_alpha).expect("编码成功");
+        assert_eq!(bytes[25], 6, "有透明像素 ⇒ color type 6（RGBA）");
+    }
 
     /// PNG 输出带标准签名、IHDR 宽高与像素一致，且解码回来的像素就是输入的 RGBA。
     #[test]
