@@ -1,8 +1,7 @@
 # RuPix
 
-
-**[⬇️ 发布版 (Gitee)](https://gitee.com/qiuzongman/RuPix/releases)**
- ｜ **[⬇️ 发布版 (GitHub)](https://github.com/zongmanqiu/RuPix/releases)**
+**[⬇️ 下载 0.1.0 (Gitee)](https://gitee.com/qiuzongman/RuPix/releases/download/0.1.0/RuPix_0.1.0.zip)**
+ ｜ **[⬇️ 下载 0.1.0 (GitHub)](https://github.com/zongmanqiu/RuPix/releases/download/0.1.0/RuPix_0.1.0.zip)**
  ｜ [Gitee主仓](https://gitee.com/qiuzongman/RuPix)
  ｜ [GitHub镜像](https://github.com/zongmanqiu/RuPix)
 
@@ -26,8 +25,8 @@ Windows 10/11 上的小巧极速看图器。**宿主只做「看图」，位图�
 级别定宽、来源模块，并且"打开了哪张图、等了多久、用的是哪一档、关窗怎么裁决"都写在默认档里。
 出问题时把 `temp\` 里最新那枚运行日志与崩溃报告发出来，环境就不用来回问。
 
-界面范式模仿 [Pineapple Pictures（菠萝看图）](https://github.com/BLumia/pineapple-pictures)：
-无边框深色窗口、画布铺满、无常驻工具栏/状态栏，控件悬浮、悬停才出现。
+界面采用无边框窗口：画布铺满、无常驻工具栏/状态栏，控件悬浮、悬停才出现；
+深/浅主题与整窗不透明度都可在设置页或右键「外观 ▸」里调。
 
 ## 功能速览
 
@@ -195,11 +194,3 @@ RuPix\                  ← 工作区根（宿主文档只画宿主这一侧）
 ## License
 
 AGPL-3.0，全文见 [`LICENSE`](LICENSE)。
-
-## 致谢
-
-- [Pineapple Pictures（菠萝看图）](https://github.com/BLumia/pineapple-pictures)——UI 范式与交互语义的来源
-- CurSeen——工程管理范式（分层门禁、构建流水线、文档体系）的参考项目
-- 各解码库作者：image / zune-jpeg / libwebp / jxl-oxide / heif-oxide / zenavif / rawler 等，
-  解码器依赖清单在解码器仓库内独立维护；
-  宿主自身依赖见 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md)
