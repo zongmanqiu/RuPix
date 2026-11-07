@@ -87,6 +87,9 @@ fn legacy_ini_loads_without_loss() {
         decoder_index_github: SourceId::Github.index_url().to_string(),
         plugin_index_gitee: SourceId::Gitee.plugin_index_url().to_string(),
         plugin_index_github: SourceId::Github.plugin_index_url().to_string(),
+        // m250 新增：老 fixture 没有这两键 ⇒ 回内置默认。
+        update_index_gitee: SourceId::Gitee.update_index_url().to_string(),
+        update_index_github: SourceId::Github.update_index_url().to_string(),
         hotkeys: Hotkeys::default(),
         allow_multiple: false,
         // 旧 fixture 不含 ui_cards 键 → 回空表（= 设置页各卡全部展开）。

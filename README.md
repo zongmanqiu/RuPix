@@ -164,6 +164,7 @@ RuPix\                  ← 工作区根（宿主文档只画宿主这一侧）
 | 改代码的流程、改动 → 文档同步对照 | [`开发指南.md`](开发指南.md) |
 | 文档登记簿（何时更新 / 谁验证） | [`DOCS_MANIFEST.md`](DOCS_MANIFEST.md) |
 | 变更史 | [`HISTORY.md`](HISTORY.md) |
+| 宿主更新清单（版本 / 说明 / 两镜像地址） | [`update.json`](update.json)；「关于」页手动检查更新 |
 | 第三方依赖与许可清单 | [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) |
 | 踩过的坑（改代码前必读） | [`docs/踩坑记录/踩坑记录.md`](docs/踩坑记录/踩坑记录.md) |
 | 构建流水线契约与分步脚本 | [`build/build_readme.md`](build/build_readme.md) |

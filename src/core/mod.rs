@@ -35,6 +35,8 @@ pub mod paths;
 pub mod pixels;
 /// 缩略图条的后台解码账本（在途请求 + 内存缓存 + LRU 淘汰）。
 pub mod thumbs;
+/// 宿主自更新的纯逻辑：版本 / 清单 / 「文件名 + 版本号」两条判据（离屏可测）。
+pub mod update;
 /// 跨层复用的小工具（字节数格式化等）。放 core 是因为 core 不能反向依赖上层。
 pub mod util;
 pub mod viewer;

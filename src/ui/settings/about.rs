@@ -1,4 +1,4 @@
-//! 「关于」页：版本与构建信息、赞助码。
+//! 「关于」页：版本与构建信息、赞助码、手动检查更新。
 //!
 //! ★ 2026-10-17 审计第二轮的前置拆分：`ui/settings.rs`（2699 行）大到没法逐行精读，
 //!   本文件是其中**一页/一窗**的纯搬动切片——不改行为、不改文案、不改版式。
@@ -127,6 +127,30 @@ pub fn about_page() -> Element {
         .bg(card_bg)
         .corner(card_radius);
 
+    // 「检查更新」是宿主第三处（也是唯一手动的）联网入口：只在用户点这一下时
+    // 后台拉 update.json，不做启动检查、不轮询。地址取 ini 的
+    // update_index_gitee / update_index_github（高级用户手改，界面不出现）。
+    let update_card = Element::col()
+        .spacing(8)
+        .child(
+            Element::label("软件更新")
+                .font_size(FONT_MD)
+                .font_weight(600),
+        )
+        .child(
+            Element::label(format!("当前版本 {}", env!("CARGO_PKG_VERSION")))
+                .font_size(FONT_MD)
+                .fg(to_color(TEXT_SECONDARY)),
+        )
+        .child(super::rows::btn("检查更新").on_click(move |_ctx| {
+            if let Err(e) = crate::core::update::request(crate::core::update::Request::Check) {
+                log::warn!("发起检查更新失败：{e}");
+            }
+        }))
+        .padding(card_pad)
+        .bg(card_bg)
+        .corner(card_radius);
+
     Element::scroll()
         .fill()
         .padding_xy(16, PAGE_TOP_MARGIN)
@@ -135,6 +159,7 @@ pub fn about_page() -> Element {
                 .fill()
                 .spacing(ABOUT_CARD_GAP)
                 .child(info_card)
+                .child(update_card)
                 .child(donate_card),
         )
 }

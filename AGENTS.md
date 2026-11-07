@@ -201,10 +201,12 @@ cost=…ms bitmap=…`、`[decode-req] kind=… tier=… verdict=…`、`[close]
 "数标签行数 = 上屏次数、数 `src=prefetch` = 预读命中"这类读数必须能在默认档日志上直接数出来。
 落盘上限 `core::paths::RUN_LOG_MAX_BYTES`：**写满即停 + 一条标记**，不许改回截断重写（见 K83）。
 
-### 联网只有设置页两张下载卡（2026-10-26 立；m148 改成本地优先）
+### 联网入口：两张下载卡 + 关于页一次手动检查（2026-10-26 立；m148 本地优先；m250 增第三处）
 
-宿主的网络行为只有设置页**两张下载卡**（解码器 / 插件），动作都只有两个：**更新清单**
-（只在用户点「刷新」时）与**拉对应资产**（只在用户点「下载 / 升级」时）：
+宿主的网络行为只有三处，全部由用户手动触发：设置页**两张下载卡**（解码器 / 插件），
+动作是**更新清单**（点「刷新」）与**拉对应资产**（点「下载 / 升级」）；以及「关于」页的
+**检查更新**（m250，点一下才拉 `update.json`，确认后才下 ZIP）。第三处不修掉下面
+「不做自动更新」的口径——无人触发的检查 / 轮询依旧一律不做。
 
 - **进页只读随包清单**：`<exe>/docs/decoders.json`（`core::paths::docs_dir`；`deploy.py` 从
   解码器仓库的发布清单复制）。没网、镜像被墙、用户永不联网，这一页都打得开；文件
@@ -250,6 +252,14 @@ cost=…ms bitmap=…`、`[decode-req] kind=… tier=… verdict=…`、`[close]
   不许再直接引常量。
 - 不做：上传任何数据、上报统计、自动更新、后台轮询。离线可用是底线：本地清单 + 已装 DLL
   永远可用；取不到就如实报错，其余功能一律照常。
+- ★ **本体更新（m250）**：清单 `main/update.json`（仓根，随 master 推送），地址落 ini
+  `update_index_gitee` / `update_index_github`（`CONFIG_ONLY_KEYS`，界面不出现）；
+  只认**文件名 + 版本号**两条判据，**不校验 sha256 / size / 下载字节数**（用户 2026-11-07
+  拍板：官方渠道下载，与「清单无哈希、只认 id + version」同一条口径）。
+  包内只许 `rupix.exe` / `LICENSE` / `THIRD-PARTY-NOTICES.md` / `README.txt`，
+  覆盖由 exe 同级的 `rupix_update.bat` 在进程外完成，旧 exe 备份 `.old`；
+  绝不整目录同步、绝不删 `decoders/` `plugins/` `rupix.ini` 等用户数据。
+  判据唯一正本 `src/core/update.rs`，编排 `src/runtime/update.rs`，发布序见 `开发指南.md §五`。
 
 新增任何联网行为都要先回答两个问题：**这份数据非联网不可吗？能不能随包分发？**
 （例：解码器清单随包分发，联网只是为了"上架新档不必重发宿主"——这是选联网的唯一理由。）
@@ -490,6 +500,7 @@ cost=…ms bitmap=…`、`[decode-req] kind=… tier=… verdict=…`、`[close]
 | 8 | 端到端冒烟 | `cargo run --release --example decoder_smoke -- <dll>...` / `--probe-decode` | 各解码器解码 OK |
 | 9 | 发布 | `main\build\full.bat`（或 `6_deploy.bat`） | `rupix.exe` 落 `.build\`，解码器清单核对过；**许可全文与第三方署名清单也落 `.build\`**（`deploy.py` 的 `license_gate` 硬拦：缺文件、空壳、或全文不是 AGPL 都不给部署） |
 | 10 | 文档同步 | 核 `docs/` 与 `DOCS_MANIFEST.md` | 清单里的文件描述成立 |
+| 13 | 更新清单发布序 | 打包 → `gen_update_json.py` → 上传两侧资产 → `check_update_asset.py` → **最后**推 `update.json` | 两个镜像都 `[ok]` 且文件名 / 版本与清单一致；提前推清单会让更新按钮必然 404 |
 | 11 | 结构文档新鲜度 | `python build\structure_gen.py --check`（漂移则 `--write` 重生成） | exit 0；第一/三/四节数字与第五节符号索引 = `src/` 现状。**这些数字与索引不许手改**，改 `src/` 后跑 `--write` |
 | 12 | 发布包打包器 | 一律 7-Zip 命令行 `7za a -tzip -mx=9 -mtm=off -mta=off -mtc=off <包.zip> <顶层目录>`；**禁止** Python `zipfile` / `shutil.make_archive` / `.7z` 容器，找不到 `7za` 直接报错；细则见 `开发指南.md` §一「打包铁律」 | 产物是标准 ZIP/Deflate；`7za l -slt` 核对条目；主程序包为空壳（exe + 许可 + 说明，不含解码器 / 插件 / 清单 / 运行期数据） |
 

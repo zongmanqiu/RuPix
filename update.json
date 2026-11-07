@@ -1,0 +1,9 @@
+{
+  "version": "0.1.0",
+  "published": "2026-11-07",
+  "notes": "## RuPix 0.1.0 · 先行测试版\n\nWindows x64 免安装看图器。这是第一个公开测试版：功能已可用，但仍在快速迭代，建议先试用；遇到问题欢迎在仓库 Issue 反馈。\n\n**附件** `RuPix_0.1.0.zip`：只含主程序与许可、说明文件，解压后双击 `rupix.exe` 即可。开箱可直接查看 SVG / SVGZ 矢量图；**不含解码器与插件**，其它格式请在「设置 → 解码器 → 可下载」点「刷新」后按需安装，插件在「设置 → 插件」页下载。\n\n### 能做什么\n\n- **多格式**：JPEG / PNG / GIF / WebP / HEIC / AVIF / JXL / RAW / TIFF / MPO / PDF 等 150+ 后缀（解码器按需下载）；内置直接处理 SVG / SVGZ\n- **动图与多页**：GIF / APNG / WebP / AVIF 逐帧播放，TIFF / MPO / PDF 按页浏览，两者共用一套控件\n- **空格看图**：托盘常驻时，在文件管理器选中图片按空格直接预览\n- **文件关联**：设置页勾选后缀、点一次批量写入打开方式，不必逐个手动关联\n- **界面**：深/浅主题、整窗不透明度、极简模式、棋盘格背景、缩略图条、可隐藏的底部按钮栏（隐藏后信息居中）\n- **窗口**：置顶、锁住、多开（单进程多窗口）、最小化到托盘、WASD 平移\n- **插件与工具**：调色、色阶、取色器、RAW 参数、图片属性、复制画面 / 文件 / 路径\n\n### 安装与卸载\n\n解压到任意目录，双击 `rupix.exe`；配置 `rupix.ini` 首次运行时生成在 exe 同级目录。首次打开 JPG / PNG 等格式前，请在「设置 → 解码器」点「刷新」并安装需要的解码器。卸载只需删除该目录，文件关联可在 Windows「默认应用」中改回。\n\n### 注意\n\n- 仅 Windows x64；免安装，默认不改动系统设置（文件关联由你在设置页主动开启）\n- 包内不含解码器与插件，首次需联网下载一次；下载源可在设置页切换\n- 许可 AGPL-3.0，第三方声明见包内 `THIRD-PARTY-NOTICES.md`\n- 完整更新记录见仓库 `HISTORY.md`",
+  "urls": {
+    "gitee": "https://gitee.com/qiuzongman/RuPix/releases/download/0.1.0/RuPix_0.1.0.zip",
+    "github": "https://github.com/zongmanqiu/RuPix/releases/download/0.1.0/RuPix_0.1.0.zip"
+  }
+}

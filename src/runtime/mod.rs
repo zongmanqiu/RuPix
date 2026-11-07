@@ -30,6 +30,9 @@
 //! 各窗口自己的 16ms 轮询收（实拍 ≈31 ms 一拍）。翻页上屏因此比单窗时代慢半拍，
 //! 换来的是"一个进程、一个托盘"这条用户口径。
 
+/// 宿主本体自更新的后台编排（检查 / 下载 / 进程外覆盖）。
+pub mod update;
+
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
@@ -517,6 +520,8 @@ impl WinRt {
         let config = shared.config.clone();
         let hub = shared.hub.clone();
 
+        // 宿主更新：后台线程只投递结果，弹窗 / 退出统一在活动窗口这一拍处理。
+        crate::runtime::update::poll(ctx, &config);
         // 安装轮询（下载/卸载进度）：250 ms 一次，提示落在活动窗口上。
         if shared.last_install_poll.get().elapsed() >= Duration::from_millis(250) {
             shared.last_install_poll.set(Instant::now());

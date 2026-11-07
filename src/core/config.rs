@@ -28,6 +28,7 @@
 //! | `download_source` | 联网来源（解码器清单 / 插件清单 / 将来的本体更新共用） | `gitee` |
 //! | `ui_theme`       | 看图窗口配色：`dark` / `light`（不碰设置页） | `dark` |
 //! | `decoder_index_gitee` / `decoder_index_github` | 解码器清单地址（可改：镜像/自建） | 内置默认 |
+//! | `update_index_gitee` / `update_index_github` | 本体更新清单地址（可改） | 内置默认 |
 //! | `plugin_index_gitee` / `plugin_index_github`   | 插件清单地址（可改：镜像/自建）   | 内置默认 |
 //!
 //! 文件位置：**`<exe 目录>/rupix.ini`**（便携，路径唯一来源 [`crate::core::paths`]）。
@@ -141,6 +142,22 @@ impl SourceId {
             }
             SourceId::Github => {
                 "https://raw.githubusercontent.com/zongmanqiu/RuPix-Plugins/refs/heads/main/plugins.json"
+            }
+        }
+    }
+
+    /// 宿主本体更新清单 `update.json` 的地址（主仓仓根 raw）。
+    ///
+    /// ★ 与解码器 / 插件清单不同：这一份在**主仓** `RuPix`（不是复数子仓），
+    ///   分支 `master`（GitHub 是自动镜像）。生效值在
+    ///   [`Config::update_index_gitee`] / [`Config::update_index_github`]，ini 可改。
+    pub fn update_index_url(self) -> &'static str {
+        match self {
+            SourceId::Gitee => {
+                "https://raw.giteeusercontent.com/qiuzongman/RuPix/raw/master/update.json"
+            }
+            SourceId::Github => {
+                "https://raw.githubusercontent.com/zongmanqiu/RuPix/refs/heads/master/update.json"
             }
         }
     }
@@ -654,6 +671,10 @@ pub struct Config {
     /// 读者 = [`crate::extensions::remote`]。
     pub plugin_index_gitee: String,
     pub plugin_index_github: String,
+    /// 宿主本体更新清单的两个地址；口径同 [`Config::decoder_index_gitee`]。
+    /// 读者 = [`crate::runtime::update`]（只在「关于」页手动点检查时联网）。
+    pub update_index_gitee: String,
+    pub update_index_github: String,
     /// 快捷键绑定组（见 [`crate::core::hotkey::Hotkeys`]）。出厂默认值见
     /// `Hotkeys::default`；用户可在设置页改，落盘为单一 `hotkeys=` 键。
     pub hotkeys: crate::core::hotkey::Hotkeys,
@@ -721,6 +742,8 @@ impl Default for Config {
             decoder_index_github: SourceId::Github.index_url().to_string(),
             plugin_index_gitee: SourceId::Gitee.plugin_index_url().to_string(),
             plugin_index_github: SourceId::Github.plugin_index_url().to_string(),
+            update_index_gitee: SourceId::Gitee.update_index_url().to_string(),
+            update_index_github: SourceId::Github.update_index_url().to_string(),
             hotkeys: crate::core::hotkey::Hotkeys::default(),
             allow_multiple: false,
             decode_timeout_s: 20,
@@ -780,6 +803,8 @@ impl Config {
             "decoder_index_github",
             "plugin_index_gitee",
             "plugin_index_github",
+            "update_index_gitee",
+            "update_index_github",
         ]
         .into_iter()
         .filter(|k| !present(k))
@@ -794,7 +819,9 @@ impl Config {
                 "decoder_index_gitee" => &self.decoder_index_gitee,
                 "decoder_index_github" => &self.decoder_index_github,
                 "plugin_index_gitee" => &self.plugin_index_gitee,
-                _ => &self.plugin_index_github,
+                "plugin_index_github" => &self.plugin_index_github,
+                "update_index_gitee" => &self.update_index_gitee,
+                _ => &self.update_index_github,
             };
             block.push_str(&format!("{k}={v}\n"));
         }
@@ -976,6 +1003,12 @@ impl Config {
                 "plugin_index_github" => {
                     cfg.plugin_index_github = url_or(v, SourceId::Github.plugin_index_url())
                 }
+                "update_index_gitee" => {
+                    cfg.update_index_gitee = url_or(v, SourceId::Gitee.update_index_url())
+                }
+                "update_index_github" => {
+                    cfg.update_index_github = url_or(v, SourceId::Github.update_index_url())
+                }
                 _ => {}
             }
         }
@@ -1014,7 +1047,7 @@ impl Config {
              checker={}\nfilmstrip={}\nlocked={}\n\
              long_image_fit={}\nwheel_behavior={}\nctrl_wheel={}\ninit_window={}\nwindow_w={}\n\
              window_h={}\nopacity={}\n\
-             decoders_disabled={}\nextensions_disabled={}\nextensions_isolated={}\ndecoders_preferred={}\nprefetch={}\nclose_to_tray={}\nspace_preview={}\ndrag_image={}\nshow_toolbar_buttons={}\nraw_last={}\ndownload_source={}\nui_theme={}\ndecoder_index_gitee={}\ndecoder_index_github={}\nplugin_index_gitee={}\nplugin_index_github={}\nhotkeys={}\nallow_multiple={}\ndecode_timeout_s={}\nui_cards={}\n",
+             decoders_disabled={}\nextensions_disabled={}\nextensions_isolated={}\ndecoders_preferred={}\nprefetch={}\nclose_to_tray={}\nspace_preview={}\ndrag_image={}\nshow_toolbar_buttons={}\nraw_last={}\ndownload_source={}\nui_theme={}\ndecoder_index_gitee={}\ndecoder_index_github={}\nplugin_index_gitee={}\nplugin_index_github={}\nupdate_index_gitee={}\nupdate_index_github={}\nhotkeys={}\nallow_multiple={}\ndecode_timeout_s={}\nui_cards={}\n",
             self.stay_on_top as i32,
             self.dbl_click.index(),
             self.slide_interval,
@@ -1045,6 +1078,8 @@ impl Config {
             self.decoder_index_github,
             self.plugin_index_gitee,
             self.plugin_index_github,
+            self.update_index_gitee,
+            self.update_index_github,
             self.hotkeys.to_ini(),
             self.allow_multiple as i32,
             self.decode_timeout_s,
@@ -1167,6 +1202,8 @@ fn default_ini() -> String {
     let decoder_github = SourceId::Github.index_url();
     let plugin_gitee = SourceId::Gitee.plugin_index_url();
     let plugin_github = SourceId::Github.plugin_index_url();
+    let update_gitee = SourceId::Gitee.update_index_url();
+    let update_github = SourceId::Github.update_index_url();
     format!(
         "\
 # RuPix 偏好设置（与 rupix.exe 同目录，便携——删掉本文件即恢复出厂默认）
@@ -1286,6 +1323,10 @@ decoder_index_github={decoder_github}
 plugin_index_gitee={plugin_gitee}
 plugin_index_github={plugin_github}
 
+# 宿主本体更新清单地址（「关于」页点「检查更新」时才联网；留空 = 内置默认）
+update_index_gitee={update_gitee}
+update_index_github={update_github}
+
 # 快捷键绑定（动作id:键;动作id2:键2；每个动作至多一把）。整项留空 = 全部出厂默认；
 # 单个动作写成 `fit:` = 明确解绑；键名写坏 = 该动作保持出厂默认（不会静默解绑）。动作 id：
 # prev/next/first/last/zoom_in/zoom_out/fit/actual/rotate/flip/pause/filmstrip/fullscreen
@@ -1305,7 +1346,7 @@ hotkeys={hotkeys}
 ///   ★ 写在 UI 写点处的 `ini 键：<名>` 注释是**给人导航的约定，没有测试读它**（2026-10-24 实测：
 ///   20 个键里 13 个标了，没标的是 `double_click`、`filmstrip`、`locked`、`long_image_fit`、
 ///   `decoders_disabled`、`window_w`、`window_h`）——别把它当成门禁。
-pub const ALL_KEYS: [&str; 34] = [
+pub const ALL_KEYS: [&str; 36] = [
     "stay_on_top",
     "double_click",
     "slide_interval",
@@ -1336,6 +1377,8 @@ pub const ALL_KEYS: [&str; 34] = [
     "decoder_index_github",
     "plugin_index_gitee",
     "plugin_index_github",
+    "update_index_gitee",
+    "update_index_github",
     "hotkeys",
     "allow_multiple",
     "decode_timeout_s",
@@ -1347,11 +1390,13 @@ pub const ALL_KEYS: [&str; 34] = [
 /// 两个门禁都读这张表，别在别处再抄第二份：
 /// - `hygiene_scan.py` 第 6 查：这类键只豁免"用户入口"，**行为读者照旧必须有**；
 /// - `ui_touchpoints_cover_all_keys`（本文件测试）：跳过"UI 源码里必须出现这个键名"。
-pub const CONFIG_ONLY_KEYS: [&str; 5] = [
+pub const CONFIG_ONLY_KEYS: [&str; 7] = [
     "decoder_index_gitee",
     "decoder_index_github",
     "plugin_index_gitee",
     "plugin_index_github",
+    "update_index_gitee",
+    "update_index_github",
     // 挂死恢复的超时秒数：只服务慢盘 / 超大文件，界面上不出现。
     "decode_timeout_s",
 ];
