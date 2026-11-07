@@ -29,6 +29,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -133,6 +134,24 @@ const ICON_FONT: &str = "Segoe MDL2 Assets";
 /// 工具栏上的一个按钮。
 ///
 /// ★ 这一份枚举是**浮条与右键菜单「操作」子菜单的共同真源**：菜单项由
+/// **底部浮条的按钮显不显示**（m245，ini 键 `show_toolbar_buttons` 的运行时镜像）。
+///
+/// ★ 唯一写点 = [`set_toolbar_buttons`]，由 `runtime::apply_session_flags` 从 `Config`
+///   回灌；`Config` 才是正本（菜单与设置页都先写配置）。放在模块级而不是 `Chrome` 字段：
+///   这是**全局**开关，而 [`Chrome::row`] / [`Chrome::pill`] / [`Chrome::btn_rect`] 都是
+///   关联函数（命中、绘制、鸟瞰避让共 30 个调用点）——一处读，几何与命中天然同源，
+///   不会出现「画没了但还点得着」。
+static TOOLBAR_BUTTONS: AtomicBool = AtomicBool::new(true);
+
+/// 写镜像，返回「值变没变」（调用方据此标脏）。
+pub fn set_toolbar_buttons(on: bool) -> bool {
+    TOOLBAR_BUTTONS.swap(on, Ordering::Relaxed) != on
+}
+
+fn toolbar_buttons() -> bool {
+    TOOLBAR_BUTTONS.load(Ordering::Relaxed)
+}
+
 /// [`Btn::ALL`] 现生成，加一个新按钮两处同时出现，不会只改一半。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Btn {
@@ -141,7 +160,6 @@ pub enum Btn {
     Fit,
     Actual,
     Fullscreen,
-    Checker,
     Rotate,
     Mirror,
     // ── 动画组（`Chrome::row` 按"是不是动图"整组显隐，浮条与右键菜单同步）──
@@ -151,8 +169,6 @@ pub enum Btn {
     PlayPause,
     /// 前进一帧（走 [`crate::core::hotkey::Action::FrameNext`]）。
     FrameFwd,
-    /// 属性（信息）：打开图片属性窗口。放在最右，**用文本字形**而非图标字体。
-    Info,
 }
 
 /// 标题栏窗口按钮。
@@ -218,9 +234,7 @@ impl Btn {
             Btn::Fit => "\u{E799}",        // AspectRatio
             Btn::Actual => "\u{E71E}",     // Zoom（1:1 原尺寸）
             Btn::Fullscreen => "\u{E740}", // FullScreen
-            // GridView：2×2 格子，比调色板（E790 Color）更贴近"棋盘格"意象。
-            Btn::Checker => "\u{F0E2}", // GridView
-            Btn::Rotate => "\u{E7AD}",  // Rotate
+            Btn::Rotate => "\u{E7AD}",     // Rotate
             // MDL2 没有专用"镜像"字形，Switch（双向对箭头）是视觉上最接近的。
             Btn::Mirror => "\u{E8AB}", // Switch
             // 上一帧 / 下一帧用 Previous / Next（竖线 + 单三角）：双三角的
@@ -233,15 +247,7 @@ impl Btn {
             // E89D 整个不存在（这两个都试过，真机截图上是空框）。
             Btn::PlayPause if paused => "\u{E768}", // Play：暂停中，按下去继续
             Btn::PlayPause => "\u{E769}",           // Pause：播放中，按下去暂停
-            // 属性用**普通文本字形**的感叹号：MDL2 的 PUA 码位各家说法不一，
-            // 拿不准就有"豆腐块"风险；一个 "!" 不需要赌码位。
-            Btn::Info => "!",
         }
-    }
-
-    /// 该按钮用普通文本字体画（`!`），而不是 Segoe MDL2 图标字体。
-    pub fn text_glyph(self) -> bool {
-        matches!(self, Btn::Info)
     }
 
     /// 悬停提示文字（图标按钮没有文字标签，悬停时浮出小条说明）。
@@ -254,14 +260,12 @@ impl Btn {
             Btn::Fit => "适应窗口",
             Btn::Actual => "1:1 原尺寸",
             Btn::Fullscreen => "全屏",
-            Btn::Checker => "棋盘格背景",
             Btn::Rotate => "旋转 90°",
             Btn::Mirror => "水平镜像",
             Btn::FrameBack => "上一帧",
             // 双状态按钮的名字写成两态：图标已经表示当前态，名字负责说"按了会去哪"。
             Btn::PlayPause => "暂停/继续动画",
             Btn::FrameFwd => "下一帧",
-            Btn::Info => "属性",
         }
     }
 
@@ -278,8 +282,6 @@ impl Btn {
             Btn::Fullscreen => crate::core::hotkey::Action::Fullscreen,
             Btn::Rotate => crate::core::hotkey::Action::Rotate,
             Btn::Mirror => crate::core::hotkey::Action::Flip,
-            Btn::Checker => crate::core::hotkey::Action::Checker,
-            Btn::Info => crate::core::hotkey::Action::Properties,
             Btn::FrameBack => crate::core::hotkey::Action::FramePrev,
             Btn::PlayPause => crate::core::hotkey::Action::PauseAnim,
             Btn::FrameFwd => crate::core::hotkey::Action::FrameNext,
@@ -289,22 +291,21 @@ impl Btn {
 
     /// 工具栏按钮全集。浮条布局、命中测试、右键菜单「操作」子菜单都从这里生成。
     ///
-    /// ★ 动画那三颗**必须连续**排在 `Info` 之前——[`Chrome::row`] 用"前段 + 中段 + 尾段"
-    /// 三个切片表达显隐，插到中间就得改成逐颗过滤。翻页两颗紧挨动画组之后，同样
-    /// 必须连续（与动画组互斥显隐，二者在 `ALL` 里各占一段连续区间）。
-    pub const ALL: [Btn; 12] = [
+    /// ★ 动画那三颗**必须连续且排在末尾**——[`Chrome::row`] 用"截掉尾段"表达显隐，
+    /// 插到中间就得改成逐颗过滤。翻页两颗紧挨动画组之后，同样必须连续
+    /// （与动画组互斥显隐，二者在 `ALL` 里各占一段连续区间）。
+    /// m247：只留操作类按钮；棋盘格归「外观 ▸」、属性归右键顶层，两颗都不再是按钮。
+    pub const ALL: [Btn; 10] = [
         Btn::Out,
         Btn::In,
         Btn::Fit,
         Btn::Actual,
         Btn::Fullscreen,
-        Btn::Checker,
         Btn::Rotate,
         Btn::Mirror,
         Btn::FrameBack,
         Btn::PlayPause,
         Btn::FrameFwd,
-        Btn::Info,
     ];
 
     /// 这颗属不属于动画组（`pub` 给测试与右键菜单用）。
@@ -1199,14 +1200,19 @@ impl Chrome {
     ///
     /// ★ 只有**一组**：多页文档与动图共用这三颗（页与帧在宿主里是同一个号，
     ///   见 [`crate::core::pixels::Anim`]）。所以返回"前段 + 尾段"两个切片就够——
-    ///   播放组在 [`Btn::ALL`] 里连续，隐藏它就是把中间一段跳掉，`Info` 往前挪 3 格。
+    ///   动画组是 [`Btn::ALL`] 末尾连续三颗，静态图只取 `..ANIM_START`。
     pub fn row(anim: bool, vw: f32) -> (&'static [Btn], Option<&'static [Btn]>) {
-        let head = &Btn::ALL[..8];
-        let tail = &Btn::ALL[11..];
+        // m245：隐藏按钮 = 这一行没有按钮。`pill` / `btn_rect` / `hit` / 鸟瞰避让
+        // 全部经由本函数推导，所以一处收口就够，别在调用点各判一次。
+        // m247：动画组是 `ALL` 末尾连续三颗，静态图直接截掉尾段；`Info` 撤走后
+        // 不再有尾段按钮，第二个返回值恒为 `None`（保留接口给调用点链拼接）。
+        if !toolbar_buttons() {
+            return (&[], None);
+        }
         if anim && vw >= FULL_ROW_MIN_W {
             (Btn::ALL.as_slice(), None)
         } else {
-            (head, Some(tail))
+            (&Btn::ALL[..ANIM_START], None)
         }
     }
 
@@ -1221,7 +1227,7 @@ impl Chrome {
     /// 格宽自适应之后，按当前文本让位会让缩略图随每次翻页挪一格；这里按上限留，
     /// 一次留够，之后不动。
     pub(crate) fn cell_reserve(vw: f32) -> f32 {
-        match info_place(vw) {
+        match info_place(vw, toolbar_buttons()) {
             InfoPlace::Pill => INFO_CELL_MAX,
             InfoPlace::Above => 0.0,
         }
@@ -1239,7 +1245,9 @@ impl Chrome {
     pub(crate) fn pill(view: (f32, f32, f32, f32), anim: bool, cell: f32) -> (f32, f32, f32, f32) {
         let (_, _, vw, vh) = view;
         let n = Self::row_len(anim, vw) as f32;
-        let w = cell + 8.0 * 2.0 + n * BTN_W + (n - 1.0) * BTN_GAP;
+        // n=0（m245 隐藏按钮）时没有「按钮之间的间隙」，负 gap 会把胶囊算窄一格。
+        let gap = if n > 0.0 { (n - 1.0) * BTN_GAP } else { 0.0 };
+        let w = cell + 8.0 * 2.0 + n * BTN_W + gap;
         let h = 40.0;
         ((vw - w) / 2.0, vh - h - 12.0, w, h)
     }
@@ -1334,13 +1342,15 @@ impl Chrome {
     }
 }
 
-// 按钮尺寸常量（逻辑 dp）。图标按钮比文字窄；9 键时浮条总宽
-// 9×34 + 8×3 + 2×8 = 346，最小窗口（360）内放得下——第 9 个「属性」键进来时把
-// `BTN_W` 从 36 收到 34 就是为了这一条：386 会顶破 360 的最小窗宽。
-/// 满组（14 颗，动画组或翻页组 + Info）浮条（只算按钮）要多宽：`8×2 + 14×BTN_W + 13×BTN_GAP`。
-const FULL_ROW_W: f32 = 8.0 * 2.0 + 14.0 * 34.0 + 13.0 * 3.0;
-/// 9 颗（收掉中段组）时的浮条宽——状态格的门槛照它算，不是照 14 颗。
-const NARROW_ROW_W: f32 = 8.0 * 2.0 + 9.0 * 34.0 + 8.0 * 3.0;
+// 按钮尺寸常量（逻辑 dp）。7 键时浮条总宽 7×34 + 6×3 + 2×8 = 272，
+// 最小窗口（360）内放得下；`BTN_W` 定 34 就是为这条，再宽会顶破 360。
+/// 满组 10 颗 + 2 颗余量（与旧 14 颗同比例）：`8×2 + 12×BTN_W + 11×BTN_GAP`。
+/// 余量是刻意的：门槛宁可宽一点，也不让动画组在放不下的窗口里挤掉信息格。
+const FULL_ROW_W: f32 = 8.0 * 2.0 + 12.0 * 34.0 + 11.0 * 3.0;
+/// 7 颗（收掉末尾动画组）时的浮条宽——状态格的门槛照它算。
+const NARROW_ROW_W: f32 = 8.0 * 2.0 + 7.0 * 34.0 + 6.0 * 3.0;
+/// 动画组在 `Btn::ALL` 里的起点（末尾连续三颗）。
+const ANIM_START: usize = 7;
 const BTN_W: f32 = 34.0;
 const BTN_H: f32 = 28.0;
 const BTN_GAP: f32 = 3.0;
@@ -1419,8 +1429,10 @@ const FULL_ROW_MIN_W: f32 = FULL_ROW_W + INFO_CELL_MAX;
 /// 为什么：档位若按实际宽判，暂停动图（82→153 px）就会让信息从浮条里翻到上面一行，
 /// 那正是用户报过的"上升一行"。**横向滑动是自适应的固有代价，纵向跳档不是。**
 /// 整行档仍保留：窄窗里状态没地方放 = 帧号彻底看不见，比占一行更糟。
-fn info_place(vw: f32) -> InfoPlace {
-    if vw >= PILL_INFO_MIN_W {
+fn info_place(vw: f32, buttons: bool) -> InfoPlace {
+    // m245：按钮一隐，浮条里再没有别的东西跟信息争宽 ⇒ 任何窗宽都留在浮条里，
+    // 由 paint 用 Align::Center 居中；Above 那行只是「有按钮 + 窄窗」的退路。
+    if !buttons || vw >= PILL_INFO_MIN_W {
         InfoPlace::Pill
     } else {
         InfoPlace::Above
@@ -1496,7 +1508,6 @@ pub fn paint(
     minimal_mode: bool,
     title: &str,
 ) {
-    let checker_on = chrome.checker.get();
     let (vx, vy, vw, _vh) = view;
     // 视口绝对坐标 → 画布原点相对坐标。
     let local = |x: f32, y: f32, w: f32, h: f32| (x - vx, y - vy, w, h);
@@ -1506,9 +1517,6 @@ pub fn paint(
         family: Some(ICON_FONT),
         ..TextStyle::new(17.0)
     };
-    // 文本字形（"属性"的感叹号）：走默认字体，比图标字体略粗一点视觉才齐。
-    let text_ts = TextStyle::new(16.0);
-
     // 计算各元素是否显示
     let show_title = title_visible(fullscreen_on, minimal_mode, chrome.hover_title.get());
     // 悬停信息条也算"在浮条上"：整行档（窄窗）就住在那儿。不认它的后果是极简模式下
@@ -1529,7 +1537,8 @@ pub fn paint(
     // （用户 2026-10-18 复看：定宽在信息右侧留下一大片空白）。两者分开，纵向就不会跳。
     // 量宽与绘制用**同一份 style**（旧写法量 12 号、画 13 号，胶囊比字窄一圈）。
     let info_ts = TextStyle::new(13.0);
-    let place = info_place(vw);
+    let buttons = toolbar_buttons(); // m245：隐藏后信息独占浮条并水平居中
+    let place = info_place(vw, buttons);
     let title_room = vw - TITLE_BTN_RESERVE - TITLE_PAD;
     // 每帧先清零再按需回写：hover / tick_hide 读到的永远是这帧**实际画出来**的那块
     // （没画 = 零矩形 = 不可悬停）。
@@ -1550,9 +1559,14 @@ pub fn paint(
     // 整行档（窄窗）的矩形就地定下：浮条上的悬停提示要照它让位，否则两条叠在一起。
     const INFO_H: f32 = 40.0;
     let above = if place == InfoPlace::Above && show_info {
-        let ix = vx + INFO_GAP;
-        let iy = vy + py - INFO_H - INFO_GAP;
         let w = info_w.min(vw - 2.0 * INFO_GAP);
+        // m245：常态贴左是给按钮让位；按钮一隐，整行档的信息胶囊也水平居中。
+        let ix = if buttons {
+            vx + INFO_GAP
+        } else {
+            vx + (vw - w) / 2.0
+        };
+        let iy = vy + py - INFO_H - INFO_GAP;
         chrome.info_rect.set((ix, iy, w, INFO_H));
         Some((ix, iy, w))
     } else {
@@ -1717,7 +1731,8 @@ pub fn paint(
     // 浮条与上面的翻页箭头现在是同一条门控（极简 = 只在悬停时出现，2026-10-19 用户翻案）。
     // 浮条矩形 `px/py/pw/ph` 已在前面"浮条几何 + 信息条落位"那段算出（状态格占不占位
     // 参与总宽，两处用的是同一个 `Chrome::pill`）。
-    if show_toolbar {
+    // m245：按钮全隐且信息另起一行时，浮条里什么都没有 ⇒ 不画这粒空胶囊。
+    if show_toolbar && (buttons || place == InfoPlace::Pill) {
         let (lx, ly, lw, lh) = local(px, py, pw, ph);
         canvas.fill_round_rect(lx, ly, lw, lh, 10.0, &Paint::fill(tk::pill_bg()));
 
@@ -1728,20 +1743,36 @@ pub fn paint(
         // 文本框按上限夹住 → 常态既不截断也不折行；只有病态输入（一个目录上万张 /
         // 一张图上万帧）才会被 `clip_text` 收成省略号，那也比把胶囊撑出第二行好。
         if show_info && place == InfoPlace::Pill {
-            let tw = cell - 8.0 - INFO_PAD_L - INFO_GAP_L - 1.0 - INFO_GAP_R;
-            let tx = px + 8.0 + INFO_PAD_L;
-            let shown = chrome.clip(canvas, info, &info_ts, tw);
-            let (lx, ly, lw, lh) = local(tx, py, tw, ph);
-            canvas.draw_text(
-                &shown,
-                Rect::new(lx as i32, ly as i32, lw as i32, lh as i32),
-                tk::overlay_text_muted(),
-                Align::Start,
-                &info_ts,
-            );
-            let (sx, sy, sw, sh) = local(tx + tw + INFO_GAP_L, py + 10.0, 1.0, ph - 20.0);
-            canvas.fill_rect(sx, sy, sw, sh, &Paint::fill(tk::pill_sep()));
-            chrome.info_rect.set((tx, py, tw, ph));
+            if buttons {
+                let tw = cell - 8.0 - INFO_PAD_L - INFO_GAP_L - 1.0 - INFO_GAP_R;
+                let tx = px + 8.0 + INFO_PAD_L;
+                let shown = chrome.clip(canvas, info, &info_ts, tw);
+                let (lx, ly, lw, lh) = local(tx, py, tw, ph);
+                canvas.draw_text(
+                    &shown,
+                    Rect::new(lx as i32, ly as i32, lw as i32, lh as i32),
+                    tk::overlay_text_muted(),
+                    Align::Start,
+                    &info_ts,
+                );
+                let (sx, sy, sw, sh) = local(tx + tw + INFO_GAP_L, py + 10.0, 1.0, ph - 20.0);
+                canvas.fill_rect(sx, sy, sw, sh, &Paint::fill(tk::pill_sep()));
+                chrome.info_rect.set((tx, py, tw, ph));
+            } else {
+                // m245：只剩信息 ⇒ 整条浮条的宽度都给它，文字水平居中，分隔线不存在。
+                // 文本框 = 浮条内缩 8，Align::Center 使文本中心恰为浮条（= 窗口）中心。
+                let inner_w = pw - 16.0;
+                let shown = chrome.clip(canvas, info, &info_ts, inner_w);
+                let (lx, ly, lw, lh) = local(px + 8.0, py, inner_w, ph);
+                canvas.draw_text(
+                    &shown,
+                    Rect::new(lx as i32, ly as i32, lw as i32, lh as i32),
+                    tk::overlay_text_muted(),
+                    Align::Center,
+                    &info_ts,
+                );
+                chrome.info_rect.set((px, py, pw, ph));
+            }
         }
 
         let anim = chrome.anim.get();
@@ -1763,20 +1794,19 @@ pub fn paint(
                 canvas.fill_round_rect(hx, hy, hw, hh, 6.0, &Paint::fill(c));
             }
             let glyph = b.glyph(paused);
-            let color = match b {
-                // 开关类按钮激活时给一点绿色，扫一眼能看出状态。
-                Btn::Checker if checker_on => tk::overlay_text_active(),
-                Btn::Fullscreen if fullscreen_on => tk::overlay_text_active(),
-                _ => tk::overlay_text(),
+            // 开关类按钮激活时给一点绿色，扫一眼能看出状态（m247 后只剩全屏）。
+            let color = if b == Btn::Fullscreen && fullscreen_on {
+                tk::overlay_text_active()
+            } else {
+                tk::overlay_text()
             };
             let (tx, ty, tw, th) = local(bx, by, bw, bh);
-            let ts = if b.text_glyph() { &text_ts } else { &icon_ts };
             canvas.draw_text(
                 glyph,
                 Rect::new(tx as i32, ty as i32, tw as i32, th as i32),
                 color,
                 Align::Center,
-                ts,
+                &icon_ts,
             );
         }
 
@@ -1920,9 +1950,15 @@ mod tests {
     #[test]
     fn the_status_cell_tracks_the_text_while_the_tier_tracks_the_window() {
         // ① 档位只看视口宽：门槛 = 9 颗(346) + 满格。
-        assert_eq!(info_place(PILL_INFO_MIN_W), InfoPlace::Pill);
-        assert_eq!(info_place(PILL_INFO_MIN_W - 1.0), InfoPlace::Above);
-        assert_eq!(info_place(360.0), InfoPlace::Above, "最小窗放不下满格");
+        assert_eq!(info_place(PILL_INFO_MIN_W, true), InfoPlace::Pill);
+        assert_eq!(info_place(PILL_INFO_MIN_W - 1.0, true), InfoPlace::Above);
+        assert_eq!(
+            info_place(360.0, true),
+            InfoPlace::Above,
+            "最小窗放不下满格"
+        );
+        // m245：按钮隐藏后连最小窗也留在浮条里居中，不再另起一行压在画上。
+        assert_eq!(info_place(360.0, false), InfoPlace::Pill);
         // ② 格宽 = 文本宽 + 固定内边距：短状态不留空白，最长也就顶到满格。
         let short = info_cell_w(82.0); // 日常那条 "8/184 · 117%"
         let long = info_cell_w(212.0); // 最坏那条
@@ -2069,22 +2105,22 @@ mod tests {
         }
     }
 
-    /// 动画组三颗必须**连续**排在 `Info` 之前——[`Chrome::row`] 用"前段 + 尾段"两个
-    /// 切片表达显隐，谁往中间插一颗就把这个前提悄悄破掉（表现是浮条少一颗或重影）。
+    /// 动画组三颗必须**连续且排在末尾**——[`Chrome::row`] 用"截掉尾段"表达显隐，
+    /// 谁往中间插一颗就把这个前提悄悄破掉（表现是浮条少一颗或重影）。
     #[test]
-    fn anim_group_is_contiguous_and_info_is_last() {
+    fn anim_group_is_contiguous_and_at_the_tail() {
         let idx: Vec<usize> = Btn::ALL
             .iter()
             .enumerate()
             .filter(|(_, b)| b.is_anim())
             .map(|(i, _)| i)
             .collect();
-        assert_eq!(idx, vec![8, 9, 10], "动画组必须是连号");
         assert_eq!(
-            Btn::ALL.last().copied(),
-            Some(Btn::Info),
-            "「属性」按口径永远在最右"
+            idx,
+            vec![ANIM_START, ANIM_START + 1, ANIM_START + 2],
+            "动画组必须是末尾连号"
         );
+        assert_eq!(ANIM_START + 3, Btn::ALL.len(), "动画组之后不许再有按钮");
     }
 
     /// 双状态按钮：播放中画 ⏸、暂停中画 ▶，两个字不能相同。
@@ -2100,7 +2136,7 @@ mod tests {
         }
     }
 
-    /// 行的颗数与浮条宽度：静态 9 颗、可播放（动图或多页文档）12 颗；
+    /// 行的颗数与浮条宽度：静态 7 颗、可播放（动图或多页文档）10 颗；
     /// **窗口放不下"满组 + 状态格"时播放组也退回**——状态格优先，因为按钮还有
     /// 快捷键与右键菜单，状态没有第二处。
     ///
@@ -2109,32 +2145,32 @@ mod tests {
     #[test]
     fn row_follows_playability_and_width() {
         let count = |anim: bool, vw: f32| Chrome::row_len(anim, vw);
-        assert_eq!(count(false, 1920.0), 9);
-        assert_eq!(count(true, 1920.0), 12);
+        assert_eq!(count(false, 1920.0), 7);
+        assert_eq!(count(true, 1920.0), 10);
         assert_eq!(
             count(true, FULL_ROW_MIN_W - 1.0),
-            9,
-            "放不下 12 颗 + 格子就不给播放组"
+            7,
+            "放不下 10 颗 + 格子就不给播放组"
         );
-        assert_eq!(count(true, FULL_ROW_MIN_W), 12);
-        assert_eq!(count(true, 360.0), 9, "窄窗不许把按钮挤出窗口");
-        // anim=true 时显示 12 颗（8 + 3 播放 + 1 Info），宽度 = 格 + 16 + 12×34 + 11×3
+        assert_eq!(count(true, FULL_ROW_MIN_W), 10);
+        assert_eq!(count(true, 360.0), 7, "窄窗不许把按钮挤出窗口");
+        // anim=true 时显示 10 颗（7 + 3 播放），宽度 = 格 + 16 + 10×34 + 9×3
         let (_x, _y, w, _h) = Chrome::pill(
             (0.0, 0.0, 1920.0, 1080.0),
             true,
             Chrome::cell_reserve(1920.0),
         );
-        let w12 = 8.0 * 2.0 + 12.0 * 34.0 + 11.0 * 3.0;
-        assert_eq!(w, w12 + INFO_CELL_MAX, "12 颗 + 满格");
+        let w10 = 8.0 * 2.0 + 10.0 * 34.0 + 9.0 * 3.0;
+        assert_eq!(w, w10 + INFO_CELL_MAX, "10 颗 + 满格");
     }
 
     /// 浮条总宽必须在**最小窗口**（360，见 `ui::window` 的 `min_size`）内放得下。
     ///
-    /// 加第 9 个「属性」按钮时：`BTN_W` 得从 36 收到 34，否则浮条两端被切掉
-    /// ——正是当初加旋转/镜像按钮时踩过的坑（用户报"新按钮没有背景"）。
+    /// `BTN_W` 定 34 是为了满组在 360 的最小窗宽里放得下——正是当初加
+    /// 旋转/镜像按钮时踩过的坑（用户报"新按钮没有背景"）。
     #[test]
     fn pill_fits_min_window() {
-        // 动图态 + **满格**一起量：窄到放不下 12 颗时 `Chrome::row` 自己退回 9 颗，
+        // 动图态 + **满格**一起量：窄到放不下 10 颗时 `Chrome::row` 自己退回 7 颗，
         // 而格宽自适应之后"最坏那一帧"就是满格，只有按它判才兜得住。
         let (_x, _y, w, _h) =
             Chrome::pill((0.0, 0.0, 360.0, 260.0), true, Chrome::cell_reserve(360.0));
@@ -3367,6 +3403,41 @@ mod tests {
             .slide_due
             .set(Instant::now() - Duration::from_millis(1));
         assert!(!chrome.tick_slideshow(pace), "关掉之后到点也不许发");
+    }
+
+    /// **m245 隐藏按钮栏**：浮条收窄到只剩信息、仍水平居中；按钮几何与命中一起消失。
+    /// 这条钉的是「画没了但还点得着」那类回归——`row` 是几何与命中的唯一入口。
+    #[test]
+    fn hiding_buttons_leaves_a_centered_info_only_pill() {
+        let view = (0.0, 0.0, 1200.0, 800.0);
+        let cell = 120.0;
+        let _ = set_toolbar_buttons(true);
+        let (x, _, w, _) = Chrome::pill(view, false, cell);
+        assert!(w > cell + 16.0, "有按钮时胶囊必须更宽：{w}");
+        assert_eq!(x, (1200.0 - w) / 2.0, "常态下浮条居中");
+        assert_eq!(Chrome::row(false, 1200.0).0.len(), 7);
+        assert!(Chrome::btn_rect(Btn::Out, view, false, cell).is_some());
+
+        assert!(set_toolbar_buttons(false), "从开到关应报变化（要标脏）");
+        let (x2, _, w2, _) = Chrome::pill(view, false, cell);
+        assert_eq!(w2, cell + 16.0, "隐藏后只剩信息格 + 左右 8：{w2}");
+        assert_eq!(x2, (1200.0 - w2) / 2.0, "隐藏后仍水平居中");
+        assert!(Chrome::row(false, 1200.0).0.is_empty());
+        assert!(Chrome::row(true, 1200.0).0.is_empty(), "动图也不给按钮");
+        assert!(
+            Chrome::btn_rect(Btn::Out, view, false, cell).is_none(),
+            "按钮没画出来就不该有命中矩形"
+        );
+        let chrome = Chrome::new(false);
+        let (bx, by, _, _) = Chrome::pill(view, false, cell);
+        assert!(
+            !matches!(chrome.hit((bx + 4.0, by + 20.0), view), Some(Press::Btn(_))),
+            "藏在信息格里的位置不该命中按钮"
+        );
+
+        // 模块级镜像必须复位，别污染同进程其它用例（门禁单线程跑）。
+        assert!(set_toolbar_buttons(true));
+        assert_eq!(Chrome::pill(view, false, cell).2, w, "复位后回到常态宽度");
     }
 
     /// 用户一插手，放映必须让位。两条手动入口各钉一次（键盘闸、滚轮闸）——

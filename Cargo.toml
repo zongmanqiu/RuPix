@@ -158,6 +158,8 @@ windows = { version = "0.62", features = [
     "Win32_Storage_FileSystem",
     # ReadDirectoryChangesW 的 OVERLAPPED / 完成例程参数挂在 System::IO 下
     "Win32_System_IO",
+    # 文件关联（m244，修宪唯一例外）：RegCreateKeyExW / RegSetValueExW / RegQueryValueExW
+    "Win32_System_Registry",
     # 扩展进程 Job Object（KILL_ON_JOB_CLOSE：宿主退出/崩溃时内核兑底杀整组子进程）
     "Win32_System_JobObjects",
     # SystemTimeToFileTime：会话戳 / crash.log 的时间戳要换算到本地时区

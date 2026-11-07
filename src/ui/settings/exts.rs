@@ -308,6 +308,8 @@ pub mod tests {
             to_tray: sig(false),
             space_preview: sig(false),
             drag_image: sig(false),
+            show_toolbar_buttons: sig(true),
+            filmstrip: sig(false),
             allow_multiple: sig(false),
             opacity: signal(0.75),
             opacity_label: signal(String::new()),

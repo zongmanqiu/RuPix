@@ -642,7 +642,7 @@ impl ImageCanvas {
     /// 执行一次悬浮层按钮/箭头/标题栏按钮的动作。调用点保证命中仍成立。
     fn exec(&self, ctx: &mut EventCtx, press: Press) {
         match press {
-            Press::Btn(b) => exec_btn(ctx, &self.viewer, &self.chrome, &self.config, &self.hub, b),
+            Press::Btn(b) => exec_btn(ctx, &self.viewer, &self.chrome, b),
             Press::Arrow(Arrow::Prev) => {
                 self.chrome.slide_stop();
                 self.viewer.borrow_mut().step(-1);
@@ -660,23 +660,25 @@ impl ImageCanvas {
     ///
     /// ```text
     /// 打开…
+    /// 复制 ▸                    画面 PNG / 原文件 / 文件路径（m248 上移，与「打开」同为文件类）
     /// RAW 参数…                 ← 常驻；仅无头裸像素可点（相机 RAW / 普通图片置灰）
-    /// 复制 ▸                    画面 PNG / 原文件 / 文件路径
+    /// 属性…                     图片信息窗（m247 从浮条收编到顶层）
     /// ─────
-    /// 操作 ▸            **严格等于底部浮条**：浮条有什么按钮就有什么项（同一份 `Btn::ALL`）
+    /// 操作 ▸            **严格等于底部浮条**（m247 后只收操作类，同一份 `Btn::ALL`）
     /// 工具 ▸                    宿主内置低频辅助（取色器等）
     /// 插件 ▸                    外部进程命令
     /// ─────
-    /// 窗口 ▸                    极简模式（勾选）/ 缩略图条（勾选）/ 不透明度 ▸ 10~100%
+    /// 外观 ▸                    极简模式 / 棋盘格背景 / 缩略图条 / 显示按钮（勾选）/
+    ///                        主题色 ▸ 深色·浅色 / 不透明度 ▸ 10~100%
     /// 幻灯片放映 / 停止放映
     /// 左键拖图（勾选）
     /// ─────
     /// 设置…（「关于」不再单列，它是设置窗五页里的最后一项，见 `settings::rows::NAV_LABELS`）
     /// ```
     ///
-    /// 「窗口 ▸」收的是**改变窗口长什么样**的三项（2026-11-04 用户口径）：装饰显隐、
-    /// 底部常驻区、整窗 alpha。放映改的是看图行为，左键拖图改的是手势分工，都不是窗口
-    /// 外观，所以留在顶层；放映还因为不在浮条 `Btn::ALL` 里而必须随手可及（见下方 ★）。
+    /// 「外观 ▸」收的是**改变画面上出现什么 / 长什么样**的开关（m246 改名并补齐）：
+    /// 与设置 → 选项 → 外观卡同一条轴。放映改的是看图行为，左键拖图改的是手势分工，
+    /// 都不是外观，所以留在顶层；放映还因为不在浮条 `Btn::ALL` 里而必须随手可及（见下方 ★）。
     ///
     /// 装配出口会调 [`align_menu_columns`] 把**每一级**的标签左沿对齐：勾选列是
     /// 逐级判定的，纯动作列表（复制 / 插件）不补就会比别的子菜单少缩进一列。
@@ -727,6 +729,17 @@ impl ImageCanvas {
             it
         });
 
+        // ── 复制（二级菜单，向右弹出）──
+        // m248：紧跟「打开…」——两者都针对文件，文件类四项（打开 / 复制 / RAW 参数 /
+        // 属性）在第一个分隔线之前连成一块。2026-11-03 用户口径「三个复制收纳到
+        // "复制"里面，向右弹出，这样比较节省空间」：同一次只选一种口径（画面 PNG /
+        // 文件本身 / 路径文本），平铺会摊成菜单最长的三段。快捷键仍挂在「复制当前」
+        // 与「复制文件路径」上，收进子菜单不影响按键——显示的是同一份 hotkeys。
+        items.push(MenuItem::submenu(
+            "复制",
+            self.copy_items(has_image, has_file),
+        ));
+
         // ── 新建窗口：**不做**（2026-11-05 用户裁定）──
         //
         // 多开开启时这里曾多出一项「新建窗口」，但它的产物是一扇**没有图**的空窗：
@@ -750,15 +763,15 @@ impl ImageCanvas {
             items.push(it);
         }
 
-        // ── 复制（二级菜单，向右弹出）──
-        // 2026-11-03 用户口径「三个复制收纳到"复制"里面，向右弹出，这样比较节省空间」。
-        // 这三项本来就不该并排：同一次只选一种口径（画面 PNG / 文件本身 / 路径文本），
-        // 平铺把它们摊成菜单最长的三段。快捷键仍挂在「复制当前」与「复制文件路径」上，
-        // 收进子菜单不影响按键——菜单显示的是同一份 `hotkeys.display(...)`。
-        items.push(MenuItem::submenu(
-            "复制",
-            self.copy_items(has_image, has_file),
-        ));
+        // ── 属性…（m247）：从浮条「!」与「操作 ▸」收编到顶层 ──
+        // 与「RAW 参数…」同组：都是"打开一个关于这张图的信息窗"。
+        // 快捷键 Action::Properties 走 exec_action 那条独立路径，行为不变。
+        items.push({
+            let v = self.viewer.clone();
+            let mut it = MenuItem::run("属性…", move |ctx| settings::open_metadata(ctx, &v), false);
+            it.shortcut = self.config.borrow().hotkeys.display(Action::Properties);
+            it
+        });
 
         items.push(MenuItem::separator());
 
@@ -779,8 +792,8 @@ impl ImageCanvas {
         //
         // 「窗口置顶」入口已移到标题栏置顶钮（📌，读写同一 `ws.topmost`），
         // 菜单里不再重复。
-        // ── 窗口 ▸：三项窗口外观收成一个子菜单（2026-11-04 用户口径）──
-        items.push(MenuItem::submenu("窗口", self.window_items()));
+        // ── 外观 ▸：改画面长什么样的开关收成一个子菜单（m246 改名）──
+        items.push(MenuItem::submenu("外观", self.appearance_items()));
 
         // ── 幻灯片放映：改的是"怎么浏览这一组图"，不是窗口外观，所以留在顶层 ──
         //
@@ -826,7 +839,7 @@ impl ImageCanvas {
         //
         // 2026-11-03 用户点名进菜单（"和极简模式那些放一起"）。理由成立：这条改的是手感，
         // 而手感不对的时候人正盯着画面——不该要先开设置页才能试另一种分工。
-        // 2026-11-04 三项窗口外观收进「窗口 ▸」时，本项按"手势分工 ≠ 窗口外观"留在顶层。
+        // 2026-11-04 收进子菜单、11-07 改名「外观 ▸」时，本项按手势分工 ≠ 外观留在顶层。
         // 勾选态**直接读 `config.drag_image`**，不像 `filmstrip` 那样另存一份会话位：
         // canvas 每次按下都现读配置，多存一份就是第二正本（还会漂）。
         // 不标脏：切换不改这一帧的任何像素，下一次按下自然按新分工走。
@@ -865,12 +878,15 @@ impl ImageCanvas {
         ctx.show_context_menu(at, items);
     }
 
-    /// 「窗口 ▸」子菜单：只放**改变窗口长什么样**的三项（2026-11-04 用户口径）。
+    /// 「外观 ▸」子菜单：只放**改变画面上出现什么 / 长什么样**的开关（m246）。
     ///
-    /// 极简模式（chrome 显隐）、缩略图条（底部常驻区）、不透明度（整窗 alpha）都是
-    /// 窗口外观；放映改的是浏览行为、左键拖图改的是手势分工，留在顶层不进来。
+    /// 与设置 → 选项 → 外观卡同一条轴：极简模式（chrome 显隐）、棋盘格背景、
+    /// 缩略图条（底部常驻区）、显示按钮（浮条按钮）、不透明度（整窗 alpha）。
+    /// 全部读写同一份 `Config`，`runtime::apply_session_flags` 每帧把配置推给窗口信号。
+    /// 棋盘格只在本菜单与设置页「外观」卡（m247 已从浮条 / 「操作 ▸」撤走）。
+    /// 放映改的是浏览行为、左键拖图改的是手势分工，留在顶层不进来。
     /// 不透明度保留自己的档位子菜单：十档铺平会把这里撑成一长列，三级反而好找。
-    fn window_items(&self) -> Vec<MenuItem> {
+    fn appearance_items(&self) -> Vec<MenuItem> {
         let mut out = Vec::new();
 
         // ── 极简模式：当前窗口临时切换（不落盘）──
@@ -890,6 +906,32 @@ impl ImageCanvas {
             it.checkable = true;
             it.checked = on;
             it.shortcut = self.config.borrow().hotkeys.display(Action::Minimal);
+            it
+        });
+
+        // ── 棋盘格背景（m246，ini 键 checker）──
+        //
+        // m247 起棋盘格只在这里和设置页「外观」卡；浮条与「操作 ▸」里那颗已撤走
+        // （显示开关不是操作）。这里带勾选态，读写同一份 `Config`、走 `persist_session`，
+        // 并当场推窗口信号，切换当下就重绘。
+        out.push({
+            let on = self.config.borrow().checker;
+            let chrome = self.chrome.clone();
+            let cfg = self.config.clone();
+            let hub = self.hub.clone();
+            let mut it = MenuItem::run(
+                "棋盘格背景",
+                move |ctx| {
+                    let on = !cfg.borrow().checker;
+                    chrome.checker.set(on);
+                    persist_session(&cfg, &hub, |c| c.checker = on);
+                    ctx.mark_dirty();
+                },
+                on,
+            );
+            it.checkable = true;
+            it.checked = on;
+            it.shortcut = self.config.borrow().hotkeys.display(Action::Checker);
             it
         });
 
@@ -918,7 +960,56 @@ impl ImageCanvas {
             it
         });
 
+        // ── 显示按钮（m245，ini 键 show_toolbar_buttons）──
+        // 按钮对应的操作在右键「操作 ▸」里一颗不缺，信息（页码 / 缩放 / 帧号）
+        // 却只有浮条这一处载体 ⇒ 只隐按钮、留信息并水平居中。归「外观 ▸」：
+        // 改的是画面上出现什么（m246 口径）。
+        out.push({
+            let on = self.config.borrow().show_toolbar_buttons;
+            let cfg = self.config.clone();
+            let hub = self.hub.clone();
+            let mut it = MenuItem::run(
+                "显示按钮",
+                move |ctx| {
+                    let on = !cfg.borrow().show_toolbar_buttons;
+                    persist_session(&cfg, &hub, |c| c.show_toolbar_buttons = on);
+                    super::chrome::set_toolbar_buttons(on);
+                    // 不提示：按钮当场消失/出现，屏幕自己已经说了。
+                    ctx.mark_dirty();
+                },
+                on,
+            );
+            it.checkable = true;
+            it.checked = on;
+            it
+        });
+
         out.push(MenuItem::separator());
+
+        // ── 主题色（m247，ini 键 ui_theme）：与设置页下拉同一份 Config ──
+        // runtime::apply_theme 每帧幂等推令牌，写完配置下一帧就换色；
+        // persist_session 里 push_to_hub 把设置页下拉同步过来，不需要第二条通道。
+        let cur_theme = self.config.borrow().ui_theme;
+        let theme_hub = self.hub.clone();
+        let mut theme_items = Vec::new();
+        for t in crate::core::config::UiTheme::ALL {
+            theme_items.push(
+                MenuItem::run(
+                    t.label(),
+                    {
+                        let cfg = self.config.clone();
+                        let hub = theme_hub.clone();
+                        move |ctx| {
+                            persist_session(&cfg, &hub, |c| c.ui_theme = t);
+                            ctx.mark_dirty();
+                        }
+                    },
+                    cur_theme == t,
+                )
+                .check(cur_theme == t),
+            );
+        }
+        out.push(MenuItem::submenu("主题色", theme_items));
 
         // ── 不透明度：10%~100%，10% 一档，勾选当前档（ini 键：opacity）──
         let cur = self.config.borrow().opacity;
@@ -1318,10 +1409,8 @@ impl ImageCanvas {
                 {
                     let v = self.viewer.clone();
                     let chrome = self.chrome.clone();
-                    let cfg = self.config.clone();
-                    let hub = self.hub.clone();
                     move |ctx| {
-                        exec_btn(ctx, &v, &chrome, &cfg, &hub, b);
+                        exec_btn(ctx, &v, &chrome, b);
                         ctx.mark_dirty();
                     }
                 },
@@ -1331,11 +1420,11 @@ impl ImageCanvas {
             if let Some(sc) = b.shortcut(&self.config.borrow().hotkeys) {
                 it.shortcut = Some(sc);
             }
-            // 开关类给勾选列：全屏/棋盘格的当前态一眼可见。
-            let state = match b {
-                Btn::Fullscreen => Some(ws.fullscreen),
-                Btn::Checker => Some(self.chrome.checker.get()),
-                _ => None,
+            // 开关类给勾选列：m247 后只剩全屏这一颗带状态。
+            let state = if b == Btn::Fullscreen {
+                Some(ws.fullscreen)
+            } else {
+                None
             };
             if let Some(on) = state {
                 it.checkable = true;
@@ -1369,7 +1458,7 @@ fn ops_row(has_index: bool) -> Vec<(Btn, bool)> {
 /// 才让出 `MENU_CHECK_W + MENU_GAP`（24dp），没有就贴左。于是「操作」「工具」「窗口」
 /// 「不透明度」这些含开关的级会缩进，而「复制」「插件」这类纯动作列表不会——同一棵菜单里
 /// 文字左沿差一列，看起来就是插件名"没留间隔"。
-/// 补位递归到每一级，包括「窗口 ▸ 不透明度 ▸ 档位」这样的三级。
+/// 补位递归到每一级，包括「外观 ▸ 不透明度 ▸ 档位」这样的三级。
 ///
 /// 装配出口统一补位：本级没有开关项时，给第一个非分隔线项声明 `checkable`，
 /// `checked` 保持 false（绘制只在 `checked` 时画勾，不会多出一枚没来由的对勾）。
@@ -1410,23 +1499,10 @@ fn persist_session(cfg: &Rc<RefCell<Config>>, hub: &Hub, apply: impl FnOnce(&mut
     settings::push_to_hub(hub, &cfg.borrow());
 }
 
-fn exec_btn(
-    ctx: &mut EventCtx,
-    viewer: &Rc<RefCell<Viewer>>,
-    chrome: &Rc<Chrome>,
-    cfg: &Rc<RefCell<Config>>,
-    hub: &Hub,
-    b: Btn,
-) {
+fn exec_btn(ctx: &mut EventCtx, viewer: &Rc<RefCell<Viewer>>, chrome: &Rc<Chrome>, b: Btn) {
     // 手动按浮条任何一颗都算"用户插手了画面"，幻灯片当场让位（见 `Chrome::slide_stop`）。
     chrome.slide_stop();
-    // 「属性」要开窗口，而 `settings::open_metadata` 内部会 `viewer.borrow()`——
-    // 这里必须先于任何 borrow_mut 处理，否则同线程重入 borrow 直接 panic。
-    if b == Btn::Info {
-        settings::open_metadata(ctx, viewer);
-        return;
-    }
-    // 全屏同理，而且它**原来就漏在这条规矩外面**：`toggle_fullscreen` 同步改窗口尺寸 →
+    // 全屏要改窗口：`toggle_fullscreen` 同步改窗口尺寸 →
     // resize/paint 被就地重放一遍 → 那里再 `viewer.borrow()`，而下面那行正握着 `borrow_mut`
     // → 同线程重入直接 panic（UI 线程没了 = 整个查看器没了）。它压根不需要 `Viewer`。
     if b == Btn::Fullscreen {
@@ -1455,24 +1531,15 @@ fn exec_btn(
         }
         Btn::PlayPause => v.toggle_anim_pause(),
         // Fullscreen 在函数开头就分流走了（不许带着 viewer 的可变借用车窗动作）。
-        // 与 `Btn::Info` 同一处理：**什么都不做**，这里放 `unreachable!` 等于把
+        // **什么都不做**：这里放 `unreachable!` 等于把
         // "上游改了分流、这里没同步"这种看得见的小 bug 升级成整个查看器没了。
         Btn::Fullscreen => {}
-        Btn::Checker => {
-            let on = !chrome.checker.get();
-            chrome.checker.set(on);
-            persist_session(cfg, hub, |c| c.checker = on);
-        }
         Btn::Rotate => {
             v.rotate_cw();
         }
         Btn::Mirror => {
             v.toggle_flip();
         }
-        // Info 在函数开头就分流走了（它不走这条按钮动作）。真被走到说明上游分流改了而这里
-        // 没同步——**什么都不做**：UI 线程里 `unreachable!` 就是整个查看器没了，而"点了属性
-        // 钮没反应"是个看得见、改得动的 bug（§八.1 红线，hygiene 的 panic_source 查）。
-        Btn::Info => {}
     }
 }
 
@@ -2857,13 +2924,13 @@ mod tests {
     fn menu_columns_aligned_on_every_level() {
         // 纯动作列表（复制 / 插件）本来不含开关项；含开关的级不该被多余改动。
         // 根级这里全用动作项，刻意覆盖补位分支（真实菜单根级自带「左键拖图」开关项）；
-        // 「窗口 ▸ 不透明度 ▸ 档位」是收编后新出现的三级，递归必须够得着。
+        // 「外观 ▸ 不透明度 ▸ 档位」是收编后新出现的三级，递归必须够得着。
         let mut items = vec![
             MenuItem::separator(),
             MenuItem::run("打开…", |_| {}, false),
             MenuItem::submenu("插件", vec![MenuItem::run("色阶分析", |_| {}, false)]),
             MenuItem::submenu(
-                "窗口",
+                "外观",
                 vec![
                     MenuItem::run("极简模式", |_| {}, true),
                     MenuItem::separator(),
@@ -2876,7 +2943,7 @@ mod tests {
         let has_checks = |v: &[MenuItem]| v.iter().any(|it| it.checkable);
         assert!(has_checks(&items), "根级要留列");
         assert!(has_checks(&items[2].submenu), "纯动作子菜单也要留列");
-        assert!(has_checks(&items[3].submenu), "窗口子菜单照旧留列");
+        assert!(has_checks(&items[3].submenu), "外观子菜单照旧留列");
         assert!(
             has_checks(&items[3].submenu[2].submenu),
             "三级档位列表也要留列"

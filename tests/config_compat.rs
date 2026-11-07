@@ -66,6 +66,9 @@ fn legacy_ini_loads_without_loss() {
         // 旧版 fixture 不含 drag_image 键 → 回默认（**开**）。这条钉的是"新键默认开，
         // 也不许把老配置读成关"——老 ini 升级后左键拖图片照常，不必重设。
         drag_image: true,
+        // 旧版 fixture 同样不含 show_toolbar_buttons → 回默认（**开**）。
+        // 老 ini 升级后底部按钮照常显示，不会被静默隐藏。
+        show_toolbar_buttons: true,
         raw_last: Some(RawParams {
             width: 1920,
             height: 1080,

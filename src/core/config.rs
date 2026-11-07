@@ -21,6 +21,7 @@
 //! | `close_to_tray`   | 关闭改为收进系统托盘（即时生效）            | `0`  |
 //! | `space_preview`   | 空格预览：资源管理器选中图片按空格弹预览（QuickLook 式） | `0`  |
 //! | `drag_image`      | 左键拖动图片：画布里拖动只平移图片，移动窗口交给标题栏 | `1`  |
+//! | `show_toolbar_buttons` | 底部浮条显示按钮：关掉只留信息并水平居中 | `1`  |
 //! | `decoders_disabled`| 被停用的解码器 id（分号分隔）             | 空   |
 //! | `decoders_preferred`| 各扩展名的首选解码器 `扩展名=解码器id`（分号分隔）| 空  |
 //! | `raw_last`        | 裸数据参数窗的上次使用值 `宽x高:布局`       | 空   |
@@ -616,6 +617,10 @@ pub struct Config {
     /// 图比窗口小也拖得动，且**图边允许越过窗口边**（2026-11-03 第三、四条口径）；
     /// 夹取永远留一枚 24dp 的衣角在画面里，所以图拖不丢——见 `viewer::zoom::overscroll`。
     pub drag_image: bool,
+    /// **底部浮条显不显示按钮**（m245，ini 键 `show_toolbar_buttons`，默认开）。
+    /// 关掉 = 只留信息格并水平居中；按钮对应的操作在右键「操作 ▸」里全都在，
+    /// 信息（页码 / 缩放 / 帧号）没有别的载体，所以只隐按钮不隐信息。
+    pub show_toolbar_buttons: bool,
     /// 裸数据参数窗的「上次使用值」（宽/高/布局），新裸数据文件的预填默认。
     /// `None` = 还没用过（首开空窗）。
     pub raw_last: Option<crate::core::decode::RawParams>,
@@ -708,6 +713,7 @@ impl Default for Config {
             close_to_tray: false,
             space_preview: false,
             drag_image: true,
+            show_toolbar_buttons: true,
             raw_last: None,
             download_source: SourceId::Gitee,
             ui_theme: UiTheme::Dark,
@@ -909,6 +915,10 @@ impl Config {
                 // 空格预览（QuickLook 式）：16ms 轮询差分装/摘低级键盘钩子。
                 "space_preview" => set_bool(&mut cfg.space_preview, v, "space_preview"),
                 "drag_image" => set_bool(&mut cfg.drag_image, v, "drag_image"),
+                // 隐藏按钮栏（m245）：关掉后浮条只剩信息并居中。
+                "show_toolbar_buttons" => {
+                    set_bool(&mut cfg.show_toolbar_buttons, v, "show_toolbar_buttons")
+                }
                 // 多开（2026-11-04）：勾上后再双击图片在同一进程里新开一扇窗口
                 // （进程与托盘仍是一个）；不勾则就地换图。
                 "allow_multiple" => set_bool(&mut cfg.allow_multiple, v, "allow_multiple"),
@@ -1004,7 +1014,7 @@ impl Config {
              checker={}\nfilmstrip={}\nlocked={}\n\
              long_image_fit={}\nwheel_behavior={}\nctrl_wheel={}\ninit_window={}\nwindow_w={}\n\
              window_h={}\nopacity={}\n\
-             decoders_disabled={}\nextensions_disabled={}\nextensions_isolated={}\ndecoders_preferred={}\nprefetch={}\nclose_to_tray={}\nspace_preview={}\ndrag_image={}\nraw_last={}\ndownload_source={}\nui_theme={}\ndecoder_index_gitee={}\ndecoder_index_github={}\nplugin_index_gitee={}\nplugin_index_github={}\nhotkeys={}\nallow_multiple={}\ndecode_timeout_s={}\nui_cards={}\n",
+             decoders_disabled={}\nextensions_disabled={}\nextensions_isolated={}\ndecoders_preferred={}\nprefetch={}\nclose_to_tray={}\nspace_preview={}\ndrag_image={}\nshow_toolbar_buttons={}\nraw_last={}\ndownload_source={}\nui_theme={}\ndecoder_index_gitee={}\ndecoder_index_github={}\nplugin_index_gitee={}\nplugin_index_github={}\nhotkeys={}\nallow_multiple={}\ndecode_timeout_s={}\nui_cards={}\n",
             self.stay_on_top as i32,
             self.dbl_click.index(),
             self.slide_interval,
@@ -1027,6 +1037,7 @@ impl Config {
             self.close_to_tray as i32,
             self.space_preview as i32,
             self.drag_image as i32,
+            self.show_toolbar_buttons as i32,
             raw_last,
             self.download_source.id(),
             self.ui_theme.id(),
@@ -1233,6 +1244,10 @@ space_preview=0
 # （只有空窗——还没有图——时那一按才归窗口。）
 drag_image=1
 
+# 底部浮条显示按钮：开（默认）= 按钮 + 信息；关 = 只留信息并水平居中。
+# 按钮对应的操作在右键「操作 ▸」里全都在，信息（页码 / 缩放 / 帧号）没有别的载体。
+show_toolbar_buttons=1
+
 # 允许多开：勾上后再双击图片，在**同一个进程**里新开一扇看图窗口——
 # 任务管理器里始终只有一条 rupix.exe，系统托盘也始终只有一个。
 # 关（默认）= 单窗口：二次启动转发到已有窗口，就地换图。
@@ -1290,7 +1305,7 @@ hotkeys={hotkeys}
 ///   ★ 写在 UI 写点处的 `ini 键：<名>` 注释是**给人导航的约定，没有测试读它**（2026-10-24 实测：
 ///   20 个键里 13 个标了，没标的是 `double_click`、`filmstrip`、`locked`、`long_image_fit`、
 ///   `decoders_disabled`、`window_w`、`window_h`）——别把它当成门禁。
-pub const ALL_KEYS: [&str; 33] = [
+pub const ALL_KEYS: [&str; 34] = [
     "stay_on_top",
     "double_click",
     "slide_interval",
@@ -1313,6 +1328,7 @@ pub const ALL_KEYS: [&str; 33] = [
     "close_to_tray",
     "space_preview",
     "drag_image",
+    "show_toolbar_buttons",
     "raw_last",
     "download_source",
     "ui_theme",
@@ -1572,6 +1588,8 @@ mod tests {
             space_preview: true,
             // 默认是**开**，所以"翻转成非默认"这一路要写 false。
             drag_image: false,
+            // m245：同样是默认开，喂 false 才证得出「关」能存住。
+            show_toolbar_buttons: false,
             allow_multiple: true,
             raw_last: Some(crate::core::decode::RawParams {
                 width: 1920,
@@ -1606,6 +1624,10 @@ mod tests {
         assert!(
             !back.drag_image,
             "drag_image 没存住（默认开，这里喂的是关）"
+        );
+        assert!(
+            !back.show_toolbar_buttons,
+            "show_toolbar_buttons 没存住（默认开，这里喂的是关）"
         );
         assert!(back.allow_multiple, "allow_multiple 没存住");
         assert_eq!(

@@ -187,7 +187,8 @@ fn apply_minimal_mode(chrome: &Chrome, want: bool, applied: &Cell<bool>) -> bool
 /// 标题栏、键盘）都当场写配置并推设置页（m53-L），不存在"只改窗口不改配置"的
 /// 临时态，所以不存在把用户操作每帧覆写回去的风险。
 fn apply_session_flags(chrome: &Chrome, cfg: &Config) -> bool {
-    let mut changed = false;
+    // m245：按钮显隐是全局配置的运行时镜像；值变了也要标脏，否则切换后不重绘。
+    let mut changed = crate::ui::chrome::set_toolbar_buttons(cfg.show_toolbar_buttons);
     for (slot, want) in [
         (&chrome.checker, cfg.checker),
         (&chrome.filmstrip, cfg.filmstrip),

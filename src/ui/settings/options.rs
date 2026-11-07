@@ -30,7 +30,10 @@ pub fn options_page(h: &Handles) -> Element {
         )
 }
 
-/// 「外观」：颜色与可见元素长什么样。四项全是看图窗口的观感，不改图片像素。
+/// 「外观」：颜色与可见元素长什么样。六项全是看图窗口的观感，不改图片像素。
+///
+/// ★ 归属判据（m246）：改「画面上出现什么 / 长什么样」→ 本卡 + 右键「外观 ▸」；
+///   改「窗口或进程以什么方式存在」→ 下一张「窗口」卡，不进右键外观菜单。
 fn appearance_body(h: &Handles) -> Element {
     Element::col()
         .fill()
@@ -53,7 +56,15 @@ fn appearance_body(h: &Handles) -> Element {
         // ini 键：minimal_mode（即时生效：runtime 差分推给当前窗口，m51-D）
         .child(check_row("极简模式", h.minimal_mode))
         // ini 键：checker（即时生效：runtime 每帧把配置推给当前窗口，m53-L）
-        .child(check_row("棋盘格", h.checker))
+        .child(check_row("棋盘格背景", h.checker))
+        // ini 键：filmstrip（m53 起落盘）。m246 补进设置页——此前只有右键
+        // 「外观 ▸」有这一项，设置窗里找不到。与菜单共用同一份 Config，
+        // runtime 每帧把配置推给 chrome.filmstrip，无需新增同步通道。
+        .child(check_row("缩略图条", h.filmstrip))
+        // ini 键：show_toolbar_buttons（m245）。关掉 = 浮条只留信息并水平居中；
+        // 按钮对应的操作在右键「操作 ▸」里全都在，信息没有别的载体。
+        // 同一个开关也在右键「外观 ▸」里，两处都写同一份 Config。
+        .child(check_row("显示按钮", h.show_toolbar_buttons))
 }
 
 /// 「窗口」：窗口／进程以什么方式存在——z 序、初始尺寸、关窗去向、能否开第二扇。
@@ -119,8 +130,8 @@ fn browse_body(h: &Handles) -> Element {
         ))
 }
 
-/// 「系统与网络」：都不改画面，改的是后台怎么跑、从哪拉东西。只有两项，
-/// 不另开第五张卡——一张卡只装一行，标题比内容还抢眼，折叠反倒多一次点击。
+/// 「系统与网络」：都不改画面，改的是后台怎么跑、从哪拉东西、系统认不认我们。
+/// m244 起第三行是文件关联（独立窗，ini 没有它的键——关联态住注册表，修宪唯一例外）。
 fn system_body(h: &Handles) -> Element {
     Element::col()
         .fill()
@@ -143,5 +154,13 @@ fn system_body(h: &Handles) -> Element {
                 h.download_source,
             )
             .width(CONTROL_GROUP_W),
+        ))
+        // 文件关联（m244）：独立窗，150+ 后缀勾选网格 + 一次性写入。
+        // 不放 ini 键、不做每帧计数——打开窗才知道细节，这里只给入口。
+        .child(option_row(
+            "文件关联",
+            super::rows::btn("管理…").on_click(|ctx| {
+                super::super::association::show(ctx);
+            }),
         ))
 }

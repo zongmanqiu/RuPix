@@ -1,6 +1,7 @@
 //! 平台层：Windows 专属的薄壳（SEH/DLL 加载/剪贴板/无边框窗口/崩溃钩子）。
 //!
 //! core 的纯逻辑不碰这里；`ui`/`decoders`/`runtime` 需要平台能力时从本层取。
+pub mod association;
 pub mod clipboard;
 pub mod color;
 pub mod crash_evidence;

@@ -155,6 +155,10 @@ pub struct Handles {
     pub minimal_mode: Signal<bool>,
     /// 棋盘格透明背景（ini 键 checker；m53 起落盘，勾选即时作用于当前窗口）。
     pub checker: Signal<bool>,
+    /// 底部缩略图条（ini 键 filmstrip；m53 起落盘）。m246 起设置页「外观」卡
+    /// 也有这一项；`runtime::apply_session_flags` 每帧把配置推给窗口信号，
+    /// 不需要第二份状态，也不会把菜单的临时切换覆写回去。
+    pub filmstrip: Signal<bool>,
     pub long_fit: Signal<bool>,
     pub dcb: Signal<usize>,
     /// 「幻灯片间隔（秒）」文本框（ini 键 slide_interval）。
@@ -175,6 +179,9 @@ pub struct Handles {
     /// 左键拖动的分工（ini 键 drag_image 的 UI 写点）。默认开 = 画布里拖图片、
     /// 标题栏拖窗口；判据本体在 `ui::canvas::left_drag`。
     pub drag_image: Signal<bool>,
+    /// 底部浮条显不显示按钮（ini 键 show_toolbar_buttons，m245）。默认开；
+    /// 关掉 = 只留信息并水平居中。同一个开关也在右键「外观 ▸」里。
+    pub show_toolbar_buttons: Signal<bool>,
     /// 多开开关（ini 键 allow_multiple 的 UI 写点）。默认关 = 单窗口（二次启动就地换图）；
     /// 开 = 二次启动在同一进程里新开一扇窗口，进程与托盘仍只有一个。
     pub allow_multiple: Signal<bool>,
@@ -308,6 +315,7 @@ impl Handles {
         set(&mut dirty, &mut c.stay_on_top, self.stay.get());
         set(&mut dirty, &mut c.minimal_mode, self.minimal_mode.get());
         set(&mut dirty, &mut c.checker, self.checker.get());
+        set(&mut dirty, &mut c.filmstrip, self.filmstrip.get());
         set(&mut dirty, &mut c.long_image_fit, self.long_fit.get());
         let dcb = DblClick::from_index(self.dcb.get() as i64);
         if c.dbl_click != dcb {
@@ -354,6 +362,11 @@ impl Handles {
         set(&mut dirty, &mut c.close_to_tray, self.to_tray.get());
         set(&mut dirty, &mut c.space_preview, self.space_preview.get());
         set(&mut dirty, &mut c.drag_image, self.drag_image.get());
+        set(
+            &mut dirty,
+            &mut c.show_toolbar_buttons,
+            self.show_toolbar_buttons.get(),
+        );
         set(&mut dirty, &mut c.allow_multiple, self.allow_multiple.get());
         let op = slider_to_opacity(self.opacity.get());
         if c.opacity != op {
@@ -486,6 +499,7 @@ impl Handles {
         put_b(&self.stay, c.stay_on_top);
         put_b(&self.minimal_mode, c.minimal_mode);
         put_b(&self.checker, c.checker);
+        put_b(&self.filmstrip, c.filmstrip);
         put_b(&self.long_fit, c.long_image_fit);
         let put_u = |slot: &Signal<usize>, v: usize| {
             if slot.get() != v {
@@ -507,6 +521,7 @@ impl Handles {
         put_b(&self.to_tray, c.close_to_tray);
         put_b(&self.space_preview, c.space_preview);
         put_b(&self.drag_image, c.drag_image);
+        put_b(&self.show_toolbar_buttons, c.show_toolbar_buttons);
         put_b(&self.allow_multiple, c.allow_multiple);
         if self.opacity.get() != opacity_to_slider(c.opacity) {
             self.opacity.set(opacity_to_slider(c.opacity));
@@ -806,6 +821,7 @@ pub(crate) fn settings_window(config: &Rc<RefCell<Config>>, hub: &Hub) -> Window
             stay: sig(c.stay_on_top),
             minimal_mode: sig(c.minimal_mode),
             checker: sig(c.checker),
+            filmstrip: sig(c.filmstrip),
             long_fit: sig(c.long_image_fit),
             dcb: signal(c.dbl_click.index() as usize),
             slide_secs: signal(c.slide_interval.to_string()),
@@ -817,6 +833,7 @@ pub(crate) fn settings_window(config: &Rc<RefCell<Config>>, hub: &Hub) -> Window
             to_tray: sig(c.close_to_tray),
             space_preview: sig(c.space_preview),
             drag_image: sig(c.drag_image),
+            show_toolbar_buttons: sig(c.show_toolbar_buttons),
             allow_multiple: sig(c.allow_multiple),
             opacity: signal(opacity_to_slider(c.opacity)),
             opacity_label: signal(format!("{}%", c.opacity)),
@@ -1085,6 +1102,7 @@ pub(crate) mod tests {
             stay: sig(false),
             minimal_mode: sig(false),
             checker: sig(false),
+            filmstrip: sig(false),
             long_fit: sig(false),
             dcb: signal(0),
             slide_secs: signal("3".into()),
@@ -1096,6 +1114,7 @@ pub(crate) mod tests {
             to_tray: sig(false),
             space_preview: sig(false),
             drag_image: sig(false),
+            show_toolbar_buttons: sig(true),
             allow_multiple: sig(false),
             opacity: signal(0.75),
             opacity_label: signal(String::new()),
@@ -1341,7 +1360,9 @@ pub(crate) mod tests {
             4,
             "选项页应有四张卡：外观 / 窗口 / 看图与操作 / 系统与网络"
         );
-        let want = [4, 5, 4, 2];
+        // m244：系统与网络卡 2→3（新增「文件关联」入口行——它没有 ini 键，状态住注册表）。
+        // m246：外观卡 5→6（补「缩略图条」），整页 17→18 行。
+        let want = [6, 5, 4, 3];
         let mut rows = 0;
         for (i, (card, n)) in cards.iter().zip(want).enumerate() {
             let node = tree.get(*card).expect("卡");
@@ -1355,7 +1376,7 @@ pub(crate) mod tests {
             assert_eq!(got, n, "卡 {i} 行数不对（分组串位了？）");
             rows += got;
         }
-        assert_eq!(rows, 15, "15 项一项都不能在分组里丢");
+        assert_eq!(rows, 18, "18 项一项都不能在分组里丢");
 
         let expanded_card_h = tree.get(cards[1]).expect("窗口卡").bounds.h;
         let expanded_content_h = tree.get(root).expect("页面").content_h;

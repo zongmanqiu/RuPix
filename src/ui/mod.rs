@@ -50,6 +50,7 @@ pub fn to_key_input(ev: &WKeyEvent) -> Option<KeyInput> {
 //   （几十个常量 + 两个转换函数），再发布一遍只是抄名单，`super::tokens::…` 已经够短。
 pub(crate) mod tokens;
 
+pub mod association;
 pub mod brand;
 pub mod canvas;
 pub mod chrome;
