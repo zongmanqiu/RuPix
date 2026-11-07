@@ -673,6 +673,14 @@ pub struct Config {
     ///
     /// 登记在 [`CONFIG_ONLY_KEYS`]：只有慢盘 / 超大文件这类场景需要手改 ini。
     pub decode_timeout_s: u64,
+    /// 设置页各张卡的**展开**列表（卡 id，`;` 分隔存盘，ini 键 `ui_cards`）。
+    ///
+    /// 空 = 全部收起（出厂默认，用户 2026-11-07 拍板）。存"展开的"而不是"收起的"：
+    /// 卡片会随版本增删，存收起集就得替每一枚新卡决定一个默认值；存展开集意味着
+    /// **新卡天然是收起的**（与"默认全收"一致），老 ini 里没有它就不展开。
+    /// id 表在界面层（`ui::settings::Card`）——`core` 不认识界面，只保管这串字符串；
+    /// 认不出的 id 在回填时被静默忽略，下一次 `Handles::sync` 按现有卡重新收集时自动消失。
+    pub ui_cards_expanded: Vec<String>,
 }
 
 impl Default for Config {
@@ -710,6 +718,7 @@ impl Default for Config {
             hotkeys: crate::core::hotkey::Hotkeys::default(),
             allow_multiple: false,
             decode_timeout_s: 20,
+            ui_cards_expanded: Vec::new(),
         }
     }
 }
@@ -909,6 +918,16 @@ impl Config {
                 "decode_timeout_s" => {
                     cfg.decode_timeout_s = v.parse().unwrap_or(20).min(600);
                 }
+                // 设置页各张卡的展开集（分号分隔的卡 id）。不认识的 id 照样记着——
+                // 界面层回填时按自己的卡表匹配，匹配不上就是"没有那张卡"，
+                // 下一次 `Handles::sync` 按现有卡重收集时会把它清掉。
+                "ui_cards" => {
+                    cfg.ui_cards_expanded = v
+                        .split(';')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                }
                 // 快捷键组：整段交给 Hotkeys::from_ini 解析（内部先 default 再覆盖）。
                 "hotkeys" => cfg.hotkeys = crate::core::hotkey::Hotkeys::from_ini(v),
                 // 裸数据「上次使用值」：`宽x高:布局号`（如 `1920x1080:8`）。解析不出
@@ -985,7 +1004,7 @@ impl Config {
              checker={}\nfilmstrip={}\nlocked={}\n\
              long_image_fit={}\nwheel_behavior={}\nctrl_wheel={}\ninit_window={}\nwindow_w={}\n\
              window_h={}\nopacity={}\n\
-             decoders_disabled={}\nextensions_disabled={}\nextensions_isolated={}\ndecoders_preferred={}\nprefetch={}\nclose_to_tray={}\nspace_preview={}\ndrag_image={}\nraw_last={}\ndownload_source={}\nui_theme={}\ndecoder_index_gitee={}\ndecoder_index_github={}\nplugin_index_gitee={}\nplugin_index_github={}\nhotkeys={}\nallow_multiple={}\ndecode_timeout_s={}\n",
+             decoders_disabled={}\nextensions_disabled={}\nextensions_isolated={}\ndecoders_preferred={}\nprefetch={}\nclose_to_tray={}\nspace_preview={}\ndrag_image={}\nraw_last={}\ndownload_source={}\nui_theme={}\ndecoder_index_gitee={}\ndecoder_index_github={}\nplugin_index_gitee={}\nplugin_index_github={}\nhotkeys={}\nallow_multiple={}\ndecode_timeout_s={}\nui_cards={}\n",
             self.stay_on_top as i32,
             self.dbl_click.index(),
             self.slide_interval,
@@ -1018,6 +1037,8 @@ impl Config {
             self.hotkeys.to_ini(),
             self.allow_multiple as i32,
             self.decode_timeout_s,
+            // 分号分隔的卡 id；空串 = 全部展开。
+            self.ui_cards_expanded.join(";"),
         );
         // 原子写（M2）：写临时文件 → **flush 到盘** → 改名覆盖。
         //
@@ -1223,6 +1244,11 @@ allow_multiple=0
 # 只有网络盘 / 超大文件这类「合理很慢」的场景才需要调大。
 decode_timeout_s=20
 
+# 设置页各张卡的**收起**状态（卡 id 分号分隔；留空 = 全部展开）。
+# 只有点过卡片标题把它收起，这里才会出现内容，例如 options.appearance;keys.plugins。
+# 收起的卡下次开设置页仍是收起的；卡 id 改过就等于让老状态失效（认不出的忽略）。
+ui_cards=
+
 # 裸数据参数窗的上次使用值（宽x高:布局，如 1920x1080:8；留空 = 还没用过）
 raw_last=
 
@@ -1264,7 +1290,7 @@ hotkeys={hotkeys}
 ///   ★ 写在 UI 写点处的 `ini 键：<名>` 注释是**给人导航的约定，没有测试读它**（2026-10-24 实测：
 ///   20 个键里 13 个标了，没标的是 `double_click`、`filmstrip`、`locked`、`long_image_fit`、
 ///   `decoders_disabled`、`window_w`、`window_h`）——别把它当成门禁。
-pub const ALL_KEYS: [&str; 32] = [
+pub const ALL_KEYS: [&str; 33] = [
     "stay_on_top",
     "double_click",
     "slide_interval",
@@ -1297,6 +1323,7 @@ pub const ALL_KEYS: [&str; 32] = [
     "hotkeys",
     "allow_multiple",
     "decode_timeout_s",
+    "ui_cards",
 ];
 
 /// 配置专用键：只给高级用户手改 ini，**界面刻意不出现**（2026-10-29 用户口径）。
@@ -1312,6 +1339,17 @@ pub const CONFIG_ONLY_KEYS: [&str; 5] = [
     // 挂死恢复的超时秒数：只服务慢盘 / 超大文件，界面上不出现。
     "decode_timeout_s",
 ];
+
+/// **纯界面状态**的键：它的"行为读者"只能是设置页自己（m243）。
+///
+/// 与 [`CONFIG_ONLY_KEYS`] 恰好相反——那个是"界面刻意不出现、只给高级用户手改"，
+/// 这个是"**界面就是它唯一的消费者**"。`ui_cards` 描述的就是设置页长什么样（哪几张卡
+/// 收起），所以"改了不影响任何画面或交互"这句话在它身上不成立：它本身就是画面。
+///
+/// 这张表只向 `hygiene_scan.py` 第 6 查交代这一件事——**不是给"懒得接行为读者"的键
+/// 开后门**。准入门槛写死：只收设置页自身的显示状态（某张卡收不收）；像"某一行显隐"
+/// 这种都不算，那应由那一行自己的行为读者体现。
+pub const UI_STATE_KEYS: [&str; 1] = ["ui_cards"];
 
 #[cfg(test)]
 mod tests {
@@ -1677,6 +1715,32 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    /// `ui_cards` 走出界面之后要能原样回来：`save_to` 的 `join(";")` 与 `load_from` 的
+    /// `split(';')` 必须是同一套写法，**顺序也在内**——这张表的用法就是"照原样回填"，
+    /// 顺序变了等于给用户换了一套 ini 写法（`Handles::sync` 也按 `Card::ALL` 固定顺序收集）。
+    #[test]
+    fn ui_cards_survive_a_disk_round_trip() {
+        let p = temp_ini("cards");
+        let mut c = Config {
+            ui_cards_expanded: vec!["options.window".into(), "plugins.available".into()],
+            ..Config::default()
+        };
+        c.save_to(&p);
+        assert_eq!(
+            Config::load_from(&p).ui_cards_expanded,
+            c.ui_cards_expanded,
+            "ui_cards 写盘再读回变了样（顺序或分隔符对不上）"
+        );
+        // 空表（全部展开）也不许写成 `;` 或别的残渣。
+        c.ui_cards_expanded.clear();
+        c.save_to(&p);
+        assert!(
+            Config::load_from(&p).ui_cards_expanded.is_empty(),
+            "全部展开时读回来必须是空表"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
     /// 默认配置写出来的值一定等于再读一遍读到的值（幂等：反复保存不会把配置漂咸）。
     #[test]
     fn save_then_load_is_idempotent() {
@@ -1853,7 +1917,7 @@ plugin_source=github
              decoders_disabled=abc;def\nextensions_disabled=com.example.ocr\ndecoders_preferred=jpg=jpeg;png=png\nprefetch=0\nclose_to_tray=1\nspace_preview=1\ndrag_image=0\nraw_last=1x2:3\ndownload_source=github\n\
              decoder_index_gitee=https://a.example/d.json\ndecoder_index_github=https://b.example/d.json\n\
              plugin_index_gitee=https://a.example/p.json\nplugin_index_github=https://b.example/p.json\n\
-             hotkeys=prev:Right\n",
+             hotkeys=prev:Right\nui_cards=options.appearance;keys.plugins\n",
         )
         .unwrap();
         let c = Config::load_from(&p);
@@ -1917,6 +1981,12 @@ plugin_source=github
         assert_eq!(c.decoder_index_github, "https://b.example/d.json");
         assert_eq!(c.plugin_index_gitee, "https://a.example/p.json");
         assert_eq!(c.plugin_index_github, "https://b.example/p.json");
+        // 分号分隔、顺序照 ini 原样（界面层回填按自己的卡表匹配，这里只管搬字符串）。
+        assert_eq!(
+            c.ui_cards_expanded,
+            vec!["options.appearance".to_string(), "keys.plugins".to_string()],
+            "ui_cards 没有消费方"
+        );
         let _ = std::fs::remove_file(&p);
     }
 

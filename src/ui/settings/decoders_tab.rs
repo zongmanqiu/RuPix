@@ -540,6 +540,8 @@ pub mod tests {
             card_window: sig(true),
             card_browse: sig(true),
             card_system: sig(true),
+            card_ext_installed: sig(true),
+            card_ext_available: sig(true),
 
             ui_theme: signal(0),
             download_source: signal(0),

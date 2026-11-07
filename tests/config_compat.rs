@@ -86,6 +86,10 @@ fn legacy_ini_loads_without_loss() {
         plugin_index_github: SourceId::Github.plugin_index_url().to_string(),
         hotkeys: Hotkeys::default(),
         allow_multiple: false,
+        // 旧 fixture 不含 ui_cards 键 → 回空表（= 设置页各卡全部展开）。
+        // 与 `drag_image` 那条相反方向的判据：这张表里"缺键"表示**没有收起的卡**，
+        // 所以老配置升级后不该突然看到一页折叠起来的卡片。
+        ui_cards_expanded: Vec::new(),
     };
     assert_eq!(cfg, expected, "老配置直读结果与预期不符");
 }

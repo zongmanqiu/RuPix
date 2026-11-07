@@ -74,7 +74,8 @@ cd main
 python build\layering_scan.py     # 五层方向 + 各层禁引 crate + decoders/extensions 禁互引；violations: 0 才算过
 python build\hygiene_scan.py      # 硬编路径 / 调试残留 / TODO 真标记 / FFI 边界无解 / 生产区 panic 源 /
                                   # 设置键的"最后一公里"（每个 ini 键既要有 UI 入口、也要有行为读者；
-                                  #   `CONFIG_ONLY_KEYS` 登记者只要求行为读者）/
+                                  #   `CONFIG_ONLY_KEYS` 登记者只要求行为读者；
+                                  #   `UI_STATE_KEYS` 登记者（纯界面状态，如 `ui_cards`）只豁免行为读者、入口照旧要）/
                                   # 第三方补丁登记对账（PATCHES.md 章节 ↔ `.3rd` 标记两问；归档逐字节那一格由集成门禁 j13 守）/
                                   # 文本里的不可见控制字符（脚本改文件时反斜杠转义会吃掉一个字母，锚点会静默损坏）/
                                   # `.ps1` 必须纯 ASCII（PS 5.1 按 ANSI 读无 BOM 的 .ps1，中文注释会坏到邻近语句上，K27）/

@@ -212,6 +212,14 @@ ARM_KEY_NAME = re.compile(r'^\s*"([a-z_0-9]+)"\s*=>')
 CONFIG_ONLY_DECL = re.compile(
     r"pub const CONFIG_ONLY_KEYS:\s*\[&str;\s*\d+\s*\]\s*=\s*\[(.*?)\];", re.S
 )
+# 第 6 查的第二类例外：`core/config.rs` 的 `UI_STATE_KEYS`（**纯界面状态**的键，m243）。
+# 它们的"行为读者"只能是设置页自己：`ui_cards` 描述的就是设置页长什么样（哪几张卡收起），
+# "改了不影响画面"在它身上不成立——它本身就是画面。与 CONFIG_ONLY_KEYS 正好相反：
+# 那个是"界面刻意不出现"，这个是"界面是它唯一的消费者"。准入写死在 config.rs 那张表里，
+# 本查不自己维护名单（第二份名单＝改一处漏一处）。
+UI_STATE_DECL = re.compile(
+    r"pub const UI_STATE_KEYS:\s*\[&str;\s*\d+\s*\]\s*=\s*\[(.*?)\];", re.S
+)
 CFG_FIELD = re.compile(r"\bcfg\.([a-z_][a-z0-9_]*)")
 
 # 违规分类的**固定顺序**，用于打印表头与 `--json` 里的 `by_category` 键序。
@@ -289,7 +297,13 @@ def parse_config_only(text):
     return set(re.findall(r'"([a-z_0-9]+)"', m.group(1))) if m else set()
 
 
-def last_mile(keys, arms, sources, config_only=()):
+def parse_ui_state(text):
+    """从 `config.rs` 里读 `UI_STATE_KEYS`（纯界面状态的键，读者只有设置页自己）。"""
+    m = UI_STATE_DECL.search(text)
+    return set(re.findall(r'"([a-z_0-9]+)"', m.group(1))) if m else set()
+
+
+def last_mile(keys, arms, sources, config_only=(), ui_state=()):
     """每个键：要有**用户入口**（`src/ui/**` 引用它的字段），也要有**行为读者**
     （除 `src/core/config.rs` 与 `src/ui/settings/**` 之外还有地方引用它）。
 
@@ -299,8 +313,12 @@ def last_mile(keys, arms, sources, config_only=()):
 
     `config_only`：`CONFIG_ONLY_KEYS` 里的键（高级用户手改 ini，界面刻意不出现）。
     只豁免"用户入口"，**行为读者照旧必须有**——否则就是"改了没人读"的假数据源。
+
+    `ui_state`：`UI_STATE_KEYS` 里的键（纯界面状态，读者天然只在设置页内）。
+    只豁免"行为读者"这一格，**入口照旧必须有**（`ui_touchpoints_cover_all_keys` 另管）。
     """
     config_only = set(config_only)
+    ui_state = set(ui_state)
     bad = []
     for key in keys:
         fields = arms.get(key) or set()
@@ -325,7 +343,7 @@ def last_mile(keys, arms, sources, config_only=()):
                 f"config_last_mile: 键 `{key}`（字段 {sorted(fields)}）没有用户入口——"
                 "`src/ui/**` 里没有任何一处非注释引用它"
             )
-        if not behavior:
+        if not behavior and key not in ui_state:
             bad.append(
                 f"config_last_mile: 键 `{key}`（字段 {sorted(fields)}）没有行为读者——"
                 "只有设置页自己碰它，改了不影响任何画面或交互（K116 的用户面同族）"
@@ -342,6 +360,7 @@ def detect_last_mile(src_dir, root_dir):
     if not keys:
         return ["config_last_mile: ALL_KEYS 没解析出任何键（词式变了，本查失明）"]
     config_only = parse_config_only(text)
+    ui_state = parse_ui_state(text)
     sources = {}
     for p in sorted(src_dir.rglob("*.rs")):
         rel = p.relative_to(root_dir).as_posix()
@@ -353,7 +372,7 @@ def detect_last_mile(src_dir, root_dir):
                 continue  # 测试桩与注释都不算引用
             prod.append(line)
         sources[rel] = prod
-    return last_mile(keys, arms, sources, config_only)
+    return last_mile(keys, arms, sources, config_only, ui_state)
 
 
 # ── 七查（m123）：第三方补丁的"登记簿章节 ↔ `.3rd` 标记"两问 ──────────────────
@@ -945,6 +964,28 @@ def selftest() -> int:
         last_mile(["alpha"], {"alpha": {"a_flag"}}, {"src/ui/settings/p.rs": ["c.a_flag = y;"]},
                   {"alpha"}) != [],
         "配置专用键仍必须有行为读者（只豁免入口，不豁免'改了得有人读'）",
+    )
+    # 纯界面状态键（m243）：`ui_cards` 这类"设置页自身的显示状态"，行为读者天然只在
+    # 设置页里。豁免的**只有**"行为读者"这一格——入口照旧必须有，名单外的键照旧要报。
+    expect(
+        parse_ui_state('pub const UI_STATE_KEYS: [&str; 1] = [\n    "ui_cards",\n];')
+        == {"ui_cards"},
+        "UI_STATE_KEYS 没解析出来（本查会失明）",
+    )
+    expect(
+        last_mile(["alpha"], {"alpha": {"a_flag"}},
+                  {"src/ui/settings/p.rs": ["h.card(c.a_flag).set(x);"]},
+                  (), {"alpha"}) == [],
+        "纯界面状态键：读者只在设置页里，不该报'没有行为读者'",
+    )
+    expect(
+        last_mile(["beta"], {"beta": {"b_mode"}}, {"src/ui/settings/p.rs": ["c.b_mode = y;"]},
+                  (), {"alpha"}) != [],
+        "不在 UI_STATE_KEYS 里的键，照样必须有行为读者（名单不是全域豁免）",
+    )
+    expect(
+        last_mile(["alpha"], {"alpha": {"a_flag"}}, {}, (), {"alpha"}) != [],
+        "纯界面状态键仍然必须有用户入口（豁免的只有行为读者那一格）",
     )
 
     # patch_parity —— 七查两问：缺标记 / 无落点豁免 / 孤儿标记，各证一次。

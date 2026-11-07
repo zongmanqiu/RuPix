@@ -87,6 +87,67 @@ const _: () = assert!(
 /// 打开中的设置窗信号句柄。
 pub type Hub = Rc<RefCell<Option<Handles>>>;
 
+/// 设置页的一张**可折叠卡片**——它在 `ui_cards` 键里的身份（m243）。
+///
+/// 为什么收成枚举而不是散着写字符串：卡 id 是 ini 里的一等公民（用户能手改、跨版本
+/// 读回），散着写就得在「回填」和「收集」两处各抄一份名单，将来加一张卡漏抄一边就是
+/// 静默半残。这里一处定义、[`Card::ALL`] 一处枚举，两个方向都只能从这张表走。
+///
+/// ★ **顺序即 ini 里的书写顺序**（`sync` 按它收集）。别按字母重排——重排会让同一组
+///   折叠状态在盘上换一种写法（幂等测试盯着这一点）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Card {
+    OptionsAppearance,
+    OptionsWindow,
+    OptionsBrowse,
+    OptionsSystem,
+    KeysKeyboard,
+    KeysMouse,
+    KeysPlugins,
+    DecodersInstalled,
+    DecodersDownload,
+    DecodersPreferred,
+    PluginsInstalled,
+    PluginsAvailable,
+}
+
+impl Card {
+    /// 全部卡片（页序）。加卡只在这里加一行——`ui_cards` 的白名单就是它。
+    pub const ALL: [Card; 12] = [
+        Card::OptionsAppearance,
+        Card::OptionsWindow,
+        Card::OptionsBrowse,
+        Card::OptionsSystem,
+        Card::KeysKeyboard,
+        Card::KeysMouse,
+        Card::KeysPlugins,
+        Card::DecodersInstalled,
+        Card::DecodersDownload,
+        Card::DecodersPreferred,
+        Card::PluginsInstalled,
+        Card::PluginsAvailable,
+    ];
+
+    /// 稳定标识（写进 `ui_cards`，分号分隔）。**改名等于让老用户的折叠状态失效**
+    /// （读回时认不出就按展开处理），所以只在卡片换页时才动它。
+    pub fn id(self) -> &'static str {
+        match self {
+            Card::OptionsAppearance => "options.appearance",
+            Card::OptionsWindow => "options.window",
+            Card::OptionsBrowse => "options.browse",
+            Card::OptionsSystem => "options.system",
+            Card::KeysKeyboard => "keys.keyboard",
+            Card::KeysMouse => "keys.mouse",
+            Card::KeysPlugins => "keys.plugins",
+            Card::DecodersInstalled => "decoders.installed",
+            Card::DecodersDownload => "decoders.download",
+            Card::DecodersPreferred => "decoders.preferred",
+            Card::PluginsInstalled => "plugins.installed",
+            Card::PluginsAvailable => "plugins.available",
+        }
+    }
+}
+
 /// 设置窗全部控件信号的句柄。
 #[derive(Clone, Copy)]
 pub struct Handles {
@@ -181,27 +242,27 @@ pub struct Handles {
     pub ext_count: Signal<usize>,
     /// 「首选解码器」搜索框文本（按扩展名子串过滤，大小写不敏感）。
     pub ext_filter: Signal<String>,
-    /// 「已安装」卡展开态。
+    /// 「已安装」卡展开态（解码器页）。
     pub card_installed: Signal<bool>,
-    /// 「可下载」卡展开态（默认收起：今天它是空的）。
+    /// 「可下载」卡展开态（解码器页）。
     pub card_download: Signal<bool>,
     /// 「首选解码器」卡展开态。
     pub card_preferred: Signal<bool>,
     /// 快捷键页「键盘快捷键」卡展开态（29 行键位，默认展开——它是这一页的主角）。
     pub card_keys: Signal<bool>,
-    /// 快捷键页「鼠标快捷键」卡展开态（三档下拉，默认展开）。
+    /// 快捷键页「鼠标快捷键」卡展开态（三档下拉）。
     pub card_mouse: Signal<bool>,
     /// 「插件快捷键」卡（第三张，2026-10-31 用户点名）。
     pub card_plugins: Signal<bool>,
     /// 「选项」页四张卡的展开态（m224）：外观 / 窗口 / 看图与操作 / 系统与网络。
-    ///
-    /// ★ 与上面六张一样是**会话态**：默认全展开、关窗即忘、不写 ini。
-    ///   `docs/待办.md` m168 记着「展开态落盘、默认全收、一个 `ui_cards` 键」尚未开工；
-    ///   真要做时这十张卡得一起定，别只给新加的四张单独落盘。
     pub card_appearance: Signal<bool>,
     pub card_window: Signal<bool>,
     pub card_browse: Signal<bool>,
     pub card_system: Signal<bool>,
+    /// 「插件」页两张卡的展开态（m243；此前是 `extensions_page` 函数内的**局部信号**，
+    /// 页面一重建就弹回展开——那本身就是个缺陷，不只是"没落盘"）。
+    pub card_ext_installed: Signal<bool>,
+    pub card_ext_available: Signal<bool>,
 }
 
 /// 解析「固定尺寸 (宽, 高)」组合输入（`,`／`，`／`x`／`×` 皆可作分隔，宽松容错）。
@@ -215,6 +276,27 @@ fn parse_win_size(s: &str) -> Option<(u32, u32)> {
 }
 
 impl Handles {
+    /// 取某张卡的展开信号（[`Card`] 与字段的一一对应只在这里写一遍）。
+    ///
+    /// 有了它，`push`（配置 → 界面）与 `sync`（界面 → 配置）都是**按 [`Card::ALL`]
+    /// 走一遍循环**，将来加卡只改枚举，不动这两个函数。
+    pub fn card(&self, c: Card) -> Signal<bool> {
+        match c {
+            Card::OptionsAppearance => self.card_appearance,
+            Card::OptionsWindow => self.card_window,
+            Card::OptionsBrowse => self.card_browse,
+            Card::OptionsSystem => self.card_system,
+            Card::KeysKeyboard => self.card_keys,
+            Card::KeysMouse => self.card_mouse,
+            Card::KeysPlugins => self.card_plugins,
+            Card::DecodersInstalled => self.card_installed,
+            Card::DecodersDownload => self.card_download,
+            Card::DecodersPreferred => self.card_preferred,
+            Card::PluginsInstalled => self.card_ext_installed,
+            Card::PluginsAvailable => self.card_ext_available,
+        }
+    }
+
     pub fn sync(&self, c: &mut Config) -> bool {
         let mut dirty = false;
         let set = |dirty: &mut bool, slot: &mut bool, v: bool| {
@@ -348,6 +430,37 @@ impl Handles {
                 self.remote_recompute();
             }
         }
+        // ini 键：ui_cards（设置页各张卡的**收起**列表，分号分隔；空 = 全部展开）。
+        //
+        // 存"收起的"而不是"展开的"：卡片会随版本增删，存展开集就得替每一枚新卡决定
+        // 一个默认值；存收起集意味着**新卡天然是展开的**，老用户的 ini 里没有它就不收。
+        //
+        // 快路径零分配（本函数每帧都在跑）：先按 `Card::ALL` 逐项与盘上列表对位比较，
+        // 只有真的不一样才去构造 `Vec<String>`。全部展开时两者都是空，一次比较就过。
+        let mut same = true;
+        let mut idx = 0usize;
+        for card in Card::ALL {
+            if !self.card(card).get() {
+                if c.ui_cards_expanded.get(idx).map(String::as_str) != Some(card.id()) {
+                    same = false;
+                    break;
+                }
+                idx += 1;
+            }
+        }
+        if same && idx != c.ui_cards_expanded.len() {
+            same = false;
+        }
+        if !same {
+            let mut collapsed = Vec::new();
+            for card in Card::ALL {
+                if !self.card(card).get() {
+                    collapsed.push(card.id().to_string());
+                }
+            }
+            c.ui_cards_expanded = collapsed;
+            dirty = true;
+        }
         // ★ 落盘标记放在**所有**差分之后：它原先是夹在 `preferred_dirty` 那段前面，
         //   之后才补进来的来源差分只把 `dirty` 置真、走不到那次 `mark_dirty()`。
         //   凡在本函数尾部新增差分，这条 `if` 都必须留在最后一行。
@@ -397,6 +510,12 @@ impl Handles {
         put_b(&self.allow_multiple, c.allow_multiple);
         if self.opacity.get() != opacity_to_slider(c.opacity) {
             self.opacity.set(opacity_to_slider(c.opacity));
+        }
+        // 卡片展开态（ini 键 ui_cards）：盘上存的是**收起**的 id，命中就收起；
+        // ini 里没提到的卡 = 展开。只在值不同时写信号——否则每帧 `push` 都会标脏。
+        for card in Card::ALL {
+            let collapsed = c.ui_cards_expanded.iter().any(|x| x == card.id());
+            put_b(&self.card(card), !collapsed);
         }
     }
 
@@ -680,6 +799,9 @@ pub(crate) fn settings_window(config: &Rc<RefCell<Config>>, hub: &Hub) -> Window
         let remote_state: Signal<String> = signal(String::new());
         let (remote_filter, remote_view, remote_status) = remote_signals(remote, remote_state);
         let plugin = PluginUi::new(&c);
+        // 卡片展开态初始值：直接读 ini 里那组"收起的卡"，别先全展开再等 `push` 收敛
+        // （开窗那一帧会闪一下十张卡全摊开的样子）。
+        let expanded = |card: Card| !c.ui_cards_expanded.iter().any(|x| x == card.id());
         let h = Handles {
             stay: sig(c.stay_on_top),
             minimal_mode: sig(c.minimal_mode),
@@ -716,18 +838,19 @@ pub(crate) fn settings_window(config: &Rc<RefCell<Config>>, hub: &Hub) -> Window
             ext_view,
             ext_count: signal(0),
             ext_filter,
-            // 三张卡的初始展开态：有内容的两张开、空的那张收起（不摊开一页空白）。
-            card_installed: sig(true),
-            card_download: sig(true),
-            card_preferred: sig(true),
-            card_keys: sig(true),
-            card_mouse: sig(true),
-            card_plugins: sig(true),
-            card_appearance: sig(true),
-            card_window: sig(true),
-            card_browse: sig(true),
-            card_system: sig(true),
-
+            // 各张卡的初始展开态：按 ini 里那组"收起的卡"（空 = 全部展开）。
+            card_installed: sig(expanded(Card::DecodersInstalled)),
+            card_download: sig(expanded(Card::DecodersDownload)),
+            card_preferred: sig(expanded(Card::DecodersPreferred)),
+            card_keys: sig(expanded(Card::KeysKeyboard)),
+            card_mouse: sig(expanded(Card::KeysMouse)),
+            card_plugins: sig(expanded(Card::KeysPlugins)),
+            card_appearance: sig(expanded(Card::OptionsAppearance)),
+            card_window: sig(expanded(Card::OptionsWindow)),
+            card_browse: sig(expanded(Card::OptionsBrowse)),
+            card_system: sig(expanded(Card::OptionsSystem)),
+            card_ext_installed: sig(expanded(Card::PluginsInstalled)),
+            card_ext_available: sig(expanded(Card::PluginsAvailable)),
             ui_theme: signal(c.ui_theme.ui_index()),
             download_source: signal(c.download_source.ui_index()),
         };
@@ -864,7 +987,7 @@ pub(crate) fn settings_window(config: &Rc<RefCell<Config>>, hub: &Hub) -> Window
                 options_page(&h),
                 shortcuts_page(&h, config.clone(), capturing, texts),
                 decoders_page(&h, config.clone()),
-                extensions_page(&config, &h.plugin),
+                extensions_page(&config, &h),
                 about_page(),
             ];
             let mut stack = Element::stack().fill().weight(1.0);
@@ -949,11 +1072,14 @@ pub fn open_settings(ctx: &mut EventCtx, config: &Rc<RefCell<Config>>, hub: &Hub
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// 布局用例共用的一套信号：取值与真实配置无关，只用来把整页的 widget 树建出来。
-    fn test_handles() -> Handles {
+    ///
+    /// `pub(crate)`：`extensions_tab` 的页面构建用例也要一套（插件页的卡片展开态
+    /// 自 m243 起挂在 `Handles` 上，不再能只靠 `PluginUi` 把页建出来）。
+    pub(crate) fn test_handles() -> Handles {
         let (ext_rows_all, ext_filter, ext_view) = decode_signals();
         Handles {
             stay: sig(false),
@@ -1000,10 +1126,53 @@ mod tests {
             card_window: sig(true),
             card_browse: sig(true),
             card_system: sig(true),
+            card_ext_installed: sig(true),
+            card_ext_available: sig(true),
             ui_theme: signal(0),
             download_source: signal(0),
             plugin: PluginUi::new(&Config::default()),
         }
+    }
+
+    /// 设置页卡片的展开态落盘（m243）：界面 → 配置按 [`Card::id`] 收集，配置 → 界面按
+    /// 同一张表回填。两向合起来才是用户要的"关窗再开还是刚才那样"。
+    #[test]
+    fn card_states_round_trip_through_config() {
+        let h = test_handles();
+        let mut c = Config::default();
+        // 出厂状态：全展开 ⇒ 盘上那串是空的（一个 id 都不写）。
+        h.sync(&mut c);
+        assert!(c.ui_cards_expanded.is_empty(), "默认不该有收起的卡");
+        // 收起两张，**故意选不同页**：枚举与字段要是按位置瞎对，这四行会串页。
+        h.card(Card::OptionsWindow).set(false);
+        h.card(Card::PluginsAvailable).set(false);
+        h.sync(&mut c);
+        assert_eq!(
+            c.ui_cards_expanded,
+            vec![
+                "options.window".to_string(),
+                "plugins.available".to_string()
+            ],
+            "收起集必须按 Card::ALL 的顺序落进 ui_cards"
+        );
+        // 再跑一帧不许重复标脏——`sync` 是每帧轮询，标脏就是每帧重绘 + 每帧落盘。
+        assert!(!h.sync(&mut c), "状态没变时 sync 不许标脏");
+        // 配置 → 界面：换一套信号模拟"关窗再开"，`push` 得把那两张重新收起来。
+        let h2 = test_handles();
+        h2.push(&c);
+        assert!(
+            !h2.card(Card::OptionsWindow).get(),
+            "重开设置页时 options.window 应仍是收起"
+        );
+        assert!(!h2.card(Card::PluginsAvailable).get());
+        assert!(h2.card(Card::KeysMouse).get(), "没被收起的卡必须展开");
+        // ini 里那串清掉（用户手删 / 全部展开）⇒ 下一次 push 全部恢复展开。
+        c.ui_cards_expanded.clear();
+        h2.push(&c);
+        assert!(
+            h2.card(Card::OptionsWindow).get(),
+            "ui_cards 清空后所有卡都该展开"
+        );
     }
 
     #[test]
@@ -1094,7 +1263,7 @@ mod tests {
             options_page(&h),
             shortcuts_page(&h, config.clone(), capturing, texts),
             decoders_page(&h, config.clone()),
-            extensions_page(&config, &h.plugin),
+            extensions_page(&config, &h),
             about_page(),
         ];
         let mut stack = Element::stack().fill().weight(1.0);

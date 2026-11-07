@@ -232,10 +232,12 @@ fn mark_installed(list: &mut [AvailablePlugin], installed: &[Extension]) {
 }
 
 /// 「插件」页。
-pub fn extensions_page(config: &Rc<RefCell<Config>>, ui: &PluginUi) -> Element {
-    let ui = *ui;
-    let card_installed = signal(true);
-    let card_available = signal(true);
+///
+/// ★ 两张卡的展开态挂在 [`Handles`] 上（m243）：此前这里是两个**函数内的局部信号**，
+///   内容闭包一重建就弹回展开——那不只是"没落盘"，是把状态放在了活不过一次重绘的地方。
+///   落盘（`ui_cards` 键）与"状态住在 `Handles` 上"是同一件事的两半，缺一不可。
+pub fn extensions_page(config: &Rc<RefCell<Config>>, h: &Handles) -> Element {
+    let ui = h.plugin;
     Element::scroll()
         .fill()
         .padding_xy(16, PAGE_TOP_MARGIN)
@@ -245,12 +247,12 @@ pub fn extensions_page(config: &Rc<RefCell<Config>>, ui: &PluginUi) -> Element {
                 .spacing(GAP)
                 .child(section_card(
                     "已安装",
-                    card_installed,
+                    h.card_ext_installed,
                     installed_body(config, ui),
                 ))
                 .child(section_card(
                     "可下载",
-                    card_available,
+                    h.card_ext_available,
                     available_body(config, ui),
                 )),
         )
@@ -1002,8 +1004,9 @@ mod tests {
     #[test]
     fn page_builds_without_panicking() {
         let cfg = Rc::new(RefCell::new(Config::default()));
-        let ui = PluginUi::new(&cfg.borrow());
-        let _ = extensions_page(&cfg, &ui);
+        // 卡片展开态自 m243 起挂在 `Handles` 上（不再有页面局部信号），所以这里要一套。
+        let h = crate::ui::settings::tests::test_handles();
+        let _ = extensions_page(&cfg, &h);
     }
 
     /// 行尾两颗小按钮（「!」详情 / 设置齿轮）必须是**同一个盒子**。
