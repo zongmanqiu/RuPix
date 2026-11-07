@@ -297,7 +297,8 @@ impl ImageCache {
 /// 8 MP 整图每帧重算会卡住拖动，而显示档在适应窗口时通常不到 2 MP；查表版变换
 /// 又比逐像素除法快一个量级。原图档放大到 100% 以上时才等于整图，那时一帧仍只算一次。
 struct TintCache {
-    key: Option<(u64, [i32; 6])>,
+    /// (显示档 gen, 六个 gain/bias, Gamma)。三个都相同才复用上一帧的位图。
+    key: Option<(u64, [i32; 6], i32)>,
     img: Option<RgbaImage>,
     upload: ImageCache,
 }
@@ -321,15 +322,16 @@ impl TintCache {
         }
     }
 
-    fn obtain(&mut self, src: &RgbaImage, v: [i32; 6]) -> Option<&Image> {
-        if self.key != Some((src.gen, v)) {
-            let px = crate::core::pixels::channel_linear_lut(
+    fn obtain(&mut self, src: &RgbaImage, v: [i32; 6], gamma: i32) -> Option<&Image> {
+        if self.key != Some((src.gen, v, gamma)) {
+            let px = crate::core::pixels::channel_gamma_lut(
                 &src.rgba,
                 [v[0], v[1], v[2]],
                 [v[3], v[4], v[5]],
+                gamma,
             );
             self.img = Some(RgbaImage::new(src.width, src.height, px));
-            self.key = Some((src.gen, v));
+            self.key = Some((src.gen, v, gamma));
         }
         let img = self.img.as_ref()?;
         self.upload.obtain(img)
@@ -419,10 +421,11 @@ fn edit_actions(
             .get()
             .filter(|t| !t.is_neutral() && edit.path == t.path);
         let out = match t {
-            Some(t) => Arc::new(crate::core::pixels::channel_linear_lut(
+            Some(t) => Arc::new(crate::core::pixels::channel_gamma_lut(
                 rgba.as_slice(),
                 t.gain(),
                 t.bias(),
+                t.gamma(),
             )),
             None => rgba,
         };
@@ -969,13 +972,16 @@ impl ImageCanvas {
         // ★ 整图**每次建菜单只取一份**，不在下面那个 for 里取：旋转过之后
         //   `whole_image_for_plugin` 要做一次整图像素变换（上限档就是 32 MB），
         //   装在循环里就是"有几枚插件转几遍"——m166 第零格埋的下，这一格收回来。
-        //   取不到（切片态 / 屏上没图 / 超上限）就是 `None`：命令型照旧只发路径，
-        //   编辑型那一项变灰。上限判据在 `pixels_within_limit`，不在这里再写一遍乘式。
-        let whole = self
-            .viewer
-            .borrow()
-            .whole_image_for_plugin()
-            .filter(|x| crate::extensions::run::pixels_within_limit(x.width, x.height));
+        //   取不到（切片态 / 屏上没图）就是 `None`：命令型照旧只发路径，
+        //   编辑型那一项变灰。
+        //
+        // ★ **这里不许过 8 MP 闸**（2026-11-07 用户报的 4080×4080 3FR 分析不了）：
+        //   "能不能送"的判据只在 `pixels_to_send`，命令型超上限还有抽样那条腿
+        //   （声明了 `image.sampled` 就发抽好的）。在菜单上先滤一道，等于把抽样
+        //   从界面上剪掉——命令型永远收到 `None`，报出来还是「请求里没有整图像素」
+        //   这种指错方向的话（日志里 `reason=no-image`，可图明明就在）。
+        //   编辑型要的"超上限就变灰"由它自己那一支判，见下面的 `edit`。
+        let whole = self.viewer.borrow().whole_image_for_plugin();
         // 另存 / 还原的两份动作只实现一次：右键菜单、运行参数窗、插件热键三条路共用。
         // 参数窗本身不认识 Viewer / Chrome，所以两颗闭包造在这里（见 [`edit_actions`]）。
         let edit_actions: Option<super::plugin_settings::RunActions> = path
@@ -1040,7 +1046,12 @@ impl ImageCanvas {
                     //   4080×4080 这类图整个菜单项灰掉——2026-11-06 用户报的
                     //   「调完就变灰、无法继续调整」正是这道闸错位：整图与上屏位图
                     //   不是一回事，实时调色只吃上屏那一份。
-                    let edit = whole.clone();
+                    // 编辑型**必须**整图、且**必须**在上限内：回写是同尺寸整档，
+                    // 抽样那一套只服务"只读统计"，编辑没有抽样这回事。
+                    let edit = whole
+                        .as_ref()
+                        .filter(|x| crate::extensions::run::pixels_within_limit(x.width, x.height))
+                        .cloned();
                     if !has_live_op && edit.is_none() {
                         // 上限数字从 `EDITOR_MAX_PIXELS` 算，不写死：写死的那一份没有任何
                         // 机器读过，改数时只会留下菜单在撒谎（run.rs 的报错串本来就是算的）。
@@ -1583,7 +1594,7 @@ impl Widget for ImageCanvas {
                 let mut cache = self.main_img.borrow_mut();
                 let mut tinted = self.tint_main.borrow_mut();
                 let shown = if let Some(t) = &live {
-                    tinted.obtain(src, t.values)
+                    tinted.obtain(src, t.values, t.gamma)
                 } else {
                     cache.obtain(src)
                 };
@@ -1686,7 +1697,7 @@ impl Widget for ImageCanvas {
                 let mut cache = self.nav_img.borrow_mut();
                 let mut tinted = self.tint_nav.borrow_mut();
                 let shown = if let Some(t) = &live {
-                    tinted.obtain(src, t.values)
+                    tinted.obtain(src, t.values, t.gamma)
                 } else {
                     cache.obtain(src)
                 };
@@ -2418,10 +2429,9 @@ pub fn handle_key(
             }
             let path = viewer.borrow().current_path();
             // 快捷键拉起的那一路也要能给出整图（与右键菜单同一份判据、同一次变换）。
-            let pixels = viewer
-                .borrow()
-                .whole_image_for_plugin()
-                .filter(|x| crate::extensions::run::pixels_within_limit(x.width, x.height));
+            // ★ 同样**不在这里过 8 MP 闸**：右键菜单那条注释说明了理由，
+            //   判据只在 `pixels_to_send`——两处各滤一道就是两个正本。
+            let pixels = viewer.borrow().whole_image_for_plugin();
             let outcome = {
                 let c = cfg.borrow();
                 crate::extensions::run_by_hotkey(&c, &ki, path, pixels)
@@ -2782,14 +2792,15 @@ fn wasd_dir(a: Action) -> u8 {
 mod tests {
     use super::*;
 
-    /// 显示层调色只在上屏位图 gen 或六个参数变化时才重算一次，不在每帧重扫整图。
+    /// 显示层调色只在上屏位图 gen / 六个参数 / Gamma 变化时才重算一次，不每帧重扫整图。
     #[test]
     fn tint_cache_only_recomputes_on_a_real_change() {
+        use crate::core::pixels::GAMMA_NEUTRAL as G;
         let src = RgbaImage::new(2, 1, vec![0, 10, 200, 255, 100, 50, 20, 128]);
         let v: [i32; 6] = [-100, 100, 100, 255, 0, 0];
         let mut cache = TintCache::new();
-        assert!(cache.obtain(&src, v).is_some());
-        assert_eq!(cache.key, Some((src.gen, v)));
+        assert!(cache.obtain(&src, v, G).is_some());
+        assert_eq!(cache.key, Some((src.gen, v, G)));
         let first = cache.img.as_ref().unwrap();
         assert_eq!(
             &first.rgba[..],
@@ -2798,22 +2809,29 @@ mod tests {
         );
         let gen = first.gen;
 
-        // 同 gen + 同参数：一次都不该重算。
-        assert!(cache.obtain(&src, v).is_some());
+        // 同 gen + 同参数 + 同 Gamma：一次都不该重算。
+        assert!(cache.obtain(&src, v, G).is_some());
         assert_eq!(cache.img.as_ref().unwrap().gen, gen);
 
         // 参数变了：重算，且新像素按新参数来。
         let v2: [i32; 6] = [100, 100, 100, 0, 0, 0];
-        assert!(cache.obtain(&src, v2).is_some());
-        assert_eq!(cache.key, Some((src.gen, v2)));
+        assert!(cache.obtain(&src, v2, G).is_some());
+        assert_eq!(cache.key, Some((src.gen, v2, G)));
         assert_ne!(cache.img.as_ref().unwrap().gen, gen);
         assert_eq!(&cache.img.as_ref().unwrap().rgba[..], &src.rgba[..]);
+
+        // ★ 只动 Gamma 也必须重算，且暗部按曲线抬起来（第七格不能漏进缓存键）。
+        let gen_g = cache.img.as_ref().unwrap().gen;
+        assert!(cache.obtain(&src, v2, 180).is_some());
+        assert_eq!(cache.key, Some((src.gen, v2, 180)));
+        assert_ne!(cache.img.as_ref().unwrap().gen, gen_g);
+        assert_eq!(&cache.img.as_ref().unwrap().rgba[..4], &[0, 42, 223, 255]);
 
         // 源位图换代（翻页/缩放）：同样必须重算。
         let next = RgbaImage::new(2, 1, vec![7, 8, 9, 255, 10, 11, 12, 255]);
         let gen2 = cache.img.as_ref().unwrap().gen;
-        assert!(cache.obtain(&next, v2).is_some());
-        assert_eq!(cache.key, Some((next.gen, v2)));
+        assert!(cache.obtain(&next, v2, 180).is_some());
+        assert_eq!(cache.key, Some((next.gen, v2, 180)));
         assert_ne!(cache.img.as_ref().unwrap().gen, gen2);
     }
 

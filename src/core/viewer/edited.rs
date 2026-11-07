@@ -176,6 +176,7 @@ impl Viewer {
                 width: w,
                 height: h,
                 rgba: l.base_rgba.clone(),
+                natural: l.natural,
                 orient,
             });
         }
@@ -186,6 +187,7 @@ impl Viewer {
             width: dw,
             height: dh,
             rgba: Arc::new(px),
+            natural: l.natural,
             orient,
         })
     }

@@ -78,6 +78,13 @@ impl Kind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Capability {
     ImageRead,
+    /// 接受**抽样**输入：整图超过 [`crate::extensions::run::EDITOR_MAX_PIXELS`] 时，
+    /// 宿主按整数步长等距取点后再发，而不是只发路径。
+    ///
+    /// ★ 必须是**声明制**，不能对 `image.read` 一刀切：条码那类插件在抽样图上
+    /// 窄条被跳掉，只会从"超限"变成"扫不出来"，更误导。只读统计（直方图）才是
+    /// 抽样无损的那一类——它要的是分布，不是每个像素。
+    ImageSampled,
     ImageWrite,
     SelectionRead,
     ClipboardWrite,
@@ -99,6 +106,7 @@ impl Capability {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "image.read" => Some(Self::ImageRead),
+            "image.sampled" => Some(Self::ImageSampled),
             "image.write" => Some(Self::ImageWrite),
             "selection.read" => Some(Self::SelectionRead),
             "clipboard.write" => Some(Self::ClipboardWrite),
@@ -119,6 +127,7 @@ impl Capability {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ImageRead => "image.read",
+            Self::ImageSampled => "image.sampled",
             Self::ImageWrite => "image.write",
             Self::SelectionRead => "selection.read",
             Self::ClipboardWrite => "clipboard.write",
@@ -141,7 +150,7 @@ impl Capability {
     ///
     /// | 类别 | 能力 | 含义 |
     /// |---|---|---|
-    /// | **宿主开通道** | `image.read` `image.write` `clipboard.write` `settings.read` `settings.write` `open.url` `open.file` | 宿主在编排层真的把这个能力接给它：发图、回写图、写剪贴板、读写它的设置区 |
+    /// | **宿主开通道** | `image.read` `image.sampled` `image.write` `clipboard.write` `settings.read` `settings.write` `open.url` `open.file` | 宿主在编排层真的把这个能力接给它：发图（可抽样）、回写图、写剪贴板、读写它的设置区 |
     /// | **仅告知** | `network` `process.spawn` `ui.window` `file.read` `file.write` `selection.read` `ui.panel` | 宿主**没有**对应通道；声明它只是让用户在首次同意页上看见"这个插件会自己干这些事"，出了事宿主不背书也不兜底 |
     ///
     /// 为什么必须分清：能力表早先把 12 项平铺在一张表里，读起来像"宿主都支持"，
@@ -151,6 +160,7 @@ impl Capability {
         matches!(
             self,
             Self::ImageRead
+                | Self::ImageSampled
                 | Self::ImageWrite
                 | Self::ClipboardWrite
                 | Self::SettingsRead
@@ -215,9 +225,14 @@ impl SettingSpec {
 /// （`image.write`）仍由插件在非交互路径上完成。新增 op 要同时给宿主解释器与端到端字节判据。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreviewOp {
-    /// `out = clamp(in * gain/100 + bias)`，R/G/B 各自一组增益与偏置。
+    /// `out = curve(clamp(in * gain/100 + bias))`：R/G/B 各自一组增益与偏置，
+    /// 之后可再叠一条 256 项色调曲线。曲线缺省为恒等（老插件行为不变）。
     ChannelLinear,
 }
+
+/// 色调曲线的中性值（`gamma = 100` ⇒ 指数 1.0 ⇒ 逐字节恒等）。
+/// 单一真源在 `core::pixels`，清单解析层只是转出，别在这里另立常量。
+pub use crate::core::pixels::GAMMA_NEUTRAL;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewSpec {
@@ -226,17 +241,39 @@ pub struct PreviewSpec {
     pub gain_keys: [String; 3],
     /// 三个偏置键在 `settings` 里的 key（顺序 R/G/B）。
     pub bias_keys: [String; 3],
+    /// 可选的第七条滑块（Gamma 曲线）。`None` = 老插件，曲线恒等。
+    pub gamma_key: Option<String>,
 }
 
-/// 一枚声明式滤镜预设：下拉里的取值 → 六个整数（R/G/B 增益、R/G/B 偏置）。
+impl PreviewSpec {
+    /// 实时参数窗要渲染的数值项，顺序即 `LiveTint.values` 的六个槽位；
+    /// 第七项（Gamma）由 [`PreviewSpec::gamma_key`] 单独追加。
+    pub fn value_keys(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self
+            .gain_keys
+            .iter()
+            .chain(self.bias_keys.iter())
+            .map(String::as_str)
+            .collect();
+        if let Some(k) = self.gamma_key.as_deref() {
+            out.push(k);
+        }
+        out
+    }
+}
+
+/// 一枚声明式滤镜预设：下拉里的取值 → 六个整数（R/G/B 增益、R/G/B 偏置）
+/// + 一个可选的 Gamma 百分比。
 ///
-/// 预设**不是独立特效**，只是一组写进六条滑块的数值；用户改任一条滑块就回落
+/// 预设**不是独立特效**，只是一组写进滑块的数值；用户改任一条滑块就回落
 /// 「自定义」。这样"反相 = gain -100 / bias 255"这类关系只有一处定义（清单），
 /// 宿主和插件都不必各自维护一张名字表。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresetSpec {
     pub value: String,
     pub values: [i32; 6],
+    /// 100 = 恒等曲线；清单省略 `gamma` 时取 100。
+    pub gamma: i32,
 }
 
 /// 解析 `presets`（加法式字段，缺省 = 没有预设表）。
@@ -312,9 +349,36 @@ fn parse_presets(
                 values[ci * 3 + i] = num;
             }
         }
+        // 可选的第七个数：Gamma 曲线。清单省略 = 100（恒等），老预设一字不改。
+        let gamma = match body.get("gamma") {
+            None | Some(Value::Null) => GAMMA_NEUTRAL,
+            Some(v) => {
+                let num = v
+                    .as_i64()
+                    .ok_or_else(|| format!("presets.{name}.gamma 必须是整数"))?;
+                let num =
+                    i32::try_from(num).map_err(|_| format!("presets.{name}.gamma 超出 i32"))?;
+                let key = spec
+                    .gamma_key
+                    .as_deref()
+                    .ok_or_else(|| format!("presets.{name}.gamma 需要 preview.gamma 声明"))?;
+                let (lo, hi) = settings
+                    .iter()
+                    .find(|s| s.key == key)
+                    .and_then(|s| s.range)
+                    .ok_or_else(|| format!("presets: `{key}` 必须是带 min/max 的滑块"))?;
+                if !(lo..=hi).contains(&(num as i64)) {
+                    return Err(format!(
+                        "presets.{name}.gamma={num} 越出滑块范围 {lo}..={hi}"
+                    ));
+                }
+                num
+            }
+        };
         out.push(PresetSpec {
             value: name.clone(),
             values,
+            gamma,
         });
     }
     Ok(out)
@@ -356,10 +420,29 @@ fn parse_preview(root: &Value, settings: &[SettingSpec]) -> Result<Option<Previe
         }
         Ok(out)
     };
+    // 可选的第七条滑块：`preview.gamma` 是**一个**键名（不是数组），必须指向
+    // 带 min/max 的 int。老清单没有这一格 ⇒ None ⇒ 曲线恒等，行为一字不变。
+    let gamma_key = match p.get("gamma") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let k = v
+                .as_str()
+                .ok_or_else(|| "preview.gamma 必须是单个键名".to_string())?;
+            let s = settings
+                .iter()
+                .find(|s| s.key == k)
+                .ok_or_else(|| format!("preview.gamma=\"{k}\" 不在 settings 里"))?;
+            if s.kind != SettingKind::Int || s.range.is_none() {
+                return Err(format!("preview.gamma=\"{k}\" 必须是带 min/max 的 int"));
+            }
+            Some(k.to_string())
+        }
+    };
     Ok(Some(PreviewSpec {
         op: PreviewOp::ChannelLinear,
         gain_keys: keys("gain")?,
         bias_keys: keys("bias")?,
+        gamma_key,
     }))
 }
 
@@ -762,12 +845,11 @@ impl Manifest {
     pub fn live_param_keys(&self) -> Option<Vec<String>> {
         let preview = self.preview.as_ref()?;
         let mut keys: Vec<String> = preview
-            .gain_keys
-            .iter()
-            .chain(preview.bias_keys.iter())
-            .cloned()
+            .value_keys()
+            .into_iter()
+            .map(str::to_string)
             .collect();
-        // 预设下拉与六个数值是同一次编辑的入口，参数窗要一起显示。判据与 UI 建同步器
+        // 预设下拉与数值是同一次编辑的入口，参数窗要一起显示。判据与 UI 建同步器
         // 那一处相同（第一个 choice 项）：两处若各挑各的，预设会掉进设置窗。
         if let Some(choice) = self.settings.iter().find(|s| s.kind == SettingKind::Choice) {
             keys.push(choice.key.clone());
@@ -1111,7 +1193,7 @@ mod tests {
         assert!(Manifest::parse(&bad).is_err());
     }
 
-    /// 能力表分层：宿主**真的**提供通道的能力只有五项，其余只是"告知用户"。
+    /// 能力表分层：宿主**真的**提供通道的能力只有这几项，其余只是"告知用户"。
     ///
     /// 这条是能力表的诚实性锚：插件作者必须分得清"声明了就有"与"声明了只是告知"。
     #[test]
@@ -1119,6 +1201,7 @@ mod tests {
         use Capability::*;
         for c in [
             ImageRead,
+            ImageSampled,
             ImageWrite,
             ClipboardWrite,
             SettingsRead,
@@ -1447,6 +1530,68 @@ mod preview_spec_tests {
         assert_eq!(p.op, PreviewOp::ChannelLinear);
         assert_eq!(p.gain_keys, ["g0", "g1", "g2"]);
         assert_eq!(p.bias_keys, ["b0", "b1", "b2"]);
+        // 老清单没有第七格：曲线恒等，参数窗仍是六个数值 + 预设。
+        assert_eq!(p.gamma_key, None);
+        assert_eq!(p.value_keys().len(), 6);
+    }
+
+    /// 一份带第七格 Gamma 的清单（加法式字段，老清单逐字不变）。
+    const GAMMA_MANIFEST: &str = r#","settings":[
+        {"key":"preset","label":"预设","type":"choice",
+         "choices":["custom","invert","shadow"],"labels":["自定义","反相","暗部补偿"]},
+        {"key":"g0","label":"G0","type":"int","min":-400,"max":400,"default":"100"},
+        {"key":"g1","label":"G1","type":"int","min":-400,"max":400,"default":"100"},
+        {"key":"g2","label":"G2","type":"int","min":-400,"max":400,"default":"100"},
+        {"key":"b0","label":"B0","type":"int","min":-255,"max":255,"default":"0"},
+        {"key":"b1","label":"B1","type":"int","min":-255,"max":255,"default":"0"},
+        {"key":"b2","label":"B2","type":"int","min":-255,"max":255,"default":"0"},
+        {"key":"gm","label":"Gamma","type":"int","min":30,"max":300,"default":"100"}
+    ],"preview":{"op":"channel-linear","gain":["g0","g1","g2"],
+                 "bias":["b0","b1","b2"],"gamma":"gm"},
+    "presets":{"invert":{"gain":[-100,-100,-100],"bias":[255,255,255]},
+               "shadow":{"gain":[100,100,100],"bias":[0,0,0],"gamma":180}}"#;
+
+    #[test]
+    fn gamma_is_the_optional_seventh_slider() {
+        let m = Manifest::parse(&base(GAMMA_MANIFEST)).expect("valid");
+        let p = m.preview.clone().expect("preview parsed");
+        assert_eq!(p.gamma_key.as_deref(), Some("gm"));
+        assert_eq!(p.value_keys(), ["g0", "g1", "g2", "b0", "b1", "b2", "gm"]);
+        let live = m.live_param_keys().expect("live keys");
+        assert!(
+            live.contains(&"gm".to_string()),
+            "第七格要进参数窗，不能掉进齿轮"
+        );
+        assert_eq!(live.len(), 8, "七个数值 + 预设下拉");
+
+        // 老预设省略 gamma ⇒ 100；新预设写明 180。
+        let inv = m.presets.iter().find(|x| x.value == "invert").unwrap();
+        assert_eq!(inv.gamma, GAMMA_NEUTRAL);
+        let shadow = m.presets.iter().find(|x| x.value == "shadow").unwrap();
+        assert_eq!(shadow.gamma, 180);
+        assert_eq!(shadow.values, crate::core::pixels::CHANNEL_NEUTRAL);
+    }
+
+    #[test]
+    fn gamma_declarations_reject_bad_keys_and_out_of_range_values() {
+        // 键不在 settings / 不是带 min/max 的 int / 写成数组，三种都要在解析期拒绝。
+        let bad_key = GAMMA_MANIFEST.replace("\"gamma\":\"gm\"", "\"gamma\":\"nope\"");
+        assert!(Manifest::parse(&base(&bad_key)).is_err());
+        let bad_type = GAMMA_MANIFEST.replace("\"gamma\":\"gm\"", "\"gamma\":\"txt\"");
+        let with_txt = bad_type.replace(
+            r#"{"key":"gm","label":"Gamma","type":"int","min":30,"max":300,"default":"100"}"#,
+            r#"{"key":"gm","label":"Gamma","type":"int","min":30,"max":300,"default":"100"},
+               {"key":"txt","label":"T","type":"int","default":"7"}"#,
+        );
+        assert!(Manifest::parse(&base(
+            &with_txt.replace("\"gamma\":\"gm\"", "\"gamma\":\"txt\"")
+        ))
+        .is_err());
+        let bad_shape = GAMMA_MANIFEST.replace("\"gamma\":\"gm\"", "\"gamma\":[\"gm\"]");
+        assert!(Manifest::parse(&base(&bad_shape)).is_err());
+        // 预设把 Gamma 推到滑块界外也要拒绝。
+        let bad_range = GAMMA_MANIFEST.replace("\"gamma\":180", "\"gamma\":9999");
+        assert!(Manifest::parse(&base(&bad_range)).is_err());
     }
 
     fn preset_base(extra: &str) -> String {

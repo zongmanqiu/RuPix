@@ -146,11 +146,14 @@ pub struct LiveTint {
     pub path: PathBuf,
     /// R/G/B 增益、R/G/B 偏置（顺序与 manifest `preview` 的六个键一致）。
     pub values: [i32; 6],
+    /// 第七条滑块：Gamma 曲线（100 = 恒等）。老插件没有这一格，恒取 100。
+    pub gamma: i32,
 }
 
 impl LiveTint {
     pub fn is_neutral(&self) -> bool {
         self.values == crate::core::pixels::CHANNEL_NEUTRAL
+            && self.gamma == crate::core::pixels::GAMMA_NEUTRAL
     }
 
     pub fn gain(&self) -> [i32; 3] {
@@ -159,6 +162,10 @@ impl LiveTint {
 
     pub fn bias(&self) -> [i32; 3] {
         [self.values[3], self.values[4], self.values[5]]
+    }
+
+    pub fn gamma(&self) -> i32 {
+        self.gamma
     }
 }
 
@@ -192,12 +199,14 @@ impl Default for LiveState {
 /// 下拉预设和「还原」都不是滑块事件。`LiveSlider::paint` 每次整窗重绘都会
 /// 跑到这里，用两组 `Cell` 判"这次是谁改的"，避免来回写打乒乓。
 struct SyncState {
-    norms: [Signal<f32>; 6],
-    ranges: [(i64, i64); 6],
+    /// 前六格是 gain/bias，第七格是 Gamma。老清单没有第七格：
+    /// `ranges[6] = (100, 100)` 让它恒等，不参与任何插值。
+    norms: [Signal<f32>; 7],
+    ranges: [(i64, i64); 7],
     preset_idx: Signal<usize>,
     custom_idx: usize,
-    /// (choice 下标, 六个整数)。`custom` 不在表里 = 保留用户自己拖出来的值。
-    presets: Vec<(usize, [i32; 6])>,
+    /// (choice 下标, 六个整数, Gamma)。`custom` 不在表里 = 保留用户自己拖出来的值。
+    presets: Vec<(usize, [i32; 6], i32)>,
     state: LiveState,
     path: PathBuf,
     reset_seen: Cell<u64>,
@@ -205,32 +214,43 @@ struct SyncState {
 }
 
 impl SyncState {
-    fn values(&self) -> [i32; 6] {
-        let mut out = [0i32; 6];
-        for (i, slot) in out.iter_mut().enumerate() {
-            let (lo, hi) = self.ranges[i];
-            let n = (lo as f32 + self.norms[i].get() * (hi - lo) as f32).round() as i64;
-            *slot = n.clamp(lo, hi) as i32;
-        }
-        out
+    fn slot_value(&self, i: usize) -> i32 {
+        let (lo, hi) = self.ranges[i];
+        let n = (lo as f32 + self.norms[i].get() * (hi - lo) as f32).round() as i64;
+        n.clamp(lo, hi) as i32
     }
 
-    fn set_values(&self, v: [i32; 6]) {
-        for (i, want) in v.iter().enumerate() {
+    fn values(&self) -> ([i32; 6], i32) {
+        let mut out = [0i32; 6];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = self.slot_value(i);
+        }
+        (out, self.slot_value(6))
+    }
+
+    fn set_values(&self, v: [i32; 6], gamma: i32) {
+        let all = [v[0], v[1], v[2], v[3], v[4], v[5], gamma];
+        for (i, want) in all.iter().enumerate() {
             let (lo, hi) = self.ranges[i];
+            // 无 Gamma 的那条老清单：零宽范围，别做 0/0 除法喂出 NaN。
+            if hi == lo {
+                self.norms[i].set(0.0);
+                continue;
+            }
             self.norms[i].set(((*want as i64 - lo) as f32 / (hi - lo) as f32).clamp(0.0, 1.0));
         }
     }
 
-    /// 当前六条滑块 → 看图窗。恒等参数直接清成 `None`，一帧都不多算。
+    /// 当前滑块 → 看图窗。恒等参数直接清成 `None`，一帧都不多算。
     fn publish(&self) {
-        let v = self.values();
-        self.state.tint.set(
-            (v != crate::core::pixels::CHANNEL_NEUTRAL).then(|| LiveTint {
-                path: self.path.clone(),
-                values: v,
-            }),
-        );
+        let (v, gamma) = self.values();
+        let neutral = v == crate::core::pixels::CHANNEL_NEUTRAL
+            && gamma == crate::core::pixels::GAMMA_NEUTRAL;
+        self.state.tint.set((!neutral).then(|| LiveTint {
+            path: self.path.clone(),
+            values: v,
+            gamma,
+        }));
     }
 
     /// 用户亲手拖了滑块：预设回落「自定义」，立即上屏。
@@ -245,7 +265,10 @@ impl SyncState {
         let r = self.state.reset.get();
         if r != self.reset_seen.get() {
             self.reset_seen.set(r);
-            self.set_values(crate::core::pixels::CHANNEL_NEUTRAL);
+            self.set_values(
+                crate::core::pixels::CHANNEL_NEUTRAL,
+                crate::core::pixels::GAMMA_NEUTRAL,
+            );
             self.preset_idx.set(self.custom_idx);
             self.last_preset.set(self.custom_idx);
             self.publish();
@@ -254,8 +277,8 @@ impl SyncState {
         let p = self.preset_idx.get();
         if p != self.last_preset.get() {
             self.last_preset.set(p);
-            if let Some((_, v)) = self.presets.iter().find(|(i, _)| *i == p) {
-                self.set_values(*v);
+            if let Some((_, v, g)) = self.presets.iter().find(|(i, _, _)| *i == p) {
+                self.set_values(*v, *g);
                 self.publish();
             }
         }
@@ -318,14 +341,13 @@ fn build_sync(
     path: PathBuf,
 ) -> Option<Rc<SyncState>> {
     let spec = ext.manifest.preview.as_ref()?;
-    let keys: Vec<&str> = spec
-        .gain_keys
-        .iter()
-        .chain(spec.bias_keys.iter())
-        .map(String::as_str)
-        .collect();
-    let mut norms: [Signal<f32>; 6] = std::array::from_fn(|_| signal(0.0f32));
-    let mut ranges = [(0i64, 1i64); 6];
+    // 六个 gain/bias 键 + 可选的第七个 Gamma 键，顺序即 `LiveTint.values` 的槽位。
+    let keys = spec.value_keys();
+    let mut norms: [Signal<f32>; 7] = std::array::from_fn(|_| signal(0.0f32));
+    let mut ranges = [(0i64, 1i64); 7];
+    // 老清单没有 Gamma：零宽范围让第七格恒等于 100，不参与插值。
+    let neutral = crate::core::pixels::GAMMA_NEUTRAL as i64;
+    ranges[6] = (neutral, neutral);
     for (i, key) in keys.iter().enumerate() {
         let idx = specs.iter().position(|s| s.key == *key)?;
         let Bound::Range { norm, lo, hi } = &bounds[idx] else {
@@ -340,7 +362,7 @@ fn build_sync(
         return None;
     };
     let custom_idx = values.iter().position(|v| v == "custom").unwrap_or(0);
-    let presets: Vec<(usize, [i32; 6])> = ext
+    let presets: Vec<(usize, [i32; 6], i32)> = ext
         .manifest
         .presets
         .iter()
@@ -348,7 +370,7 @@ fn build_sync(
             values
                 .iter()
                 .position(|v| v == &p.value)
-                .map(|i| (i, p.values))
+                .map(|i| (i, p.values, p.gamma))
         })
         .collect();
     let last = idx.get();
@@ -456,11 +478,13 @@ fn live_seed(ext: &Extension, tint: Option<&LiveTint>) -> Vec<(String, String)> 
     let Some(preview) = ext.manifest.preview.as_ref() else {
         return out;
     };
-    let values = tint
-        .map(|t| t.values)
-        .unwrap_or(crate::core::pixels::CHANNEL_NEUTRAL);
-    // 预设回填：六个数值正好等于某组预设就报那一组，否则「自定义」。重开窗时下拉
-    // 要说出"现在是哪个滤镜"，一律写自定义等于把用户刚选的东西忘掉。
+    let (values, gamma) = tint.map(|t| (t.values, t.gamma)).unwrap_or((
+        crate::core::pixels::CHANNEL_NEUTRAL,
+        crate::core::pixels::GAMMA_NEUTRAL,
+    ));
+    // 预设回填：六个数值 + Gamma 一起等于某组预设才报那一组，否则「自定义」。
+    // 「暗部补偿」那组的六个数是恒等的，只看六个数会和「原图」撞车。
+    // 重开窗时下拉要说出"现在是哪个滤镜"，一律写自定义等于把用户刚选的东西忘掉。
     if let Some(choice) = ext
         .manifest
         .settings
@@ -478,7 +502,7 @@ fn live_seed(ext: &Extension, tint: Option<&LiveTint>) -> Vec<(String, String)> 
             .manifest
             .presets
             .iter()
-            .find(|p| p.values == values)
+            .find(|p| p.values == values && p.gamma == gamma)
             .map(|p| p.value.clone())
             .unwrap_or(custom);
         out.push((choice.key.clone(), hit));
@@ -488,6 +512,9 @@ fn live_seed(ext: &Extension, tint: Option<&LiveTint>) -> Vec<(String, String)> 
     }
     for (i, key) in preview.bias_keys.iter().enumerate() {
         out.push((key.clone(), values[3 + i].to_string()));
+    }
+    if let Some(key) = preview.gamma_key.as_deref() {
+        out.push((key.to_string(), gamma.to_string()));
     }
     out
 }
@@ -915,10 +942,11 @@ mod tests {
                 (-255, 255),
                 (-255, 255),
                 (-255, 255),
+                (100, 100), // 老清单：第七格恒等
             ],
             preset_idx: signal(0usize),
             custom_idx: 0,
-            presets: vec![(1, [-100, -100, -100, 255, 255, 255])],
+            presets: vec![(1, [-100, -100, -100, 255, 255, 255], 100)],
             state: state.clone(),
             path: PathBuf::from("fixture.png"),
             reset_seen: Cell::new(0),
@@ -932,15 +960,16 @@ mod tests {
         let (sync, state) = test_sync();
         sync.preset_idx.set(1);
         sync.poll();
-        assert_eq!(sync.values(), [-100, -100, -100, 255, 255, 255]);
+        assert_eq!(sync.values().0, [-100, -100, -100, 255, 255, 255]);
         let tint = state.tint.get().expect("非恒等参数要上屏");
         assert_eq!(tint.values, [-100, -100, -100, 255, 255, 255]);
+        assert_eq!(tint.gamma(), 100);
         assert_eq!(tint.path, PathBuf::from("fixture.png"));
         assert_eq!(tint.gain(), [-100, -100, -100]);
         assert_eq!(tint.bias(), [255, 255, 255]);
-        // 同一帧被六个 LiveSlider 各跑一次 poll 也不能重复写。
+        // 同一帧被七条 LiveSlider 各跑一次 poll 也不能重复写。
         sync.poll();
-        assert_eq!(sync.values(), [-100, -100, -100, 255, 255, 255]);
+        assert_eq!(sync.values().0, [-100, -100, -100, 255, 255, 255]);
     }
 
     #[test]
@@ -960,12 +989,13 @@ mod tests {
     #[test]
     fn revert_resets_sliders_and_clears_the_live_tint() {
         let (sync, state) = test_sync();
-        sync.set_values([-100, -100, -100, 255, 255, 255]);
+        sync.set_values([-100, -100, -100, 255, 255, 255], 100);
         sync.publish();
         assert!(state.tint.get().is_some());
         state.reset.set(state.reset.get() + 1);
         sync.poll();
-        assert_eq!(sync.values(), crate::core::pixels::CHANNEL_NEUTRAL);
+        assert_eq!(sync.values().0, crate::core::pixels::CHANNEL_NEUTRAL);
+        assert_eq!(sync.values().1, crate::core::pixels::GAMMA_NEUTRAL);
         assert!(state.tint.get().is_none(), "还原后一帧都不该多算");
         assert_eq!(sync.preset_idx.get(), 0);
     }
@@ -973,14 +1003,59 @@ mod tests {
     #[test]
     fn neutral_parameters_never_publish_a_tint() {
         let (sync, state) = test_sync();
-        sync.set_values(crate::core::pixels::CHANNEL_NEUTRAL);
+        sync.set_values(
+            crate::core::pixels::CHANNEL_NEUTRAL,
+            crate::core::pixels::GAMMA_NEUTRAL,
+        );
         sync.publish();
         assert!(state.tint.get().is_none());
         let t = LiveTint {
             path: PathBuf::from("fixture.png"),
             values: crate::core::pixels::CHANNEL_NEUTRAL,
+            gamma: crate::core::pixels::GAMMA_NEUTRAL,
         };
         assert!(t.is_neutral(), "恒等参数不该被当成一次调色");
+    }
+
+    /// 第七格 Gamma：单独拖动它也要上屏、也要参与预设回填；六数恒等不等于中性。
+    #[test]
+    fn gamma_only_tint_is_not_neutral_and_preset_writes_it_back() {
+        let state = LiveState::new();
+        let sync = Rc::new(SyncState {
+            norms: std::array::from_fn(|_| signal(0.0f32)),
+            ranges: [
+                (-400, 400),
+                (-400, 400),
+                (-400, 400),
+                (-255, 255),
+                (-255, 255),
+                (-255, 255),
+                (30, 300),
+            ],
+            preset_idx: signal(0usize),
+            custom_idx: 0,
+            // 六数恒等 + Gamma 180 = 「暗部补偿」预设；只看六数会误判成「原图」。
+            presets: vec![(1, crate::core::pixels::CHANNEL_NEUTRAL, 180)],
+            state: state.clone(),
+            path: PathBuf::from("fixture.png"),
+            reset_seen: Cell::new(0),
+            last_preset: Cell::new(0),
+        });
+        sync.preset_idx.set(1);
+        sync.poll();
+        let (v, g) = sync.values();
+        assert_eq!(v, crate::core::pixels::CHANNEL_NEUTRAL);
+        assert_eq!(g, 180, "预设必须把第七格也写回滑块");
+        let tint = state.tint.get().expect("Gamma 单独生效也要上屏");
+        assert!(!tint.is_neutral());
+        assert_eq!(tint.gamma(), 180);
+        assert_eq!(tint.values, crate::core::pixels::CHANNEL_NEUTRAL);
+
+        // 还原：六数与 Gamma 一起归位，显示层不留残影。
+        state.reset.set(state.reset.get() + 1);
+        sync.poll();
+        assert_eq!(sync.values().1, crate::core::pixels::GAMMA_NEUTRAL);
+        assert!(state.tint.get().is_none());
     }
 
     /// ★ 用户报「拖动时不实时变、松手才变」的根因判据。
@@ -1044,7 +1119,7 @@ mod tests {
         // 包装组：值一样实时，脏区升整窗，派生数字与看图窗同帧刷新。
         let value = signal(0.0f32);
         let state = LiveState::new();
-        let mut norms: [Signal<f32>; 6] = std::array::from_fn(|_| signal(0.0f32));
+        let mut norms: [Signal<f32>; 7] = std::array::from_fn(|_| signal(0.0f32));
         norms[0] = value;
         let sync = Rc::new(SyncState {
             norms,
@@ -1055,6 +1130,7 @@ mod tests {
                 (-255, 255),
                 (-255, 255),
                 (-255, 255),
+                (100, 100), // 老清单：第七格恒等
             ],
             preset_idx: signal(0usize),
             custom_idx: 0,
@@ -1132,6 +1208,7 @@ mod tests {
         let tint = LiveTint {
             path: PathBuf::from("a.png"),
             values: [-100, -100, -100, 255, 255, 255],
+            gamma: crate::core::pixels::GAMMA_NEUTRAL,
         };
         let seed = live_seed(&ext, Some(&tint));
         assert_eq!(seed[0], ("preset".to_string(), "invert".to_string()));
@@ -1142,6 +1219,7 @@ mod tests {
         let tint = LiveTint {
             path: PathBuf::from("a.png"),
             values: [130, 100, 100, 7, 0, 0],
+            gamma: crate::core::pixels::GAMMA_NEUTRAL,
         };
         let seed = live_seed(&ext, Some(&tint));
         assert_eq!(seed[0], ("preset".to_string(), "custom".to_string()));

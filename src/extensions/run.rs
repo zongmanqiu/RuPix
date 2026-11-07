@@ -47,13 +47,58 @@ pub fn pixels_within_limit(w: u32, h: u32) -> bool {
     w != 0 && h != 0 && (w as u64) * (h as u64) <= EDITOR_MAX_PIXELS
 }
 
-/// 这次调用该不该送像素：**声明了 `image.read` 且整图在上限内**才送。
+/// 这一次真正送出去的像素 + 它与原图的关系（请求里的 `source` / `sample_step` 就读它）。
+pub struct Outgoing {
+    pub px: ForPlugin,
+    /// 每 N 像素取 1 点；`1` = 原样送出（未抽样）。
+    pub step: u32,
+}
+
+/// 这次调用该不该送像素、送**哪一份**。
 ///
-/// 抽出来是因为这条判据带一层边界含义——**能力最小化**：没声明的插件不该收到整图，
-/// 宿主也不该为它写一次最多 32 MB 的映射（"顺手多发点"在这种地方就是越权）。
-/// 超上限同理不发：让插件按自己看得见的信息（路径）决定怎么办，宿主不替它猜。
-fn pixels_to_send(declared: bool, image: Option<ForPlugin>) -> Option<ForPlugin> {
-    image.filter(|px| declared && pixels_within_limit(px.width, px.height))
+/// 判据分三段，顺序不能换：
+/// 1. 没声明 `image.read` ⇒ 一律不发（能力最小化，顺手多发点在这条线上就是越权，
+///    而且那是一次最多 32 MB 的映射写入）；
+/// 2. 整图在 [`EDITOR_MAX_PIXELS`] 内 ⇒ **原样发**，行为与 m166 那天完全一致；
+/// 3. 超上限且声明了 [`crate::core::ext::Capability::ImageSampled`] ⇒ 等距**抽样**后发。
+///
+/// ★ 第 3 段为什么是声明制、而不是对所有命令型放开：条码那类插件在抽样图上窄条被
+///   跳掉，结局从"超限"变成"扫不出来"，**比不发给不出更误导的答案**。抽样只对"要分布、
+///   不要每个像素"的统计型插件成立，这件事只有插件自己知道。
+///
+/// ★ 抽样而不是缩放：面积平均会把 0 混成 3、255 混成 252，暗部/高光溢出的计数随之失真；
+///   等距抽样只挑不混，每个样本都是原图上真实存在的原始字节。
+fn pixels_to_send(
+    declared: bool,
+    accepts_sampled: bool,
+    image: Option<ForPlugin>,
+) -> Option<Outgoing> {
+    let px = image.filter(|_| declared)?;
+    if pixels_within_limit(px.width, px.height) {
+        return Some(Outgoing { px, step: 1 });
+    }
+    if !accepts_sampled {
+        return None;
+    }
+    let step = crate::core::pixels::plugin_sample_step(px.width, px.height, EDITOR_MAX_PIXELS);
+    let (w, h, rgba) = crate::core::pixels::sample_strided(&px.rgba, px.width, px.height, step);
+    // 抽完没有变小 / 抽出了空图 ⇒ 退回"不发"，不发一块假图。
+    if step <= 1
+        || w == 0
+        || h == 0
+        || (w as u64) * (h as u64) >= (px.width as u64) * (px.height as u64)
+    {
+        return None;
+    }
+    Some(Outgoing {
+        px: ForPlugin {
+            width: w,
+            height: h,
+            rgba: Arc::new(rgba),
+            ..px
+        },
+        step,
+    })
 }
 
 /// 一次后台调用的产出。
@@ -200,12 +245,49 @@ fn isolations() -> &'static Mutex<Vec<String>> {
 
 /// 记一次结果：成功清零；取消不计；其余累计，达到 [`STRIKE_LIMIT`] 推入隔离队列。
 /// 返回 = 本次是否触发隔离。
-fn record_outcome(id: &str, ok: bool, cancelled: bool) -> bool {
+/// 一次调用的失败，带一条**要不要记账**的位。
+///
+/// ★ 为什么失败要分类：插件按协议回 `ok:false`（"这图我不处理 / 没有整图"）是**正常答复**，
+///   它的设计就是拒绝，宿主却把它和"崩溃、超时、协议坏"一起记三振，于是连点三次就把一枚
+///   完全健康的插件推进隔离队列——2026-11-07 真机报障的正是这个。`strike=false` 的那一类
+///   只出提示，不动隔离计数。
+pub struct Failure {
+    pub text: String,
+    pub strike: bool,
+}
+
+impl Failure {
+    /// 插件自己的答复（`ok:false`）：说清楚，但不算它坏。
+    fn reported(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            strike: false,
+        }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(text: String) -> Self {
+        Self { text, strike: true }
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            strike: true,
+        }
+    }
+}
+
+/// 记一次结果。`counts=false` 的那类失败**不进三振计数**（插件按协议拒绝，不是它坏了）。
+fn record_outcome(id: &str, ok: bool, cancelled: bool, counts: bool) -> bool {
     if ok {
         lock(strikes()).insert(id.to_string(), 0);
         return false;
     }
-    if cancelled {
+    if cancelled || !counts {
         return false;
     }
     let n = {
@@ -262,6 +344,43 @@ fn gate(ext: &Extension, wants_image: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// 一行定论：这次到底发没发像素、发了多少、为什么没发。
+///
+/// ★ 这是上一轮查案的直接产物：日志里只剩一句「插件连续失败 3 次，已推入隔离队列」，
+///   而"像素根本没发"这件事**没有任何一行记录**——最后只能靠时间线反推。有了这一行，
+///   下一次同类问题在日志的第一眼就能分清「没声明 / 没图 / 超闸没接抽样」。
+fn log_pixels(
+    id: &str,
+    declared: bool,
+    accepts_sampled: bool,
+    had_image: bool,
+    out: Option<&Outgoing>,
+) {
+    match out {
+        Some(o) => log::info!(
+            "[plugin-pixels] id={id} sent={}x{} step={} source={}x{}",
+            o.px.width,
+            o.px.height,
+            o.step,
+            o.px.natural.0,
+            o.px.natural.1
+        ),
+        None => {
+            let reason = if !declared {
+                "no-read"
+            } else if !had_image {
+                "no-image"
+            } else {
+                "over-cap"
+            };
+            log::info!(
+                "[plugin-pixels] id={id} sent=none reason={reason} \
+                 declared={declared} accepts_sampled={accepts_sampled}"
+            );
+        }
+    }
+}
+
 /// 在后台启动一次命令插件调用。立即返回，结果用 [`poll`] 取。
 ///
 /// `image` 是**屏上朝向**的当前整图（[`Viewer::whole_image_for_plugin`] 那一家的返回值，
@@ -278,8 +397,18 @@ pub fn start_command(
         return Err("该插件不是命令型".into());
     }
     gate(&ext, image_path.is_some())?;
-    // 能力最小化 + 上限：判据在 `pixels_to_send`（与编辑型同一条），不在 UI 再抄一遍。
-    let image = pixels_to_send(ext.manifest.has_capability(Capability::ImageRead), image);
+    // 能力最小化 + 上限 + 抽样：判据全在 `pixels_to_send`，不在 UI 再抄一遍。
+    let declared = ext.manifest.has_capability(Capability::ImageRead);
+    let accepts_sampled = ext.manifest.has_capability(Capability::ImageSampled);
+    let had_image = image.is_some();
+    let image = pixels_to_send(declared, accepts_sampled, image);
+    log_pixels(
+        &ext.manifest.id,
+        declared,
+        accepts_sampled,
+        had_image,
+        image.as_ref(),
+    );
     let job = register(&ext.manifest.id)?;
     let name = ext.manifest.name.clone();
     let id = ext.manifest.id.clone();
@@ -373,18 +502,30 @@ fn finish(
     name: String,
     job: &Arc<JobHandle>,
     target: Option<PathBuf>,
-    result: Result<JobOutput, String>,
+    result: Result<JobOutput, Failure>,
 ) {
     deregister(id, job);
-    let isolated_now = record_outcome(id, result.is_ok(), cancelled(job));
+    let counts = result.as_ref().err().map(|f| f.strike).unwrap_or(false);
+    let isolated_now = record_outcome(id, result.is_ok(), cancelled(job), counts);
     if isolated_now {
         log::warn!("插件 {id} 连续失败 {} 次，已推入隔离队列", STRIKE_LIMIT);
+    }
+    if let Err(f) = &result {
+        log::warn!(
+            "插件 {id} 调用失败（{}）：{}",
+            if f.strike {
+                "计入隔离"
+            } else {
+                "设计内拒绝，不记账"
+            },
+            f.text
+        );
     }
     lock(JOBS.get_or_init(|| Mutex::new(Vec::new()))).push(JobOutcome {
         plugin: name,
         id: id.to_string(),
         target,
-        result,
+        result: result.map_err(|f| f.text),
     });
 }
 
@@ -505,9 +646,9 @@ fn run_command(
     ext: &Extension,
     image_path: Option<PathBuf>,
     selection: Option<Selection>,
-    image: Option<ForPlugin>,
+    image: Option<Outgoing>,
     job: &JobHandle,
-) -> Result<JobOutput, String> {
+) -> Result<JobOutput, Failure> {
     let mut req = Request::new(ext.manifest.id.clone(), "run", ext.manifest.protocol);
     // WinRT StorageFile 只接受绝对路径；相对路径按**宿主**当前目录解析（不是插件目录）。
     req.image_path = image_path.map(|p| {
@@ -523,9 +664,12 @@ fn run_command(
     //   拿不到整图（切片态 / 超上限 / 屏上没图）就**照旧只发路径**——不是报错，
     //   老插件（只要路径的那种）行为因此完全是子集。
     let _shm = match image {
-        Some(px) => {
-            let (reference, shm) = publish_image(px.width, px.height, &px.rgba)?;
+        Some(out) => {
+            let (reference, shm) = publish_image(out.px.width, out.px.height, &out.px.rgba)?;
             req.image = Some(reference);
+            // 原图尺寸 + 步长：插件据此算"这份像素覆盖原图多少"，报告才可能诚实。
+            req.source = Some(out.px.natural);
+            req.sample_step = out.step;
             Some(shm)
         }
         None => None,
@@ -589,7 +733,7 @@ fn run_command(
 ///
 /// 交互形态与编辑型一致：**不设响应超时**——用户在插件的设置窗口里待多久都行，
 /// 取消走插件菜单。回传的设置照旧合并落盘（`persist_settings`）。
-fn run_settings(ext: &Extension, job: &JobHandle) -> Result<JobOutput, String> {
+fn run_settings(ext: &Extension, job: &JobHandle) -> Result<JobOutput, Failure> {
     let mut req = Request::new(ext.manifest.id.clone(), "settings", ext.manifest.protocol);
     attach_settings(ext, &mut req);
     let resp = run_action(ext, req, true, job)?;
@@ -608,7 +752,7 @@ fn run_action(
     req: Request,
     interactive: bool,
     job: &JobHandle,
-) -> Result<Response, String> {
+) -> Result<Response, Failure> {
     let pname = pipe_name(&ext.manifest.id);
     let pid = spawn_plugin(ext, &pname, job)?;
     let mut conn = accept_plugin(&pname, pid, job)?;
@@ -637,7 +781,7 @@ fn run_action(
             Ok(r) => r,
             Err(_) => {
                 kill_child(job);
-                return Err("插件响应通道已断".to_string());
+                return Err("插件响应通道已断".into());
             }
         }
     } else {
@@ -649,7 +793,7 @@ fn run_action(
                 return Err(if cancelled(job) {
                     "已取消".into()
                 } else {
-                    format!("插件响应超时（{} 秒）", timeout.as_secs())
+                    format!("插件响应超时（{} 秒）", timeout.as_secs()).into()
                 });
             }
         }
@@ -661,7 +805,7 @@ fn run_action(
             return Err(if cancelled(job) {
                 "已取消".into()
             } else {
-                format!("插件响应无效：{e}")
+                format!("插件响应无效：{e}").into()
             });
         }
     };
@@ -677,7 +821,10 @@ fn run_action(
         return Err("已取消".into());
     }
     if !resp.ok {
-        return Err(resp.error.unwrap_or_else(|| "插件返回失败".into()));
+        // ★ 这是**插件按协议回的答复**，不是它坏了：只出提示，不记三振。
+        return Err(Failure::reported(
+            resp.error.unwrap_or_else(|| "插件返回失败".into()),
+        ));
     }
     Ok(resp)
 }
@@ -710,13 +857,15 @@ fn publish_image(
     Ok((reference, shm))
 }
 
-fn run_editor(ext: &Extension, image: ForPlugin, job: &JobHandle) -> Result<JobOutput, String> {
+fn run_editor(ext: &Extension, image: ForPlugin, job: &JobHandle) -> Result<JobOutput, Failure> {
     let ForPlugin {
         path: image_path,
         width: w,
         height: h,
         rgba,
         orient,
+        // 编辑型**不看** natural：回写必须同尺寸，抽样在那条路上是错的。
+        natural: _,
     } = image;
     // 宿主建可读写映射（P0.1b-1 底座），写进当前解码档的整图像素（屏上朝向那一份）。
     let (reference, _shm) = publish_image(w, h, &rgba)?;
@@ -773,7 +922,7 @@ fn run_editor(ext: &Extension, image: ForPlugin, job: &JobHandle) -> Result<JobO
     // 通道，内层是 worker 的 Result。
     let payload = match rx_resp.recv() {
         Ok(p) => p,
-        Err(_) => return Err("插件响应通道已断".to_string()),
+        Err(_) => return Err("插件响应通道已断".into()),
     };
     let (resp, edited) = match payload {
         Ok(pair) => pair,
@@ -782,7 +931,7 @@ fn run_editor(ext: &Extension, image: ForPlugin, job: &JobHandle) -> Result<JobO
             return Err(if cancelled(job) {
                 "已取消".into()
             } else {
-                format!("插件响应无效：{e}")
+                format!("插件响应无效：{e}").into()
             });
         }
     };
@@ -797,7 +946,9 @@ fn run_editor(ext: &Extension, image: ForPlugin, job: &JobHandle) -> Result<JobO
             return Err(if cancelled(job) {
                 "已取消".into()
             } else {
-                resp.error.unwrap_or_else(|| "编辑型插件未回传图像".into())
+                resp.error
+                    .unwrap_or_else(|| "编辑型插件未回传图像".into())
+                    .into()
             });
         }
     };
@@ -813,7 +964,9 @@ fn run_editor(ext: &Extension, image: ForPlugin, job: &JobHandle) -> Result<JobO
         return Err("已取消".into());
     }
     if !resp.ok {
-        return Err(resp.error.unwrap_or_else(|| "插件返回失败".into()));
+        return Err(Failure::reported(
+            resp.error.unwrap_or_else(|| "插件返回失败".into()),
+        ));
     }
     persist_settings(ext, &resp);
     Ok(JobOutput::Edited {
@@ -919,45 +1072,88 @@ mod tests {
     }
 
     /// 一份只带尺寸的用例整图（`rgba` 留空：分流判据读尺寸不读像素，
-    /// 按尺寸真分配就等于为这条用例拷 32 MB）。
+    /// 按尺寸真分配就等于为每条用例拷 32 MB）。
     fn fixture_pixels(w: u32, h: u32) -> ForPlugin {
         ForPlugin {
             path: PathBuf::from("x.png"),
             width: w,
             height: h,
             rgba: Arc::new(Vec::new()),
+            natural: (w, h),
             orient: (0, false),
         }
     }
 
     /// ★ m166 第一格：命令型也能收像素了，但**送不送只有一条判据**——声明了 `image.read`
     /// 且整图在 [`EDITOR_MAX_PIXELS`] 内。没声明的一律不发（能力最小化：顺手多发点在这条线上
-    /// 就是越权，而且那是一次最多 32 MB 的映射写入）；超上限也不发（宿主不替插件猜它想怎样）。
+    /// 就是越权，而且那是一次最多 32 MB 的映射写入）；超上限且没接抽样也不发（宿主不替插件猜）。
     /// 边界取"正好等于上限"与"多一像素"这一对，只有它们能证明判据用的是 `<=` 不是 `<`。
     #[test]
     fn pixels_go_only_to_declaring_plugins_within_the_cap() {
         let ok = Some(fixture_pixels(2000, 1000));
         assert!(
-            pixels_to_send(true, ok.clone()).is_some(),
+            pixels_to_send(true, false, ok.clone()).is_some(),
             "声明 + 在上限内该送"
         );
         assert!(
-            pixels_to_send(false, ok).is_none(),
-            "没声明 image.read 一律不送"
+            pixels_to_send(false, true, ok).is_none(),
+            "没声明 image.read 一律不送（接了抽样也一样）"
         );
         assert!(
-            pixels_to_send(true, Some(fixture_pixels(4000, 2000))).is_some(),
+            pixels_to_send(true, false, Some(fixture_pixels(4000, 2000))).is_some(),
             "正好 8 MP 该在界内"
         );
         assert!(
-            pixels_to_send(true, Some(fixture_pixels(4000, 2001))).is_none(),
-            "多一像素就该出界"
+            pixels_to_send(true, false, Some(fixture_pixels(4000, 2001))).is_none(),
+            "多一像素且没接抽样 ⇒ 出界不发"
         );
         assert!(
-            pixels_to_send(true, Some(fixture_pixels(0, 4))).is_none(),
+            pixels_to_send(true, false, Some(fixture_pixels(0, 4))).is_none(),
             "0 高不是「当然在上限内」，与编辑型一样当场拒"
         );
-        assert!(pixels_to_send(true, None).is_none(), "屏上没有整图就不发");
+        assert!(
+            pixels_to_send(true, true, Some(fixture_pixels(0, 4))).is_none(),
+            "接了抽样也不是空图的通行证"
+        );
+        assert!(
+            pixels_to_send(true, false, None).is_none(),
+            "屏上没有整图就不发"
+        );
+        // 空像素缓冲（尺寸对、字节没带）抽不出东西 ⇒ 安全降级为不发，而不是发一张空图。
+        assert!(
+            pixels_to_send(true, true, Some(fixture_pixels(4000, 2001))).is_none(),
+            "没有像素字节时抽样救不了"
+        );
+    }
+
+    /// ★ 超上限 + 声明接受抽样 ⇒ 送出去的是**抽样后**的一千万级以下的图，步长 > 1。
+    ///
+    /// 这条用真像素（32 MB）走一遍，因为"抽样是否真的只挑不混"在尺寸判据里看不出来——
+    /// 那是 `core::pixels::sampling_keeps_the_distribution_while_averaging_would_not` 的活。
+    #[test]
+    fn over_cap_pixels_are_sampled_when_the_plugin_accepts_it() {
+        let (w, h) = (4000u32, 2001u32);
+        let px = ForPlugin {
+            path: PathBuf::from("big.png"),
+            width: w,
+            height: h,
+            rgba: Arc::new(vec![9u8; (w * h * 4) as usize]),
+            natural: (w, h),
+            orient: (0, false),
+        };
+        let out = pixels_to_send(true, true, Some(px)).expect("接了抽样就该有图");
+        assert!(out.step > 1, "超 8 MP 必须走抽样");
+        let got = (out.px.width as u64) * (out.px.height as u64);
+        assert!(
+            got <= crate::core::pixels::PLUGIN_SAMPLE_TARGET * 2,
+            "样本量必须落回预算：{got}"
+        );
+        assert_eq!(out.px.natural, (w, h), "原图尺寸要原样带出去");
+        assert_eq!(
+            out.px.rgba.len(),
+            (out.px.width as usize) * (out.px.height as usize) * 4,
+            "像素长度必须与新尺寸一致"
+        );
     }
 
     #[test]
@@ -1020,25 +1216,47 @@ mod tests {
     #[test]
     fn three_strikes_isolate_and_success_resets() {
         let id = "test.strikes.a";
-        assert!(!record_outcome(id, false, false));
-        assert!(!record_outcome(id, false, false));
+        assert!(!record_outcome(id, false, false, true));
+        assert!(!record_outcome(id, false, false, true));
         // 用户取消不打断连败计数，但也不计振。
-        assert!(!record_outcome(id, false, true));
-        assert!(!record_outcome(id, true, false), "成功清零");
-        assert!(!record_outcome(id, false, false));
-        assert!(!record_outcome(id, false, false));
-        assert!(record_outcome(id, false, false), "第三次实败触发隔离");
+        assert!(!record_outcome(id, false, true, true));
+        assert!(!record_outcome(id, true, false, true), "成功清零");
+        assert!(!record_outcome(id, false, false, true));
+        assert!(!record_outcome(id, false, false, true));
+        assert!(record_outcome(id, false, false, true), "第三次实败触发隔离");
         assert_eq!(take_isolations(), vec![id.to_string()]);
-        assert!(!record_outcome(id, false, false), "隔离后计数已重置");
+        assert!(!record_outcome(id, false, false, true), "隔离后计数已重置");
         let _ = take_isolations();
     }
 
     #[test]
     fn cancellation_does_not_count_as_strike() {
         let id = "test.strikes.cancel";
-        assert!(!record_outcome(id, false, true));
-        assert!(!record_outcome(id, false, true));
-        assert!(!record_outcome(id, false, true));
+        assert!(!record_outcome(id, false, true, true));
+        assert!(!record_outcome(id, false, true, true));
+        assert!(!record_outcome(id, false, true, true));
         assert!(take_isolations().is_empty(), "取消永远不触发隔离");
+    }
+
+    /// ★ 2026-11-07 报障的正：插件按协议回 `ok:false`（"这图我不处理"）连续三次，
+    /// 旧逻辑把它当三次崩溃、推进隔离队列。**拒绝是它的设计，不是它坏了。**
+    #[test]
+    fn reported_refusal_never_isolates() {
+        let id = "test.strikes.reported";
+        for _ in 0..6 {
+            assert!(
+                !record_outcome(id, false, false, false),
+                "counts=false 的失败永远不该触发隔离"
+            );
+        }
+        assert!(
+            take_isolations().is_empty(),
+            "六次设计内拒绝也不许隔离一枚健康的插件"
+        );
+        // 但它也**不该**把已有的连败计数清零——那会让"真崩三次"更容易被放过。
+        assert!(!record_outcome(id, false, false, true));
+        assert!(!record_outcome(id, false, false, true));
+        assert!(record_outcome(id, false, false, true), "真崩三次照样隔离");
+        let _ = take_isolations();
     }
 }

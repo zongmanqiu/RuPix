@@ -158,13 +158,14 @@ RuPix\                  ← 工作区根（宿主文档只画宿主这一侧）
 | 写一个插件 | [`docs/扩展体系.md`](docs/扩展体系.md)（宿主侧契约）；插件源码与《插件开发规范》在插件侧仓库自己维护 |
 | 格式 ↔ 解码库 ↔ 后缀名对照 | 解码器侧仓库自己的档位 README 与发布清单（清单真源）；宿主只记录"动态并集"这条规则，见 [`docs/图片格式与后缀名.md`](docs/图片格式与后缀名.md) |
 | 当前待办与候选功能 | [`docs/待办.md`](docs/待办.md) |
+| 待开发内容（编码相关：格式转换 / 涂鸦 / 裁剪） | [`docs/待开发内容.md`](docs/待开发内容.md) |
 | 产品定位、职责边界、轻量定义、明确不做（战略宪章） | [`docs/产品定位与边界.md`](docs/产品定位与边界.md) |
 | 每个目录放什么、为什么 | [`目录结构说明.md`](目录结构说明.md) |
 | 改代码的流程、改动 → 文档同步对照 | [`开发指南.md`](开发指南.md) |
 | 文档登记簿（何时更新 / 谁验证） | [`DOCS_MANIFEST.md`](DOCS_MANIFEST.md) |
 | 变更史 | [`HISTORY.md`](HISTORY.md) |
 | 第三方依赖与许可清单 | [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) |
-| 踩过的坑（改代码前必读） | [`docs/踩坑记录.md`](docs/踩坑记录.md) |
+| 踩过的坑（改代码前必读） | [`docs/踩坑记录/踩坑记录.md`](docs/踩坑记录/踩坑记录.md) |
 | 构建流水线契约与分步脚本 | [`build/build_readme.md`](build/build_readme.md) |
 | 测试布局（门禁 vs 探针） | [`tests/README.md`](tests/README.md) |
 | 第三方补丁政策与登记（windui 卷 + usvg 卷） | [`patches/README.md`](patches/README.md)、[`patches/PATCHES.md`](patches/PATCHES.md)、[`patches/usvg-0.48.1/PATCHES.md`](patches/usvg-0.48.1/PATCHES.md) |

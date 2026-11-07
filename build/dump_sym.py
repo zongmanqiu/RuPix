@@ -33,7 +33,7 @@
 #      结构体注释）。漏掉它们的后果**不是报错**，而是 `SymFromAddr` 返回成功、名字空、
 #      Size 一坨垃圾——2026-10-25 之前本脚本就栽在这里，还据此得出了"debug=1 没有
 #      函数名、要开 debug=2"的错误结论（实测 debug=1 名字齐全，pdb 21.9 MB；
-#      debug=2 是 74.2 MB，白胖 3.4 倍）。见 `docs/踩坑记录.md` K135。
+#      debug=2 是 74.2 MB，白胖 3.4 倍）。见 `docs/踩坑记录/踩坑记录.md` K135。
 #
 # x64 的 CONTEXT 偏移取自本机 SDK 头（`winnt.h` 的 `DECLSPEC_ALIGN(16) _CONTEXT`）：
 # Rax 0x78 … Rsp 0x98、Rbp 0xA0、R15 0xF0、**Rip 0xF8**（0x100 往后是 Xmm，不是 Rip）。

@@ -152,6 +152,12 @@ pub struct ForPlugin {
     pub height: u32,
     /// 与 `width×height` 对应的 RGBA8（已按 [`Self::orient`] 转正）。
     pub rgba: Arc<Vec<u8>>,
+    /// **原图像素尺寸**（未经旋转、也不是解码档）。
+    ///
+    /// ★ `width×height` 可能小于它：首解与预读拿到的是视口档（561×561 对一张
+    /// 4080×4080 的图），只有放大到 100% 才升级成原图档。插件要据此算"这份像素
+    /// 覆盖原图多少"——不给这一对，报告只能把 561 档说成"全量统计"。
+    pub natural: (u32, u32),
     /// 这一次转正用的 `(rot, flip)`。落地还原必须用**它**的逆变换，不是此刻的朝向——
     /// 理由与用例名见 [`crate::core::viewer::Viewer::install_edited_displayed`]。
     pub orient: (u8, bool),

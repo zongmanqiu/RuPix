@@ -10,7 +10,7 @@
 //! 轮询（一次 tick 只重扫一次，天然把一整波拷贝合并成一次 `read_dir`）。
 //! `Drop` 先 `CancelIoEx` 再关句柄，阻塞中的线程随即拿到错误返回、自行退出；
 //! ★ `Drop` **不等它**（不 `join`）——这条结构体是在 UI 线程上被析构的，等不到醒来就是
-//! 整个进程退不掉。理由与安全性写在 [`DirWatcher::drop`]，事故形状见 `docs/踩坑记录.md` K74。
+//! 整个进程退不掉。理由与安全性写在 [`DirWatcher::drop`]，事故形状见 `docs/踩坑记录/踩坑记录.md` K74。
 
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;

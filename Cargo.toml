@@ -190,7 +190,7 @@ strip = true
 # **是错的**。真实原因是 `dump_sym.py` 的 `SYMBOL_INFO` 结构体漏了
 # `Address/Register/Scope/Tag` 四个字段，`SymFromAddr` 返回成功但名字空。修正后 debug=1
 # 名字齐全（pdb 21.9 MB）；debug=2 是 **74.2 MB**，白胖 3.4 倍。别为"要名字"去开 2。
-# 整段来龙去见 `docs/踩坑记录.md` K56 / K135。
+# 整段来龙去见 `docs/踩坑记录/踩坑记录.md` K56 / K135。
 debug = 1
 # 刻意不写 `panic = "abort"`：后台解码线程的 panic 需要 `unwind` 才能被
 # `catch_unwind` 转成"这张图解码失败"而不是整个进程消失（CurSeen 2026-09-29 同款教训）。

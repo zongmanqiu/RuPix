@@ -462,32 +462,62 @@ mod tests {
 /// 通道线性变换的恒等参数：三通道增益 100%、偏置 0。
 pub const CHANNEL_NEUTRAL: [i32; 6] = [100, 100, 100, 0, 0, 0];
 
-/// 声明式 op `channel-linear`：R/G/B 各自 `out = clamp(in * gain/100 + bias)`。
+/// Gamma 的中性值：`100` = 指数 1.0 = 恒等曲线。清单里的 `gamma` 是 1.0 的整数
+/// 百分比（200 ⇒ 指数 0.5，抬暗部；50 ⇒ 指数 2.0，压暗部）。
+pub const GAMMA_NEUTRAL: i32 = 100;
+const GAMMA_MIN: i32 = 30;
+const GAMMA_MAX: i32 = 300;
+
+/// 256 项色调曲线，作用在**线性增益/偏置之后**：`out = 255·(in/255)^(100/gamma)`。
 ///
-/// ★ 与 `channels` 插件的正式回写**逐字节同源**：中间值走 i64、整除向零截断、
-/// alpha 与每像素第 4 字节原样复制。改任何一边都要同步改另一边，端到端判据
-/// `channel_linear_matches_the_plugin_formula` 钉着这一点。
-pub fn channel_linear(rgba: &[u8], gain: [i32; 3], bias: [i32; 3]) -> Vec<u8> {
+/// ★ 与 `RuPix-Plugin/plugins/channels/src/main.rs::gamma_table` 是逐字节同源的
+/// 双胞胎：宿主按清单声明在显示层提前演算，插件在正式回写里算整图，两边任何
+/// 一点漂移都会让「窗里看到的」≠「另存出去的」。`plugin_smoke` 的
+/// `preview-parity` / `gamma-parity` 两臂会真起插件逐字节比对。
+/// 中性档是**字面恒等表**（完全不碰浮点），所以 0.1.2 之前的设置文件、
+/// 老插件、六数老预设的像素一个字节都不会变。
+pub fn gamma_table(gamma_pct: i32) -> [u8; 256] {
+    let mut table = [0u8; 256];
+    if gamma_pct == GAMMA_NEUTRAL {
+        for (v, slot) in table.iter_mut().enumerate() {
+            *slot = v as u8;
+        }
+        return table;
+    }
+    let g = gamma_pct.clamp(GAMMA_MIN, GAMMA_MAX) as f64 / 100.0;
+    for (v, slot) in table.iter_mut().enumerate() {
+        let t = v as f64 / 255.0;
+        let y = 255.0 * t.powf(1.0 / g);
+        *slot = (y + 0.5).floor().clamp(0.0, 255.0) as u8;
+    }
+    table
+}
+
+/// 声明式 op 的**参考实现**（逐像素，不建表）：R/G/B 各自线性变换后叠色调曲线。
+/// 与 `channels` 插件的正式回写逐字节同源：中间值走 i64、整除向零截断、
+/// alpha 与每像素第 4 字节原样复制。
+pub fn channel_gamma(rgba: &[u8], gain: [i32; 3], bias: [i32; 3], gamma_pct: i32) -> Vec<u8> {
+    let curve = gamma_table(gamma_pct);
     let mut out = rgba.to_vec();
     for px in out.chunks_exact_mut(4) {
         for c in 0..3 {
             let n = px[c] as i64 * gain[c] as i64 / 100 + bias[c] as i64;
-            px[c] = n.clamp(0, 255) as u8;
+            px[c] = curve[n.clamp(0, 255) as usize];
         }
     }
     out
 }
 
-/// `channel_linear` 的查表版：主窗整图每帧都要跟着滑块变，逐像素做三次 i64 除法
-/// 太贵。输入只有 0..=255 共 256 种，先按同一公式把三张 256 项表算出来，之后
-/// 每像素三次查表 + 一次 alpha 复制。**输出与 [`channel_linear`] 逐字节相同**
-/// （`lut_matches_the_reference_formula` 钉着），不是"看起来差不多"的近似。
-pub fn channel_linear_lut(rgba: &[u8], gain: [i32; 3], bias: [i32; 3]) -> Vec<u8> {
+/// 声明式 op 的**查表版**：主窗整图每帧都要跟着滑块变，逐像素做三次 i64 除法
+/// 太贵。输入只有 0..=255 共 256 种，把线性式与曲线合成三张 256 项表，之后每像素
+/// 三次查表 + 一次 alpha 复制。**输出与 [`channel_gamma`] 逐字节相同**，不是近似。
+pub fn channel_gamma_lut(rgba: &[u8], gain: [i32; 3], bias: [i32; 3], gamma_pct: i32) -> Vec<u8> {
+    let curve = gamma_table(gamma_pct);
     let mut tables = [[0u8; 256]; 3];
     for c in 0..3 {
         for (v, slot) in tables[c].iter_mut().enumerate() {
             let n = v as i64 * gain[c] as i64 / 100 + bias[c] as i64;
-            *slot = n.clamp(0, 255) as u8;
+            *slot = curve[n.clamp(0, 255) as usize];
         }
     }
     let [r, g, b] = tables;
@@ -499,6 +529,16 @@ pub fn channel_linear_lut(rgba: &[u8], gain: [i32; 3], bias: [i32; 3]) -> Vec<u8
         // px[3]（alpha / 行尾填充）原样不动，与参考实现一致。
     }
     out
+}
+
+/// 六数老入口：曲线恒等，行为与 0.1.2 之前逐字节一致。
+pub fn channel_linear(rgba: &[u8], gain: [i32; 3], bias: [i32; 3]) -> Vec<u8> {
+    channel_gamma(rgba, gain, bias, GAMMA_NEUTRAL)
+}
+
+/// 六数老入口的查表版，同上。
+pub fn channel_linear_lut(rgba: &[u8], gain: [i32; 3], bias: [i32; 3]) -> Vec<u8> {
+    channel_gamma_lut(rgba, gain, bias, GAMMA_NEUTRAL)
 }
 
 /// 最近邻缩略图（保持比例，不放大）：参数窗预览只算十万级像素，拖滑块才不会卡。
@@ -524,9 +564,142 @@ pub fn nearest_thumb(rgba: &[u8], w: u32, h: u32, max_w: u32, max_h: u32) -> (u3
     (tw, th, out)
 }
 
+/// 送插件的抽样目标：约 100 万点（RGBA 4 MB）。
+///
+/// 16.6 MP 的原图 ⇒ 每 4 像素取 1 点 ⇒ 1020×1020 = 104 万点；9000×5000（45 MP）
+/// ⇒ 每 7 像素取 1 点 ⇒ 92 万点。**不论原图多大，送出去的都是 4 MB 量级**——
+/// 这才是它能绕过那道 8 MP 闸（32 MB 映射）的原因，而不是把闸抬了。
+pub const PLUGIN_SAMPLE_TARGET: u64 = 1_000_000;
+
+/// 抽样步长：`N ≥ 2` 表示"每 N 像素取 1 点"，输出 `(w/N)×(h/N)`。
+///
+/// `cap` 是**不抽样的上限**（调用方传 `EDITOR_MAX_PIXELS`）：不超过它一律返回 1，
+/// 行为与今天完全一致。**只有超上限才走到抽样**——这是"小图原样、大图抽"的分界，
+/// 也是这套改动对既有插件零影响的原因。
+///
+/// 三条约束，缺一条就会在某类图上翻车：
+/// 1. **按总面积定**，不按单边——按最长边算，全景 30000×2000 会塌到 6.6 万点，
+///    长截图反过来又会超；
+/// 2. **整数步长**，不缩放到固定尺寸——非整数比例必须重采样，那就成了"混像素"
+///    （面积平均），直方图会向均值收缩，暗部/高光溢出的计数直接失真；
+/// 3. **总量兜底 2× 目标**：单边远小于步长时长条会退化（1×64M 这类按面积算出
+///    step=8，宽那一维取不到任何点），步长加倍直到落回预算内。
+pub fn plugin_sample_step(w: u32, h: u32, cap: u64) -> u32 {
+    if w == 0 || h == 0 {
+        return 1;
+    }
+    let total = w as u64 * h as u64;
+    if total <= cap || total <= PLUGIN_SAMPLE_TARGET {
+        return 1;
+    }
+    let mut step = ((total as f64 / PLUGIN_SAMPLE_TARGET as f64).sqrt().round() as u64).max(2);
+    loop {
+        let ow = (w as u64 / step).max(1);
+        let oh = (h as u64 / step).max(1);
+        if ow * oh <= PLUGIN_SAMPLE_TARGET * 2 {
+            return step as u32;
+        }
+        step *= 2;
+    }
+}
+
+/// 等距抽样：**只挑不混**，每个样本都是原图上真实存在的原始字节。
+///
+/// ★ 与 [`nearest_thumb`] 的区别不是尺寸而是语义：那一个服务"上屏好看"（缩到某档），
+///   这一个服务"统计不失真"（保留分布）。同一个像素值 `0` 抽样后还是 `0`，
+///   面积平均则会变成 `3`、`5`——而"全图有多少暗部溢出"恰好只由 0 的个数决定。
+///
+/// ★ 采样点按**对角错位**铺（见循环里的注释），不是整齐的网格：整齐网格在周期纹理上
+///   会漏掉整个相位。位置仍是确定的，同一张图两次抽样逐字节相同。
+pub fn sample_strided(rgba: &[u8], w: u32, h: u32, step: u32) -> (u32, u32, Vec<u8>) {
+    if step <= 1 || w == 0 || h == 0 || rgba.len() < w as usize * h as usize * 4 {
+        return (w, h, rgba.to_vec());
+    }
+    let ow = (w / step).max(1);
+    let oh = (h / step).max(1);
+    let mut out = Vec::with_capacity(ow as usize * oh as usize * 4);
+    let s = step as usize;
+    for y in 0..oh as usize {
+        // **对角错位**：横向偏 `y % step`、纵向偏 `x % step`。
+        //
+        // 纯网格抽样会在周期纹理上一直踩同一相位——8×8 的细条纹配 step=4，只会取到
+        // 偶数行，**另一半像素一次都没被看到**，直方图直接偏掉一半。错开相位后每行
+        // 采到的位置不同，样本仍等概率覆盖全图，而且完全确定：同一张图两次结果一致。
+        let row = y * s;
+        for x in 0..ow as usize {
+            let si = ((row + x % s) * w as usize + x * s + y % s) * 4;
+            out.extend_from_slice(&rgba[si..si + 4]);
+        }
+    }
+    (ow, oh, out)
+}
+
 #[cfg(test)]
 mod preview_pixel_tests {
     use super::*;
+
+    /// 步长按**总面积**定，且只有超上限才抽样。
+    #[test]
+    fn sample_step_follows_area_not_the_long_edge() {
+        const CAP: u64 = 8_000_000;
+        assert_eq!(
+            plugin_sample_step(2000, 1000, CAP),
+            1,
+            "200 万点在闸内，原样送"
+        );
+        assert_eq!(plugin_sample_step(4000, 2000, CAP), 1, "正好 8 MP 仍在界内");
+        assert_eq!(
+            plugin_sample_step(4000, 2001, CAP),
+            3,
+            "多一像素才抽：sqrt(8.004)≈2.8 ⇒ 3"
+        );
+        assert_eq!(
+            plugin_sample_step(4080, 4080, CAP),
+            4,
+            "16.6 MP ⇒ 每 4 像素一点"
+        );
+        // 45 MP：sqrt(45)≈6.7 ⇒ 7；输出 1285×714 ≈ 92 万点，落在预算内。
+        assert_eq!(plugin_sample_step(9000, 5000, CAP), 7);
+        // 全景 60 MP：按面积 8，而不是按最长边 30（那会塌到 6.6 万点）。
+        assert_eq!(plugin_sample_step(30000, 2000, CAP), 8);
+        // 长条退化：1×64M 按面积算出 8，宽那一维取不到点 ⇒ 兜底加倍到 64
+        // （32 时样本 64M/32 = 2,097,152 仍超预算 2M，所以还要再翻一次）。
+        assert_eq!(plugin_sample_step(1, 64 * 1024 * 1024, CAP), 64);
+        // 零尺寸不合法，但也不许返回 0（调用方会除零）。
+        assert_eq!(plugin_sample_step(0, 100, CAP), 1);
+    }
+
+    /// ★ 抽样是**只挑不混**：每个样本都是原图里真实存在的值。
+    ///
+    /// 用一半 0、一半 255 的图来钉：抽样后仍是各占一半（分布不变），
+    /// 若换成面积平均，这两类都会变成 128 —— 暗部/高光溢出的计数就全错了。
+    #[test]
+    fn sampling_keeps_the_distribution_while_averaging_would_not() {
+        let (w, h) = (8u32, 8u32);
+        let mut px = Vec::with_capacity((w * h * 4) as usize);
+        for i in 0..(w * h) {
+            let v = if (i / w) % 2 == 0 { 0 } else { 255 };
+            px.extend_from_slice(&[v, v, v, 255]);
+        }
+        let (ow, oh, out) = sample_strided(&px, w, h, 4);
+        assert_eq!((ow, oh), (2, 2));
+        let zeros = out.chunks_exact(4).filter(|p| p[0] == 0).count();
+        let fulls = out.chunks_exact(4).filter(|p| p[0] == 255).count();
+        assert_eq!((zeros, fulls), (2, 2), "0 与 255 各占一半，抽样不改分布");
+        assert!(out.chunks_exact(4).all(|p| p[0] == 0 || p[0] == 255));
+    }
+
+    /// 步长 1 是不抽样：逐字节原样（含 alpha），一帧都不多算。
+    #[test]
+    fn step_one_is_the_identity() {
+        let src: Vec<u8> = (0..64).map(|i| (i * 3) as u8).collect();
+        assert_eq!(sample_strided(&src, 4, 4, 1), (4, 4, src.clone()));
+        // 样本不足（长度对不上）时不 panic，按原样退回。
+        assert_eq!(
+            sample_strided(&src[..10], 4, 4, 2),
+            (4, 4, src[..10].to_vec())
+        );
+    }
 
     #[test]
     fn channel_linear_matches_the_plugin_formula() {
@@ -576,6 +749,67 @@ mod preview_pixel_tests {
         let src: Vec<u8> = (0..64).map(|i| (i * 13) as u8).collect();
         assert_eq!(channel_linear_lut(&src, [100, 100, 100], [0, 0, 0]), src);
         assert_eq!(CHANNEL_NEUTRAL, [100, 100, 100, 0, 0, 0]);
+    }
+
+    #[test]
+    fn gamma_table_matches_hardcoded_bytes() {
+        // 期望字节来自独立计算（不是本模块的公式），与插件仓的用例同一组数。
+        let lift = gamma_table(200);
+        let crush = gamma_table(50);
+        for (v, want) in [(0, 0), (1, 16), (32, 90), (64, 128), (128, 181), (255, 255)] {
+            assert_eq!(lift[v], want, "lift at {v}");
+        }
+        for (v, want) in [(0, 0), (32, 4), (64, 16), (128, 64), (255, 255)] {
+            assert_eq!(crush[v], want, "crush at {v}");
+        }
+        assert_eq!(gamma_table(180)[64], 118);
+        assert_eq!(gamma_table(GAMMA_NEUTRAL)[64], 64);
+        // 越界夹到 30..300，与插件侧同款 clamp，不因调用方喂坏数而分叉。
+        assert_eq!(gamma_table(0), gamma_table(30));
+        assert_eq!(gamma_table(9999), gamma_table(300));
+    }
+
+    #[test]
+    fn gamma_lut_matches_the_reference_formula() {
+        let src: Vec<u8> = (0..256u32)
+            .flat_map(|i| [i as u8, (255 - i) as u8, (i / 2) as u8, 0xA5])
+            .collect();
+        for (gain, bias, gamma) in [
+            ([-100, 100, 200], [255, 0, 40], 180),
+            ([100, 100, 100], [0, 0, 0], 200),
+            ([100, 100, 100], [0, 0, 0], GAMMA_NEUTRAL),
+            ([-400, 0, 400], [-255, 128, 255], 50),
+            ([37, -63, 141], [7, -9, 11], 300),
+        ] {
+            assert_eq!(
+                channel_gamma_lut(&src, gain, bias, gamma),
+                channel_gamma(&src, gain, bias, gamma),
+                "LUT 与参考公式在 {gain:?}/{bias:?}/gamma={gamma} 上分叉"
+            );
+        }
+    }
+
+    #[test]
+    fn gamma_curve_runs_after_gain_bias() {
+        // 200 -> 反相 55 -> 曲线(55) = 118；若先曲线后线性则是 255-226=29。
+        let src = [200u8, 200, 200, 255];
+        assert_eq!(
+            channel_gamma(&src, [-100, -100, -100], [255, 255, 255], 200),
+            vec![118, 118, 118, 255]
+        );
+    }
+
+    #[test]
+    fn gamma_only_lifts_shadows_and_keeps_endpoints() {
+        let src = [0u8, 64, 200, 255, 255, 255, 255, 77];
+        let out = channel_gamma(&src, [100, 100, 100], [0, 0, 0], 180);
+        assert_eq!(out[0], 0, "黑端不动");
+        assert_eq!(out[4], 255, "白端不动");
+        assert_eq!(out[1], 118, "暗部抬起来");
+        assert_eq!(out[2], 223);
+        assert_eq!(out[3], 255, "alpha 不动");
+        assert_eq!(out[7], 77, "alpha 不动");
+        assert_eq!(channel_linear(&src, [100, 100, 100], [0, 0, 0]), src);
     }
 
     #[test]

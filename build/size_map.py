@@ -29,7 +29,7 @@
 5. `.pdata`（异常/展开表）与 `.reloc` **map 里没有符号行**，天生无法按 crate 归账；
    它们随函数条数增长，单列报账，不摊给任何 crate。
 6. 本工具**只出体积，不出速度结论**。体积档位的历史取舍（`lto`、`opt-level`）正本在
-   `docs/踩坑记录.md` 的 K53 与 `docs/产品定位与边界.md` §四，不在这里复述。
+   `docs/踩坑记录/踩坑记录.md` 的 K53 与 `docs/产品定位与边界.md` §四，不在这里复述。
 """
 from __future__ import annotations
 

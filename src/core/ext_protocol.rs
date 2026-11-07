@@ -77,6 +77,17 @@ pub struct Request {
     pub action: String,
     pub image_path: Option<String>,
     pub image: Option<ImageRef>,
+    /// `image` 这份像素的原图尺寸（宽, 高）。
+    ///
+    /// ★ 为什么必须给：`image.width×height` **不等于**原图——它可能是抽样后的
+    /// （`sample_step > 1`），也可能只是当前解码档（视口档 561×561 对一张
+    /// 4080×4080 的图）。插件拿不到这一对的后果已经发生过：报告写"全量、未抽稀，
+    /// 共 314,721 像素"，而原图有 1,664 万。**只有原图尺寸在请求里，报告才可能诚实。**
+    pub source: Option<(u32, u32)>,
+    /// 抽样步长：`1` = 原样送出（未抽样）；`N` = 每 N 像素取 1 点。
+    ///
+    /// 与 `source` 一起就能算出覆盖率，不必让插件知道宿主为什么抽样。
+    pub sample_step: u32,
     pub selection: Option<Selection>,
     pub args: Vec<String>,
     /// 宿主要发给插件的设置（插件声明 `settings.read` 时才有）。
@@ -95,6 +106,8 @@ impl Request {
             action: action.into(),
             image_path: None,
             image: None,
+            source: None,
+            sample_step: 1,
             selection: None,
             args: Vec::new(),
             settings: None,
@@ -113,6 +126,16 @@ impl Request {
         }
         if let Some(img) = &self.image {
             s.push_str(&format!(",\"image\":{}", img.to_json()));
+        }
+        // 这两个字段只在真的下发了像素时才有意义：没有 `image` 却说"原图多大"，
+        // 是在暗示插件"你可以自己按路径去读"，而那正是能力最小化要挡的。
+        if self.image.is_some() {
+            if let Some((w, h)) = self.source {
+                s.push_str(&format!(",\"source\":{{\"width\":{w},\"height\":{h}}}"));
+            }
+            if self.sample_step > 1 {
+                s.push_str(&format!(",\"sample_step\":{}", self.sample_step));
+            }
         }
         if let Some(sel) = &self.selection {
             s.push_str(&format!(
@@ -156,6 +179,18 @@ impl Request {
             None | Some(Value::Null) => None,
             Some(v) => Some(parse_selection(v)?),
         };
+        let source = match root.get("source") {
+            None | Some(Value::Null) => None,
+            Some(v) => {
+                let w = get_u32(v, "width")?;
+                let h = get_u32(v, "height")?;
+                Some((w, h))
+            }
+        };
+        let sample_step = match root.get("sample_step") {
+            None | Some(Value::Null) => 1,
+            Some(v) => v.as_i64().filter(|n| *n >= 1).unwrap_or(1) as u32,
+        };
         let args = match root.get("args") {
             None | Some(Value::Null) => Vec::new(),
             Some(v) => v
@@ -175,6 +210,8 @@ impl Request {
             action,
             image_path,
             image,
+            source,
+            sample_step,
             selection,
             args,
             settings,

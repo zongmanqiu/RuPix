@@ -28,6 +28,7 @@ fn probe_pixels(path: PathBuf) -> rupix_lib::core::viewer::ForPlugin {
         width: 4,
         height: 2,
         rgba: std::sync::Arc::new(px),
+        natural: (4, 2),
         orient: (0, false),
     }
 }
@@ -118,6 +119,7 @@ fn editor_pixels(
         width,
         height,
         rgba: std::sync::Arc::new(rgba),
+        natural: (width, height),
         orient,
     }
 }
@@ -492,12 +494,21 @@ fn channels_pixels() -> rupix_lib::core::viewer::ForPlugin {
     editor_pixels(4, 2, (0, false), px)
 }
 
+/// Gamma 期望字节由独立计算写死在这里，不复用宿主或插件任一侧的公式。
+/// R 通道的源值是 0..=7（暗部），G=10、B=200 用来同时盯住中间调与亮部。
+const GAMMA_180_LOW: [u8; 8] = [0, 12, 17, 22, 25, 29, 32, 35];
+const GAMMA_200_HIGH: [u8; 8] = [255, 254, 254, 253, 253, 252, 252, 251];
+
 /// 硬编码的期望像素，不从插件公式推。
 fn channels_expected(mode: &str) -> Vec<u8> {
     (0..8u8)
         .flat_map(|i| match mode {
             "red" => [255 - i, 10, 200, 255],
             "invert" => [255 - i, 245, 55, 255],
+            // 六数中性 + gamma 180：10 -> 42、200 -> 223、白端/alpha 不动。
+            "gamma180" => [GAMMA_180_LOW[i as usize], 42, 223, 255],
+            // 先反相 R 再叠 gamma 200：曲线跑在线性之后。
+            "gamma200-invert" => [GAMMA_200_HIGH[i as usize], 50, 226, 255],
             _ => [i, 10, 200, 255],
         })
         .collect()
@@ -512,6 +523,81 @@ fn record7(label: &str, ok: bool, detail: &str, fails: &mut Vec<String>) {
     );
     if !ok {
         fails.push(label.to_string());
+    }
+}
+
+/// 抽样下发端到端（2026-11-07）：同一张图按两档送，验"小图全量、大图抽样"。
+///
+/// 判据只认**插件自己印出来的那句话**：闸内必须写「全量，未抽稀」，闸外必须写
+/// 「抽样统计」且不许再出现「全量」。宿主有没有真抽样、插件有没有真读懂覆盖率，
+/// 一条断言同时管住——比分别验两侧的中间态更难作假。
+fn run_sampled_probe(dir: &Path, image: &Path) -> Result<(), String> {
+    let manifest = Manifest::from_dir(dir)?;
+    if manifest.kind != rupix_lib::core::ext::Kind::Command {
+        return Err("--sampled 只接 command 型插件".into());
+    }
+    if !manifest.has_capability(rupix_lib::core::ext::Capability::ImageSampled) {
+        return Err(format!(
+            "{} 没声明 image.sampled —— 这条臂验的就是那个声明，缺了无从测",
+            manifest.id
+        ));
+    }
+    let ext = Extension {
+        manifest,
+        dir: dir.to_path_buf(),
+        enabled: true,
+        blocked: false,
+        isolated: false,
+    };
+    rupix_lib::install_decode_stack();
+
+    let mut fails: Vec<String> = Vec::new();
+    // 2000×2000 = 4 MP（闸内）与 4000×4000 = 16 MP（闸外）两档。
+    for (label, target, want_sampled) in
+        [("within-cap", 2000u32, false), ("over-cap", 4000u32, true)]
+    {
+        let d = rupix_lib::core::decode::probe_decode(image, target, target)?;
+        let (w, h) = (d.bitmap.width, d.bitmap.height);
+        let px = rupix_lib::core::viewer::ForPlugin {
+            path: image.to_path_buf(),
+            width: w,
+            height: h,
+            rgba: std::sync::Arc::new(d.bitmap.rgba),
+            natural: d.natural,
+            orient: (0, false),
+        };
+        extensions::start_command(ext.clone(), Some(image.to_path_buf()), None, Some(px))?;
+        let text = wait_result()?;
+        let sampled = text.contains("抽样统计");
+        let full = text.contains("全量，未抽稀");
+        // 闸内这一臂期望"没抽样"——但**不**期望"全量"：解码档 2000×2000 对原图
+        // 4080×4080 本来就只是预览档，插件如实写"预览档 + 覆盖 24.03%"才是对的。
+        // 抽样与否只看步长，档位高低是另一件事，两件事在报告里各占一句话。
+        let ok = if want_sampled {
+            sampled && !full
+        } else {
+            !sampled
+        };
+        println!(
+            "[sampled] arm={label} decoded={w}x{h} natural={:?} sampled={sampled} full={full} {}",
+            d.natural,
+            if ok { "PASS" } else { "FAIL" }
+        );
+        if !ok {
+            let head: Vec<&str> = text.lines().take(4).collect();
+            println!("[sampled-report] {}", head.join(" | "));
+            fails.push(format!("{label}: sampled={sampled} full={full}"));
+        }
+    }
+    println!(
+        "[sampled] arms=2 failed={} verdict={}",
+        fails.len(),
+        if fails.is_empty() { "PASS" } else { "FAIL" }
+    );
+    if fails.is_empty() {
+        Ok(())
+    } else {
+        Err(fails.join("; "))
     }
 }
 
@@ -628,8 +714,42 @@ fn run_channels_probe(dir: &Path) -> Result<(), String> {
         &mut fails,
     );
 
+    // ⑧ Gamma 单独生效：六数全中性，只把第七条滑块推到 180。
+    //    暗部 0..=7 被抬起来，G=10 / B=200 按曲线走，白端与 alpha 一个字节不动。
+    channels_settings(
+        &store,
+        r#"{"preset":"custom","r_gain":"100","g_gain":"100","b_gain":"100","r_bias":"0","g_bias":"0","b_bias":"0","gamma":"180"}"#,
+    )?;
+    let h = one_edit(base.clone(), channels_pixels());
+    let h_ok = matches!(&h, Ok(got) if got.rgba == channels_expected("gamma180"));
+    record7(
+        "gamma-shadow",
+        h_ok,
+        &format!("bytes={:?}", h.as_ref().map(|g| g.rgba.len())),
+        &mut fails,
+    );
+
+    // ⑨ 带 Gamma 的显示层 == 插件正式回写：曲线叠在线性之后，两边逐字节同源。
+    //    真起插件跑一遍，同时用硬编码期望钉住「顺序」不被两边一起改错。
+    channels_settings(
+        &store,
+        r#"{"preset":"custom","r_gain":"-100","r_bias":"255","g_gain":"100","b_gain":"100","g_bias":"0","b_bias":"0","gamma":"200"}"#,
+    )?;
+    let j = one_edit(base.clone(), channels_pixels());
+    let src_g = channels_pixels();
+    let preview_gamma =
+        rupix_lib::core::pixels::channel_gamma(&src_g.rgba[..], [-100, 100, 100], [255, 0, 0], 200);
+    let j_parity = matches!(&j, Ok(got) if got.rgba == preview_gamma);
+    let j_bytes = matches!(&j, Ok(got) if got.rgba == channels_expected("gamma200-invert"));
+    record7(
+        "gamma-parity",
+        j_parity && j_bytes,
+        &format!("parity={j_parity} hardcoded={j_bytes}"),
+        &mut fails,
+    );
+
     println!(
-        "[w7] arms=7 failed={} verdict={}",
+        "[w7] arms=9 failed={} verdict={}",
         fails.len(),
         if fails.is_empty() { "PASS" } else { "FAIL" }
     );
@@ -671,6 +791,18 @@ fn main() -> Result<(), String> {
         );
         return run_channels_probe(&dir);
     }
+    // 抽样下发端到端（2026-11-07）：同一张图两档送，验"小图原样、大图抽样"。
+    if argv.first().map(|s| s.as_str()) == Some("--sampled") {
+        let dir = PathBuf::from(
+            argv.get(1)
+                .ok_or("用法：plugin_smoke --sampled <插件目录> <图片>")?,
+        );
+        let img = PathBuf::from(
+            argv.get(2)
+                .ok_or("用法：plugin_smoke --sampled <插件目录> <图片>")?,
+        );
+        return run_sampled_probe(&dir, &img);
+    }
     let mut args = argv.into_iter();
     let dir = args
         .next()
@@ -710,6 +842,7 @@ fn main() -> Result<(), String> {
             width: w,
             height: h,
             rgba: std::sync::Arc::new(d.bitmap.rgba),
+            natural: d.natural,
             orient: (0, false),
         };
         extensions::start_command(ext.clone(), Some(p.clone()), None, Some(real))?;

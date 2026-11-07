@@ -326,7 +326,7 @@ cost=…ms bitmap=…`、`[decode-req] kind=… tier=… verdict=…`、`[close]
 
 ## 六、这台机器的执行环境（踩过的坑，硬性）
 
-> 扩展版正本是 [`docs/踩坑记录.md`](docs/踩坑记录.md)（每条含现象 / 原因 / 解法，编号只增不改；
+> 扩展版正本是 [`docs/踩坑记录/踩坑记录.md`](docs/踩坑记录/踩坑记录.md)（每条含现象 / 原因 / 解法，编号只增不改；
 > **末号不写在这里**——写死计数就是第二正本，它上次停在 K66 而磁盘已到 K70）；下表为浓缩速查。
 
 | 坑 | 对策 |
@@ -432,7 +432,7 @@ cost=…ms bitmap=…`、`[decode-req] kind=… tier=… verdict=…`、`[close]
 
 1. **生产代码禁止 `unwrap` / `expect` / `panic!` / `todo!`**（红线）。2026-10-17 起由
    `hygiene_scan.py` 第 5 查 `panic_source` **机器执行**——此前这条红线只写在文档里，
-   一上去就扫出 6 处（见 `docs/踩坑记录.md` K57）。例外仅三类：
+   一上去就扫出 6 处（见 `docs/踩坑记录/踩坑记录.md` K57）。例外仅三类：
    `#[cfg(test)]` 测试断言、`src/main.rs` 的 stdout 输出（`--probe-decode` 探针命令面，
    `hygiene_scan.py` 唯一豁免模块）、以及**刻意保留且不能降级的 fail-fast**：在违规行
    上方 3 行内写 `// 红线豁免: <为什么>`。不做文件级白名单、不做基线冻结——豁免要可 grep、
