@@ -272,14 +272,11 @@ impl Viewer {
         if kind == ReqKind::Main {
             self.arm_main_wait();
         }
-        // 裸像素（.rgb/.yuv 等）没有头：首次请求前先按后缀 + 文件长度自动推断，
+        // 裸像素（.rgb/.bgra/.yuv 等）没有头：首次请求前先按后缀 + 文件长度自动推断，
         // 这样从命令行、文件对话框、目录首图、翻页/预读进来的路径都走同一条自动参数路。
-        // 相机 RAW 的推断返回 None，仍走普通解码。
-        if crate::core::decode::get_raw_params(path).is_none() {
-            if let Some(params) = crate::core::decode::infer_raw_params(path) {
-                crate::core::decode::set_raw_params(path, params);
-            }
-        }
+        // ★ 与缩略图共用 `ensure_raw_params` 这一处，别各写一份：两处参数不一致的
+        //   症状是「主画面看得见、胶片条那一格空着」。相机 RAW 的推断返回 None。
+        crate::core::decode::ensure_raw_params(path);
         // 参数化裸数据只能走 `request_raw`；以前这里漏了这一支，参数窗写进 store
         // 却永远没人读——表现就是"参数填了仍然不识别"。
         if crate::core::decode::get_raw_params(path).is_some() {
@@ -439,6 +436,42 @@ impl Viewer {
         self.want_seq = self.send_decode(&path, w, h, target, ReqKind::Main, false);
     }
 
+    /// 跳到第 `to` 张（帧 / 页，0 起）——右键「本图 ▸ 跳转到…帧/页」与状态格点击的落地（m275）。
+    ///
+    /// ★ 与 [`Self::step_anim`] 共用同一套机制（暂停 + 记在途目标 + 发**按号**请求）：
+    ///   ABI 的 `iv_render` 本来就带 `frame_index`，所以跳转是一次请求，不是"连按 N 下"。
+    ///   顺序解码的格式（GIF 的 LZW 只能从头解）由解码器内部快进，宿主这边不掺和。
+    ///
+    /// 越界夹到 `[0, count-1]`。总数未知（`count == 0`：GIF 惰性数帧，撞到 EOF 才回填）
+    /// 时**不猜**——菜单那一格在这种文件上是置灰的，走到这里直接不受理。
+    ///
+    /// 返回 `true` = 已经发了请求（调用方不必再说什么；画面到时会自己换）。
+    pub fn jump_anim(&mut self, to: u32) -> bool {
+        let Some(l) = self.loaded.as_ref() else {
+            return false;
+        };
+        // 静态位图没有第二张；`count == 0` 是"总数还未知"，按号跳无从夹取。
+        if !l.anim.has_index() || l.anim.count == 0 {
+            return false;
+        }
+        // 同 `step_anim`：换图窗口期按下去就是替**上一张**要帧，会把新图顶掉。
+        if !self.screen_is_current() {
+            return false;
+        }
+        let (index, count) = (l.anim.index, l.anim.count);
+        let path = l.path.clone();
+        let target = to.min(count - 1);
+        if target == index && self.step_target.is_none() {
+            // 已经在这一张：一次空请求等于让画面重解一遍同一帧（大页会白等）。
+            return false;
+        }
+        self.set_anim_paused(true);
+        self.step_target = Some(target);
+        let (w, h) = self.desired_pixels();
+        self.want_seq = self.send_decode(&path, w, h, target, ReqKind::Main, false);
+        true
+    }
+
     /// 屏幕上那份 `loaded` 是不是清单当前项。换图窗口期（旧图还顶着显示、新图在解）
     /// 为 `false`——凡是"拿旧图的属性替新图做决定"的路径都得先问这一句。
     ///
@@ -468,6 +501,18 @@ impl Viewer {
     ///   `core::pixels::Anim::has_index`。
     pub fn has_index(&self) -> bool {
         self.loaded.as_ref().is_some_and(|l| l.anim.has_index())
+    }
+
+    /// 当前这张的帧 / 页进度（`None` = 静图 / 还没解出来）。
+    ///
+    /// 跳转窗要三件：当前第几张（预填）、总数（夹取）、量词（页还是帧）。
+    /// 判据与状态行同源（[`crate::core::pixels::Anim::has_index`]）——两处若各判一套，
+    /// 就会出现"状态行写着 12/340、跳转窗说没有可跳的"。
+    pub fn anim_info(&self) -> Option<crate::core::pixels::Anim> {
+        self.loaded
+            .as_ref()
+            .map(|l| l.anim)
+            .filter(|a| a.has_index())
     }
 
     /// 动画是否处于暂停态（状态栏显示用）。

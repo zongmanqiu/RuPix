@@ -248,7 +248,7 @@ pub fn remote_summary(
 ///   一枚下载，百分比就在那一行的按钮上，状态行只说"在干什么"。
 ///
 /// 装完的收尾不在这里——工作线程没法写配置、碰信号。结果由设置窗的 250 ms 定时器取走，
-/// 交给 [`decoder_install_done`](super::decoder_install_done)（它负责**自动启用** + 两处刷新 + toast）。
+/// 交给 [`decoder_install_done`]（它负责**自动启用** + 两处刷新 + toast）。
 fn start_install(ctx: &mut EventCtx, h: Handles, e: RemoteEntry) {
     let src = SourceId::from_ui_index(h.download_source.get());
     match crate::decoders::install::start(&e, src) {
@@ -490,6 +490,7 @@ pub mod tests {
         let (ext_rows_all, ext_filter, ext_view) = decode_signals();
         let (decoders, decoder_filter, decoder_view, decoder_count) = installed_signals();
         let h = Handles {
+            update: UpdateState::new(),
             stay: sig(false),
             minimal_mode: sig(false),
             checker: sig(false),
@@ -498,14 +499,17 @@ pub mod tests {
             slide_secs: signal("3".into()),
             wheel: signal(0),
             ctrl_wheel: signal(0),
+            alt_wheel: signal(3),
+            shift_wheel: signal(3),
             init_win: signal(0),
+            borderless: sig(false),
             win_size: signal(String::new()),
             prefetch: signal(false),
             to_tray: sig(false),
             space_preview: sig(false),
             drag_image: sig(false),
             show_toolbar_buttons: sig(true),
-            filmstrip: sig(false),
+            filmstrip_pos: signal(0),
             allow_multiple: sig(false),
             opacity: signal(0.75),
             opacity_label: signal(String::new()),
@@ -684,6 +688,7 @@ pub mod tests {
         let (ext_rows_all, ext_filter, ext_view) = decode_signals();
         let (decoders, decoder_filter, decoder_view, decoder_count) = installed_signals();
         let h = Handles {
+            update: UpdateState::new(),
             stay: sig(false),
             minimal_mode: sig(false),
             checker: sig(false),
@@ -692,14 +697,17 @@ pub mod tests {
             slide_secs: signal("3".into()),
             wheel: signal(0),
             ctrl_wheel: signal(0),
+            alt_wheel: signal(3),
+            shift_wheel: signal(3),
             init_win: signal(0),
+            borderless: sig(false),
             win_size: signal(String::new()),
             prefetch: sig(false),
             to_tray: sig(false),
             space_preview: sig(false),
             drag_image: sig(false),
             show_toolbar_buttons: sig(true),
-            filmstrip: sig(false),
+            filmstrip_pos: signal(0),
             allow_multiple: sig(false),
             opacity: signal(0.75),
             opacity_label: signal(String::new()),
@@ -1079,6 +1087,7 @@ pub mod tests {
         let (ext_rows_all, ext_filter, ext_view) = decode_signals();
         let (decoders, decoder_filter, decoder_view, decoder_count) = installed_signals();
         let h = Handles {
+            update: UpdateState::new(),
             stay: sig(false),
             minimal_mode: sig(false),
             checker: sig(false),
@@ -1087,14 +1096,17 @@ pub mod tests {
             slide_secs: signal("3".into()),
             wheel: signal(0),
             ctrl_wheel: signal(0),
+            alt_wheel: signal(3),
+            shift_wheel: signal(3),
             init_win: signal(0),
+            borderless: sig(false),
             win_size: signal(String::new()),
             prefetch: signal(false),
             to_tray: sig(false),
             space_preview: sig(false),
             drag_image: sig(false),
             show_toolbar_buttons: sig(true),
-            filmstrip: sig(false),
+            filmstrip_pos: signal(0),
             allow_multiple: sig(false),
             opacity: signal(0.75),
             opacity_label: signal(String::new()),

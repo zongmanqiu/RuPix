@@ -8,9 +8,10 @@ use std::time::Instant;
 use rupix_lib::platform::http;
 
 fn main() {
+    // 直接用 ini 内置的两个默认地址：探针要验的是宿主真会去拉的那两条。
     let urls = [
-        "https://gitee.com/qiuzongman/RuPix/raw/master/update.json",
-        "https://raw.githubusercontent.com/zongmanqiu/RuPix/master/update.json",
+        rupix_lib::core::config::SourceId::Gitee.update_index_url(),
+        rupix_lib::core::config::SourceId::Github.update_index_url(),
     ];
     for url in urls {
         let t0 = Instant::now();

@@ -1,4 +1,4 @@
-//! RuPix 自有图标：**渲染 `main/image/icon.svg`**（windui 内置 resvg 光栅化）。
+//! RuPix 自有图标：**渲染 `main/assets/icon.svg`**（windui 内置 resvg 光栅化）。
 //!
 //! # 为什么必须自己有一份
 //!
@@ -14,7 +14,7 @@
 //! 要的尺寸**现场光栅化**——150% 缩放要 48、200% 要 64，任意尺寸都是矢量清晰度，
 //! 不存在"一张 PNG 缩到 16px 发糊"的问题。
 //!
-//! 造型：`image/icon.svg`（米色圆角底 + 橙红 #D14527 与深灰 #272B29 双块叠压），
+//! 造型：`assets/icon.svg`（米色圆角底 + 橙红 #D14527 与深灰 #272B29 双块叠压），
 //! 程序化绘制的第一版已退役。
 //!
 //! 兜底：SVG 光栅化意外失败时给一块纯色底板（宁可丑，也不要开天窗）。
@@ -23,7 +23,10 @@ use windui::icon::{IconSource, WindowIcon};
 use windui::render::image::Image;
 
 /// 品牌 logo（矢量源，随 exe 分发）。改 logo = 覆盖这个文件重新编译。
-const LOGO_SVG: &[u8] = include_bytes!("../../image/icon.svg");
+/// ★ 它与 `assets/rupix.ico` 是**同一份 logo 的两端**：PE 图标资源由
+///   `examples/gen_icon.rs` 从本文件光栅化而来（m274 把两者放回同一目录）。
+///   改了这里没重跑生成器，`pe_icon_asset_matches_freshly_rasterized_logo` 会红。
+const LOGO_SVG: &[u8] = include_bytes!("../../assets/icon.svg");
 
 /// 兜底底板色（与主窗深色调一致；只在 SVG 光栅化意外失败时出现）。
 const FALLBACK: [u8; 3] = [24, 26, 30];

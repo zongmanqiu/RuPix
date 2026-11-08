@@ -1,4 +1,4 @@
-//! 一次性资源生成器：把 `image/icon.svg` 光栅化成多尺寸 `assets/rupix.ico`。
+//! 一次性资源生成器：把 `assets/icon.svg` 光栅化成多尺寸 `assets/rupix.ico`。
 //!
 //! 背景动机：exe 的 PE 图标资源（资源管理器/任务管理器/固定快捷方式显示的那张）
 //! 是编译期烙进 `.rsrc` 的静态 ico；窗口/托盘/标题栏走运行时 SVG 光栅化。两条路

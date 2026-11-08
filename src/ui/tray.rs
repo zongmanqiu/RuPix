@@ -37,9 +37,12 @@ pub type TrayActionFn = Rc<dyn Fn(&mut TrayCtx)>;
 /// **连登记都不做**（不是"装上再摘掉"——那样通知区会闪一下）。此后由 `runtime` 的
 /// 应用级轮询在开关翻转时调 `TrayHandle::set_visible` 跟随。
 ///
-/// `wake` = 显示/唤出看图窗口（已有就激活，没有就新建）；`new_win` = 明确新建一扇。
+/// `wake` = 主窗口（已有就激活，没有就开一扇；左键单击与菜单首项是同一条）。
 ///
-/// `config` / `hub` 供「进入设置」菜单项复用主窗那条设置单例窗（见
+/// 菜单只有三项（用户 2026-11-08 口径）：**主窗口 / 设置 / 退出**。原来的「新建窗口」
+/// 已删——多开走资源管理器右键「新窗口打开」与二次启动转发，托盘不该是开窗入口。
+///
+/// `config` / `hub` 供「设置」菜单项复用主窗那条设置单例窗（见
 /// [`crate::ui::settings::settings_window`]）：托盘回调拿的是 `TrayCtx` 而非
 /// `EventCtx`，故这里走 ctx 无关的 `settings_window`，再由 `TrayCtx::open_window` 开窗。
 pub fn build(
@@ -47,7 +50,6 @@ pub fn build(
     config: Rc<RefCell<Config>>,
     hub: Hub,
     wake: TrayActionFn,
-    new_win: TrayActionFn,
 ) -> Tray {
     let (w, h, rgba) = super::brand::tray_icon();
     let settings_cfg = config.clone();
@@ -62,12 +64,10 @@ pub fn build(
         // 多窗口之后没有"唯一主窗"可谈，这件事只有宿主知道。
         .on_left_click(move |ctx| (left_click)(ctx))
         .menu(vec![
-            TrayMenuItem::item("显示窗口", move |ctx| (show_item)(ctx)),
-            TrayMenuItem::item("新建窗口", move |ctx| (new_win)(ctx)),
-            TrayMenuItem::separator(),
+            TrayMenuItem::item("主窗口", move |ctx| (show_item)(ctx)),
             // 设置窗是普通顶层窗（多窗口时代不再挂 owner）：从托盘进来时没有任何窗口
             // 在场，`owned` 会指向一个不存在的发起者。
-            TrayMenuItem::item("进入设置", move |ctx| {
+            TrayMenuItem::item("设置", move |ctx| {
                 ctx.open_window(super::settings::settings_window(
                     &settings_cfg,
                     &settings_hub,

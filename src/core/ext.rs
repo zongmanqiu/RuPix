@@ -632,7 +632,7 @@ pub struct Manifest {
     pub license: String,
     /// 发行日期 `YYYY-MM-DD`（可选；仅展示）。
     pub released: String,
-    /// 响应超时（毫秒，可选）：缺省 [`DEFAULT_TIMEOUT_MS`]，上限 [`MAX_TIMEOUT_MS`]。
+    /// 响应超时（毫秒，可选）：缺省 `DEFAULT_TIMEOUT_MS`，上限 [`MAX_TIMEOUT_MS`]。
     ///
     /// 为什么要有它：OCR/批处理这类插件天生比 30s 慢，而宿主不能替插件猜它要多久——
     /// 猜短了插件被腰斩，猜长了用户干等。**插件自己声明，宿主只负责封顶。**
@@ -873,7 +873,7 @@ impl Manifest {
         self.capabilities.contains(&cap)
     }
 
-    /// 本插件的响应超时（缺省 [`DEFAULT_TIMEOUT_MS`]）。
+    /// 本插件的响应超时（缺省 `DEFAULT_TIMEOUT_MS`）。
     ///
     /// 编辑型不用它——编辑是交互任务，用户画多久都行，由「取消」兜底。
     pub fn response_timeout(&self) -> std::time::Duration {
@@ -921,6 +921,8 @@ impl DynamicHotkeys {
     }
 
     /// 某个插件的动态热键（展示用）。
+    ///
+    /// **展示侧尚未接（m282 调用图）**：热键冲突提示里还没用到，保留为数据 API。
     pub fn of_plugin(&self, id: &str) -> Option<&PluginHotkey> {
         self.entries.iter().find(|e| e.plugin_id == id)
     }
@@ -1410,7 +1412,7 @@ mod range_and_run_ui_tests {
         format!(
             r#"{{
                 "schema":1,"id":"test.channels","name":"C","version":"1.0.0",
-                "protocol":1,"min_host":"0.1.0","kind":"editor","entry":"c.exe",
+                "protocol":1,"min_host":"0.0.1","kind":"editor","entry":"c.exe",
                 "capabilities":["image.read","image.write","settings.read","settings.write"],
                 "platforms":["windows-x64"]{extra}
             }}"#
@@ -1496,7 +1498,7 @@ mod preview_spec_tests {
         format!(
             r#"{{
                 "schema":1,"id":"test.preview","name":"P","version":"1.0.0",
-                "protocol":1,"min_host":"0.1.0","kind":"editor","entry":"p.exe",
+                "protocol":1,"min_host":"0.0.1","kind":"editor","entry":"p.exe",
                 "capabilities":["image.read","image.write","settings.read","settings.write"],
                 "platforms":["windows-x64"]{extra}
             }}"#
@@ -1598,7 +1600,7 @@ mod preview_spec_tests {
         format!(
             r#"{{
                 "schema":1,"id":"test.presets","name":"P","version":"1.0.0",
-                "protocol":1,"min_host":"0.1.0","kind":"editor","entry":"p.exe",
+                "protocol":1,"min_host":"0.0.1","kind":"editor","entry":"p.exe",
                 "capabilities":["image.read","image.write","settings.read","settings.write"],
                 "platforms":["windows-x64"],
                 "settings":[
@@ -1652,7 +1654,7 @@ mod preview_spec_tests {
     fn manifests_without_a_preview_keep_the_old_settings_boundary() {
         let plain = Manifest::parse(
             r#"{"schema":1,"id":"t.plain","name":"P","version":"1.0.0","protocol":1,
-                "min_host":"0.1.0","kind":"command","entry":"p.exe",
+                "min_host":"0.0.1","kind":"command","entry":"p.exe",
                 "platforms":["windows-x64"]}"#,
         )
         .expect("valid");

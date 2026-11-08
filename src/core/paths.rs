@@ -13,7 +13,7 @@
 //!
 //! 因此**任何**持久化只往一个地方写：`exe` 的同级目录——其中**用户要看的**（配置）
 //! 直接放在根，**只用来取证的**（日志、转储、会话戳）收进根下的 `temp\` 一枚子目录，
-//! 按天命名、启动时清掉 7 天之前的（[`KEEP_DAYS`]）；**纯提速件**（丢了你只会觉得
+//! 按天命名、启动时清掉 7 天之前的（`KEEP_DAYS`）；**纯提速件**（丢了你只会觉得
 //! 慢一点，如 SVG 字体索引缓存）收进根下的 `cache\`，不参与按天清理。根目录里
 //! 因此只剩 `rupix.ini` 与 `decoders\`，一眼看得完；删目录仍然即净卸载（`temp\`
 //! 与 `cache\` 都在目录里）。外部目录一个字节都不碰。
@@ -22,7 +22,7 @@
 //! |----------------|-------------------------------|
 //! | 配置文件       | `<exe 目录>/rupix.ini`    |
 //! | 解码器清单     | `<exe 目录>/docs/decoders.json`（发布随包提供；「刷新」时覆盖） |
-//! | 运行日志       | `<exe 目录>/temp/rupix-<YYYY-MM-DD>.log`（按天，写满即停见 [`RUN_LOG_MAX_BYTES`]） |
+//! | 运行日志       | `<exe 目录>/temp/rupix-<YYYY-MM-DD>.log`（按天，写满即停见 `RUN_LOG_MAX_BYTES`） |
 //! | 崩溃报告       | `<exe 目录>/temp/crash-<YYYY-MM-DD>.log`（同一天的几次崩追加进同一枚） |
 //! | 崩溃转储       | `<exe 目录>/temp/crash-<YYYY-MM-DD-HHMMSS>.dmp`（只留最近几份，见 `platform::crash_evidence`） |
 //! | 会话戳         | `<exe 目录>/temp/rupix.run`（正常退出即删，**不日期化**——它是状态不是历史） |
@@ -144,7 +144,7 @@ pub fn crash_log_path(day: &str) -> Option<PathBuf> {
     Some(diagnostics_dir()?.join(format!("{CRASH_LOG_PREFIX}{day}{LOG_SUFFIX}")))
 }
 
-/// 运行日志路径：`<exe 目录>/temp/rupix-<day>.log`（写满即停，见 [`RUN_LOG_MAX_BYTES`]）。
+/// 运行日志路径：`<exe 目录>/temp/rupix-<day>.log`（写满即停，见 `RUN_LOG_MAX_BYTES`）。
 pub fn run_log_path(day: &str) -> Option<PathBuf> {
     Some(diagnostics_dir()?.join(format!("{RUN_LOG_PREFIX}{day}{LOG_SUFFIX}")))
 }

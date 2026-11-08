@@ -100,7 +100,7 @@ python build\hygiene_scan.py      # 硬编路径 / 调试残留 / TODO 真标记
    - 调试 / 验证脚本（`.py` / `.ps1` / 临时探针）、构建日志、命令输出（**禁止重定向到 `main/` 或 `解码器仓库`**）。
    - 计划 / 进度 / 发现类文件由工作区计划区管理，不在宿主文档内展开；一次性草稿 / 实测转储 / 截图 / 样本图片 → `.temp`。
    - 退役源码备份、探针工具目录（`.temp/*probe*/`）等。
-2. **禁止向 `main/` / `解码器仓库` 内写入任何日志、临时脚本或草稿文件**。`main/` 只放：源码（`src/`）、离屏探针（`examples/`）、构建脚本（`build/`）、文档（`*.md` / `docs/`）、资源（`image/` 品牌图标）、ABI 契约快照（`vendor/rupix-abi/`）。
+2. **禁止向 `main/` / `解码器仓库` 内写入任何日志、临时脚本或草稿文件**。`main/` 只放：源码（`src/`）、离屏探针（`examples/`）、构建脚本（`build/`）、文档（`*.md` / `docs/`）、资源（`assets/`：品牌图标 svg + PE 图标资源 ico/rc/in）、ABI 契约快照（`vendor/rupix-abi/`）。
    - `main/docs/` 的文档必须有长期价值（架构总览 / 解码器开发规范指针 / 图片格式与后缀名 / 待办 / 踩坑记录）。一次性草稿 / 实测转储放 `.temp`，不入库。「未受控文档进仓库」是明令禁止的。
 3. **target 重定向是写死的**：
    - `main/.cargo/config.toml`：`[build] target-dir = "../.temp/target"`（宿主：不得改回 `./target`）
@@ -116,7 +116,7 @@ python build\hygiene_scan.py      # 硬编路径 / 调试残留 / TODO 真标记
 
 | 允许 | 禁止 |
 |---|---|
-| `src/` `examples/` `tests/` `build/` `docs/` `image/` `patches/` | 任何 `.log` / `.txt` 草稿 / `__pycache__` |
+| `src/` `examples/` `tests/` `build/` `docs/` `assets/` `patches/` | 任何 `.log` / `.txt` 草稿 / `__pycache__` |
 | `Cargo.toml` `Cargo.lock` `build.rs` `seh_shim.c` | 编译中间产物（`.rs.bk`、备份、`.target`） |
 | 随源码的文档（`*.md` / `docs/`） | 一次性诊断脚本（→ `.temp/`） |
 | 构建脚本（`build/full.bat` 及编号步骤脚本） | 未在文档体系登记的临时文档（→ `.temp/`） |
@@ -169,7 +169,7 @@ RuPix/
 │  │                  / dump_sym.py（读自家报告/.dmp → 异常码 / 寄存器 / RVA / 线程名 / 逐帧 源码行）
 │  │                  / size_map.py（读 /MAP 链接图 → exe 体积逐 crate 账本 + 闭合检查）
 │  ├─ docs/           长期文档
-│  ├─ image/          品牌图标（svg，资源）
+│  ├─ assets/         品牌图标（svg，`include_bytes!` 进 exe）+ PE 图标资源（`rupix.ico` / `rupix.rc` / `version.rc.in`，构建期用）
 │  ├─ patches/        第三方补丁登记（windui 卷 `PATCHES.md` + usvg 卷 `usvg-0.48.1/PATCHES.md`，编号只增）
 │  ├─ seh_shim.c      C SEH 隔离层（build.rs 编译）
 │  └─ build.rs        编译 seh_shim.c（cc，static_crt）
@@ -492,7 +492,7 @@ cost=…ms bitmap=…`、`[decode-req] kind=… tier=… verdict=…`、`[close]
 |---|---|---|---|
 | 1 | 分层体检 | `cd main` → `python build\layering_scan.py` | `violations: 0` |
 | 2 | 卫生体检 | `python build\hygiene_scan.py` | `violations: 0` |
-| 3 | 格式化 | `cargo fmt --check` | exit 0（**已被 `build\2_scan.bat` 第 [3/6] 步强制执行**；此前列而不行，2026-10-17 补。★ 那一步一共 6 道：[1/6] 分层、[2/6] 卫生、[3/6] fmt、[4/6] clippy、[5/6] 结构文档新鲜度、[6/6] `dump_sym.py --selftest`） |
+| 3 | 格式化 | `cargo fmt --check` | exit 0（**已被 `build\2_scan.bat` 第 [3/7] 道强制执行**；此前列而不行，2026-10-17 补。★ 那一步一共 **7 道**：[1/7] 分层、[2/7] 卫生、[3/7] fmt、[4/7] clippy、[5/7] 结构文档新鲜度、[6/7] `dump_sym.py --selftest`、[7/7] **注释断链**（`cargo doc -D rustdoc::broken_intra_doc_links`，m282 补——前六道都只读代码、不读 doc comment，54 处断链因此长期无人发现）） |
 | 4 | 静态检查 | `cargo clippy --all-targets --release -- -D warnings` | exit 0。★ **必须带 `-D warnings`**：不带的话 clippy 有 warning 也退 0，"exit 0" 就是假绿。此列曾长期"列而不行"（与第 3 行 fmt 同一个毛病），2026-10-19 起由 `build\2_scan.bat` 第 [4/6] 步强制执行 |
 | 5 | 宿主单测 | `cargo test --lib -- --test-threads=1` | 全部 passed |
 | 6 | 集成门禁 | `cargo test --release -- --test-threads=1` | 全部 passed（含 docs_consistency） |

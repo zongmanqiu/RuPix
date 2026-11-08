@@ -2540,6 +2540,11 @@ struct UiHost {
     show_fps: bool,
     /// 平台要求宿主自己画的 1px 窗口外框色（见 `AppHandler::set_window_outline`）。
     window_outline: Option<Color>,
+    /// ★ RuPix 补丁 028 —— 无边框形态：整窗清底改用全透明。
+    ///
+    /// 平台层已经把它那块 pixmap 清成透明了，但整窗帧的**最终**清底在 `render`
+    /// 里（`pixmap.fill(self.bg)`）——宿主不跟着转透明，透明区会实心填成窗口底色。
+    bg_transparent: bool,
     /// 关闭请求拦截器：返回 true 允许关闭，false 取消。None 时默认允许。
     close_handler: Option<CloseHandler>,
     /// 窗口从隐藏态被唤起时的回调（见 [`App::on_show`]）。
@@ -2814,6 +2819,7 @@ impl UiHost {
             interval_durs,
             show_fps: std::env::var("WINDUI_FPS").is_ok_and(|v| v != "0" && !v.is_empty()),
             window_outline: None,
+            bg_transparent: false,
             close_handler,
             show_handler,
             activate_handler: None,
@@ -3379,10 +3385,17 @@ impl AppHandler for UiHost {
         // 两条后端各铺各的底：软后端直接 fill pixmap；GPU 后端要等宿主宣告「本帧整窗」
         // 才清常驻纹理——开帧时清就得靠平台层预测这一帧是局部还是整窗，而预测错一次
         // 的代价是整窗内容丢失（见 `RenderTarget::begin_damage`）。
-        target.begin_damage(None, self.bg);
+        // ★ RuPix 补丁 028：无边框形态下整窗清底也走全透明——否则平台那一刀被这里盖掉，
+        // 透明区就变成一块实心的窗口底色。
+        let bg = if self.bg_transparent {
+            Color::rgba(0, 0, 0, 0)
+        } else {
+            self.bg
+        };
+        target.begin_damage(None, bg);
         if let Some(pixmap) = target.as_pixmap() {
             pixmap.fill(tiny_skia::Color::from_rgba8(
-                self.bg.r, self.bg.g, self.bg.b, self.bg.a,
+                bg.r, bg.g, bg.b, bg.a,
             ));
         }
         self.last_present = None;
@@ -3800,7 +3813,18 @@ impl AppHandler for UiHost {
         }
     }
 
+    fn set_bg_transparent(&mut self, on: bool) {
+        if std::mem::replace(&mut self.bg_transparent, on) != on {
+            // 清底色是整帧起点：开关一变必须整窗重画，否则旧底残留。
+            self.damage.needs_full = true;
+        }
+    }
+
     fn bg(&self) -> Option<Color> {
+        // ★ RuPix 补丁 028：无边框形态下窗口底色就是透明的（平台清屏也读这份）。
+        if self.bg_transparent {
+            return Some(Color::rgba(0, 0, 0, 0));
+        }
         if self.bg_follows_theme {
             Some(self.theme_src.current().palette.bg)
         } else {

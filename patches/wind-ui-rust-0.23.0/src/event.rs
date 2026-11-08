@@ -67,6 +67,12 @@ pub enum WindowOp {
     /// 常规态，擅自改会破坏全屏恢复记录。参数是物理像素而非逻辑 dp：调用方（看图器）
     /// 拿到的是图片的自然像素尺寸，"1:1 显示"就是物理像素对物理像素，不需要再折算 DPI。
     SetClientSize(i32, i32),
+    /// ★ RuPix 补丁 028 —— 无边框形态：背景逐像素透明、但鼠标不穿透。
+    ///
+    /// `true` 时窗口即使处于 100% 不透明也留在 `WS_EX_LAYERED` 逐像素路径上，
+    /// 底色清成 alpha=0、最终 DIB 的 alpha 下限抬到 1（见 win32 `paint_layered`）。
+    /// `false` 时回到普通窗口合成。
+    SetTransparentBackground(bool),
 }
 
 /// 窗口的当前状态与能力快照。

@@ -452,7 +452,7 @@ fn installed_row(ext: Extension, config: Rc<RefCell<Config>>, ui: PluginUi) -> E
 }
 
 /// 行尾那颗「!」按钮（详情窗）。盒子钉死成 `ICON_BTN_W/H`——它是两颗小按钮的**标尺**，
-/// 齿轮按它来（见 [`tokens::ICON_BTN_W`]）。两张卡（「已安装」/「可下载」）共用这一颗。
+/// 齿轮按它来（见 `ICON_BTN_W`）。两张卡（「已安装」/「可下载」）共用这一颗。
 fn info_btn() -> Element {
     btn("!").width(ICON_BTN_W).height(ICON_BTN_H)
 }
@@ -945,7 +945,7 @@ mod tests {
             name: id.into(),
             version: version.into(),
             protocol: 1,
-            min_host: "0.1.0".into(),
+            min_host: "0.0.1".into(),
             kind: Kind::Command,
             description: String::new(),
             file: format!("{id}_{version}.zip"),

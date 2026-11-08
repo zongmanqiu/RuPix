@@ -18,7 +18,7 @@
 //!
 //! `id / name / version / abi / size / released / author / license / desc / formats / gitee / github`。
 //! `formats` 是**分号分隔、不带点**的扩展名串——和 ABI 的 `IvDecoderInfo.extensions`
-//! 同一个形状，宿主在这两处用同一套切法（[`split_formats`]）。
+//! 同一个形状，宿主在这两处用同一套切法（`split_formats`）。
 //!
 //! **清单里没有哈希**（2026-11-02 用户口径）：产物全部出自我们自己的构建，不对外接受第三方
 //! 改动，"这枚 DLL 是不是我们发的"由 `id` + `version` 认定就够了。这是解码器仓与宿主两侧
@@ -28,7 +28,7 @@
 //!
 //! - **信息不全的项直接不显示**（2026-10-26 用户口径）：清单是手写 `gitee` / `github` 的，半成品条目
 //!   完全可能混进来。画一行"名称有、大小没有、按钮点了不知道下什么"比不画更糟，
-//!   所以 [`parse_catalog`] 把认不出的项**丢掉并计数**（[`Catalog::skipped`]，
+//!   所以 `parse_catalog` 把认不出的项**丢掉并计数**（[`Catalog::skipped`]，
 //!   只进日志，不摊到状态行——2026-10-29 用户口径：状态行只报数字）。
 //!   整份清单解析失败才是错误。
 //! - **id / version 要能当文件名用**：下载落盘是 `<id>_<ver>.dll`，所以这两段在解析阶段
@@ -43,7 +43,7 @@
 //! `SourceId::index_url` 拉一份，**解析成功后再原子覆盖本地文件**；失败就保留旧清单，
 //! 状态行如实说原因。切换 Gitee / GitHub **不联网**：同一份清单里两列地址都在，只换列。
 //!
-//! 刷新走后台线程（[`start_refresh`] / [`poll_refresh`]），理由与 DLL 下载相同：
+//! 刷新走后台线程（`start_refresh` / `poll_refresh`），理由与 DLL 下载相同：
 //! WinHTTP 四个阶段的超时加起来足够把设置窗冻成"未响应"。
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

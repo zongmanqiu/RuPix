@@ -52,7 +52,7 @@ pub(super) fn rank_candidates(scores: Vec<(i32, PathBuf)>) -> Vec<(i32, PathBuf)
 /// 候选筛选的一项（**只借不藏**，不持 `Library`，便于测试）。
 ///
 /// 宿主选解码器的判据只有这几样：认领哪些扩展名、是否被用户关掉、是否进了黑名单、
-/// **会哪种解码类型**（`caps`，契约可选导出 `iv_caps` 的位图，缺席时由 [`caps_of`] 推定）。
+/// **会哪种解码类型**（`caps`，契约可选导出 `iv_caps` 的位图，缺席时由 `caps_of` 推定）。
 /// `id` **只**服务用户显式首选的按名反查（[`preferred_candidate`]）——自动仲裁
 /// [`select_candidate`] 依旧不读它，理由见其注释里「为什么不该手写优先级表」的说明。
 ///

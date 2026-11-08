@@ -56,6 +56,7 @@ pub mod canvas;
 pub mod chrome;
 pub mod dialog_footer;
 pub mod filmstrip;
+pub mod goto_dialog;
 /// 抓手光标（松手 / 抓手）的 SVG 光栅化与切换。
 pub mod hand_cursor;
 pub mod pin;
@@ -63,11 +64,14 @@ pub mod plugin_result;
 pub mod plugin_settings;
 pub mod raw_dialog;
 pub mod recovery_hint;
+pub mod rotate_dialog;
 pub mod settings;
 pub mod singleton;
 pub mod svg;
 pub mod text_window;
 pub mod tray;
+pub mod update_state;
+pub mod update_window;
 pub mod window;
 
 // ── 层内中枢（2026-10-26，对标 CurSeen 的同款做法）────────────────────

@@ -10,7 +10,7 @@
 //! 世代令牌（`seq`）的作用：**丢弃过期结果**。连按右方向键时，前几张的解码结果会在
 //! 用户已经翻过去之后才回来；没有令牌的话，旧图会把新图盖掉，表现为"翻页后画面跳回去"。
 //!
-//! 令牌有**两处消费点**：UI 侧 [`Viewer::apply`] 判 `seq != want_seq` 丢弃过期 Done；
+//! 令牌有**两处消费点**：UI 侧 `Viewer::apply` 判 `seq != want_seq` 丢弃过期 Done；
 //! 解码线程侧 [`decode_loop`] 判 `Main`/`Prefetch` 的 `seq < main_floor` 直接**不发**
 //! 解码（空串 Err 占位 Done）——后者省的是 CPU，前者省的是像素覆盖。这一刀出自
 //! 早期「手感断点清单」的 A1 条目（m07，已随 m47 收编删除；落地数字见 `HISTORY.md` 2026-10-14 段）。
@@ -74,7 +74,7 @@ struct Req {
     raw: Option<RawParams>,
     /// 请求语义：主画面 / 预读 / 缩略图。决定取消策略（见 [`ReqKind`]）。
     kind: ReqKind,
-    /// 显式开关：这一次要**原生降采样**（[`REQ_ALLOW_SCALED`]），与 `kind` 无关。
+    /// 显式开关：这一次要**原生降采样**（`REQ_ALLOW_SCALED`），与 `kind` 无关。
     ///
     /// 为什么单列一位而不是只看 `kind`：缩略图天然要缩放，但主画面的**首解**同样
     /// 要——首屏要的是快，清晰度由随后那一次原图档升级补上（见 `viewer::tick` 的
@@ -312,6 +312,26 @@ pub fn get_raw_params(path: &Path) -> Option<RawParams> {
         .copied()
 }
 
+/// 取这次解码该用的裸数据参数：会话里已有（参数窗确认过 / 首开推断过）就直接还，
+/// 否则按后缀 + 文件长度推断一份并写回 store；推不出返回 `None`，交给参数窗。
+///
+/// ★ 主画面（`viewer::schedule::send_decode`）与缩略图（`core::thumbs::ensure`）
+///   **必须共用这一处**。裸像素没有文件头，`raw = None` 的请求在解码器侧只会得到
+///   「没有尺寸信息」，于是同一张图主画面看得见、条上那一格永远空着
+///   （2026-11-08 用户实报 `noise.bgra`，1M 目录里 11 个裸像素后缀全部中招）。
+///   相机 RAW / 普通图走早退：它们有头，不需要也不该去反推宽高。
+pub fn ensure_raw_params(path: &Path) -> Option<RawParams> {
+    if let Some(p) = get_raw_params(path) {
+        return Some(p);
+    }
+    if !is_headerless_path(path) {
+        return None;
+    }
+    let p = infer_raw_params(path)?;
+    set_raw_params(path, p);
+    Some(p)
+}
+
 /// 解码线程 → UI。数据走 `std::sync::mpsc`（不会自己叫醒 UI）；
 /// 主画面回包另经 [`DONE_WAKER`] 叫醒一帧，见 `decode_loop` 尾部的说明。
 #[derive(Debug)]
@@ -361,11 +381,13 @@ pub struct MetaEvent {
 // 就完全忽略这条通道。
 static META_TX: std::sync::OnceLock<StdSender<MetaEvent>> = std::sync::OnceLock::new();
 
-/// 装入查询事件的接收端（幂等）。由 `runtime::run` 在建解码线程之前调用。
+/// 装入查询事件的接收端（幂等）。
 ///
-/// ★ 多窗口（2026-11-04）：这只是**兜底**。GUI 现在每个看图窗口各有一条解码线程，
-/// 各自带着自己的回程（见 [`DecodeSink`]），thread-local 优先——全局单槽留着是给
-/// 直调路径（探针 / 示例 / 无 sink 的旧测试）一个"至少能收到"的落点。
+/// ★ 多窗口（2026-11-04）：这只是**兜底**。GUI 每个看图窗口各有一条解码线程、
+/// 各自带着自己的回程（见 [`DecodeSink`]），thread-local 优先——全局单槽只为
+/// 「没有 sink 的直调路径」保留。
+/// **当前宿主无调用方**（m282 全仓调用图确认）：与 [`install_done_waker`] 成对，
+/// 后者仍有测试在用；删这个槽要连带动 [`publish_meta`] 的兜底分支，故保留。
 pub fn install_meta_sender(tx: StdSender<MetaEvent>) {
     let _ = META_TX.set(tx);
 }
@@ -1489,10 +1511,60 @@ pub fn probe_decode_frame(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::mpsc::channel;
 
     use super::*;
+
+    /// 测试专用：一条**不跑解码线程**的 `Decoder`，让别的模块能稳定读到入队的请求。
+    /// 生产路径仍只有 `spawn_with` 一条真线程，这里只是同一个结构体的裸构造，
+    /// 不存在第二套发送行为。
+    pub(crate) fn stub_decoder() -> Decoder {
+        Decoder {
+            queue: Arc::new(Queue::new()),
+            owner: NEXT_OWNER.fetch_add(1, Ordering::Relaxed),
+            next_seq: Cell::new(1),
+            main_floor: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// 队列快照（路径 / 裸数据参数 / 请求种类 / 目标框）：缩略图那侧靠它验「走的是哪条通道」，
+    /// 而不是靠 `inflight.len()` 这种两种写法都绿的间接量。
+    pub(crate) fn pending_reqs(
+        d: &Decoder,
+    ) -> Vec<(PathBuf, Option<RawParams>, ReqKind, u32, u32)> {
+        d.queue
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|r| (r.path.clone(), r.raw, r.kind, r.max_w, r.max_h))
+            .collect()
+    }
+
+    /// ★ 负向验证：有文件头的图不进裸数据通道，也不许被反推宽高。
+    /// 挂错判据（把 `is_headerless_path` 写成恒真）时这条先红。
+    #[test]
+    fn ensure_raw_params_leaves_headered_files_alone() {
+        let p = PathBuf::from("thumbs-gate/camera.nef");
+        assert!(ensure_raw_params(&p).is_none(), "相机 RAW 不该走裸数据推断");
+        assert!(get_raw_params(&p).is_none(), "更不许往会话 store 里塞参数");
+        let jpg = PathBuf::from("thumbs-gate/plain.jpg");
+        assert!(ensure_raw_params(&jpg).is_none());
+    }
+
+    /// 参数窗确认过的值优先于推断（用户改过的宽高不能被自动推断覆盖）。
+    #[test]
+    fn ensure_raw_params_keeps_the_users_value() {
+        let p = PathBuf::from("thumbs-gate/user.bgra");
+        let want = RawParams {
+            width: 640,
+            height: 480,
+            layout: 8,
+        };
+        set_raw_params(&p, want);
+        assert_eq!(ensure_raw_params(&p), Some(want));
+    }
 
     #[test]
     fn rawpx_inference_uses_suffix_layout_and_length() {

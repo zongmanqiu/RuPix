@@ -6,13 +6,13 @@
 use super::*;
 
 /// 关于页：信息卡、赞助码。
-pub fn about_page() -> Element {
+pub fn about_page(h: &Handles) -> Element {
     const HOMEPAGE: &str = "https://gitee.com/qiuzongman/RuPix";
     const GITHUB_MIRROR: &str = "https://github.com/zongmanqiu/RuPix";
 
-    const LOGO_SVG: &[u8] = include_bytes!("../../../image/icon.svg");
-    const DONATE_WECHAT_SVG: &[u8] = include_bytes!("../../../image/WeChatPay.svg");
-    const DONATE_ALIPAY_SVG: &[u8] = include_bytes!("../../../image/ALiPay.svg");
+    const LOGO_SVG: &[u8] = include_bytes!("../../../assets/icon.svg");
+    const DONATE_WECHAT_SVG: &[u8] = include_bytes!("../../../assets/WeChatPay.svg");
+    const DONATE_ALIPAY_SVG: &[u8] = include_bytes!("../../../assets/ALiPay.svg");
 
     const LOGO_SIZE: i32 = 56;
     const DONATE_QR_SIZE: i32 = 160;
@@ -127,26 +127,56 @@ pub fn about_page() -> Element {
         .bg(card_bg)
         .corner(card_radius);
 
-    // 「检查更新」是宿主第三处（也是唯一手动的）联网入口：只在用户点这一下时
-    // 后台拉 update.json，不做启动检查、不轮询。地址取 ini 的
-    // update_index_gitee / update_index_github（高级用户手改，界面不出现）。
+    // 「版本更新」卡：版式与交互对齐 CurSeen 的关于页（用户 2026-11-08 点名）。
+    //
+    // ★ 反馈**只**走这张卡：检查 / 下载的进展写在状态行，下载时「检查更新」原地让位
+    //   给进度条，不再往主窗口弹 toast。按钮忙时置灰，因此不需要再拦「重复点击」。
+    const PROGRESS_W: i32 = 220;
+
+    let up = h.update;
+    let check_btn = super::rows::btn("检查更新")
+        .enabled_signal(up.busy.map(|b| !*b))
+        .visible_when(move || !up.downloading.get())
+        .on_click(|_ctx| {
+            if let Err(e) = crate::core::update::request(crate::core::update::Request::Check) {
+                log::warn!("发起检查更新失败：{e}");
+            }
+        });
+    let progress = Element::progress(up.progress)
+        .width(PROGRESS_W)
+        .visible_when(move || up.downloading.get() && up.progress.get() >= 0.0);
+    let progress_unknown = Element::progress_indeterminate()
+        .width(PROGRESS_W)
+        .visible_when(move || up.downloading.get() && up.progress.get() < 0.0);
+    // 当前更新源：灰字只读。切换入口仍在解码器页的「来源」下拉（同一份 config）。
+    let source_hint = Element::label_signal(h.download_source.map(|s| {
+        let name = if *s == 0 { "Gitee" } else { "GitHub" };
+        format!("更新源：{name}")
+    }))
+    .font_size(FONT_MD)
+    .fg(to_color(TEXT_SECONDARY));
+
     let update_card = Element::col()
         .spacing(8)
         .child(
-            Element::label("软件更新")
+            Element::label("版本更新")
                 .font_size(FONT_MD)
                 .font_weight(600),
         )
         .child(
-            Element::label(format!("当前版本 {}", env!("CARGO_PKG_VERSION")))
+            Element::row()
+                .child(check_btn)
+                .child(progress)
+                .child(progress_unknown)
+                .child(Element::leaf().width(8))
+                .child(source_hint)
+                .cross(Align::Center),
+        )
+        .child(
+            Element::label_signal(up.status)
                 .font_size(FONT_MD)
                 .fg(to_color(TEXT_SECONDARY)),
         )
-        .child(super::rows::btn("检查更新").on_click(move |_ctx| {
-            if let Err(e) = crate::core::update::request(crate::core::update::Request::Check) {
-                log::warn!("发起检查更新失败：{e}");
-            }
-        }))
         .padding(card_pad)
         .bg(card_bg)
         .corner(card_radius);

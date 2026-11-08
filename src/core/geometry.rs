@@ -63,7 +63,7 @@ pub fn fit_to(rgba: Vec<u8>, w: u32, h: u32, max_w: u32, max_h: u32) -> Bitmap {
 }
 
 /// 「先转再缩」，但**整图那一趟搬运不做**：先按方向反推出来的块划分降采样，再把那份
-/// 小图转正。与 `fit_to(oriented(..))` **逐字节相同**（[`fit_oriented_matches_orient_then_fit`]）。
+/// 小图转正。与 `fit_to(oriented(..))` **逐字节相同**（`fit_oriented_matches_orient_then_fit`）。
 ///
 /// ★ 为什么不写成"先缩再转"那么显然：`downscale` 的输出格边界是 `floor(i*n/t)`，从**近端**
 ///   锚定；而"先转再缩"里被方向反着取样（`w-1-x` / `h-1-y`）的那根轴，其格边界落在**远端**
@@ -413,6 +413,80 @@ pub fn transformed(rgba: &[u8], w: u32, h: u32, rot: u8, flip: bool) -> (u32, u3
     (dw as u32, dh as u32, out)
 }
 
+/// 任意角度旋转（**恒输出同尺寸**，双线性逆采样，越界填透明）。
+///
+/// `deg` 是顺时针度数（UI 只给整数，见 `ui::rotate_dialog`）。输出恒为 `w×h`：
+/// 编辑覆盖与 `natural` / 鸟瞰 / 缩放的全部账目都压在"尺寸不变"这一条上
+/// （`viewer/edited.rs` 模块头），所以宁可裁掉转出来的边角，也不放大包围盒。
+///
+/// ★ 一次成图、**绝不累积**：每次都从源像素反解。把上一次的输出再喂回来，
+/// 连调 1° 十次会把画质糊成一团（`rotated_is_not_accumulated` 钉住这条）。
+///
+/// 采样在**预乘空间**做（同 `scale_premul` 的判据）：全透明像素的 RGB 本来就是 0，
+/// 直接插值会在不透明边缘拉出一圈黑边。输出像素 `(x,y)` 反查源点用的是
+/// 逆时针矩阵 `sx = cx + dx·cos + dy·sin`、`sy = cy − dx·sin + dy·cos`；
+/// 90° 时与 [`transformed`] 的 `dst(x,y)=src(y, h−1−x)` 逐点一致（有单测锁）。
+pub fn rotated(rgba: &[u8], w: u32, h: u32, deg: i32) -> Vec<u8> {
+    let (wu, hu) = (w as usize, h as usize);
+    let mut out = vec![0u8; wu * hu * 4];
+    if wu == 0 || hu == 0 || rgba.len() < wu * hu * 4 {
+        return out;
+    }
+    let d = deg.rem_euclid(360);
+    if d == 0 {
+        out[..wu * hu * 4].copy_from_slice(&rgba[..wu * hu * 4]);
+        return out;
+    }
+    let t = (d as f64).to_radians();
+    let (c, sn) = (t.cos(), t.sin());
+    let (cx, cy) = ((wu as f64 - 1.0) / 2.0, (hu as f64 - 1.0) / 2.0);
+    for y in 0..hu {
+        let dy = y as f64 - cy;
+        for x in 0..wu {
+            let dx = x as f64 - cx;
+            let sx = cx + dx * c + dy * sn;
+            let sy = cy - dx * sn + dy * c;
+            let px = sample_premul(rgba, wu, hu, sx, sy);
+            let i = (y * wu + x) * 4;
+            for (k, v) in px.iter().enumerate() {
+                out[i + k] = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// 预乘空间双线性：返回 `[r, g, b, a]`，都是 0..255 的浮点，越界采样记 0。
+fn sample_premul(src: &[u8], w: usize, h: usize, sx: f64, sy: f64) -> [f64; 4] {
+    let ix = sx.floor() as i64;
+    let iy = sy.floor() as i64;
+    let fx = sx - ix as f64;
+    let fy = sy - iy as f64;
+    let mut sum = [0.0f64; 4];
+    for (oy, wy) in [(0i64, 1.0 - fy), (1, fy)] {
+        for (ox, wx) in [(0i64, 1.0 - fx), (1, fx)] {
+            let (px, py) = (ix + ox, iy + oy);
+            if px < 0 || py < 0 || px >= w as i64 || py >= h as i64 {
+                continue;
+            }
+            let i = (py as usize * w + px as usize) * 4;
+            let a = src[i + 3] as f64 / 255.0;
+            let wt = wx * wy;
+            sum[0] += src[i] as f64 * a * wt;
+            sum[1] += src[i + 1] as f64 * a * wt;
+            sum[2] += src[i + 2] as f64 * a * wt;
+            sum[3] += a * wt;
+        }
+    }
+    let a = sum[3];
+    if a <= 1e-9 {
+        [0.0; 4]
+    } else {
+        let inv = 1.0 / a;
+        [sum[0] * inv, sum[1] * inv, sum[2] * inv, a * 255.0]
+    }
+}
+
 /// [`transformed`] 的**逆**：给同一份像素再转一次，回到转之前的样子。
 ///
 /// 存在的理由只有一条：编辑/分析型插件拿到的是"屏上朝向"那一份（契约见
@@ -420,10 +494,8 @@ pub fn transformed(rgba: &[u8], w: u32, h: u32, rot: u8, flip: bool) -> (u32, u3
 /// 发送那一刻冻结的朝向**，不是此刻的 `rot/flip`（用户在插件窗口里待着时，主窗口可能又被转过）。
 ///
 /// D4 里只有 90° 与 270° 互逆，其余六个（恒等、三个 180°/镜像组合、两次对角转置）都是自逆。
-/// 这条性质不许靠人推：同文件的用例 [`transformed_then_inverted_is_identity`] 拿**生产内核**
+/// 这条性质不许靠人推：同文件的用例 `transformed_then_inverted_is_identity` 拿**生产内核**
 /// 在 3×5（宽高不等，才能抓到维度没换的错）上逐种验一遍。
-///
-/// [`transformed_then_inverted_is_identity`]: self::transformed_then_inverted_is_identity
 pub fn inverted(rot: u8, flip: bool) -> (u8, bool) {
     match (rot % 4, flip) {
         (1, false) => (3, false),
@@ -984,5 +1056,74 @@ pub struct RectI {
 impl RectI {
     pub const fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
         Self { x, y, w, h }
+    }
+}
+
+#[cfg(test)]
+mod rotate_tests {
+    use super::{rotated, transformed};
+
+    /// 4×4 非对称图案：每格一个不同的 RGBA，转错方向 / 换错轴立刻能看出来。
+    fn pattern() -> Vec<u8> {
+        let mut v = Vec::with_capacity(4 * 4 * 4);
+        for y in 0..4 {
+            for x in 0..4 {
+                v.extend_from_slice(&[20 + x * 40 + y, 60 + y * 40 + x, 200 - x * 20, 255]);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn zero_degrees_is_byte_identical() {
+        let src = pattern();
+        assert_eq!(rotated(&src, 4, 4, 0), src);
+        assert_eq!(rotated(&src, 4, 4, 360), src);
+        assert_eq!(rotated(&src, 4, 4, -360), src);
+    }
+
+    /// 90° 必须与生产用的 `transformed(rot=1)` 同源：顺时针方向、换轴都不许反。
+    #[test]
+    fn ninety_degrees_matches_the_stepwise_transform() {
+        let src = pattern();
+        let (_, _, want) = transformed(&src, 4, 4, 1, false);
+        assert_eq!(rotated(&src, 4, 4, 90), want);
+        let (_, _, want180) = transformed(&src, 4, 4, 2, false);
+        assert_eq!(rotated(&src, 4, 4, 180), want180);
+    }
+
+    /// 只从不透明区域取样时，透明边界不许拉出黑边（预乘空间的判据）。
+    #[test]
+    fn transparent_border_does_not_leak_black() {
+        let mut src = vec![0u8; 5 * 5 * 4];
+        let i = (2 * 5 + 2) * 4;
+        src[i..i + 4].copy_from_slice(&[200, 100, 50, 255]);
+        let out = rotated(&src, 5, 5, 30);
+        for px in out.chunks_exact(4) {
+            if px[3] > 0 {
+                // 预乘还原后，颜色只能是原色与透明的混合，不该出现 (0,0,0) 实心黑。
+                assert!(px[0] > 0 || px[3] == 0, "透明邻域把红通道拉黑了：{px:?}");
+            }
+        }
+    }
+
+    /// ★ 负向臂：连调两次 1° 与一次 2° **不相同**。这条证明显示层必须每次都从
+    /// 源图重算（缓存键里带 `deg`、源用 `src.gen`），不能拿上一帧的输出接着转。
+    #[test]
+    fn rotated_is_not_accumulated() {
+        let src = pattern();
+        let once = rotated(&src, 4, 4, 2);
+        let twice = rotated(&rotated(&src, 4, 4, 1), 4, 4, 1);
+        assert_ne!(
+            once, twice,
+            "两次 1° 竟然等于一次 2°，说明采样退化成了无损搬像素"
+        );
+    }
+
+    #[test]
+    fn out_of_range_input_is_safe() {
+        assert_eq!(rotated(&[1, 2, 3], 0, 0, 45), Vec::<u8>::new());
+        let short = rotated(&[0u8; 8], 4, 4, 45);
+        assert_eq!(short.len(), 4 * 4 * 4);
     }
 }

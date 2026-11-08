@@ -7,21 +7,27 @@
 //! | 键                | 含义                                        | 默认 |
 //! |-------------------|---------------------------------------------|------|
 //! | `stay_on_top`     | 启动时窗口置顶                              | `0`  |
-//! | `double_click`    | 双击：0 无 / 1 关窗 / 2 最大化 / 3 全屏     | `1`  |
+//! | `double_click`    | 双击**画面区**：0 无 / 1 关窗 / 2 最大化 / 3 全屏；标题栏双击恒为最大化/恢复 | `1`  |
 //! | `slide_interval`  | 幻灯片每张停留秒数（1..=600）        | `3`  |
 //! | `show_title_bar`  | 标题条：1 完整（文件名+三钮）/ 0 无按钮     | `1`  |
 //! | `long_image_fit`  | 长图自动按宽适应（竖向可拖）                | `0`  |
-//! | `wheel_behavior`  | 滚轮：0 缩放 / 1 翻页                       | `0`  |
-//! | `ctrl_wheel`      | Ctrl+滚轮：0 缩放 / 1 翻页                   | `1`  |
-//! | `init_window`     | 启动窗口：0 固定 / 1 全屏 / 3 图片尺寸       | `0`  |
+//! | `wheel_behavior`  | 滚轮：0 放大/缩小 / 1 下一张·上一张 / 2 不透明度± / 3 无 | `0`  |
+//! | `ctrl_wheel`      | Ctrl+滚轮：同上四档                          | `1`  |
+//! | `alt_wheel`       | Alt+滚轮：同上四档（新增默认关闭）           | `3`  |
+//! | `shift_wheel`     | Shift+滚轮：同上四档（新增默认关闭）         | `3`  |
+//! | `init_window`     | 窗口尺寸：0 固定 / 1 全屏 / 3 图片尺寸        | `0`  |
+//! | `borderless`      | 无边框形态：隐藏自绘 chrome 与底色、背景透明          | `0`  |
 //! | `window_w`        | 固定尺寸档窗口宽（100..=8192）               | `800`|
 //! | `window_h`        | 固定尺寸档窗口高（100..=8192）               | `600`|
 //! | `opacity`         | 窗口整体不透明度（百分制，10% 档）          | `90` |
-//! | `prefetch`        | 邻图预读：后台先解好前后各两张（即时生效）  | `1`  |
+//! | `prefetch`        | 图片预读总开关（邻图 + 缩略图条可见一屏，即时生效） | `1`  |
+//! | `prefetch_depth`  | **只写 ini**：每个方向预读几张（1..=4，默认 3）；界面不出现 | `3` |
 //! | `close_to_tray`   | 关闭改为收进系统托盘（即时生效）            | `0`  |
 //! | `space_preview`   | 空格预览：资源管理器选中图片按空格弹预览（QuickLook 式） | `0`  |
 //! | `drag_image`      | 左键拖动图片：画布里拖动只平移图片，移动窗口交给标题栏 | `1`  |
-//! | `show_toolbar_buttons` | 底部浮条显示按钮：关掉只留信息并水平居中 | `1`  |
+//! | `sort_by`         | 清单排序维度：0 文件名 / 1 大小 / 2 创建日期 / 3 修改日期 | `0`  |
+//! | `sort_desc`       | 排序方向：0 升序 / 1 倒序                    | `0`  |
+//! | `show_toolbar_buttons` | 底部浮条显示操作按钮：关掉只留信息并水平居中 | `1`  |
 //! | `decoders_disabled`| 被停用的解码器 id（分号分隔）             | 空   |
 //! | `decoders_preferred`| 各扩展名的首选解码器 `扩展名=解码器id`（分号分隔）| 空  |
 //! | `raw_last`        | 裸数据参数窗的上次使用值 `宽x高:布局`       | 空   |
@@ -39,13 +45,15 @@
 //! 轮询 [`poll_save`] 统一落盘，退出时 [`flush_save`] 权威保存；写盘走
 //! `.tmp` → fsync → rename 的**原子写**——半途断电既不会留下半个 ini，也不会留下
 //! "名字是新的、内容是空的"那个更阴的版本（见 [`Config::save_to`] 里那段解释）。
-//! 首次启动生成带注释的默认 ini（[`DEFAULT_INI`]，「文件即文档」）。
+//! 首次启动生成带注释的默认 ini（`default_ini`，「文件即文档」）。
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use crate::core::gallery::{SortBy, SortSpec};
 
 /// 解码器清单的来源：Gitee / GitHub。
 ///
@@ -199,7 +207,11 @@ impl SourceId {
     }
 }
 
-/// 双击图片的行为（与菠萝看图的 DoubleClickBehavior 一一对应）。
+/// 双击**画面区**的行为（与菠萝看图的 DoubleClickBehavior 一一对应）。
+///
+/// ★ **标题栏不在本枚举管辖内**：双击顶条恒等于「最大化 / 恢复」，判据见
+/// `ui::canvas::double_click_action`（2026-11-08 用户报「秒退」：默认关窗
+/// 曾把双击顶条也吃掉）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DblClick {
     /// 无操作。
@@ -262,96 +274,111 @@ pub fn clamp_slide_interval(v: u32) -> u32 {
     v.clamp(SLIDE_SEC_MIN, SLIDE_SEC_MAX)
 }
 
-/// 滚轮行为（菠萝 MouseWheelBehavior：Zoom / Switch）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Wheel {
-    /// 缩放（RuPix 默认——看图器滚轮=缩放是主流习惯）。
-    Zoom,
-    /// 翻页（菠萝备选项）。
-    Switch,
-}
-
-impl Wheel {
-    pub fn from_index(i: i64) -> Self {
-        if i == 1 {
-            Wheel::Switch
-        } else {
-            Wheel::Zoom
-        }
-    }
-
-    pub fn index(self) -> i64 {
-        match self {
-            Wheel::Zoom => 0,
-            Wheel::Switch => 1,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Wheel::Zoom => "缩放图片",
-            Wheel::Switch => "切换图片",
-        }
-    }
-
-    pub const ALL: [Wheel; 2] = [Wheel::Zoom, Wheel::Switch];
-}
-
-/// Ctrl+滚轮行为（与 [`Wheel`] 同构，只是按住 Ctrl 时的另一路分派）。
+/// 滚轮可挂的**成对动作**（m278）：一个下拉管上下两个方向，选了「下一张 / 上一张」，
+/// 另一个方向自动是「上一张 / 下一张」，不用为上下各建一行。
 ///
-/// 2026-10-14 快捷键优化：普通滚轮沿用旧默认（缩放），Ctrl+滚轮补一个简单档，
-/// 让用户在不引鼠标捕获子系统的前提下也能用 Ctrl+滚轮翻页。
+/// ★ 下标 `0/1` 沿用 2026-10-14 老 ini 的取值（`wheel_behavior` / `ctrl_wheel`）：
+/// **老配置升级后行为一字不变**。`2`（不透明度）与 `3`（无）是新增档，`3` 是
+/// `alt_wheel` / `shift_wheel` 两个新键的默认值——用户口径「新增的这些都默认关闭」。
+///
+/// ★ 动作本体只有 [`crate::core::hotkey::Action`] 一份正本：这里只登记「哪两个动作互为
+/// 反向」，不另造一套动作表，鼠标下拉也不是 35 项全表（用户最终拍板「定制比较好」）。
+/// 以后加动作改 hotkey.rs，这里 `pair()` 是唯一要一起改的地方；下拉由 `ALL` 自动生成。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CtrlWheel {
-    /// 缩放（与无修饰滚轮一致）。
+pub enum WheelAction {
+    /// 向上放大 / 向下缩小。执行走 `zoom_by_wheel`（保留指针锚点），不走离散 Action。
     Zoom,
-    /// 翻页（默认——普通滚轮缩放时，Ctrl+滚轮翻页互补）。
-    Switch,
+    /// 向下一张 / 向上一张。执行走碎增量 + 节奏闸 + `Viewer::step`（与裸滚轮翻页同路）。
+    Navigate,
+    /// 向上不透明度 +10% / 向下 −10%。
+    Opacity,
+    /// 不响应滚轮（新增两行的默认）。
+    None,
 }
 
-impl CtrlWheel {
+impl WheelAction {
     pub fn from_index(i: i64) -> Self {
-        if i == 0 {
-            CtrlWheel::Zoom
-        } else {
-            CtrlWheel::Switch
+        match i {
+            0 => WheelAction::Zoom,
+            1 => WheelAction::Navigate,
+            2 => WheelAction::Opacity,
+            3 => WheelAction::None,
+            _ => WheelAction::Zoom,
         }
     }
 
     pub fn index(self) -> i64 {
         match self {
-            CtrlWheel::Zoom => 0,
-            CtrlWheel::Switch => 1,
+            WheelAction::Zoom => 0,
+            WheelAction::Navigate => 1,
+            WheelAction::Opacity => 2,
+            WheelAction::None => 3,
         }
     }
 
+    /// 下拉里写的就是「向下滚」那一头；反向由 [`Self::pair`] 给出。
     pub fn label(self) -> &'static str {
         match self {
-            CtrlWheel::Zoom => "缩放图片",
-            CtrlWheel::Switch => "切换图片",
+            WheelAction::Zoom => "放大 / 缩小",
+            WheelAction::Navigate => "下一张 / 上一张",
+            WheelAction::Opacity => "不透明度 + / −",
+            WheelAction::None => "无（关闭）",
         }
     }
 
-    pub const ALL: [CtrlWheel; 2] = [CtrlWheel::Zoom, CtrlWheel::Switch];
+    /// `(向下滚, 向上滚)` 的两个动作。**只列成对类型**——「打开文件」这类单向动作
+    /// 绑到滚轮上"另一个方向是什么"说不清，正是用户不复用全键盘表的原因。
+    ///
+    /// Zoom 档虽然登记在这里（语义完整），实际执行走 `zoom_by_wheel` 以保留指针锚点；
+    /// Navigate 档同理走节奏闸。新加的 Opacity 档才直接投 `exec_action`。
+    pub fn pair(self) -> Option<(crate::core::hotkey::Action, crate::core::hotkey::Action)> {
+        use crate::core::hotkey::Action;
+        match self {
+            WheelAction::None => None,
+            WheelAction::Zoom => Some((Action::ZoomOut, Action::ZoomIn)),
+            WheelAction::Navigate => Some((Action::Next, Action::Prev)),
+            WheelAction::Opacity => Some((Action::OpacityDown, Action::OpacityUp)),
+        }
+    }
+
+    pub const ALL: [WheelAction; 4] = [
+        WheelAction::Zoom,
+        WheelAction::Navigate,
+        WheelAction::Opacity,
+        WheelAction::None,
+    ];
 }
 
-/// 启动窗口模式（用户拍板 2026-10-10 三档，取代旧「恒 800×600 永远居中」）。
+/// 兼容旧写法：`Wheel` / `CtrlWheel` 曾是两份同构的两档枚举，m278 合并成一份四档。
+/// 保留类型别名让 ini 键名与字段类型名不必跟着改，实际只有一个枚举。
+pub type Wheel = WheelAction;
+pub type CtrlWheel = WheelAction;
+
+/// 窗口尺寸三档（m271 恢复第三档，并把它从 `borderless` 里拆回来）。
+///
+/// 这是**窗口多大**这一条轴，和「有没有边框」（`borderless`）正交：
+/// 无边框只是不画 chrome，三档尺寸它都能配；反过来，第三档也不是无边框的专利。
+///
+/// 前两档里图片**恒为适应窗口**（含放大小图，2026-10-08 口径）；第三档把窗口
+/// 反过来贴图片的原始像素，于是图片天然 1:1——两条轴合起来才覆盖"100% / 适应"
+/// 这两种用户真正会说的诉求，不需要再加一个缩放档。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitWindow {
     /// 固定尺寸：按 `window_w × window_h` 建窗（默认档，旧版唯一行为）。
     Fixed,
-    /// 启动即全屏（图片自动适应窗口——适应档天然跟随视口，无需额外处理）。
+    /// 全屏：铺满当前显示器（`rcMonitor`，含任务栏那一条）。
     Fullscreen,
-    /// 图片尺寸：启动**首图**解码完成后窗口客户区调成图片原始像素（翻页不跟随；
-    /// 无图启动回落固定尺寸）。尺寸先夹进 `[WINDOW_MIN, WINDOW_MAX]`，再交给 windui
-    /// 的 `set_window_size`——它会把窗口**夹到显示器工作区**（显示器减去任务栏）并居中，
-    /// 因此实际生效范围就是 100×100 ~ 当前显示器可用尺寸。
+    /// 图片尺寸：窗口客户区跟着**当前这张图**走——启动第一张、翻页、目录跳转都跟，
+    /// 图多大窗多大（1:1 原始像素）；超出显示器工作区时等比缩进工作区（装不下就是
+    /// 装不下），小于 `100×100` 时放大到最短边 100（再小就点不到标题栏了）。
+    /// 空白空间不铺底色：无边框时透明区直接透出桌面。
     Natural,
 }
 
 impl InitWindow {
-    /// 兼容旧 ini：0(旧自动/常规)→固定；1(旧最大化)→全屏；**2 是旧版「常规窗口」
-    /// 的退役值，故意跳过落到固定**——新存储值用 3 表示图片尺寸，防旧文件误读。
+    /// 兼容旧 ini：0(旧自动/常规)→固定；1(旧最大化)→全屏；3→图片尺寸。
+    /// **2 是旧版「常规窗口」的退役值**，故意跳过落到固定——3 一直是图片尺寸的
+    /// 存储号（m269 短暂退役、m271 恢复），老 ini 里的 3 现在又能生效了。
     pub fn from_index(i: i64) -> Self {
         match i {
             1 => InitWindow::Fullscreen,
@@ -368,8 +395,8 @@ impl InitWindow {
         }
     }
 
-    /// 设置页下拉里的**位置**（0/1/2，必须连续）。与 ini 存储值 `index()` 分开：
-    /// 2 是旧版「常规窗口」的退役值，不能拿来当 `Natural` 的存储号，但下拉只有三项。
+    /// 设置页下拉里的位置（0/1/2，必须连续）。**与 `index()` 不同序**：2 是旧版
+    /// 「常规窗口」占过的存储号，不能拿来当 `Natural` 的存储值，但下拉只有三项。
     pub fn ui_index(self) -> usize {
         match self {
             InitWindow::Fixed => 0,
@@ -386,7 +413,7 @@ impl InitWindow {
     pub fn label(self) -> &'static str {
         match self {
             InitWindow::Fixed => "固定尺寸",
-            InitWindow::Fullscreen => "全屏（图片适应窗口）",
+            InitWindow::Fullscreen => "全屏",
             InitWindow::Natural => "图片尺寸",
         }
     }
@@ -435,7 +462,7 @@ impl UiTheme {
     }
 
     /// 从 ini 值还原。认不出的一律回落深色——手改坏的配置不该把界面变成
-    /// 第三种没人设计过的配色（与 [`crate::ui::tokens::Theme::from_id`] 同一判据）。
+    /// 第三种没人设计过的配色（与 `crate::ui::tokens::Theme::from_id` 同一判据）。
     pub fn from_id(s: &str) -> UiTheme {
         match s.trim().to_ascii_lowercase().as_str() {
             "light" => UiTheme::Light,
@@ -569,8 +596,13 @@ pub struct Config {
     pub minimal_mode: bool,
     /// 棋盘格透明背景（m53 起落盘；默认关）。
     pub checker: bool,
-    /// 底部缩略图条（m53 起落盘；默认关。开了会占掉画面底部一条）。
+    /// 缩略图条（m53 起落盘；默认关。开了会占掉画面一条）。
     pub filmstrip: bool,
+    /// 缩略图条贴**左边**（m253；默认关 = 贴底）。
+    ///
+    /// 宽屏上竖排比横排划算：横排扣掉一整条高、竖排只扣 112 宽，画面高度全留
+    /// 给图。两个方向共用同一套格子与命中（`ui::filmstrip::Side`）。
+    pub filmstrip_left: bool,
     /// 标题栏锁定（m53 起落盘；默认关）。锁住后整窗交互封锁，只留锁钮解锁。
     pub locked: bool,
     /// 长图自动按宽适应、竖向可拖（菠萝 `autoLongImageMode`）。
@@ -579,8 +611,17 @@ pub struct Config {
     pub wheel: Wheel,
     /// Ctrl+滚轮行为（与 `wheel` 同族，独立一档）。
     pub ctrl_wheel: CtrlWheel,
-    /// 启动时的窗口模式（三档，见 [`InitWindow`]）。
+    /// Alt+滚轮行为（m278 新增，默认「无」）。
+    pub alt_wheel: WheelAction,
+    /// Shift+滚轮行为（m278 新增，默认「无」）。条内滚轮仍归缩略图条，不看这一档。
+    pub shift_wheel: WheelAction,
+    /// 窗口尺寸三档（见 [`InitWindow`]）：固定 / 全屏 / 图片尺寸。
     pub init_window: InitWindow,
+    /// 无边框形态（m269）：自绘 chrome 全隐、底色不画、图片透明区透出桌面，
+    /// 但鼠标只与本窗交互（不穿透）。与 [`Config::init_window`] **完全正交**：
+    /// 三档尺寸都能配它（m271 起——m269 曾把"窗口贴图"塞进这里，导致
+    /// 无边框下「适应窗口」和「100%」退化成同一件事）。
+    pub borderless: bool,
     /// 固定尺寸档的窗口宽/高（clamp 在 [`WINDOW_MIN`]..=[`WINDOW_MAX`]，默认 800×600）。
     pub window_w: u32,
     pub window_h: u32,
@@ -602,12 +643,23 @@ pub struct Config {
     /// 拉黑/不认领该后缀）时**静默回退自动**，不报错、不清理——这是一张用户
     /// 显式维护、天然跟解码器同生共死的稀疏覆盖表，不是全量人工优先级清单。
     pub decoders_preferred: BTreeMap<String, String>,
-    /// 邻图预读：后台把同文件夹前后各两张先解好（**视口那一档**），翻页即换。
+    /// 图片预读：后台先解好**邻图 ±N** 与**缩略图条可见的那一屏**（都是**视口那一档**），
+    /// 连续翻页与点格子远跳都能零解码上屏。下注集合按清单索引算、按份数封顶，
+    /// 与目录里有多少张图无关（m265）。
     ///
-    /// 默认开。关掉它的真实理由只有资源：预读缓存最坏驻留 `PREFETCH_CAP` × 视口档
-    /// ≈ 256 MiB（[`crate::core::viewer`] 的字节闸），低配机 / 电池 / 不想让后台
-    /// 抢 CPU 的用户有权要一台安静的机器。判据口径见 `viewer::request_prefetch`。
+    /// 默认开。关掉它的真实理由只有资源：预读缓存最坏驻留由
+    /// [`crate::core::viewer`] 的份数闸 + 256 MiB 字节闸封顶，低配机 / 电池 /
+    /// 不想让后台抢 CPU 的用户有权要一台安静的机器。判据口径见 `viewer::request_prefetch`。
     pub prefetch: bool,
+    /// 每个方向预读几张（m281）。**只给高级用户手改 ini，界面刻意不出现**——
+    /// 登记在 [`CONFIG_ONLY_KEYS`]；行为读者是 `viewer::prefetch_offsets`。
+    ///
+    /// 默认 [`PREFETCH_DEPTH_DEFAULT`] = 3，合法范围 1..=[`PREFETCH_DEPTH_MAX`]。
+    /// 写坏 / 越界一律回落默认（m51-H 口径：单行笔误等于保持默认），不静默夹到边界。
+    /// 上限 4 不是随口定的：解码线程**串行**，调大只增加后台工作量、不会让单张更快，
+    /// 超过某个深度反把当前图的重解挤到队尾；而且 `viewer::PREFETCH_CAP` 的算式
+    /// `2×上限 + 常规一屏 7 + 1 = 16` 要保证「可见格不会被邻图挤掉」。
+    pub prefetch_depth: u32,
     /// 关闭（含双击关窗）改为隐藏窗口 + 收进系统托盘，真退出走托盘右键菜单。
     ///
     /// **运行期即时生效**：关窗裁决在 `runtime` 的 `on_close_request` 里当场读本项，
@@ -634,7 +686,17 @@ pub struct Config {
     /// 图比窗口小也拖得动，且**图边允许越过窗口边**（2026-11-03 第三、四条口径）；
     /// 夹取永远留一枚 24dp 的衣角在画面里，所以图拖不丢——见 `viewer::zoom::overscroll`。
     pub drag_image: bool,
-    /// **底部浮条显不显示按钮**（m245，ini 键 `show_toolbar_buttons`，默认开）。
+    /// 目录清单按哪个属性排（m275，ini 键 `sort_by`，默认「文件名」）。
+    ///
+    /// 四个维度见 [`SortBy`]；方向在 [`Config::sort_desc`]。**两格合起来才是口径**
+    /// （[`Config::sort_spec`]），与资源管理器的「排序方式 ▸ + 倒序」同构。
+    ///
+    /// 生效时机是**当场**：runtime 每帧 `Viewer::sync_sort` 对齐一次，顺序变了就重排
+    /// 当前清单、锚点不动（当前这张还是这张，只是它两侧换了人）。
+    pub sort_by: SortBy,
+    /// 排序方向：`false` 升序 / `true` 倒序（m275，ini 键 `sort_desc`）。
+    pub sort_desc: bool,
+    /// **底部浮条显不显示操作按钮**（m245，ini 键 `show_toolbar_buttons`，默认开）。
     /// 关掉 = 只留信息格并水平居中；按钮对应的操作在右键「操作 ▸」里全都在，
     /// 信息（页码 / 缩放 / 帧号）没有别的载体，所以只隐按钮不隐信息。
     pub show_toolbar_buttons: bool,
@@ -709,6 +771,20 @@ pub struct Config {
     pub ui_cards_expanded: Vec<String>,
 }
 
+/// 预读深度的**唯一默认值正本**（m281）。Default、from_ini 回落、首启 ini 模板都读它。
+pub const PREFETCH_DEPTH_DEFAULT: u32 = 3;
+/// 预读深度上限：与 `viewer::PREFETCH_CAP` 的算式绑定，见 [`Config::prefetch_depth`]。
+pub const PREFETCH_DEPTH_MAX: u32 = 4;
+
+/// 预读深度解析的**唯一正本**：写坏 / 越界一律回落默认，不夹到边界。
+/// 抽成纯函数是为了让负向臂能拿「旧实现」喂同一套判据（见 tests）。
+fn parse_prefetch_depth(v: &str) -> u32 {
+    v.parse::<u32>()
+        .ok()
+        .filter(|&n| (1..=PREFETCH_DEPTH_MAX).contains(&n))
+        .unwrap_or(PREFETCH_DEPTH_DEFAULT)
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -718,11 +794,15 @@ impl Default for Config {
             minimal_mode: false,
             checker: false,
             filmstrip: false,
+            filmstrip_left: false,
             locked: false,
             long_image_fit: false,
-            wheel: Wheel::Zoom,
-            ctrl_wheel: CtrlWheel::Switch,
+            wheel: WheelAction::Zoom,
+            ctrl_wheel: WheelAction::Navigate,
+            alt_wheel: WheelAction::None,
+            shift_wheel: WheelAction::None,
             init_window: InitWindow::Fixed,
+            borderless: false,
             window_w: 800,
             window_h: 600,
             opacity: OPACITY_DEFAULT,
@@ -731,9 +811,12 @@ impl Default for Config {
             extensions_isolated: Vec::new(),
             decoders_preferred: BTreeMap::new(),
             prefetch: true,
+            prefetch_depth: PREFETCH_DEPTH_DEFAULT,
             close_to_tray: false,
             space_preview: false,
             drag_image: true,
+            sort_by: SortBy::Name,
+            sort_desc: false,
             show_toolbar_buttons: true,
             raw_last: None,
             download_source: SourceId::Gitee,
@@ -753,10 +836,18 @@ impl Default for Config {
 }
 
 impl Config {
+    /// 排序口径（`sort_by` + `sort_desc` 两格折成一个 `Copy` 值）。
+    ///
+    /// 清单枚举、右键菜单打勾、设置页下拉都从这里取——**两格不许各自被读**，
+    /// 否则"维度换了方向没换"这类组合会在某条路上对不上。
+    pub fn sort_spec(&self) -> SortSpec {
+        SortSpec::new(self.sort_by, self.sort_desc)
+    }
+
     /// 从磁盘加载；文件缺失或解析失败一律回默认值。
     ///
     /// 路径见 [`crate::core::paths::config_path`]。文件不存在（首次启动）时先写一份
-    /// [`DEFAULT_INI`]——用户打开 ini 就知道每个键是干嘛的，文件即文档。
+    /// `default_ini`——用户打开 ini 就知道每个键是干嘛的，文件即文档。
     pub fn load() -> Self {
         match crate::core::paths::config_path() {
             Some(p) => {
@@ -893,11 +984,15 @@ impl Config {
                 // 取代、翻图恒重置变换、关窗恒直关，读到只当未知键忽略。
                 "checker" => set_bool(&mut cfg.checker, v, "checker"),
                 "filmstrip" => set_bool(&mut cfg.filmstrip, v, "filmstrip"),
+                "filmstrip_left" => set_bool(&mut cfg.filmstrip_left, v, "filmstrip_left"),
                 "locked" => set_bool(&mut cfg.locked, v, "locked"),
                 "long_image_fit" => set_bool(&mut cfg.long_image_fit, v, "long_image_fit"),
-                "wheel_behavior" => cfg.wheel = Wheel::from_index(v.parse().unwrap_or(0)),
-                "ctrl_wheel" => cfg.ctrl_wheel = CtrlWheel::from_index(v.parse().unwrap_or(1)),
+                "wheel_behavior" => cfg.wheel = WheelAction::from_index(v.parse().unwrap_or(0)),
+                "ctrl_wheel" => cfg.ctrl_wheel = WheelAction::from_index(v.parse().unwrap_or(1)),
+                "alt_wheel" => cfg.alt_wheel = WheelAction::from_index(v.parse().unwrap_or(3)),
+                "shift_wheel" => cfg.shift_wheel = WheelAction::from_index(v.parse().unwrap_or(3)),
                 "init_window" => cfg.init_window = InitWindow::from_index(v.parse().unwrap_or(0)),
+                "borderless" => set_bool(&mut cfg.borderless, v, "borderless"),
                 // 固定尺寸档的窗口宽高：越界/乱码一律夹回区间（用户手改 ini 也钳住）。
                 "window_w" => cfg.window_w = v.parse().unwrap_or(800).clamp(WINDOW_MIN, WINDOW_MAX),
                 "window_h" => cfg.window_h = v.parse().unwrap_or(600).clamp(WINDOW_MIN, WINDOW_MAX),
@@ -934,6 +1029,9 @@ impl Config {
                         .collect();
                 }
                 "prefetch" => set_bool(&mut cfg.prefetch, v, "prefetch"),
+                // 隐藏键：只给高级用户手改 ini（CONFIG_ONLY_KEYS），界面不出现。
+                // 笔误 / 越界一律回落默认，不 min 到上限——手滑的 999 不该被当成有效值。
+                "prefetch_depth" => cfg.prefetch_depth = parse_prefetch_depth(v),
                 // `svg_progressive`（矢量渐进首绘）随机制退场：老配置里的这一键落到
                 // 下面的 `_ => {}` 被静默忽略，与 `cache_age` 同一种收场。
                 // 旧键 `cache_age`（磁盘解码缓存的自动清理档位）与更早的 `cache_limit`
@@ -942,6 +1040,10 @@ impl Config {
                 // 空格预览（QuickLook 式）：16ms 轮询差分装/摘低级键盘钩子。
                 "space_preview" => set_bool(&mut cfg.space_preview, v, "space_preview"),
                 "drag_image" => set_bool(&mut cfg.drag_image, v, "drag_image"),
+                // 排序口径（m275）：维度存号（0 文件名 / 1 大小 / 2 创建 / 3 修改），
+                // 方向单独一格。写坏了回落默认（文件名升序），不"猜一个近似的"。
+                "sort_by" => cfg.sort_by = SortBy::from_index(v.parse().unwrap_or(0)),
+                "sort_desc" => set_bool(&mut cfg.sort_desc, v, "sort_desc"),
                 // 隐藏按钮栏（m245）：关掉后浮条只剩信息并居中。
                 "show_toolbar_buttons" => {
                     set_bool(&mut cfg.show_toolbar_buttons, v, "show_toolbar_buttons")
@@ -1044,29 +1146,36 @@ impl Config {
             .unwrap_or_default();
         let body = format!(
             "stay_on_top={}\ndouble_click={}\nslide_interval={}\nminimal_mode={}\n\
-             checker={}\nfilmstrip={}\nlocked={}\n\
-             long_image_fit={}\nwheel_behavior={}\nctrl_wheel={}\ninit_window={}\nwindow_w={}\n\
-             window_h={}\nopacity={}\n\
-             decoders_disabled={}\nextensions_disabled={}\nextensions_isolated={}\ndecoders_preferred={}\nprefetch={}\nclose_to_tray={}\nspace_preview={}\ndrag_image={}\nshow_toolbar_buttons={}\nraw_last={}\ndownload_source={}\nui_theme={}\ndecoder_index_gitee={}\ndecoder_index_github={}\nplugin_index_gitee={}\nplugin_index_github={}\nupdate_index_gitee={}\nupdate_index_github={}\nhotkeys={}\nallow_multiple={}\ndecode_timeout_s={}\nui_cards={}\n",
+             checker={}\nfilmstrip={}\nfilmstrip_left={}\nlocked={}\n\
+             long_image_fit={}\nwheel_behavior={}\nctrl_wheel={}\nalt_wheel={}\nshift_wheel={}\ninit_window={}\nborderless={}\nwindow_w={}\n\
+             window_h={}\nopacity={}\nsort_by={}\nsort_desc={}\n\
+             decoders_disabled={}\nextensions_disabled={}\nextensions_isolated={}\ndecoders_preferred={}\nprefetch={}\nprefetch_depth={}\nclose_to_tray={}\nspace_preview={}\ndrag_image={}\nshow_toolbar_buttons={}\nraw_last={}\ndownload_source={}\nui_theme={}\ndecoder_index_gitee={}\ndecoder_index_github={}\nplugin_index_gitee={}\nplugin_index_github={}\nupdate_index_gitee={}\nupdate_index_github={}\nhotkeys={}\nallow_multiple={}\ndecode_timeout_s={}\nui_cards={}\n",
             self.stay_on_top as i32,
             self.dbl_click.index(),
             self.slide_interval,
             self.minimal_mode as i32,
             self.checker as i32,
             self.filmstrip as i32,
+            self.filmstrip_left as i32,
             self.locked as i32,
             self.long_image_fit as i32,
             self.wheel.index(),
             self.ctrl_wheel.index(),
+            self.alt_wheel.index(),
+            self.shift_wheel.index(),
             self.init_window.index(),
+            self.borderless as i32,
             self.window_w,
             self.window_h,
             opacity,
+            self.sort_by.index(),
+            self.sort_desc as i32,
             decoders_disabled,
             extensions_disabled,
             extensions_isolated,
             decoders_preferred,
             self.prefetch as i32,
+            self.prefetch_depth,
             self.close_to_tray as i32,
             self.space_preview as i32,
             self.drag_image as i32,
@@ -1224,8 +1333,11 @@ minimal_mode=0
 # 棋盘格透明背景（1 开 / 0 关）
 checker=0
 
-# 底部缩略图条（1 开 / 0 关；开着会占掉画面底部一条）
+# 缩略图条（1 开 / 0 关；开着会占掉画面一条）
 filmstrip=0
+
+# 缩略图条贴左边（1 左 / 0 底；宽屏竖排比横排省画面）
+filmstrip_left=0
 
 # 标题栏锁定（1 开 / 0 关；锁住后整窗交互封锁，只留锁钮解锁）
 locked=0
@@ -1233,14 +1345,24 @@ locked=0
 # 长图自动按宽适应（竖向可拖）
 long_image_fit=0
 
-# 滚轮：0 缩放 / 1 翻页
+# 滚轮：0 放大/缩小 / 1 下一张·上一张 / 2 不透明度± / 3 无
 wheel_behavior=0
 
-# Ctrl+滚轮：0 缩放 / 1 翻页
+# Ctrl+滚轮：同上四档
 ctrl_wheel=1
 
-# 启动窗口：0 固定尺寸 / 1 全屏（图片适应窗口）/ 3 图片尺寸（按启动首图原始像素开窗）
+# Alt / Shift + 滚轮：同上四档，新增两行默认关闭
+alt_wheel=3
+shift_wheel=3
+
+# 启动窗口（窗口尺寸）：0 固定尺寸 / 1 全屏（图片适应窗口）/ 3 图片尺寸（窗口贴着图走）
+# 前两档里图片总是适应窗口；第三档窗口 = 当前图片的原始像素，翻页也跟着变。
 init_window=0
+
+# 无边框形态：隐藏标题栏/按钮栏/缩略图条/底色，图片透明区透出桌面，
+# 但右键、快捷键、拖动、缩放、置顶、锁定全在，鼠标仍只与看图窗交互（不穿透）。
+# 与上面的尺寸档正交：三档都能配。0 关 / 1 开
+borderless=0
 
 # 固定尺寸档的窗口宽高（最低 100，最高 8192）
 window_w=800
@@ -1262,9 +1384,16 @@ extensions_isolated=
 # 留空 = 自动按解码器文件名顺序选择；指向不存在/已停用解码器的条目自动忽略）
 decoders_preferred=
 
-# 邻图预读：开着一张图时，后台把同文件夹前后各两张先解好（存的是视口那一档，
-# 与图片本身多大无关，预算 ≤256 MiB）。翻页就是按下即换；关掉它则每次翻页现场解码
+# 图片预读：开着一张图时，后台把前后几张与缩略图条可见的那一屏先解好
+# （存的是视口那一档，与图片本身多大无关，预算 ≤256 MiB）。翻页、点格子都是按下即换；
+# 关掉它则每次翻页现场解码。
 prefetch=1
+
+# 预读深度：每个方向预读几张（1..=4，默认 3）。**设置页里没有这一项，只给高级用户手改 ini**。
+# 解码线程是串行的，调大只会增加后台工作量、不会让单张更快；写坏或 >4 一律回落 3。
+# 方向已定时同方向给满 N 张、反方向留 1 张（A→B→A 来回翻仍能命中）。
+# 手改这一项后**重启程序**才生效（设置页里那颗开关是改完即时生效）。
+prefetch_depth=3
 
 # 关闭窗口改为收进系统托盘（真退出走托盘右键菜单；改动即时生效）
 close_to_tray=0
@@ -1281,7 +1410,16 @@ space_preview=0
 # （只有空窗——还没有图——时那一按才归窗口。）
 drag_image=1
 
-# 底部浮条显示按钮：开（默认）= 按钮 + 信息；关 = 只留信息并水平居中。
+# 目录内图片的排序维度：0 文件名（默认）/ 1 大小 / 2 创建日期 / 3 修改日期。
+# 文件名比较走系统那把 StrCmpLogicalW，与资源管理器的顺序逐字一致（中文按拼音、
+# img2 排在 img10 前）。改了当场重排当前清单，正在看的那张不动。
+sort_by=0
+
+# 排序方向：0 升序（默认）/ 1 倒序。倒序会把整条比较翻转（含并列时的名字次序），
+# 与资源管理器「倒序」同义——按大小倒序就是「最大的那张在最前」。
+sort_desc=0
+
+# 底部浮条显示操作按钮：开（默认）= 按钮 + 信息；关 = 只留信息并水平居中。
 # 按钮对应的操作在右键「操作 ▸」里全都在，信息（页码 / 缩放 / 帧号）没有别的载体。
 show_toolbar_buttons=1
 
@@ -1346,18 +1484,22 @@ hotkeys={hotkeys}
 ///   ★ 写在 UI 写点处的 `ini 键：<名>` 注释是**给人导航的约定，没有测试读它**（2026-10-24 实测：
 ///   20 个键里 13 个标了，没标的是 `double_click`、`filmstrip`、`locked`、`long_image_fit`、
 ///   `decoders_disabled`、`window_w`、`window_h`）——别把它当成门禁。
-pub const ALL_KEYS: [&str; 36] = [
+pub const ALL_KEYS: [&str; 43] = [
     "stay_on_top",
     "double_click",
     "slide_interval",
     "minimal_mode",
     "checker",
     "filmstrip",
+    "filmstrip_left",
     "locked",
     "long_image_fit",
     "wheel_behavior",
     "ctrl_wheel",
+    "alt_wheel",
+    "shift_wheel",
     "init_window",
+    "borderless",
     "window_w",
     "window_h",
     "opacity",
@@ -1366,9 +1508,12 @@ pub const ALL_KEYS: [&str; 36] = [
     "extensions_isolated",
     "decoders_preferred",
     "prefetch",
+    "prefetch_depth",
     "close_to_tray",
     "space_preview",
     "drag_image",
+    "sort_by",
+    "sort_desc",
     "show_toolbar_buttons",
     "raw_last",
     "download_source",
@@ -1390,7 +1535,7 @@ pub const ALL_KEYS: [&str; 36] = [
 /// 两个门禁都读这张表，别在别处再抄第二份：
 /// - `hygiene_scan.py` 第 6 查：这类键只豁免"用户入口"，**行为读者照旧必须有**；
 /// - `ui_touchpoints_cover_all_keys`（本文件测试）：跳过"UI 源码里必须出现这个键名"。
-pub const CONFIG_ONLY_KEYS: [&str; 7] = [
+pub const CONFIG_ONLY_KEYS: [&str; 8] = [
     "decoder_index_gitee",
     "decoder_index_github",
     "plugin_index_gitee",
@@ -1399,6 +1544,9 @@ pub const CONFIG_ONLY_KEYS: [&str; 7] = [
     "update_index_github",
     // 挂死恢复的超时秒数：只服务慢盘 / 超大文件，界面上不出现。
     "decode_timeout_s",
+    // 预读深度：开关在设置页，但「几张」这个参数刻意不进 UI（2026-11-09 用户口径）。
+    // hygiene 第 6 查仍要求它有行为读者 → `viewer::prefetch_offsets` 读它。
+    "prefetch_depth",
 ];
 
 /// **纯界面状态**的键：它的"行为读者"只能是设置页自己（m243）。
@@ -1616,9 +1764,10 @@ mod tests {
             minimal_mode: true,
             checker: true,
             filmstrip: true,
+            filmstrip_left: true,
             locked: true,
             long_image_fit: true,
-            wheel: Wheel::Switch,
+            wheel: WheelAction::Navigate,
             init_window: InitWindow::Fullscreen,
             window_w: 1024,
             window_h: 768,
@@ -1652,9 +1801,10 @@ mod tests {
         assert!(back.minimal_mode, "minimal_mode 没存住");
         assert!(back.checker, "checker 没存住");
         assert!(back.filmstrip, "filmstrip 没存住");
+        assert!(back.filmstrip_left, "filmstrip_left 没存住");
         assert!(back.locked, "locked 没存住");
         assert!(back.long_image_fit);
-        assert_eq!(back.wheel, Wheel::Switch);
+        assert_eq!(back.wheel, WheelAction::Navigate);
         assert_eq!(back.init_window, InitWindow::Fullscreen);
         assert_eq!(back.ui_theme, UiTheme::Light, "ui_theme 没存住");
         assert_eq!(
@@ -1979,9 +2129,9 @@ plugin_source=github
         std::fs::write(
             &p,
             "stay_on_top=1\ndouble_click=3\nminimal_mode=1\n\
-             long_image_fit=1\nwheel_behavior=1\nctrl_wheel=0\ninit_window=3\nwindow_w=1024\n\
+             long_image_fit=1\nwheel_behavior=1\nctrl_wheel=0\ninit_window=1\nborderless=1\nwindow_w=1024\n\
              window_h=768\nopacity=30\n\
-             decoders_disabled=abc;def\nextensions_disabled=com.example.ocr\ndecoders_preferred=jpg=jpeg;png=png\nprefetch=0\nclose_to_tray=1\nspace_preview=1\ndrag_image=0\nraw_last=1x2:3\ndownload_source=github\n\
+             decoders_disabled=abc;def\nextensions_disabled=com.example.ocr\ndecoders_preferred=jpg=jpeg;png=png\nprefetch=0\nclose_to_tray=1\nspace_preview=1\ndrag_image=0\nsort_by=3\nsort_desc=1\nraw_last=1x2:3\ndownload_source=github\n\
              decoder_index_gitee=https://a.example/d.json\ndecoder_index_github=https://b.example/d.json\n\
              plugin_index_gitee=https://a.example/p.json\nplugin_index_github=https://b.example/p.json\n\
              hotkeys=prev:Right\nui_cards=options.appearance;keys.plugins\n",
@@ -1992,9 +2142,19 @@ plugin_source=github
         assert_eq!(c.dbl_click, DblClick::Fullscreen, "double_click 没有消费方");
         assert!(c.minimal_mode, "minimal_mode 没有消费方");
         assert!(c.long_image_fit, "long_image_fit 没有消费方");
-        assert_eq!(c.wheel, Wheel::Switch, "wheel_behavior 没有消费方");
-        assert_eq!(c.ctrl_wheel, CtrlWheel::Zoom, "ctrl_wheel 没有消费方");
-        assert_eq!(c.init_window, InitWindow::Natural, "init_window 没有消费方");
+        assert_eq!(c.wheel, WheelAction::Navigate, "wheel_behavior 没有消费方");
+        assert_eq!(c.ctrl_wheel, WheelAction::Zoom, "ctrl_wheel 没有消费方");
+        assert_eq!(
+            c.init_window,
+            InitWindow::Fullscreen,
+            "init_window 没有消费方"
+        );
+        assert!(c.borderless, "borderless 没有消费方");
+        assert_eq!(
+            c.sort_spec(),
+            SortSpec::new(SortBy::Modified, true),
+            "sort_by / sort_desc 没有消费方"
+        );
         assert_eq!(
             (c.window_w, c.window_h),
             (1024, 768),
@@ -2101,6 +2261,105 @@ plugin_source=github
         }
     }
 
+    /// m281：预读深度是**隐藏 ini 键**——默认 3、可改、写坏/越界回落 3、
+    /// 老配置缺键不变、首启模板写得出、且登记在 CONFIG_ONLY_KEYS（界面不许出现 N）。
+    #[test]
+    fn prefetch_depth_is_a_hidden_ini_key_with_a_default_of_three() {
+        assert_eq!(PREFETCH_DEPTH_DEFAULT, 3, "出厂默认必须是 3");
+        assert_eq!(Config::default().prefetch_depth, 3);
+        assert!(ALL_KEYS.contains(&"prefetch_depth"), "没登记进 ALL_KEYS");
+        assert!(
+            CONFIG_ONLY_KEYS.contains(&"prefetch_depth"),
+            "必须登记为配置专用键：界面不许出现 N"
+        );
+        for (raw, want) in [
+            ("3", 3),
+            ("1", 1),
+            ("4", 4),
+            ("0", 3),   // 越界
+            ("5", 3),   // 越界
+            ("999", 3), // 手滑
+            ("abc", 3), // 笔误
+            ("", 3),    // 空值
+        ] {
+            let p = temp_ini("depth");
+            std::fs::write(&p, format!("prefetch_depth={raw}\n")).unwrap();
+            let got = Config::load_from(&p).prefetch_depth;
+            let _ = std::fs::remove_file(&p);
+            assert_eq!(got, want, "prefetch_depth={raw:?} 应读成 {want}");
+        }
+        let p = temp_ini("depth-missing");
+        std::fs::write(&p, "prefetch=0\n").unwrap();
+        assert_eq!(
+            Config::load_from(&p).prefetch_depth,
+            3,
+            "老 ini 缺键必须安静回落 3"
+        );
+        let _ = std::fs::remove_file(&p);
+        assert!(
+            default_ini().contains("prefetch_depth=3"),
+            "首启模板要写出这一键，高级用户才找得到"
+        );
+    }
+
+    /// 负向臂：把「写坏夹到上限」的旧解析喂同一套逐值判据，必须当场红。
+    /// 手滑写 999 不该被当成有效深度——那是把笔误静默变成 4。
+    #[test]
+    #[should_panic(expected = "旧实现把笔误夹成了有效深度")]
+    fn prefetch_depth_rejects_clamping_instead_of_falling_back() {
+        // 旧实现：parse 之后 `.min(上限)`，越界与手滑都被静默夹成 4。
+        let old = |v: &str| {
+            v.parse::<u32>()
+                .unwrap_or(PREFETCH_DEPTH_DEFAULT)
+                .min(PREFETCH_DEPTH_MAX)
+        };
+        for (raw, want) in [("999", 3), ("5", 3), ("0", 3), ("abc", 3), ("", 3)] {
+            assert_eq!(
+                old(raw),
+                want,
+                "旧实现把笔误夹成了有效深度：{raw:?} 应读成 {want}，实得 {}",
+                old(raw)
+            );
+        }
+    }
+
+    /// m281：N **不许出现在设置页的生产代码里**（用户口径「开关暴露、参数不暴露」）。
+    /// [`CONFIG_ONLY_KEYS`] 只豁免「UI 入口必须有」这一格，并不禁止有人日后偷偷加一行
+    /// 数字输入框；这里钉的是反面。注释里提一句键名给读源码的人导航，不算暴露。
+    fn assert_no_hidden_depth_in_settings(ui: &str, what: &str) {
+        let production = ui
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !production.contains("prefetch_depth"),
+            "{what}：设置页生产代码里出现了 prefetch_depth，N 不许暴露在 UI"
+        );
+    }
+
+    #[test]
+    fn prefetch_depth_never_appears_in_settings_ui_code() {
+        let ui = concat!(
+            include_str!("../ui/settings/mod.rs"),
+            include_str!("../ui/settings/options.rs"),
+            include_str!("../ui/settings/rows.rs"),
+            include_str!("../ui/settings/shortcuts.rs"),
+            include_str!("../ui/settings/decoders.rs"),
+            include_str!("../ui/settings/decoders_tab.rs"),
+        );
+        assert_no_hidden_depth_in_settings(ui, "现状");
+    }
+
+    /// 负向臂：给设置页塞一行「预读深度」下拉，同一个判据必须当场红。
+    #[test]
+    #[should_panic(expected = "N 不许暴露在 UI")]
+    fn prefetch_depth_rejects_a_settings_row() {
+        let old = "fn browse_body(h: &Handles) -> Element {\n    \
+                   choice_row(\"预读深度\", h.prefetch_depth)\n}";
+        assert_no_hidden_depth_in_settings(old, "旧版式");
+    }
+
     /// M3：首启生成的注释模板解析回来必须是**纯默认值**（模板漂移了默认值，
     /// 用户首启就会拿到一份和自己想的不一样的配置）。
     #[test]
@@ -2130,7 +2389,8 @@ plugin_source=github
     }
 
     /// 旧 ini 的 init_window 值必须按既定映射升级，不能误读：
-    /// 1(旧"最大化")→全屏；2(旧"常规窗口"，退役值)→固定；3(新)→图片尺寸。
+    /// 1(旧"最大化")→全屏；2(旧"常规窗口") 是退役值，回落固定；
+    /// 3 一直是「图片尺寸」的存储号（m269 短暂退役、m271 恢复）。
     #[test]
     fn init_window_legacy_values_map_correctly() {
         assert_eq!(InitWindow::from_index(0), InitWindow::Fixed);
@@ -2138,9 +2398,13 @@ plugin_source=github
         assert_eq!(
             InitWindow::from_index(2),
             InitWindow::Fixed,
-            "旧「常规」不得误读成图片尺寸"
+            "旧「常规」不得误读成别的档"
         );
-        assert_eq!(InitWindow::from_index(3), InitWindow::Natural);
+        assert_eq!(
+            InitWindow::from_index(3),
+            InitWindow::Natural,
+            "3 是「图片尺寸」的存储号，老 ini 必须还能开出这一档"
+        );
         assert_eq!(InitWindow::from_index(99), InitWindow::Fixed);
     }
 
@@ -2155,15 +2419,24 @@ plugin_source=github
         let _ = std::fs::remove_file(&p);
     }
 
-    /// 设置页下拉的位置与 ini 存储值是两套编号：`Natural` 存 3、显示在第 2 项。
+    /// m271：下拉三档，位置必须连续（0/1/2）；存储值是 0/1/3 —— 2 被退役值占着，
+    /// 所以 `index()` 与 `ui_index()` **不同序**，这条单测就是钉这件事。
     #[test]
     fn init_window_ui_positions_are_dense_and_round_trip() {
+        assert_eq!(InitWindow::ALL.len(), 3, "窗口尺寸必须三档");
         for (i, w) in InitWindow::ALL.iter().enumerate() {
             assert_eq!(w.ui_index(), i, "下拉位置必须连续");
             assert_eq!(InitWindow::from_ui_index(i), *w);
+            assert_eq!(InitWindow::from_index(w.index()), *w, "存储值往返");
         }
+        assert_eq!(InitWindow::Fixed.index(), 0);
+        assert_eq!(InitWindow::Fullscreen.index(), 1);
+        assert_eq!(
+            InitWindow::Natural.index(),
+            3,
+            "存储值 2 是退役的「常规窗口」，不能再被任何档占用"
+        );
         assert_eq!(InitWindow::from_ui_index(3), InitWindow::Fixed, "越界回落");
-        assert_eq!(InitWindow::Natural.index(), 3, "ini 存储值不变");
     }
 
     /// 注释模板也必须包含全部键（注释里解释了 A 键、盘上却写出 B 键 = 文档失真）。

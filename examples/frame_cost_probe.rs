@@ -164,7 +164,7 @@ fn checker_base_plus_half(c: &mut SkiaCanvas<'_>, vx: f32, vy: f32, vw: f32, vh:
 /// ★ 不含 `viewer.thumb_window()` 与 `viewer.thumb()`（那要活的 Gallery 状态机，探针够不着），
 /// 所以这条读数是**下界**，不是这段代码的全部代价。
 fn strip_rebuild(vw: f32, paths: &[PathBuf]) -> (Vec<(usize, Rect)>, usize) {
-    let cap = rupix_lib::ui::filmstrip::capacity(vw);
+    let cap = rupix_lib::ui::filmstrip::capacity(rupix_lib::ui::filmstrip::Side::Bottom, vw);
     let picked: Vec<(usize, PathBuf)> = paths
         .iter()
         .take(cap)
@@ -176,7 +176,13 @@ fn strip_rebuild(vw: f32, paths: &[PathBuf]) -> (Vec<(usize, Rect)>, usize) {
     let owned: Vec<PathBuf> = picked.iter().map(|(_, p)| p.clone()).collect();
     // 这份克隆在后面确实没人读——不钉住它，优化器把整段循环当死码删掉，臂就空跑了。
     std::hint::black_box(&owned);
-    let rects = rupix_lib::ui::filmstrip::layout((0.0, 0.0, vw, 600.0), picked.len());
+    let rects = rupix_lib::ui::filmstrip::layout(
+        rupix_lib::ui::filmstrip::Placement::new(
+            rupix_lib::ui::filmstrip::Side::Bottom,
+            (0.0, 0.0, vw, 600.0),
+        ),
+        picked.len(),
+    );
     let items: Vec<(usize, Rect)> = picked
         .iter()
         .zip(rects)
@@ -190,9 +196,15 @@ fn strip_rebuild(vw: f32, paths: &[PathBuf]) -> (Vec<(usize, Rect)>, usize) {
 /// 留着旧形状不是怀旧——两臂之差才是本轮删掉的那笔；而且 `strip_items`（命中测试的
 /// 账本）在两臂里都照建，这条臂没有靠"少做别的事"充数。
 fn strip_rebuild_by_ref(vw: f32, paths: &[PathBuf]) -> (Vec<(usize, Rect)>, usize) {
-    let cap = rupix_lib::ui::filmstrip::capacity(vw);
+    let cap = rupix_lib::ui::filmstrip::capacity(rupix_lib::ui::filmstrip::Side::Bottom, vw);
     let n = cap.min(paths.len());
-    let rects = rupix_lib::ui::filmstrip::layout((0.0, 0.0, vw, 600.0), n);
+    let rects = rupix_lib::ui::filmstrip::layout(
+        rupix_lib::ui::filmstrip::Placement::new(
+            rupix_lib::ui::filmstrip::Side::Bottom,
+            (0.0, 0.0, vw, 600.0),
+        ),
+        n,
+    );
     let slots: Vec<rupix_lib::ui::filmstrip::Slot<'_>> = (0..n)
         .map(|i| rupix_lib::ui::filmstrip::Slot {
             idx: i,
@@ -515,16 +527,16 @@ fn install_equivalence(path: &Path, natural: (u32, u32), alt: (u32, u32)) {
     assert_eq!(c.len(), 1);
 }
 
-// ───────── D6 自然序排序键的写法（m111 · O17） ─────────
-// 靶子＝`core::gallery::natural_key` 里数字段那四行：零填充数值与段长度各造一枚**中间 String**
-// 再 `push_str`（`&format!("{num:020}")` 与 `&(end-i).to_string()`）。Schwartzian 那一轮（HISTORY
-// 2026-10-14）把"每次比较现算一遍键"收成了"每项一次"，**没碰键里的这两次分配**（K120 查过：无结案）。
-// ★ 两处臂都**逐字复刻生产那段切分**——探针碰不到 crate 私有函数，这是从 B1.1 那轮就背着的副本债
-//   （`examples/bench_gallery_sort.rs` 头顶写着同一句话）：改了生产必须同步这里，否则臂在量另一条路。
+// ───────── D6 自然序排序键的写法（m111 · O17；m275 起降级为历史对照） ─────────
+// 靶子＝**已删除的** `core::gallery::natural_key` 里数字段那四行：零填充数值与段长度各造一枚
+// **中间 String** 再 `push_str`。Schwartzian 那一轮（HISTORY 2026-10-14）把"每次比较现算一遍键"
+// 收成了"每项一次"，**没碰键里的这两次分配**（K120 查过：无结案）。
+// ★ m275 起 `natural_key` / `sort_natural` 已被删除：生产排序直接调系统 `StrCmpLogicalW`
+//   （比 UTF-16 名，3000 项 2.8 ms），所以下面两臂**都成了历史形**，比的是"写这个键要花多少
+//   分配"，**不是**"今天网里跑的那条路"。要看现行排序的成本，看 `bench_dir_listing` 的 A 臂。
 // K125 第④问在这条上有好答案：直写**不引入任何新判断**，所以只有"省"的一档、没有反档——
 // 但正因如此更要防"省的是不是真的那两枚分配"：两臂的键必须**逐字节相同**，整本排序的**顺序也必须相同**。
-// ★★ m111 落地状态：**直写臂＝今天的生产**，现形臂＝落地前的旧形，留着只为"这条确实省过"可复核。
-//   判废/落地的读数都写在这段的输出里，别把旧臂当成现网在跑的那条。
+// ★★ m111 落地状态：直写臂曾是生产；现形臂是落地前的旧形。m275 之后两者都只是对照。
 
 /// 旧形（m111 之前的生产）：每枚数字段两次中间 String 分配。
 #[inline(never)]
@@ -640,8 +652,12 @@ fn natural_sorted_names(names: &[String], key: fn(&str) -> String) -> Vec<String
     decorated.into_iter().map(|(_, n)| n.to_string()).collect()
 }
 
-/// ★ 探针是不是在量生产那条路：真造一册刁钻名字的**目录**，读生产 `Gallery::from_file`
-/// 给出的顺序，必须与臂的顺序逐项相同。副本对不上生产＝臂作废（K119 同形：量具先过自己的判据）。
+/// 复刻顺序 vs **生产**顺序：真造一册刁钻名字的目录，读生产 `Gallery::from_file` 给出的次序。
+///
+/// ★ m275 之前这里是个硬断言（副本对不上生产＝臂作废，K119 同形）。现在它**只能报告**：
+///   生产改用系统 `StrCmpLogicalW`，与旧键在 `a b` / `a-b` / `a01` vs `a1` 这类形状上
+///   **本来就该不一致**，硬断下去等于让探针自己炸掉。留着它是为了那行差集读数——
+///   "旧键与资源管理器口径差几项"本身是有信息量的。
 /// 覆盖形状：大小写同段 / 前导零 / 无数字段 / 超 20 位（parse 兜底）/ 中文段 / 纯数字名。
 /// 后缀用 `.png`——它由**解码器**认领（wic 是 `auto_claim=false`，进不了清单），
 /// 所以跑探针要先 `RUPIX_DECODERS_DIR` 指向发布解码器目录，否则这里如实炸出来而不是静默空册。
@@ -654,8 +670,11 @@ fn natural_key_pin_to_production(names: &[String], key: fn(&str) -> String) {
     for n in names {
         std::fs::write(dir.join(n), b"x").unwrap_or_else(|e| panic!("夹具文件写不出 {n}：{e}"));
     }
-    let g = rupix_lib::core::gallery::Gallery::from_file(&dir)
-        .unwrap_or_else(|e| panic!("生产清单读不出（解码器目录没挂上？）：{e:?}"));
+    let g = rupix_lib::core::gallery::Gallery::from_file(
+        &dir,
+        rupix_lib::core::gallery::SortSpec::DEFAULT,
+    )
+    .unwrap_or_else(|e| panic!("生产清单读不出（解码器目录没挂上？）：{e:?}"));
     let got: Vec<String> = (0..g.len())
         .map(|i| {
             g.peek(i)
@@ -667,11 +686,16 @@ fn natural_key_pin_to_production(names: &[String], key: fn(&str) -> String) {
         })
         .collect();
     let want = natural_sorted_names(names, key);
-    assert_eq!(got, want, "生产给出的顺序 ≠ 臂给出的顺序＝探针在量另一条路");
+    let diff = got.iter().zip(&want).filter(|(a, b)| a != b).count();
     std::fs::remove_dir_all(&dir).unwrap_or_else(|e| panic!("夹具目录清不掉 {dir:?}：{e}"));
     println!(
-        "  对生产钉子：真目录 {} 项，生产顺序与臂逐项相同 ✅（副本没漂）",
-        got.len()
+        "  对生产对照（仅报告）：真目录 {} 项，旧键与系统口径差 {diff} 项{}",
+        got.len(),
+        if diff == 0 {
+            "（这份小册上恰好一致）"
+        } else {
+            "（m275 之后本来就允许不一致）"
+        }
     );
 }
 
@@ -1179,10 +1203,9 @@ fn main() {
         natural_sorted_names(&names, natural_key_written),
         "整册顺序不同＝直写改了排序语义，不是等价改写"
     );
-    // 钉子跑在两臂上：落地后**直写臂＝生产**，现形臂是落地前的旧形；两条都必须逐项等于生产
-    // （它们逐字节同键，所以这条钉子同时防两件事：副本漂了、以及"旧形臂其实和今天跑的不是一条路"）。
+    // 对生产**只报告不裁决**（m275：生产改用系统 `StrCmpLogicalW`，旧键的口径与它本来就不同）。
     // 格式来源要先挂上：`.png` 由解码器认领（wic `auto_claim=false` 进不了清单），
-    // 不挂就得到一张空册——空册会让钉子"什么都不比"地绿过去，正是量具骗人。
+    // 不挂就得到一张空册——空册会让读数变成"什么都不比"，正是量具骗人。
     rupix_lib::decoders::install_format_source();
     let pin = natural_key_pin_corpus();
     natural_key_pin_to_production(&pin, natural_key_now);

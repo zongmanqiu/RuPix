@@ -12,7 +12,6 @@ use std::rc::Rc;
 
 use windui::prelude::*;
 
-use super::tokens as tk;
 use super::{Chrome, Hub, ImageCanvas};
 use crate::core::config::Config;
 use crate::core::viewer::Viewer;
@@ -25,7 +24,11 @@ pub(crate) fn build_root(
 ) -> Element {
     Element::stack()
         .fill()
-        .bg(tk::empty_bg())
+        // ★ m269：**根节点不铺底色**。窗口底色由 `App::bg`（宿主每帧清底）负责，
+        //   两份写的是同一个 `empty_bg()`，本来冗余；而无边框形态要把那份转成全透明
+        //   （windui 补丁 028），根节点再铺一层不透明底会把透明清底整个盖掉——
+        //   实测症状是"图片透明区仍是一片 (15,15,15) 实心色"。画布自己的底色照旧（
+        //   `ui::canvas` ①底），所以普通形态看不出任何差别。
         // 整窗接收拖放：把文件从资源管理器拖进来即打开。
         .on_drop_files({
             let v = viewer.clone();

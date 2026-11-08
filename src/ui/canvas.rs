@@ -26,6 +26,8 @@
 //! | 左键拖动 · 标题栏那一条             | 移动窗口（永远，不受开关影响）         |
 //! | 左键拖动 · 画布里                     | **平移图片**，窗口不动；图边能越过窗口边，但永远还剩 24dp 在画面里 |
 //! | 左键拖动 · 空窗（没有图 / 视口未量出）| 移动窗口（拖不动东西时不堵这条路）                        |
+//! | 左键拖动 · 缩略图条里               | **平移缩略图条**（看更远的图），不换图、不动画面、不动窗口（m258） |
+//! | 滚轮 · 缩略图条里                    | 平移缩略图条一格；Shift = 一屏（不看四行滚轮设置，条上没有缩放入口）|
 //! | 拖右下角鸟瞰图里的视口框            | 改变视角（平移图片）                   |
 //! | Ctrl+左键拖动 / 中键拖动            | 平移图片（兜底手势，不看开关）         |
 //! | 右键                                | 上下文菜单                             |
@@ -47,6 +49,7 @@
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use windui::core::{EventCtx, Widget};
@@ -64,7 +67,7 @@ use windui::text::{TextEngine, TextStyle};
 use std::sync::Arc;
 
 use crate::core::config::Config;
-use crate::core::gallery::Jump;
+use crate::core::gallery::{Jump, SortBy};
 use crate::core::geometry::RectI;
 use crate::core::pixels::MAX_TEXTURE_SIDE;
 // 鸟瞰 / 浮层的配色取自全 ui 共用的令牌（[`crate::ui::tokens`]），本文件不自带色值。
@@ -130,6 +133,29 @@ pub struct ImageCanvas {
     strip_hover: Cell<Option<usize>>,
     /// 缩略图的上屏纹理缓存。
     strip: Strip,
+    /// 条的滚动锚点（m258）：`None` = 跟着当前图居中（老行为），
+    /// `Some(first)` = 用户拖过/滚过这里，条不再自动回正。
+    strip_first: Cell<Option<usize>>,
+    /// 条上正在进行的拖动：起点、起始首格、格距、主轴方向。`None` = 没在拖。
+    strip_drag: Cell<Option<StripDrag>>,
+    /// 本次拖动已越过阈值（[`DRAG_SLOP`]）⇒ 抬起时不再当"点格子"。
+    strip_dragged: Cell<bool>,
+    /// 上一帧画出的条几何（**视口绝对坐标**）：事件回调据此判断"指针在不在条上"、
+    /// 以及滚动指示的热区。与 `strip_items` 一样只由 `paint` 写——命中与绘制同源。
+    strip_at: Cell<Option<filmstrip::Placement>>,
+    /// 正在拖滚动指示的滑块（m259）。`None` = 没在拖。
+    strip_scrub: Cell<Option<StripScrub>>,
+    /// 上一帧的每屏格数（条内滚轮"一屏"要用）与目录长度（判断能不能滚）。
+    strip_cap: Cell<usize>,
+    strip_len: Cell<usize>,
+    /// 上一帧的边：换边（底 ↔ 左）时清锚点——两个方向格数不同，旧位置没有意义。
+    strip_side: Cell<Option<filmstrip::Side>>,
+    /// 上一帧清单所属的目录（m260）：换目录时清锚点。同一目录内换图**不清**——
+    /// 用户要的就是"滚到很远处再点一张"。
+    strip_dir: RefCell<Option<PathBuf>>,
+    /// 上一次见到的排序代数（m275）。**重排之后"用户滚到的首格"指的是另一张图**，
+    /// 所以和换目录一样要归零——不归零的话，换个排序就像被条拽到别处去了一次。
+    strip_sort: Cell<u64>,
     /// 扣掉缩略图条之后**留给图片**的内容矩形。
     ///
     /// 条是常驻的一块地（不是盖在画面上的浮层），所以摆图、缩放锚点、鸟瞰几何
@@ -140,7 +166,9 @@ pub struct ImageCanvas {
 /// 滚轮翻页档每张图需要的增量（一格 WHEEL_DELTA）。
 const WHEEL_STEP: i32 = 120;
 
-/// 把一次滚轮增量并进累计器，攒够一格就给出**一个**翻页方向（`0` = 还没攒够）。
+/// 把一次滚轮增量并进累计器，攒够一格就给出**一个**滚轮符号（`0` = 还没攒够）。
+/// 这是滚轮方向（向上 `+1` / 向下 `-1`），**不是**清单步进方向；交给
+/// `Viewer::step` 或缩略图条之前必须经 [`wheel_nav_dir`] 翻号。
 ///
 /// 单独抽出来只为一句：这条判据（碎增量 → 整格）与那条节奏闸（`Chrome::wheel_gate`）
 /// 是两件事，测试要能各自钉住自己那件。★ 攒够就把累计器**清零**而不是扣一格——
@@ -154,12 +182,49 @@ fn wheel_detent(acc: i32, delta: i32) -> (i32, isize) {
     }
 }
 
+/// 滚轮符号 → 清单步进方向（m268：翻页与缩略图条共用这一处）。
+///
+/// Windows 的 `WM_MOUSEWHEEL` 向上滚给 `+120`、向下滚给 `-120`；清单惯例是
+/// **向下滚 = 看后面**（`step(+1)` / 条首格往大走），所以把 [`wheel_detent`]
+/// 的符号交给 `Viewer::step` 之前必须先翻号。m259 只在条上写了 `- dir`，翻页
+/// 这一路漏了：向上滚反而换下一张，用户实机报「ctrl+向下滚轮，应该是看后面的
+/// 图片？」。
+/// ★ 抽成函数而不是两处各写一个负号：条与翻页从此共用同一根轴，谁再把裸
+/// `dir` 喂给 `step` 就是把两套方向写回来了。
+fn wheel_nav_dir(dir: isize) -> isize {
+    -dir
+}
+
+/// m278：四行滚轮各读自己那一档，优先级 Ctrl > Alt > Shift > 裸滚轮。
+///
+/// 抽成纯函数是为了让「按修饰键选档」能被单测直接量，不必驱动真实窗口——
+/// 不透明度档会碰 `EventCtx::set_window_opacity`，那种探针在测试夹具里不稳。
+/// 下拉只有一张（[`crate::core::config::WheelAction::ALL`]），一个值管上下两个方向。
+fn wheel_action_for(c: &Config, mods: &windui::event::Mods) -> crate::core::config::WheelAction {
+    if mods.ctrl {
+        c.ctrl_wheel
+    } else if mods.alt {
+        c.alt_wheel
+    } else if mods.shift {
+        c.shift_wheel
+    } else {
+        c.wheel
+    }
+}
+
 /// 左键挪动多少才算"拖动窗口"而不是"点一下"（逻辑 dp）。
 ///
 /// **必须有这个阈值**：直接按下就拖会走系统的窗口移动循环，那是个模态循环，
 /// 第二次按下进不了本控件——双击关窗（本应用的主力交互之一）当场失效。
 /// 比系统双击允许的抖动略大一点：手抖不会被当成拖动，想拖也不会觉得迟钝。
 const DRAG_SLOP: f32 = 4.0;
+
+/// 无边框窗四缘的缩放命中带（逻辑 dp）。
+///
+/// 与 windui `handle_nchittest` 的 `RESIZE_BORDER_LOGICAL` 同一个数：那一圈归
+/// **非客户区**，按下是缩放、光标是系统给的 `IDC_SIZE*`，既不能拖图，也不该被
+/// 宿主的自绘光标覆盖顶掉（2026-11-08 用户实报「移到边框线没反应」）。
+const RESIZE_BAND_DP: f32 = 8.0;
 
 /// 这次移动算不算"拖动"（越过 [`DRAG_SLOP`]）。
 ///
@@ -169,6 +234,72 @@ fn beyond_slop(start: (f32, f32), pos: (f32, f32)) -> bool {
     let dx = pos.0 - start.0;
     let dy = pos.1 - start.1;
     dx * dx + dy * dy >= DRAG_SLOP * DRAG_SLOP
+}
+
+/// 缩略图条拖动（m258）：条是**独立滚动的列表**，左键拖它 = 去看更远的图。
+///
+/// 记 `pitch` 而不是每帧重算：拖动过程中格数固定 ⇒ 格距不变，按下那一刻的正是
+/// 用户手指下那一格的宽度（均分布局下，只剩两三张时一格会变宽，不能写死常量）。
+#[derive(Clone, Copy)]
+struct StripDrag {
+    start: (f32, f32),
+    first: usize,
+    pitch: f32,
+    /// 底条看横位移、左条看纵位移（只沿主轴生效，另一维的抖动不算）。
+    horizontal: bool,
+}
+
+/// 拖动位移 → 新的窗口首格（纯函数，供单测）。
+///
+/// 往左/往上拖 = 想看**后面**的图 ⇒ 首格减小；反向同理。按整格取整：半格以内不动，
+/// "拖一点点就窜一格"是错的手感。夹紧交给调用方给的 `max_first`（`len - n`）。
+fn strip_drag_first(start_first: usize, delta: f32, pitch: f32, max_first: usize) -> usize {
+    let steps = (delta / pitch.max(1.0)).round() as isize;
+    (start_first as isize - steps).clamp(0, max_first as isize) as usize
+}
+
+/// 拖滚动指示的滑块（m259）：与"按格平移"分开，因为它按**行程比例**映射——
+/// 目录几百张时，拖一格滑块要跳过几十张，按格算根本到不了。
+#[derive(Clone, Copy)]
+struct StripScrub {
+    /// 命中时指针在主轴上的位置。
+    grab_at: f32,
+    /// 命中时滑块起点（主轴）。
+    thumb0: f32,
+    /// 滑块能走的行程（轨道长 - 滑块长）；`0` = 滑块占满，拖不动。
+    span: f32,
+    max_first: usize,
+    /// 底条看横轴、左条看纵轴。
+    horizontal: bool,
+}
+
+/// 滑块拖动 → 首格（纯函数）。`grab` 是按下那一刻指针距滑块起点的偏移 ⇒ 跟手不跳。
+fn scrub_first(s: &StripScrub, pos: (f32, f32)) -> usize {
+    if s.span <= 0.0 {
+        return 0;
+    }
+    let main = if s.horizontal { pos.0 } else { pos.1 };
+    let t = (main - s.grab_at + s.thumb0).clamp(0.0, s.span);
+    let ratio = t / s.span;
+    (ratio * s.max_first as f32).round() as usize
+}
+
+/// 点轨道空白 → 首格：让**滑块中心**落到指针处（与拖动共用同一套行程映射，
+/// 所以"点一下再拖"不会先跳一截）。
+fn scrub_jump(
+    pos: (f32, f32),
+    track0: f32,
+    thumb_len: f32,
+    span: f32,
+    max_first: usize,
+    horizontal: bool,
+) -> usize {
+    if span <= 0.0 {
+        return 0;
+    }
+    let main = if horizontal { pos.0 } else { pos.1 };
+    let t = (main - track0 - thumb_len / 2.0).clamp(0.0, span);
+    (t / span * max_first as f32).round() as usize
 }
 
 /// 左键按下之后"这一拖归谁"。判据抽成纯函数的理由与 [`beyond_slop`] 同一条：
@@ -193,7 +324,16 @@ enum LeftDrag {
 ///   与"视口还没量出来"两种——那时那一按留着拖窗口，**不许把拖窗口这条路堵死**。
 /// - `!in_title`：指针不在顶部标题栏那一条里——**标题栏永远带走窗口**（判据单一来源
 ///   见 [`Chrome::in_title_strip`]）。
-fn left_drag(drag_image: bool, can_pan: bool, in_title: bool, fullscreen: bool) -> LeftDrag {
+///
+/// 后三项是无边框形态（`chrome::borderless()`）与"图溢出视口"的输入，见下面那段。
+fn left_drag(
+    drag_image: bool,
+    can_pan: bool,
+    in_title: bool,
+    fullscreen: bool,
+    borderless: bool,
+    overflows: bool,
+) -> LeftDrag {
     // ★ m238 修复轮（用户 2026-11-05 实机）：真全屏时窗口铺满显示器且**不许被拖走**。
     // 收起顶条只改了绘制、关掉系统圆角只改了 DWM 属性，都没动这条手势判据 —— 于是
     // 顶缘按下仍会把全屏窗拖离显示器，看起来还是「假全屏」。全屏时：画布里照常平移
@@ -205,10 +345,47 @@ fn left_drag(drag_image: bool, can_pan: bool, in_title: bool, fullscreen: bool) 
             LeftDrag::None
         };
     }
+    // ★ m272（用户 2026-11-08 实机：「无边框拖窗口只有顶部那条 40dp 的隐形热区，
+    //   没有任何提示」）：无边框形态整套自绘 chrome 全隐，**它没有标题栏**——顶部
+    //   那条只是 `in_title_strip` 的几何残留，谁也看不见它，不会有人去试。
+    //   那个形态下**整块画面就是标题栏**：左键一律搬窗口。
+    //
+    //   唯一的例外是图**真的溢出视口**（按了 `1`=100%、或滚轮放大过）：那时不拖图
+    //   就没法看画外那半张，于是回落到平移；想搬窗口先缩回适应。这与普通窗口完全
+    //   同构——放大后画面拖图、缩小时画面留给窗口——所以不必为无边框另立一套心智。
+    //   `in_title` 在这里无所谓：两种结果都含 Window。
+    if borderless {
+        return if drag_image && overflows {
+            LeftDrag::PanImage
+        } else {
+            LeftDrag::Window
+        };
+    }
     if drag_image && can_pan && !in_title {
         LeftDrag::PanImage
     } else {
         LeftDrag::Window
+    }
+}
+
+/// 双击该做什么：**标题栏恒等于「最大化 / 恢复」**，画面区才按 `double_click` 设置。
+///
+/// ★ 2026-11-08 用户报「秒退」：默认 `double_click=1` 是**关窗**，而双击判定当年对
+/// 标题栏和画面区一视同仁 —— 于是双击顶条就把整扇窗收了（日志里只有一次
+/// `[close] action=Close`，无 panic，看着就像进程凭空消失）。
+///
+/// 标题栏是特殊区域：它承载的是**窗口级动作**（关闭 / 最大化 / 最小化 / 锁 / 置顶），
+/// 双击那里在任何系统里都轮到「最大化 / 恢复」，不该被「双击图片关窗」这条产品设定
+/// 接管。判据只此一处，别在分支里各写一遍。
+fn double_click_action(
+    in_title: bool,
+    cfg: crate::core::config::DblClick,
+) -> crate::core::config::DblClick {
+    use crate::core::config::DblClick;
+    if in_title {
+        DblClick::Maximize
+    } else {
+        cfg
     }
 }
 
@@ -291,14 +468,15 @@ impl ImageCache {
     }
 }
 
-/// 实时调色纹理：键 = (源位图 gen, 六个参数)，变一次才重算一次 + 重新上传。
+/// 显示层纹理：键 = (源位图 gen, 六个参数, Gamma, 旋转角度)，变一次才重算一次 + 重新上传。
 ///
 /// 只变换**已经派生到显示档**的那份位图（视口尺寸量级），原图/base 一字节不动：
 /// 8 MP 整图每帧重算会卡住拖动，而显示档在适应窗口时通常不到 2 MP；查表版变换
 /// 又比逐像素除法快一个量级。原图档放大到 100% 以上时才等于整图，那时一帧仍只算一次。
 struct TintCache {
-    /// (显示档 gen, 六个 gain/bias, Gamma)。三个都相同才复用上一帧的位图。
-    key: Option<(u64, [i32; 6], i32)>,
+    /// (显示档 gen, 六个 gain/bias, Gamma, 角度)。四个都相同才复用上一帧的位图。
+    /// ★ 角度进键是「不累积重采样」的落点：每次都从 `src` 重算，绝不用上一帧输出。
+    key: Option<(u64, [i32; 6], i32, i32)>,
     img: Option<RgbaImage>,
     upload: ImageCache,
 }
@@ -322,16 +500,23 @@ impl TintCache {
         }
     }
 
-    fn obtain(&mut self, src: &RgbaImage, v: [i32; 6], gamma: i32) -> Option<&Image> {
-        if self.key != Some((src.gen, v, gamma)) {
+    fn obtain(&mut self, src: &RgbaImage, v: [i32; 6], gamma: i32, deg: i32) -> Option<&Image> {
+        if self.key != Some((src.gen, v, gamma, deg)) {
             let px = crate::core::pixels::channel_gamma_lut(
                 &src.rgba,
                 [v[0], v[1], v[2]],
                 [v[3], v[4], v[5]],
                 gamma,
             );
+            // 顺序与 `edit_actions` 的另存路径一致：先调色、后旋转。
+            // 于是「窗里看到的」==「另存出去的」（pixels.rs 的 parity 判据）。
+            let px = if deg != 0 {
+                crate::core::geometry::rotated(&px, src.width, src.height, deg)
+            } else {
+                px
+            };
             self.img = Some(RgbaImage::new(src.width, src.height, px));
-            self.key = Some((src.gen, v, gamma));
+            self.key = Some((src.gen, v, gamma, deg));
         }
         let img = self.img.as_ref()?;
         self.upload.obtain(img)
@@ -429,6 +614,18 @@ fn edit_actions(
             )),
             None => rgba,
         };
+        // ★ 显示层只在上屏档转过；整图这里补同一角度，且顺序仍是「先调色后旋转」。
+        // 少这一步，用户看到的是转过的图、另存出去的却是原角度（parity 判据）。
+        let deg = if ch.rotate_path.get().as_deref() == Some(cur_save.as_path()) {
+            super::rotate_dialog::angle_of(ch.rotate_deg.get())
+        } else {
+            0
+        };
+        let out = if deg != 0 {
+            Arc::new(crate::core::geometry::rotated(out.as_slice(), w, h, deg))
+        } else {
+            out
+        };
         let ch = ch.clone();
         let name = default_png_name(&cur_save);
         ctx.request_save_file(
@@ -441,18 +638,23 @@ fn edit_actions(
     let v2 = viewer.clone();
     let cur_r = cur_owned;
     let live_revert = live.clone();
+    let ch_revert = chrome.clone();
     let revert: Rc<dyn Fn(&mut EventCtx)> = Rc::new(move |ctx| {
-        // 两个来源一起还原：显示层调色 + 插件正式写回的编辑覆盖。
+        // 三个来源一起还原：显示层调色 + 旋转角度 + 插件正式写回的编辑覆盖。
         let had_tint = live_revert.tint.get().is_some();
+        let had_rotate = ch_revert.rotate_deg.get() != 0.0;
+        ch_revert.rotate_deg.set(0.0);
+        ch_revert.rotate_path.set(None);
         live_revert.tint.set(None);
         let r = live_revert.reset.get();
         live_revert.reset.set(r + 1);
         let restored = v2.borrow_mut().revert_edited(&cur_r);
-        if had_tint || restored {
+        if had_tint || had_rotate || restored {
             log::info!(
-                "[plugin-edit] verdict=reverted file={} tint={} overlay={}",
+                "[plugin-edit] verdict=reverted file={} tint={} rotate={} overlay={}",
                 cur_r.display(),
                 had_tint,
+                had_rotate,
                 restored
             );
             ctx.toast_ok("已还原");
@@ -488,6 +690,16 @@ impl ImageCanvas {
             strip_pressed: Cell::new(None),
             strip_hover: Cell::new(None),
             strip: Strip::new(),
+            strip_first: Cell::new(None),
+            strip_drag: Cell::new(None),
+            strip_dragged: Cell::new(false),
+            strip_at: Cell::new(None),
+            strip_scrub: Cell::new(None),
+            strip_cap: Cell::new(1),
+            strip_len: Cell::new(0),
+            strip_side: Cell::new(None),
+            strip_dir: RefCell::new(None),
+            strip_sort: Cell::new(0),
             last_work: Cell::new(Rect::new(0, 0, 1, 1)),
         }
     }
@@ -661,20 +873,28 @@ impl ImageCanvas {
     /// ```text
     /// 打开…
     /// 复制 ▸                    画面 PNG / 原文件 / 文件路径（m248 上移，与「打开」同为文件类）
-    /// RAW 参数…                 ← 常驻；仅无头裸像素可点（相机 RAW / 普通图片置灰）
     /// 属性…                     图片信息窗（m247 从浮条收编到顶层）
     /// ─────
     /// 操作 ▸            **严格等于底部浮条**（m247 后只收操作类，同一份 `Btn::ALL`）
-    /// 工具 ▸                    宿主内置低频辅助（取色器等）
+    /// 本图 ▸                    RAW 参数… / 跳转到…帧/页 / 取色器（m276）
     /// 插件 ▸                    外部进程命令
     /// ─────
-    /// 外观 ▸                    极简模式 / 棋盘格背景 / 缩略图条 / 显示按钮（勾选）/
-    ///                        主题色 ▸ 深色·浅色 / 不透明度 ▸ 10~100%
+    /// 外观 ▸                    显示操作按钮（勾选，m263 提到组首）/ 极简模式 / 棋盘格背景 /
+    ///                        缩略图条 / 主题色 ▸ 深色·浅色 / 不透明度 ▸ 10~100%
+    ///                        （m262 起组内不画分隔线）
     /// 幻灯片放映 / 停止放映
     /// 左键拖图（勾选）
+    /// 排序 ▸                    文件名 / 大小 / 创建日期 / 修改日期 ── 倒序（m275）
     /// ─────
     /// 设置…（「关于」不再单列，它是设置窗五页里的最后一项，见 `settings::rows::NAV_LABELS`）
     /// ```
+    ///
+    /// 「本图 ▸」（m276 由「工具 ▸」改名）收的是**只作用于当前这张图**、且**不进浮条**的
+    /// 低频功能：改它的裸数据解码参数（RAW 参数…）、在它自己的帧/页里按号定位
+    /// （跳转到…帧/页）、取它的一个像素（取色器）。与「操作 ▸」的分界不是"对不对这张图
+    /// 做事"，而是**有没有浮条按钮**——操作 ▸ 严格等于 `Btn::ALL`，这一组只进菜单、
+    /// 不占浮条空间（用户口径「一排按钮已经很多了」）。「排序 ▸」改的是"这一组图的
+    /// 下一张是谁"，不针对单张，所以留在顶层浏览区。
     ///
     /// 「外观 ▸」收的是**改变画面上出现什么 / 长什么样**的开关（m246 改名并补齐）：
     /// 与设置 → 选项 → 外观卡同一条轴。放映改的是看图行为，左键拖图改的是手势分工，
@@ -730,8 +950,9 @@ impl ImageCanvas {
         });
 
         // ── 复制（二级菜单，向右弹出）──
-        // m248：紧跟「打开…」——两者都针对文件，文件类四项（打开 / 复制 / RAW 参数 /
-        // 属性）在第一个分隔线之前连成一块。2026-11-03 用户口径「三个复制收纳到
+        // m248：紧跟「打开…」——两者都针对文件。m276 把「RAW 参数…」收进「本图 ▸」
+        // 之后，第一块是文件类三项（打开 / 复制 / 属性）：它们只碰磁盘上的这个文件，
+        // 不依赖当前这张图有没有解出来。2026-11-03 用户口径「三个复制收纳到
         // "复制"里面，向右弹出，这样比较节省空间」：同一次只选一种口径（画面 PNG /
         // 文件本身 / 路径文本），平铺会摊成菜单最长的三段。快捷键仍挂在「复制当前」
         // 与「复制文件路径」上，收进子菜单不影响按键——显示的是同一份 hotkeys。
@@ -746,25 +967,13 @@ impl ImageCanvas {
         // 想再开一张图，直接双击/拖放本来就会新开一扇（`allow_multiple` 的语义），
         // 所以这一项是绕远路。托盘菜单里那一项保留——它在零窗口时是唯一入口。
 
-        // 裸数据参数：**常驻**，只有当前文件确实是无头裸像素时才可点。
-        // 相机 RAW（CR2/NEF…）有完整文件头，参数窗对它们没有意义，所以同样置灰；
-        // 这样用户永远找得到入口，又不会在普通图片上误触。
-        {
-            let path = self.viewer.borrow().current_path();
-            let enabled = super::raw_dialog::menu_enabled(path.as_deref());
-            let v = self.viewer.clone();
-            let cfg = self.config.clone();
-            let mut it = MenuItem::run(
-                "RAW 参数…",
-                move |ctx| super::raw_dialog::open_current_params(ctx, &v, &cfg),
-                false,
-            );
-            it.enabled = enabled;
-            items.push(it);
-        }
+        // m276：「RAW 参数…」已收进「本图 ▸」——它改的是"这张图怎么解"，
+        // 和取色器 / 跳帧页一样只作用于当前这张图，不属于文件类（打开 / 复制 / 属性）。
+        // 仍**常驻**，只有当前文件确实是无头裸像素时才可点；相机 RAW（CR2/NEF…）
+        // 有完整文件头，参数窗对它们没有意义，所以同样置灰。
 
         // ── 属性…（m247）：从浮条「!」与「操作 ▸」收编到顶层 ──
-        // 与「RAW 参数…」同组：都是"打开一个关于这张图的信息窗"。
+        // 文件类最后一项：读的是磁盘上这个文件的元数据与 EXIF，不依赖画面解没解出来。
         // 快捷键 Action::Properties 走 exec_action 那条独立路径，行为不变。
         items.push({
             let v = self.viewer.clone();
@@ -778,10 +987,13 @@ impl ImageCanvas {
         // ── 操作：浮条按钮全集，菜单恒列；没有帧/页号时那三颗变灰 ──
         items.push(MenuItem::submenu("操作", self.ops_items(ws)));
 
-        // ── 工具：宿主内置的低频辅助（m217）──
-        // 夹在「操作」（恒列 `Btn::ALL`，与浮条按宽度/帧页号的裁剪不同）与「插件」之间。
-        // 这组只进菜单不进浮条——用户口径「一排按钮已经很多了，太占空间」。
-        items.push(MenuItem::submenu("工具", self.tool_items(has_image)));
+        // ── 本图（m276 由「工具」改名并收编两项）──
+        // 位置不动：仍在「操作」（恒列 `Btn::ALL`）与「插件」之间，都在"对画面做事"这一块。
+        // 三项只作用于当前这张图，且只进菜单不进浮条——用户口径「一排按钮已经很多了」。
+        items.push(MenuItem::submenu(
+            "本图",
+            self.current_image_items(has_image),
+        ));
 
         // ── 插件：只列已发现且启用的命令型插件；空目录给可读空态 ──
         items.push(MenuItem::submenu("插件", self.plugin_items()));
@@ -860,6 +1072,57 @@ impl ImageCanvas {
             it
         });
 
+        // ── 排序 ▸（m275，ini 键 sort_by + sort_desc）──
+        //
+        // 归这一组而不是「外观 ▸」：排序改的是**下一张是谁**，与「幻灯片放映」
+        // 「左键拖图」同类（都是看图行为），画面长什么样一个字不动。
+        // 四项维度 + 一条分隔线 + 倒序：先选按什么排、再定方向，与资源管理器的
+        // 「排序方式 ▸」同构（那边也是四个维度 + 一个升降序）。
+        //
+        // 勾选态直接读配置（唯一正本）；改完**当场**重排——`Viewer::sync_sort` 在
+        // 下一次 tick（16ms 内）对齐，重排拿当前这张当锚点，画面不闪、不重解码。
+        {
+            let cfg = self.config.clone();
+            let cur = self.config.borrow().sort_spec();
+            let mut sub = Vec::new();
+            for by in SortBy::ALL {
+                let cfg = cfg.clone();
+                let hub = self.hub.clone();
+                sub.push(
+                    MenuItem::run(
+                        by.label(),
+                        move |ctx| {
+                            persist_session(&cfg, &hub, |c| c.sort_by = by);
+                            ctx.mark_dirty();
+                        },
+                        cur.by == by,
+                    )
+                    // 四项都要留勾选列：只给勾着的那项 `.check` 会让整列随选项跳。
+                    .check(cur.by == by),
+                );
+            }
+            sub.push(MenuItem::separator());
+            let cfg = self.config.clone();
+            let hub = self.hub.clone();
+            sub.push(
+                MenuItem::run(
+                    "倒序",
+                    move |ctx| {
+                        let on = !cfg.borrow().sort_desc;
+                        persist_session(&cfg, &hub, |c| c.sort_desc = on);
+                        ctx.mark_dirty();
+                    },
+                    cur.desc,
+                )
+                .check(cur.desc),
+            );
+            items.push(MenuItem::submenu("排序", sub));
+        }
+
+        // m276：「跳转到…帧/页」与「RAW 参数…」一起收进「本图 ▸」——它换的是
+        // **这一张图里的第几帧/页**，不是"清单里的第几张"，与「排序 ▸」（改下一张是谁）
+        // 不是同一件事。状态格 `(12/340)` 的点击入口照旧留着，那是鼠标最短的一条路。
+
         items.push(MenuItem::separator());
         items.push({
             let mut it = MenuItem::run(
@@ -880,14 +1143,44 @@ impl ImageCanvas {
 
     /// 「外观 ▸」子菜单：只放**改变画面上出现什么 / 长什么样**的开关（m246）。
     ///
-    /// 与设置 → 选项 → 外观卡同一条轴：极简模式（chrome 显隐）、棋盘格背景、
-    /// 缩略图条（底部常驻区）、显示按钮（浮条按钮）、不透明度（整窗 alpha）。
+    /// ★ m262：内部**不画分隔线**。顶层那条已经把「开关区」整体分出来了，这里再按
+    ///   「显隐 vs 观感」切一次是同一维度切两遍；删掉后六项连成一块，与设置页
+    ///   「外观」卡（卡片里本来也没有分隔线）版式对齐。
+    ///
+    /// 与设置 → 选项 → 外观卡同一条轴：显示操作按钮（浮条按钮，m263 提到组首 —— 这组里
+    /// 最常切的一颗）、极简模式（chrome 显隐）、棋盘格背景、缩略图条（底部常驻区）、
+    /// 主题色、不透明度（整窗 alpha）。组内先看使用频次，再排几何尺度。
     /// 全部读写同一份 `Config`，`runtime::apply_session_flags` 每帧把配置推给窗口信号。
     /// 棋盘格只在本菜单与设置页「外观」卡（m247 已从浮条 / 「操作 ▸」撤走）。
     /// 放映改的是浏览行为、左键拖图改的是手势分工，留在顶层不进来。
     /// 不透明度保留自己的档位子菜单：十档铺平会把这里撑成一长列，三级反而好找。
     fn appearance_items(&self) -> Vec<MenuItem> {
         let mut out = Vec::new();
+
+        // ── 显示操作按钮（m245，ini 键 show_toolbar_buttons；m263 提到组首）──
+        // 这组里最常切的一颗：右键是「正盯着图顺手切」，先给最常切的那颗。
+        // 按钮对应的操作在右键「操作 ▸」里一颗不缺，信息（页码 / 缩放 / 帧号）
+        // 却只有浮条这一处载体 ⇒ 只隐按钮、留信息并水平居中。归「外观 ▸」：
+        // 改的是画面上出现什么（m246 口径）。
+        out.push({
+            let on = self.config.borrow().show_toolbar_buttons;
+            let cfg = self.config.clone();
+            let hub = self.hub.clone();
+            let mut it = MenuItem::run(
+                "显示操作按钮",
+                move |ctx| {
+                    let on = !cfg.borrow().show_toolbar_buttons;
+                    persist_session(&cfg, &hub, |c| c.show_toolbar_buttons = on);
+                    super::chrome::set_toolbar_buttons(on);
+                    // 不提示：按钮当场消失/出现，屏幕自己已经说了。
+                    ctx.mark_dirty();
+                },
+                on,
+            );
+            it.checkable = true;
+            it.checked = on;
+            it
+        });
 
         // ── 极简模式：当前窗口临时切换（不落盘）──
         out.push({
@@ -935,56 +1228,44 @@ impl ImageCanvas {
             it
         });
 
-        // ── 缩略图条：底部一排缩略图，点一格直接跳过去 ──
+        // ── 缩略图条：关 / 下方 / 左侧（m254 三态，m262 与设置页共用一根轴）──
         //
-        // 会话态（同棋盘格），m53 起落盘：开着关窗，下次启动照样开着。
+        // ★ m254 之前这里是两个并列勾选，于是"勾了左侧却没开条"是个能点出来的死状态。
+        //   位置是**属性**不是第二个开关 ⇒ 三态收进一个子菜单，勾当前项。
+        //   m262 起设置页也改成同一个三选一下拉，档位 / 标签 / 翻译全走
+        //   `settings::{FILMSTRIP_POS, filmstrip_index, filmstrip_bools}`，不再各写一套。
+        //   快捷键 T 仍只切开关（只翻 `filmstrip`），挂在父项上。
         out.push({
-            let on = self.chrome.filmstrip.get();
-            let chrome = self.chrome.clone();
-            let cfg = self.config.clone();
-            let hub = self.hub.clone();
-            let mut it = MenuItem::run(
-                "缩略图条",
-                move |ctx| {
-                    let on = !chrome.filmstrip.get();
-                    chrome.filmstrip.set(on);
-                    persist_session(&cfg, &hub, |c| c.filmstrip = on);
-                    // 不提示：条当场出现/消失，屏幕自己已经说了。
-                    ctx.mark_dirty();
-                },
-                on,
-            );
-            it.checkable = true;
-            it.checked = on;
+            let cur = settings::filmstrip_index(&self.config.borrow());
+            let mut items = Vec::new();
+            for (idx, label) in settings::FILMSTRIP_POS.iter().enumerate() {
+                let chrome = self.chrome.clone();
+                let cfg = self.config.clone();
+                let hub = self.hub.clone();
+                items.push(
+                    MenuItem::run(
+                        *label,
+                        move |ctx| {
+                            // 选位置必然把条打开（idx 0 才是关）——死状态从入口上就没法产生。
+                            let (film, left) = settings::filmstrip_bools(idx);
+                            chrome.filmstrip.set(film);
+                            chrome.filmstrip_left.set(left);
+                            persist_session(&cfg, &hub, |c| {
+                                c.filmstrip = film;
+                                c.filmstrip_left = left;
+                            });
+                            // 不提示：条当场出现/消失/挪边，屏幕自己已经说了。
+                            ctx.mark_dirty();
+                        },
+                        cur == idx,
+                    )
+                    .check(cur == idx),
+                );
+            }
+            let mut it = MenuItem::submenu("缩略图条", items);
             it.shortcut = self.config.borrow().hotkeys.display(Action::Filmstrip);
             it
         });
-
-        // ── 显示按钮（m245，ini 键 show_toolbar_buttons）──
-        // 按钮对应的操作在右键「操作 ▸」里一颗不缺，信息（页码 / 缩放 / 帧号）
-        // 却只有浮条这一处载体 ⇒ 只隐按钮、留信息并水平居中。归「外观 ▸」：
-        // 改的是画面上出现什么（m246 口径）。
-        out.push({
-            let on = self.config.borrow().show_toolbar_buttons;
-            let cfg = self.config.clone();
-            let hub = self.hub.clone();
-            let mut it = MenuItem::run(
-                "显示按钮",
-                move |ctx| {
-                    let on = !cfg.borrow().show_toolbar_buttons;
-                    persist_session(&cfg, &hub, |c| c.show_toolbar_buttons = on);
-                    super::chrome::set_toolbar_buttons(on);
-                    // 不提示：按钮当场消失/出现，屏幕自己已经说了。
-                    ctx.mark_dirty();
-                },
-                on,
-            );
-            it.checkable = true;
-            it.checked = on;
-            it
-        });
-
-        out.push(MenuItem::separator());
 
         // ── 主题色（m247，ini 键 ui_theme）：与设置页下拉同一份 Config ──
         // runtime::apply_theme 每帧幂等推令牌，写完配置下一帧就换色；
@@ -1298,33 +1579,91 @@ impl ImageCanvas {
         out
     }
 
-    /// 「操作」子菜单的项：由 [`Btn::ALL`] 生成，动作与浮条按钮同一份代码。
-    /// 「复制 ▸」的三项：画面 PNG / 磁盘上的文件本身 / 路径文本。
+    /// 「本图 ▸」子菜单：三项都只作用于当前这张图，且都不进浮条。
     ///
-    /// 从主菜单搬进子菜单只是**层级**变化（2026-11-03 用户要省空间），行为一字未改：
-    /// 灰项判据（`has_image` / `has_file`）、回执 toast、以及"占用剪贴板时报错而不是
-    /// 无条件说已复制"那条都原样跟着走。
-    /// 「工具」子菜单（m217）：宿主内置的低频辅助，只进菜单不进浮条。
+    /// m276 由「工具 ▸」改名并收编两项；前身是 m217 只有取色器一项的「工具 ▸」。
+    ///
+    /// 两个"打开一个窗"的常驻项在前、按原本在顶层的先后排（RAW 参数 → 跳转），
+    /// 会话开关「取色器」垫底；中间一条分隔线把"改这张图的参数 / 定位到这张图的
+    /// 某一帧页"与"切换一种指针模式"分开，三者不是同一种动作。
+    ///
+    /// 前两项**常驻 + 置灰**：入口永远找得到（用户不必先猜"这功能在不在"），
+    /// 但静态图上点不开。跳转判据是 `count > 1` 而不是 `has_index()`——单帧动图
+    /// （`delay>0` 但只有一帧）没有第二张可去；RAW 参数判据是"无头裸像素"，
+    /// 相机 RAW 有完整文件头，参数窗对它们没有意义。
     ///
     /// 取色器是**会话临时态**（同极简模式，不落盘）：开关与指针位置都在 `Chrome`，
     /// 菜单回调、画布事件、paint 三者读同一份；切换时清掉旧指针位置，免得下次
     /// 一开模式就有一枚停在别处的浮层。没有图时置灰——空窗没有像素可采样。
-    fn tool_items(&self, has_image: bool) -> Vec<MenuItem> {
-        let on = self.chrome.picker.get();
-        let chrome = self.chrome.clone();
-        let mut it = MenuItem::run(
-            "取色器",
-            move |ctx| {
-                chrome.toggle_picker();
-                ctx.mark_dirty();
-            },
-            on,
-        );
-        it.checkable = true;
-        it.checked = on;
-        it.enabled = has_image;
-        it.shortcut = self.config.borrow().hotkeys.display(Action::Picker);
-        vec![it]
+    fn current_image_items(&self, has_image: bool) -> Vec<MenuItem> {
+        let mut out = Vec::with_capacity(4);
+
+        // ── RAW 参数…：从顶层文件类收编（m276）──
+        {
+            let path = self.viewer.borrow().current_path();
+            let enabled = super::raw_dialog::menu_enabled(path.as_deref());
+            let v = self.viewer.clone();
+            let cfg = self.config.clone();
+            let mut it = MenuItem::run(
+                "RAW 参数…",
+                move |ctx| super::raw_dialog::open_current_params(ctx, &v, &cfg),
+                false,
+            );
+            it.enabled = enabled;
+            out.push(it);
+        }
+
+        // ── 跳转到…帧/页：从顶层浏览区收编（m276 改名）──
+        // 名字里写明"帧/页"，免得被当成"跳到清单里第几张"——那是对一组图做的事，
+        // 归「排序 ▸」与前后翻页；这一项只在同一张图的帧/页之间挪。
+        {
+            let anim = self.viewer.borrow().anim_info();
+            let v = self.viewer.clone();
+            let mut it = MenuItem::run(
+                "跳转到…帧/页",
+                move |ctx| super::goto_dialog::open(ctx, &v),
+                false,
+            );
+            it.enabled = anim.is_some_and(|a| a.count > 1);
+            out.push(it);
+        }
+
+        // ── 旋转角度…（m280）：整数度数 + ± 微调，输入即变 ──
+        // 与上面两项同属「打开一个关于这张图的窗」，排在分隔线之前；
+        // 不进浮条也不进「操作 ▸」（那一组严格等于 `Btn::ALL`，m247 铁律）。
+        {
+            let chrome = self.chrome.clone();
+            let v = self.viewer.clone();
+            let mut it = MenuItem::run(
+                "旋转角度…",
+                move |ctx| super::rotate_dialog::open(ctx, &chrome, &v),
+                false,
+            );
+            it.enabled = has_image;
+            out.push(it);
+        }
+
+        out.push(MenuItem::separator());
+
+        // ── 取色器（m217）：本组原有的一项 ──
+        {
+            let on = self.chrome.picker.get();
+            let chrome = self.chrome.clone();
+            let mut it = MenuItem::run(
+                "取色器",
+                move |ctx| {
+                    chrome.toggle_picker();
+                    ctx.mark_dirty();
+                },
+                on,
+            );
+            it.checkable = true;
+            it.checked = on;
+            it.enabled = has_image;
+            it.shortcut = self.config.borrow().hotkeys.display(Action::Picker);
+            out.push(it);
+        }
+        out
     }
 
     fn copy_items(&self, has_image: bool, has_file: bool) -> Vec<MenuItem> {
@@ -1455,7 +1794,7 @@ fn ops_row(has_index: bool) -> Vec<(Btn, bool)> {
 /// 让右键菜单**每一级**都留出同一条勾选列，标签左沿才对得齐。
 ///
 /// windui 的 `level_width` 逐级判 `items.iter().any(|it| it.checkable)`：本级有开关项
-/// 才让出 `MENU_CHECK_W + MENU_GAP`（24dp），没有就贴左。于是「操作」「工具」「窗口」
+/// 才让出 `MENU_CHECK_W + MENU_GAP`（24dp），没有就贴左。于是「操作」「本图」「窗口」
 /// 「不透明度」这些含开关的级会缩进，而「复制」「插件」这类纯动作列表不会——同一棵菜单里
 /// 文字左沿差一列，看起来就是插件名"没留间隔"。
 /// 补位递归到每一级，包括「外观 ▸ 不透明度 ▸ 档位」这样的三级。
@@ -1578,6 +1917,28 @@ fn exec_title_btn(
     }
 }
 
+/// 缩略图条占掉一条边之后留给画面的那块地（`last_work` 的正本）。
+///
+/// ★ 与 `filmstrip::layout` 的 `Placement.view` 是**同一份 `content` 的两种推导**：
+/// 这里减掉条、那里画条。贴左时两边都必须从 `content.x` 起算——若一边拿 `work`
+/// 再扣一次，条就会画进画面里、或者画面被扣掉两条宽。
+fn work_of(content: Rect, side: filmstrip::Side) -> Rect {
+    match side {
+        filmstrip::Side::Bottom => Rect::new(
+            content.x,
+            content.y,
+            content.w,
+            (content.h as f32 - filmstrip::STRIP_H).max(1.0) as i32,
+        ),
+        filmstrip::Side::Left => Rect::new(
+            content.x + filmstrip::STRIP_W as i32,
+            content.y,
+            (content.w as f32 - filmstrip::STRIP_W).max(1.0) as i32,
+            content.h,
+        ),
+    }
+}
+
 impl Widget for ImageCanvas {
     fn measure(&self, _avail: Size, _style: &Style, _text: &mut dyn TextEngine) -> Size {
         // 由父容器的 `fill()` 决定尺寸，控件本身不贡献固有尺寸。
@@ -1594,46 +1955,113 @@ impl Widget for ImageCanvas {
         _style: &Style,
     ) {
         self.last.set(content);
-        // 缩略图条占掉底部一条（它是常驻的地，不是浮层）：摆图、悬浮层、命中测试
+        // 缩略图条占掉一条边（它是常驻的地，不是浮层）：摆图、悬浮层、命中测试
         // 一律用扣掉之后的 `work`——**画在哪就要点在哪**，三者共用一份几何。
-        let strip_on = self.strip_on() && filmstrip::fits(content.h as f32);
+        // m253：贴底扣高、贴左扣宽（`filmstrip_left`），两根主轴共用一套格子。
+        let strip_side = filmstrip::Side::from_left(self.chrome.filmstrip_left.get());
+        // m269：无边框形态下 chrome 全隐，条画出来就是一块多余的浮层 ⇒ 不显示
+        // （不改配置，关掉形态后条照原样回来）。判据在 `fits` 之前，换边归零逻辑照旧走。
+        let strip_on = self.strip_on()
+            && !chrome::borderless()
+            && filmstrip::fits(strip_side, content.w as f32, content.h as f32);
+        // 条的主轴长度：底条按内容宽、左条按内容高——都用**完整** `content`，
+        // 因为条画的就是 `content` 的那一条（不是 `work`）。
+        let strip_axis = match strip_side {
+            filmstrip::Side::Bottom => content.w as f32,
+            filmstrip::Side::Left => content.h as f32,
+        };
+        // 换边 / 关条 ⇒ 锚点归零（m258）：两个方向每屏格数不同，旧首格没有意义；
+        // 关掉再打开时"跟着当前图"才符合直觉（没人会记得上次滚到哪）。
+        let side_now = if strip_on { Some(strip_side) } else { None };
+        if self.strip_side.replace(side_now) != side_now {
+            self.strip_first.set(None);
+            self.strip_drag.set(None);
+            self.strip_dragged.set(false);
+        }
+        // 换目录 ⇒ 锚点归零（m260）：条记的是"这个目录里的浏览位置"，换个目录后旧位置
+        // 没有意义（还可能把条停在几百张之外，让人以为条坏了）。判据是**目录**而不是
+        // 格数——同目录里增删文件不算换目录，同一目录内换图更不动它（用户要的正是
+        // "滚到很远再点一张"）。
+        let dir_changed = {
+            let v = self.viewer.borrow();
+            let prev = self.strip_dir.borrow();
+            match (prev.as_deref(), v.gallery_dir()) {
+                (None, None) => false,
+                (Some(a), Some(b)) => a != b,
+                _ => true,
+            }
+        };
+        // 重排（m275）与换目录同一条处置：条记的是"这个顺序里的浏览位置"，
+        // 顺序换了之后同一个槽位已经是另一张图。
+        let sort_changed = {
+            let v = self.viewer.borrow();
+            let epoch = v.sort_epoch();
+            let stale = self.strip_sort.get() != epoch;
+            if stale {
+                self.strip_sort.set(epoch);
+            }
+            stale
+        };
+        if dir_changed || sort_changed {
+            let dir = self.viewer.borrow().gallery_dir().map(Path::to_path_buf);
+            *self.strip_dir.borrow_mut() = dir;
+            self.strip_first.set(None);
+            self.strip_drag.set(None);
+            self.strip_dragged.set(false);
+        }
         let work = if strip_on {
-            Rect::new(
-                content.x,
-                content.y,
-                content.w,
-                (content.h as f32 - filmstrip::STRIP_H).max(1.0) as i32,
-            )
+            work_of(content, strip_side)
         } else {
             content
         };
+        // m254：用户**刚**打开条 / 换了边，但窗口放不下 ⇒ 先把窗口放大到刚好放得下，
+        // 下一帧条自然出现（`apply_session_flags` 只置一次请求，这里消费即清）。
+        // ★ 用户自己把窗口拉小（条自动隐藏）不会被反向顶大——那种"拉不动"的窗口很讨厌。
+        // 最大化 / 全屏时 `set_window_size` 由框架自行忽略，条先不显示，还原后自动出现。
+        if self.chrome.strip_fit_request.get() {
+            self.chrome.strip_fit_request.set(false);
+            // m269：无边框形态下条本就不显示，别为了"放得下条"把窗口顶大
+            // （那时候画面里根本没有那条）。
+            if self.chrome.filmstrip.get() && !strip_on && !chrome::borderless() {
+                let dpi = canvas.dpi_scale().max(0.5);
+                let (tw, th) =
+                    filmstrip::grow_to_fit(strip_side, content.w as f32, content.h as f32);
+                self.chrome
+                    .strip_resize
+                    .set(Some(((tw * dpi).round() as i32, (th * dpi).round() as i32)));
+            }
+        }
         self.last_work.set(work);
         let (vx, vy, vw, vh) = (work.x as f32, work.y as f32, work.w as f32, work.h as f32);
         let (checker_a, checker_b) = (tk::checker_a(), tk::checker_b());
         let checker_on = self.chrome.checker.get();
 
         // ① 底：棋盘格（透明背景开关）或近黑空场。
-        if checker_on {
-            let mut y = vy - (vy % CHECKER);
-            while y < vy + vh {
-                let mut x = vx - (vx % CHECKER);
-                let row = ((y - vy) / CHECKER) as i32;
-                while x < vx + vw {
-                    let col = ((x - vx) / CHECKER) as i32;
-                    let c = if (row + col) % 2 == 0 {
-                        checker_a
-                    } else {
-                        checker_b
-                    };
-                    let w = CHECKER.min(vx + vw - x);
-                    let h = CHECKER.min(vy + vh - y);
-                    canvas.fill_rect(x, y, w, h, &Paint::fill(c));
-                    x += CHECKER;
+        // m269：无边框形态不画底色 —— 让 pixmap 的透明底直接上屏（补丁 028 负责
+        // 逐像素合成 + alpha 下限 1），图片透明区因此透出桌面。
+        if !chrome::borderless() {
+            if checker_on {
+                let mut y = vy - (vy % CHECKER);
+                while y < vy + vh {
+                    let mut x = vx - (vx % CHECKER);
+                    let row = ((y - vy) / CHECKER) as i32;
+                    while x < vx + vw {
+                        let col = ((x - vx) / CHECKER) as i32;
+                        let c = if (row + col) % 2 == 0 {
+                            checker_a
+                        } else {
+                            checker_b
+                        };
+                        let w = CHECKER.min(vx + vw - x);
+                        let h = CHECKER.min(vy + vh - y);
+                        canvas.fill_rect(x, y, w, h, &Paint::fill(c));
+                        x += CHECKER;
+                    }
+                    y += CHECKER;
                 }
-                y += CHECKER;
+            } else {
+                canvas.fill_rect(vx, vy, vw, vh, &Paint::fill(tk::empty_bg()));
             }
-        } else {
-            canvas.fill_rect(vx, vy, vw, vh, &Paint::fill(tk::empty_bg()));
         }
 
         // ② 图 + 空场提示 / 错误。
@@ -1644,6 +2072,16 @@ impl Widget for ImageCanvas {
             self.live.tint.get().filter(|t| {
                 !t.is_neutral() && v.current_path().as_deref() == Some(t.path.as_path())
             })
+        };
+        // 旋转角度（m280）：绑路径，换图后旧值自动失效（与 `LiveTint.path` 同判据）。
+        let rotate_deg = {
+            let v = self.viewer.borrow();
+            let bound = self.chrome.rotate_path.get();
+            if bound.is_some() && bound.as_deref() == v.current_path().as_deref() {
+                super::rotate_dialog::angle_of(self.chrome.rotate_deg.get())
+            } else {
+                0
+            }
         };
         let hint_ts = TextStyle::new(14.0);
         let mut nav: Option<(Rect, Rect)> = None;
@@ -1661,7 +2099,15 @@ impl Widget for ImageCanvas {
                 let mut cache = self.main_img.borrow_mut();
                 let mut tinted = self.tint_main.borrow_mut();
                 let shown = if let Some(t) = &live {
-                    tinted.obtain(src, t.values, t.gamma)
+                    tinted.obtain(src, t.values, t.gamma, rotate_deg)
+                } else if rotate_deg != 0 {
+                    // 没调色但转了角度：仍要走 tinted 那一趟，只不过参数取中性。
+                    tinted.obtain(
+                        src,
+                        crate::core::pixels::CHANNEL_NEUTRAL,
+                        crate::core::pixels::GAMMA_NEUTRAL,
+                        rotate_deg,
+                    )
                 } else {
                     cache.obtain(src)
                 };
@@ -1764,7 +2210,15 @@ impl Widget for ImageCanvas {
                 let mut cache = self.nav_img.borrow_mut();
                 let mut tinted = self.tint_nav.borrow_mut();
                 let shown = if let Some(t) = &live {
-                    tinted.obtain(src, t.values, t.gamma)
+                    tinted.obtain(src, t.values, t.gamma, rotate_deg)
+                } else if rotate_deg != 0 {
+                    // 没调色但转了角度：仍要走 tinted 那一趟，只不过参数取中性。
+                    tinted.obtain(
+                        src,
+                        crate::core::pixels::CHANNEL_NEUTRAL,
+                        crate::core::pixels::GAMMA_NEUTRAL,
+                        rotate_deg,
+                    )
                 } else {
                     cache.obtain(src)
                 };
@@ -1846,12 +2300,36 @@ impl Widget for ImageCanvas {
         *self.strip_items.borrow_mut() = if strip_on {
             // 先向状态机要"这一屏该显示哪几张"（顺带为缺图的发起后台解码），
             // 再把格子摆开。m100：路径全程按引用走，一帧一个 `PathBuf` 都不克隆。
-            let cap = filmstrip::capacity(vw);
-            let (first, n) = self.viewer.borrow_mut().strip_window(cap);
+            let cap = filmstrip::capacity(strip_side, strip_axis);
+            // m258：条是**独立滚动的列表**。锚点由拖动/滚轮写入；`None` 时保持老行为
+            // （当前图居中，见 `strip_window_first`）。★ m260：`Some` 时条完全听用户的——
+            // 当前图可以不在视野里（用户要的正是"拖到很远再点一张"）。
+            let (first, n) = self
+                .viewer
+                .borrow_mut()
+                .strip_window(cap, self.strip_first.get());
+            let len = self.viewer.borrow().gallery_len();
+            self.strip_cap.set(n.max(1));
+            self.strip_len.set(len);
             // gallery_pos() 返回 1-based，filmstrip 内部用 0-based 索引比较，需减 1
             let cur = self.viewer.borrow().gallery_pos().saturating_sub(1);
-            // 条画在**完整视口**的底部（扣掉的那条正是它占的地，用 work 就叠回画面上了）。
-            let rects = filmstrip::layout((vx, vy, vw, content.h as f32), n);
+            // 条画在**完整 content** 的那一条上（扣掉的那条正是它占的地，用 work 就
+            // 叠回画面上了）。★ 贴左时 `work.x` 已经右移了一条宽 ⇒ 这里必须重新取
+            // `content.x` / `content.w`，不能拿上面那组 `vx`/`vw`（那是 work 的）。
+            let at = filmstrip::Placement::new(
+                strip_side,
+                (
+                    content.x as f32,
+                    content.y as f32,
+                    content.w as f32,
+                    content.h as f32,
+                ),
+            );
+            let rects = filmstrip::layout(at, n);
+            // 事件回调（命中 / 拖动 / 滚轮 / 滚动指示 / 光标）要判断"指针在不在条上"：
+            // 把 `Placement` 整份存下来，`panel` / `layout` 都能从它推——与 `strip_items`
+            // 同一条理由：绘制与命中共用同一帧几何。
+            self.strip_at.set(Some(at));
             let v = self.viewer.borrow();
             let slots: Vec<filmstrip::Slot<'_>> = (0..n)
                 .filter_map(|i| {
@@ -1863,16 +2341,38 @@ impl Widget for ImageCanvas {
                     })
                 })
                 .collect();
-            self.strip.paint(
-                canvas,
-                (vx, vy, vw, content.h as f32),
-                &slots,
-                cur,
-                self.strip_hover.get(),
-                |p| v.thumb(p),
-            );
+            self.strip
+                .paint(canvas, at, &slots, cur, self.strip_hover.get(), |p| {
+                    v.thumb(p)
+                });
+            // 滚动指示（m258，m261 改位）：目录长于一屏才出现。底条压**条上缘**
+            // （缩略图之上，避开窗口底部那圈缩放边框）、左条压靠画面的右缘；
+            // 视觉 6dp、命中热区 16dp，不加按钮（按钮会吃掉一格且要维护四个态）。
+            if let Some((track, thumb)) = filmstrip::scroll_bar(at, first, n, len) {
+                canvas.fill_round_rect(
+                    track.x as f32,
+                    track.y as f32,
+                    track.w as f32,
+                    track.h as f32,
+                    1.0,
+                    &Paint::fill(tk::strip_track()),
+                );
+                canvas.fill_round_rect(
+                    thumb.x as f32,
+                    thumb.y as f32,
+                    thumb.w as f32,
+                    thumb.h as f32,
+                    1.0,
+                    &Paint::fill(tk::strip_thumb()),
+                );
+            }
             slots.iter().map(|s| (s.idx, s.rect)).collect()
         } else {
+            self.strip_at.set(None);
+            self.strip_cap.set(1);
+            self.strip_len.set(0);
+            // m265：条没画 ⇒ 没有「可见的那一屏」，预读退回纯邻图（每帧比较，不变即返回）。
+            self.viewer.borrow_mut().set_prefetch_strip(0, 0);
             Vec::new()
         };
 
@@ -2010,6 +2510,77 @@ impl ImageCanvas {
         self.chrome.hit(pos, self.work_tuple())
     }
 
+    /// 指针落在缩略图条背板里吗（用 `paint` 写下的那一帧几何，**视口绝对坐标**）。
+    fn in_strip_panel(&self, pos: (f32, f32)) -> bool {
+        let Some(at) = self.strip_at.get() else {
+            return false;
+        };
+        let r = filmstrip::panel(at);
+        pos.0 >= r.x as f32
+            && pos.0 < (r.x + r.w) as f32
+            && pos.1 >= r.y as f32
+            && pos.1 < (r.y + r.h) as f32
+    }
+
+    /// 指针落在四缘缩放带里吗（按**整块 content** 的边缘算，不是 `work` 的）。
+    fn in_resize_band(&self, pos: (f32, f32)) -> bool {
+        let c = self.last.get();
+        pos.0 < c.x as f32 + RESIZE_BAND_DP
+            || pos.0 >= (c.x + c.w) as f32 - RESIZE_BAND_DP
+            || pos.1 < c.y as f32 + RESIZE_BAND_DP
+            || pos.1 >= (c.y + c.h) as f32 - RESIZE_BAND_DP
+    }
+
+    /// 指针落在「能拖图」的那块地上吗。
+    ///
+    /// `last_work` 是扣掉缩略图条之后留给画面的矩形；再与「content 去掉四缘缩放带」
+    /// 求交，条、窗口边框、条与画面之间的空白就全被排除。标题栏另由
+    /// [`Chrome::in_title_strip`] 判（它永远拖窗口，见 [`left_drag`]）。
+    /// ★ 这三者以前都算「可拖区」，于是缩略图上也是松手、拖条时还是抓手，
+    ///   自绘覆盖一路盖到窗口边框，把系统缩放光标吃掉了。
+    fn in_pan_area(&self, pos: (f32, f32)) -> bool {
+        let w = self.last_work.get();
+        let c = self.last.get();
+        let left = (c.x as f32 + RESIZE_BAND_DP).max(w.x as f32);
+        let top = (c.y as f32 + RESIZE_BAND_DP).max(w.y as f32);
+        let right = (c.x as f32 + c.w as f32 - RESIZE_BAND_DP).min((w.x + w.w) as f32);
+        let bottom = (c.y as f32 + c.h as f32 - RESIZE_BAND_DP).min((w.y + w.h) as f32);
+        pos.0 >= left && pos.0 < right && pos.1 >= top && pos.1 < bottom
+    }
+
+    /// 命中滚动指示的热区：返回 `(轨道, 滑块)`（绘制用的矩形）。
+    ///
+    /// 判据全部走 `filmstrip::scroll_at`（一屏放得下就 `None`）——热区、绘制、能不能滚
+    /// 三者同源，不许各算一遍。
+    fn strip_scroll_hit(&self, pos: (f32, f32)) -> Option<(Rect, Rect)> {
+        let at = self.strip_at.get()?;
+        filmstrip::scroll_at(
+            at,
+            self.strip_shown_first(),
+            self.strip_cap.get(),
+            self.strip_len.get(),
+            pos,
+        )
+    }
+
+    /// 条能不能滚：目录长于一屏。与 `filmstrip::scroll_bar` 同一条判据——
+    /// 指示条出现 = 能滚，两者不许各自算一遍。
+    fn strip_scrollable(&self) -> bool {
+        self.strip_len.get() > self.strip_cap.get()
+    }
+
+    /// 当前**显示**的窗口首格（拖动/滚轮的起点）。`strip_items` 的第一格就是它。
+    ///
+    /// 为什么不直接读锚点：锚点可能被夹紧（目录变短 / 换边），而 `strip_items` 是
+    /// **这一帧真画在屏上**的那一批——用户眼睛看到、手指下的才是起点。
+    fn strip_shown_first(&self) -> usize {
+        self.strip_items
+            .borrow()
+            .first()
+            .map(|(idx, _)| *idx)
+            .unwrap_or(0)
+    }
+
     /// 左键按下的归属分派（Down 分支只调这一句）。
     ///
     /// ★ 抽成方法不是为了好看，是为了**把接线钉住**：[`left_drag`] 是纯函数，它绿了
@@ -2019,11 +2590,20 @@ impl ImageCanvas {
     /// 先算成局部变量再分支：`self.viewer.borrow()` 的 `Ref` 若活进分支里，
     /// 那句 `borrow_mut()` 就是 `already borrowed` panic（§七 的禁写形状）。
     fn press_left(&self, pos: (f32, f32), view: (f32, f32, f32, f32), ctrl: bool) {
+        // 无边框那两问也在这里一次取好：`chrome::borderless()` 是模块级镜像（不借
+        // viewer），`can_pan` / `overflows` 借 viewer 的 `Ref`——与本函数下面那次
+        // `borrow_mut()` 必须错开，所以拷成 bool 再往下传。
+        let (borderless, can_pan, overflows) = {
+            let v = self.viewer.borrow();
+            (chrome::borderless(), v.can_pan(), v.overflows())
+        };
         let mode = left_drag(
             self.config.borrow().drag_image,
-            self.viewer.borrow().can_pan(),
+            can_pan,
             Chrome::in_title_strip(pos, view),
             window_state().fullscreen,
+            borderless,
+            overflows,
         );
         if ctrl || mode == LeftDrag::PanImage {
             self.viewer.borrow_mut().begin_drag(pos);
@@ -2034,13 +2614,15 @@ impl ImageCanvas {
         }
     }
 
-    /// 按当前指针位置与拖动状态换光标：拖动中=抓手、可拖区悬停=松手、其余=箭头。
+    /// 按当前指针位置与拖动状态换光标：**只有能拖图的那块地**才给手型。
     ///
     /// ★ 判据与 [`left_drag`] **同源**：光标说"这一拖归图片"，按下去就一定是拖图。
-    /// 两边各写一套的话会出现"光标是手、按下却把窗口拖走了"。
+    ///   两边各写一套的话会出现"光标是手、按下却把窗口拖走了"。
     ///
     /// 浮条/左右箭头/标题钮上不接手——那里点的是控件；标题栏那一条也留箭头，
     /// 因为那里永远拖窗口（[`left_drag`] 的第三项）。
+    /// ★ m261（用户 2026-11-08）：缩略图条与四缘缩放带**都不接手**。条是独立列表，
+    ///   拖它归列表不归画面；边框那 8dp 是非客户区，自绘覆盖会把系统的缩放光标顶掉。
     fn sync_hand(&self, pos: (f32, f32)) {
         // 取色模式优先（m217）：十字光标，且不许被下面的抓手/箭头覆盖。
         // 光标说"这一拖归图片"、按下去却是取样，是最刺眼的语义错位。
@@ -2048,22 +2630,40 @@ impl ImageCanvas {
             crate::platform::cursor::use_cross();
             return;
         }
-        // 拖动中不看位置：指针可能已经拖出画布，手型要一直握着。
+        // 图片拖动中不看位置：指针可能已经拖出画布，手型要一直握着。
+        // ★ 条拖动 / 拖滚动指示**不在此列**：那两样拖的是列表，给抓手就会让
+        //   "手型停在条上"一路带到窗口边框（缩放光标出不来的直接成因）。
         if self.viewer.borrow().dragging() {
             super::hand_cursor::apply(Some(true));
+            return;
+        }
+        // 四缘缩放带：只撤覆盖，光标交给框架（WM_SETCURSOR 已经设好了 IDC_SIZE*）。
+        // 走 `apply(None)` 会顺手 `use_arrow()`，那一帧就把缩放光标顶成箭头。
+        if self.in_resize_band(pos) {
+            super::hand_cursor::release();
             return;
         }
         if self.chrome_hit(pos).is_some() {
             super::hand_cursor::apply(None);
             return;
         }
+        // 缩略图条 / 条外空白：不是能拖图的地，一律箭头。
+        if !self.in_pan_area(pos) {
+            super::hand_cursor::apply(None);
+            return;
+        }
         let in_title = Chrome::in_title_strip(pos, self.work_tuple());
-        let can_pan = self.viewer.borrow().can_pan();
+        let (borderless, can_pan, overflows) = {
+            let v = self.viewer.borrow();
+            (chrome::borderless(), v.can_pan(), v.overflows())
+        };
         let mode = left_drag(
             self.config.borrow().drag_image,
             can_pan,
             in_title,
             window_state().fullscreen,
+            borderless,
+            overflows,
         );
         super::hand_cursor::apply(match mode {
             LeftDrag::PanImage => Some(false),
@@ -2076,35 +2676,86 @@ impl ImageCanvas {
         match p.kind {
             PointerKind::Wheel(delta) => {
                 // ★ 放映让位挂在**滚轮事件本身**上，不挂在翻页节奏闸上：默认档里滚轮是缩放
-                // （`config.wheel == Zoom`），那条路根本不进 `wheel_gate`——2026-10-31 用户实测
+                // （默认档 `wheel == Zoom`），那条路根本不进 `wheel_gate`——2026-10-31 用户实测
                 // "滚轮没用、方向键有用"就是这个错位。缩放同样是"用户插手了画面"。
                 self.chrome.slide_stop();
                 if self.chrome.locked.get() {
                     return true; // 锁定：吞掉滚轮，不缩放不翻页
                 }
-                // 滚轮行为（设置项，菠萝 MouseWheelBehavior）：缩放或翻页。
-                // Ctrl+滚轮走独立开关（config.ctrl_wheel），不按 Ctrl 时走 config.wheel——
-                // 两条各管各的，用户想"裸滚轮翻页 + Ctrl 缩放"或反之都能配。
-                let zoom = if p.mods.ctrl {
-                    self.config.borrow().ctrl_wheel == crate::core::config::CtrlWheel::Zoom
-                } else {
-                    self.config.borrow().wheel == crate::core::config::Wheel::Zoom
-                };
-                if zoom {
-                    let c = self.center();
-                    self.viewer.borrow_mut().zoom_by_wheel(delta, pos, c);
-                } else {
-                    // 每格（±120）翻一张；碎增量累计后按符号翻（判据见 [`wheel_detent`]）。
+                // 缩略图条（m259）：条内滚轮 = 翻列表，**不换图**。
+                // 这里不看 `config.wheel`——列表上的滚轮就是滚动列表，条上也没有
+                // 可缩放的画布；Shift+滚轮 = 一屏。碎增量同样攒够一格才算（`wheel_detent`）。
+                // ★ 方向（m259 订正、m268 与翻页共用一根轴）：Windows 向上滚给 +120，
+                //   列表惯例是"向下滚 = 看后面" ⇒ 先经 [`wheel_nav_dir`] 翻号。
+                //   第一版写成 `+ dir`，于是"往下滚想看后面"反而在开头卡死，用户实报
+                //   "滚轮对滚动条不起作用"就是这一句。
+                if self.in_strip_panel(pos) && self.strip_scrollable() {
                     let (acc, dir) = wheel_detent(self.wheel_acc.get(), delta);
                     self.wheel_acc.set(acc);
                     if dir != 0 {
-                        // 再过一道节奏闸（A3 / m64）：`WHEEL_PACE` 内最多翻一张，压在闸里的
-                        // 那一下由 runtime 的 16 ms 轮询兜出去（`Chrome::tick_wheel_pace`）——
-                        // **挂起不是丢弃**，丢弃会让"快滚两格只翻一张"变成常态手感。
-                        if self.chrome.wheel_gate(dir) {
-                            self.viewer.borrow_mut().step(dir);
+                        let n = self.strip_cap.get();
+                        let step = if p.mods.shift { n } else { 1 } as isize;
+                        let max_first = self.strip_len.get().saturating_sub(n) as isize;
+                        let from = self.strip_first.get().unwrap_or(self.strip_shown_first());
+                        let first = (from as isize + wheel_nav_dir(dir) * step).clamp(0, max_first)
+                            as usize;
+                        if self.strip_first.replace(Some(first)) != Some(first) {
+                            ctx.mark_dirty();
                         }
                     }
+                    return true;
+                }
+                // ── 滚轮行为（m278）：四档定制的**成对动作**，一个下拉管上下两个方向 ──
+                // Ctrl / Alt / Shift 各读自己那一档，都不按才走裸滚轮档。缩略图条内
+                // 那一支已在上面 return（条上滚轮恒滚条、Shift 一屏），不会来抢。
+                let wa = wheel_action_for(&self.config.borrow(), &p.mods);
+                match wa {
+                    // 放大 / 缩小：保留指针锚点与连续缩放，不改走离散 Action。
+                    crate::core::config::WheelAction::Zoom => {
+                        let c = self.center();
+                        self.viewer.borrow_mut().zoom_by_wheel(delta, pos, c);
+                    }
+                    // 下一张 / 上一张：与 m278 之前**同一条路径**（碎增量 + 节奏闸），
+                    // 老 ini 的 wheel_behavior=1 / ctrl_wheel=1 行为一字不变。
+                    crate::core::config::WheelAction::Navigate => {
+                        // 每格（±120）翻一张；碎增量累计后按符号翻（判据见 [`wheel_detent`]）。
+                        let (acc, dir) = wheel_detent(self.wheel_acc.get(), delta);
+                        self.wheel_acc.set(acc);
+                        if dir != 0 {
+                            // ★ 方向（m268）：`dir` 是滚轮符号，不是清单方向。向下滚（-120）
+                            //   要看后面 ⇒ 经 [`wheel_nav_dir`] 翻成 `+1`。节奏闸里存的也必须是
+                            //   翻好的步进方向，否则 `tick_wheel_pace` 兜出去的那一下会反着翻。
+                            let step_dir = wheel_nav_dir(dir);
+                            // 节奏闸（A3 / m64）：`WHEEL_PACE` 内最多翻一张，压在闸里的那一下
+                            // 由 runtime 的 16 ms 轮询兜出去 —— **挂起不是丢弃**。
+                            if self.chrome.wheel_gate(step_dir) {
+                                self.viewer.borrow_mut().step(step_dir);
+                            }
+                        }
+                    }
+                    // 不透明度 + / −：新增档。同样过碎增量与节奏闸，免得触控板一格跳十档。
+                    // 向上滚 = +、向下滚 = −，与 `WheelAction::pair()` 登记的反向一致。
+                    crate::core::config::WheelAction::Opacity => {
+                        let (acc, dir) = wheel_detent(self.wheel_acc.get(), delta);
+                        self.wheel_acc.set(acc);
+                        if dir != 0 && self.chrome.wheel_gate(dir) {
+                            let a = if dir > 0 {
+                                Action::OpacityUp
+                            } else {
+                                Action::OpacityDown
+                            };
+                            exec_action(
+                                Some(ctx),
+                                &self.viewer,
+                                &self.chrome,
+                                &self.config,
+                                &self.hub,
+                                a,
+                            );
+                        }
+                    }
+                    // 无（新增两行的默认）：吞掉这一记，不缩放不翻页不调透明度。
+                    crate::core::config::WheelAction::None => {}
                 }
                 ctx.mark_dirty();
                 true
@@ -2135,6 +2786,33 @@ impl ImageCanvas {
                 let sh = filmstrip::hit(&self.strip_items.borrow(), pos);
                 if self.strip_hover.replace(sh) != sh {
                     ctx.mark_dirty();
+                }
+                // 拖滚动指示的滑块（m259）：按行程比例走，指针跑到条外也不会断。
+                if let Some(s) = self.strip_scrub.get() {
+                    let first = scrub_first(&s, pos);
+                    if self.strip_first.replace(Some(first)) != Some(first) {
+                        ctx.mark_dirty();
+                    }
+                    return true;
+                }
+                // 缩略图条拖动（m258）：条内左键拖 = 平移条本身（看更远的图）。
+                // ★ 必须排在拖图/拖窗之前：条上那一拖的语义是"翻列表"，而
+                //   `press_left` 会把它判成 PanImage（拖条却动图，老行为）。
+                if let Some(d) = self.strip_drag.get() {
+                    let delta = if d.horizontal {
+                        pos.0 - d.start.0
+                    } else {
+                        pos.1 - d.start.1
+                    };
+                    if self.strip_dragged.get() || beyond_slop(d.start, pos) {
+                        self.strip_dragged.set(true);
+                        let max_first = self.strip_len.get().saturating_sub(self.strip_cap.get());
+                        let first = strip_drag_first(d.first, delta, d.pitch, max_first);
+                        if self.strip_first.replace(Some(first)) != Some(first) {
+                            ctx.mark_dirty();
+                        }
+                    }
+                    return true;
                 }
                 // 鸟瞰拖动中：缩略图上的点跟随鼠标（优先级最高，吞掉拖图）。
                 // 只有 pan 真的变了才标脏——拖到图边缘时 pan 钳在原地，画面一个像素
@@ -2200,6 +2878,9 @@ impl ImageCanvas {
                 // `viewer.dragging()`——回到窗口后不动按钮也会继续拖图/拖窗，直到下一次点击。
                 let was_nav = self.nav_drag.replace(false);
                 let was_strip = self.strip_pressed.replace(None).is_some();
+                let was_dragging_strip = self.strip_drag.replace(None).is_some();
+                let was_scrub = self.strip_scrub.replace(None).is_some();
+                self.strip_dragged.set(false);
                 let was_pending = self.lmb_pending.replace(None).is_some();
                 let was_drag = self.viewer.borrow().dragging();
                 if was_drag {
@@ -2207,7 +2888,15 @@ impl ImageCanvas {
                 }
                 let left = self.chrome.pointer_left();
                 let strip = self.strip_hover.replace(None).is_some();
-                if left || strip || was_nav || was_strip || was_pending || was_drag {
+                if left
+                    || strip
+                    || was_nav
+                    || was_strip
+                    || was_dragging_strip
+                    || was_scrub
+                    || was_pending
+                    || was_drag
+                {
                     ctx.mark_dirty();
                 }
                 // 指针离窗：清掉取色采样点（回来时第一记 Move 会重新落点），
@@ -2271,27 +2960,100 @@ impl ImageCanvas {
                     ctx.mark_dirty();
                     return true;
                 }
-                // 缩略图条：按下记格子，抬起时仍在同一格才跳。
+                // 状态格（m275）：`(12/340)` 不只是看得见的进度，还是一颗**按钮**——
+                // 点它弹「跳转到…帧/页」窗（与右键入口同名）。
                 //
-                // 排在双击关窗**之前**是刻意的：条是常驻的一块地，落在它上面的一击
-                // 属于"选图"，不该被双击关窗吃掉（也没道理去拖窗口）。
-                // 坐标已统一：filmstrip::layout 和 paint 均使用 work rect 坐标系
-                // 直接使用 pos 进行命中测试，无需额外补偿
-                if !self.chrome.locked.get() {
-                    if let Some(i) = filmstrip::hit(&self.strip_items.borrow(), pos) {
-                        self.strip_pressed.set(Some(i));
+                // 判据用 `paint` 回写的真实矩形（[`Chrome::in_info_cell`]）：这帧没画 =
+                // 零矩形 = 点不到（无边框形态 / 极简模式已收起 / 没有状态文本都自动落进来）。
+                // 只有**有帧/页号**的图才吃掉这一击（`chrome.anim` 的语义就是 `has_index`，
+                // 见 `paint` 里那条注释）：静态位图上按状态文字照旧是"拖窗口"，不该白吞。
+                //
+                // 排在这里：`chrome.hit` 已经把浮条按钮与箭头挑走了，状态格是浮条里
+                // 剩下那一段；而 `press_left` 还没记账，所以这一击不会被当成"拖窗口"。
+                if !self.chrome.locked.get()
+                    && self.chrome.anim.get()
+                    && self.chrome.in_info_cell(pos)
+                {
+                    super::goto_dialog::open(ctx, &self.viewer);
+                    ctx.mark_dirty();
+                    return true;
+                }
+                // 缩略图条（m258）：条是**独立滚动的列表**。
+                //  - 按在条上（含格子之间的缝）就接管这一击：条内左键拖 = 平移条；
+                //  - 老代码只拦"命中格子"，落在缝里的那一按会落到 `press_left`，
+                //    于是"按住条往左拖，动的却是主画面"——那是对不上的手感。
+                // ★ 仍排在双击关窗**之前**：条是常驻的一块地，落在它上面的一击属于
+                //   "选图 / 翻列表"，不该被双击关窗吃掉（也没道理去拖窗口）。
+                if !self.chrome.locked.get() && self.in_strip_panel(pos) {
+                    // ① 滚动指示的热区优先（m259）：滑块按**行程比例**走，比按格平移精确。
+                    //    用户实测的原始报障是"2dp 太细，鼠标对不准，而且滚轮也不动它"——
+                    //    所以热区放到 16dp，并支持"点在轨道空白处直接跳过去"。
+                    if let Some((track, thumb)) = self.strip_scroll_hit(pos) {
+                        let side = self.strip_side.get().unwrap_or(filmstrip::Side::Bottom);
+                        let horizontal = side == filmstrip::Side::Bottom;
+                        let (t0, tlen, thlen) = if horizontal {
+                            (track.x as f32, track.w as f32, thumb.w as f32)
+                        } else {
+                            (track.y as f32, track.h as f32, thumb.h as f32)
+                        };
+                        let max_first = self.strip_len.get().saturating_sub(self.strip_cap.get());
+                        let span = (tlen - thlen).max(0.0);
+                        let on_thumb = if horizontal {
+                            pos.0 >= thumb.x as f32 && pos.0 < (thumb.x + thumb.w) as f32
+                        } else {
+                            pos.1 >= thumb.y as f32 && pos.1 < (thumb.y + thumb.h) as f32
+                        };
+                        let first = if on_thumb {
+                            self.strip_shown_first()
+                        } else {
+                            scrub_jump(pos, t0, thlen, span, max_first, horizontal)
+                        };
+                        self.strip_first.set(Some(first));
+                        // 跳转之后滑块在新位置 ⇒ `thumb0` 也要跟着换，否则再拖会先弹回。
+                        let thumb0 = t0
+                            + if max_first > 0 && span > 0.0 {
+                                (first as f32 / max_first as f32) * span
+                            } else {
+                                0.0
+                            };
+                        self.strip_scrub.set(Some(StripScrub {
+                            grab_at: if horizontal { pos.0 } else { pos.1 },
+                            thumb0,
+                            span,
+                            max_first,
+                            horizontal,
+                        }));
+                        self.strip_pressed.set(None);
                         ctx.mark_dirty();
                         return true;
                     }
+                    // ② 条内其余位置：记格子 + 按格平移（m258）。
+                    self.strip_pressed
+                        .set(filmstrip::hit(&self.strip_items.borrow(), pos));
+                    if self.strip_scrollable() {
+                        let side = self.strip_side.get().unwrap_or(filmstrip::Side::Bottom);
+                        self.strip_drag.set(Some(StripDrag {
+                            start: pos,
+                            first: self.strip_shown_first(),
+                            pitch: filmstrip::pitch(side, &self.strip_items.borrow()[..]),
+                            horizontal: side == filmstrip::Side::Bottom,
+                        }));
+                        self.strip_dragged.set(false);
+                    }
+                    ctx.mark_dirty();
+                    return true;
                 }
-                // 双击：按设置对话框选的行为。菠萝默认「关窗」，与我们的默认配置一致。
+                // 双击：标题栏恒等「最大化 / 恢复」，画面区按设置对话框选的行为
+                // （菠萝默认「关窗」，与我们的默认配置一致）。
                 if p.click_count >= 2 {
                     if self.chrome.locked.get() {
                         return true; // 锁定：双击也不许关窗/最大化/全屏
                     }
+                    // 标题栏判据与「拖窗口」共用 `Chrome::in_title_strip`（单一来源）。
+                    let in_title = Chrome::in_title_strip(pos, self.work_tuple());
                     // 先拷出枚举、让 `Ref` 在这一行就结束：下面三个 `ctx.*` 都会同步动窗口
                     // （关闭 / 最大化 / 全屏），那条路上框架可能回头再借一次 config。
-                    let dbl = self.config.borrow().dbl_click;
+                    let dbl = double_click_action(in_title, self.config.borrow().dbl_click);
                     match dbl {
                         crate::core::config::DblClick::Nothing => {}
                         crate::core::config::DblClick::CloseWindow => ctx.request_close(),
@@ -2326,6 +3088,21 @@ impl ImageCanvas {
             PointerKind::Up if p.button == MouseButton::Left => {
                 // 没挪够阈值的一击（单击 / 双击序列）：清账，不当拖动看。
                 self.lmb_pending.set(None);
+                // 拖滚动指示的滑块（m259）：松手即收，绝不当作"点格子"。
+                if self.strip_scrub.take().is_some() {
+                    self.strip_pressed.set(None);
+                    self.sync_hand(pos);
+                    ctx.mark_dirty();
+                    return true;
+                }
+                // 缩略图条（m258）：拖动收尾。真拖过 ⇒ 吞掉这一击（不换图）；
+                // 没越过阈值 ⇒ 继续往下走"点格子"，条上单击照旧选图。
+                if self.strip_drag.take().is_some() && self.strip_dragged.replace(false) {
+                    self.strip_pressed.set(None);
+                    self.sync_hand(pos);
+                    ctx.mark_dirty();
+                    return true;
+                }
                 if self.nav_drag.take() {
                     // 松手这一帧必须画出去：手停下之后没有"下一条 move"来补挂了。
                     if self.chrome.flush_pan() {
@@ -2709,7 +3486,7 @@ fn exec_action(
             persist_session(cfg, hub, |c| c.checker = on);
             true
         }
-        // 取色器（m217）：与右键「工具 ▸ 取色器」共用一个 toggle，不另写一份状态。
+        // 取色器（m217）：与右键「本图 ▸ 取色器」共用一个 toggle，不另写一份状态。
         Action::Picker => {
             chrome.toggle_picker();
             if let Some(c) = ctx {
@@ -2859,15 +3636,402 @@ fn wasd_dir(a: Action) -> u8 {
 mod tests {
     use super::*;
 
+    /// 本文件的生产代码文本（`include_str!` 会把测试自身也包进来）。
+    fn production_src() -> &'static str {
+        let all = include_str!("canvas.rs");
+        let cut = all.find("\n#[cfg(test)]").unwrap_or(all.len());
+        &all[..cut]
+    }
+
+    /// m263：共同序的**唯一正本**。设置页与右键标签不完全同名，但期望序只写这一处；
+    /// 负向臂也取同一份常量，免得有人把期望序改回旧序就能悄悄绕过钉子。
+    const APPEARANCE_PAGE_KEYS: [&str; 6] = [
+        "\"显示操作按钮\"",
+        "\"极简模式\"",
+        "\"棋盘格背景\"",
+        "\"缩略图条\"",
+        "\"主题色\"",
+        "\"窗口不透明度\"",
+    ];
+    const APPEARANCE_MENU_KEYS: [&str; 6] = [
+        "\"显示操作按钮\"",
+        "\"极简模式\"",
+        "\"棋盘格背景\"",
+        "\"缩略图条\"",
+        "\"主题色\"",
+        "\"不透明度\"",
+    ];
+
+    /// 滤掉整行注释，只留正文：注释里也会写项序，但那不是接线。
+    fn code_lines(src: &str) -> String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 按期望序在正文里**递增**找标签：缺一项、改名、或把某颗挪到前面都会红。
+    fn assert_order(src: &str, keys: &[&str], what: &str) {
+        let mut at = 0;
+        for k in keys {
+            let found = src[at..]
+                .find(k)
+                .unwrap_or_else(|| panic!("{what} 里找不到 {k}（项被删了或改名了？）"));
+            at += found + k.len();
+        }
+    }
+
+    /// m262：设置页「外观」卡与右键「外观 ▸」必须是同一条项序。
+    /// 两处各排各的、时间一长必漂；这是源码级接线钉子，改一边就红。
+    #[test]
+    fn appearance_order_matches_between_settings_and_menu() {
+        let page = code_lines(include_str!("settings/options.rs"));
+        let page = page
+            .split("fn appearance_body")
+            .nth(1)
+            .expect("设置页外观卡");
+        assert_order(page, &APPEARANCE_PAGE_KEYS, "设置页外观卡");
+        let menu = code_lines(production_src());
+        let menu = menu
+            .split("fn appearance_items")
+            .nth(1)
+            .expect("右键外观子菜单");
+        assert_order(menu, &APPEARANCE_MENU_KEYS, "右键外观子菜单");
+    }
+
+    /// m263 负向臂：拿 m262 的旧序（显示操作按钮排第四）喂同一个断言，必须报红。
+    /// 也钉住常量本身——把 APPEARANCE_PAGE_KEYS 改回旧序，这里不再 panic 而失败。
+    #[test]
+    #[should_panic(expected = "里找不到")]
+    fn appearance_order_rejects_show_buttons_in_the_fourth_place() {
+        let old = [
+            "\"极简模式\"",
+            "\"棋盘格背景\"",
+            "\"缩略图条\"",
+            "\"显示操作按钮\"",
+            "\"主题色\"",
+            "\"窗口不透明度\"",
+        ]
+        .join("\n");
+        assert_order(&old, &APPEARANCE_PAGE_KEYS, "m262 旧序模拟");
+    }
+
+    /// m275 / m276：顶层浏览区的**相对位置**。m275 把「排序 ▸」放在
+    /// 「幻灯片放映」「左键拖图」之后；m276 把跳转收进「本图 ▸」之后顶层只剩它，
+    /// 所以期望序也跟着收成四项。排序改的是"这一组图的下一张是谁"，画面一个像素
+    /// 都不变，混进「外观 ▸」会让人以为它影响渲染——这条一并钉住。
+    const VIEW_ORDER_MENU_KEYS: [&str; 4] = ["\"外观\"", "\"幻灯片放映\"", "\"排序\"", "\"设置…\""];
+
+    /// m276 / m280：「本图 ▸」组内四项的次序。三个"打开一个窗"的常驻项在前、
+    /// 会话开关垫底；改名 / 挪位 / 少一项都会红。
+    const CURRENT_IMAGE_MENU_KEYS: [&str; 4] = [
+        "\"RAW 参数…\"",
+        "\"跳转到…帧/页\"",
+        "\"旋转角度…\"",
+        "\"取色器\"",
+    ];
+
+    /// 顶层不许再出现收编进「本图 ▸」的两项，也不许留旧名「工具 ▸」；
+    /// 组内四项按 [`CURRENT_IMAGE_MENU_KEYS`] 递增。正向喂生产源码，负向臂喂旧布局。
+    fn assert_current_image_menu(src: &str) {
+        let menu = src.split("fn context_menu").nth(1).expect("右键菜单");
+        let top = menu.split("fn appearance_items").next().unwrap_or(menu);
+        // 只认标签与接线名，不认整串 `MenuItem::submenu("本图", …)`：
+        // `cargo fmt` 会把这行按参数折成多行，整串匹配会假红。
+        assert!(
+            top.contains("\"本图\"") && top.contains("self.current_image_items("),
+            "「本图 ▸」不在顶层或没接到组函数"
+        );
+        assert!(
+            !top.contains("\"工具\"") && !top.contains("self.tool_items("),
+            "旧名「工具 ▸」还挂在顶层"
+        );
+        assert!(
+            !top.contains("\"RAW 参数…\""),
+            "RAW 参数… 仍是顶层项，没有收进「本图 ▸」"
+        );
+        assert!(
+            !top.contains("\"跳转到…帧/页\""),
+            "跳转仍是顶层项，没有收进「本图 ▸」"
+        );
+        let group = src
+            .split("fn current_image_items")
+            .nth(1)
+            .expect("本图子菜单");
+        let group = group.split("fn copy_items").next().unwrap_or(group);
+        assert_order(group, &CURRENT_IMAGE_MENU_KEYS, "本图 ▸ 组内");
+    }
+
+    #[test]
+    fn sort_and_current_image_group_sit_where_the_browse_block_wants_them() {
+        let src = code_lines(production_src());
+        let menu = src.split("fn context_menu").nth(1).expect("右键菜单");
+        let top = menu.split("fn appearance_items").next().unwrap_or(menu);
+        assert_order(top, &VIEW_ORDER_MENU_KEYS, "右键菜单浏览区");
+        let appearance = src.split("fn appearance_items").nth(1).unwrap_or("");
+        assert!(
+            !appearance.contains("MenuItem::submenu(\"排序\""),
+            "「排序 ▸」被挪进「外观 ▸」里了：它不改画面，只改下一张是谁"
+        );
+        assert_current_image_menu(&src);
+    }
+
+    /// 负向臂①：模拟 m275 的旧布局——组已经叫「本图」了，但 RAW 参数仍摊在顶层。
+    /// 专打"顶层不许再出现收编项"这一条，必须当场红。
+    #[test]
+    #[should_panic(expected = "RAW 参数… 仍是顶层项")]
+    fn current_image_group_rejects_pre_m276_top_level_layout() {
+        let old = [
+            "fn context_menu(&self) {",
+            "    MenuItem::run(\"RAW 参数…\", |_| {}, false);",
+            "    MenuItem::submenu(\"本图\", self.current_image_items(true));",
+            "    MenuItem::submenu(\"外观\", vec![]);",
+            "}",
+            "fn appearance_items(&self) {}",
+            "fn current_image_items(&self) {",
+            "    \"RAW 参数…\"; \"跳转到…帧/页\"; \"取色器\";",
+            "}",
+            "fn copy_items(&self) {}",
+        ]
+        .join("\n");
+        assert_current_image_menu(&old);
+    }
+
+    /// 负向臂②：组内少一项（只剩 RAW 参数 + 取色器）也要红，别让项序钉子
+    /// 变成"只检查前两项"的空壳。
+    #[test]
+    #[should_panic(expected = "里找不到")]
+    fn current_image_group_rejects_losing_the_goto_item() {
+        let old = [
+            "fn context_menu(&self) {",
+            "    MenuItem::submenu(\"本图\", self.current_image_items(true));",
+            "    MenuItem::submenu(\"外观\", vec![]);",
+            "}",
+            "fn appearance_items(&self) {}",
+            "fn current_image_items(&self) {",
+            "    \"RAW 参数…\"; \"取色器\";",
+            "}",
+            "fn copy_items(&self) {}",
+        ]
+        .join("\n");
+        assert_current_image_menu(&old);
+    }
+
+    /// m273：卡内项序的两条硬约束——与外观那条钉子同住一处，共用 [`code_lines`]。
+    ///
+    /// ① 窗口卡：[`WINDOW_ROWS`] 既是序也是相邻判据。「启动窗口」与「窗口尺寸」中间
+    ///    一旦再插进任何一行（m269 就插过一次「无边框」），"选档 → 填宽高 → 置灰"
+    ///    这条读法就断成两截，断言当场红。
+    /// ② 看图卡：[`BROWSE_ROWS`] 的最后一项必须是「幻灯片间隔」——它是卡里唯一的
+    ///    数值行，夹在勾选中间会打断连读。
+    const WINDOW_ROWS: [&str; 6] = [
+        "\"启动窗口\"",
+        "\"窗口尺寸 (宽, 高)\"",
+        "\"无边框\"",
+        "\"窗口置顶\"",
+        "\"最小化到托盘\"",
+        "\"允许多开\"",
+    ];
+    const BROWSE_ROWS: [&str; 5] = [
+        "\"适应长图\"",
+        "\"左键拖图\"",
+        "\"空格看图\"",
+        "\"图片预读\"",
+        "\"幻灯片间隔 (秒)\"",
+    ];
+
+    #[test]
+    fn options_cards_keep_their_row_order() {
+        let page = code_lines(include_str!("settings/options.rs"));
+        let window = page
+            .split("fn window_body")
+            .nth(1)
+            .and_then(|s| s.split("fn browse_body").next())
+            .expect("设置页窗口卡");
+        assert_order(window, &WINDOW_ROWS, "设置页窗口卡");
+        let browse = page.split("fn browse_body").nth(1).expect("设置页看图卡");
+        assert_order(browse, &BROWSE_ROWS, "设置页看图卡");
+    }
+
+    /// m273 负向臂：拿 m272 的旧序喂同一个断言，必须报红——那正是"无边框插在尺寸中间"
+    /// 的现场。也钉住常量本身：把 WINDOW_ROWS 改回旧序，这里不再 panic 而失败。
+    #[test]
+    #[should_panic(expected = "里找不到")]
+    fn window_order_rejects_borderless_between_the_size_rows() {
+        let old = [
+            "\"窗口置顶\"",
+            "\"启动窗口\"",
+            "\"无边框\"",
+            "\"窗口尺寸 (宽, 高)\"",
+            "\"最小化到托盘\"",
+            "\"允许多开\"",
+        ]
+        .join("\n");
+        assert_order(&old, &WINDOW_ROWS, "m272 旧序模拟");
+    }
+
+    /// m265：设置页那一行叫「图片预读」，注释里写明两条来源；写回旧称会红。
+    #[test]
+    fn options_labels_picture_prefetch_with_two_sources() {
+        let src = include_str!("settings/options.rs");
+        assert!(src.contains("check_row(\"图片预读\""), "设置页标签没改");
+        assert!(
+            !src.contains("check_row(\"邻图预读\""),
+            "旧称还在 UI 字面量里"
+        );
+        assert!(
+            src.contains("邻图 ±N + 缩略图条可见的那一屏"),
+            "注释必须写明下注集合的两条来源"
+        );
+    }
+
+    /// m266：「图片预读」归哪张卡的**唯一断言**。先查它有没有跑回「系统与网络」，
+    /// 再查它是不是真在「看图」卡（m273 前叫「看图与操作」）；两条来源的注释必须跟着
+    /// 行一起挪。
+    fn assert_prefetch_card(src: &str, what: &str) {
+        let browse = src
+            .split("fn browse_body")
+            .nth(1)
+            .and_then(|s| s.split("fn system_body").next())
+            .unwrap_or_else(|| panic!("{what}：找不到 browse_body 段"));
+        let system = src
+            .split("fn system_body")
+            .nth(1)
+            .unwrap_or_else(|| panic!("{what}：找不到 system_body 段"));
+        assert!(
+            !system.contains("check_row(\"图片预读\""),
+            "{what}：「图片预读」又写回系统与网络卡了"
+        );
+        assert!(
+            browse.contains("check_row(\"图片预读\""),
+            "{what}：看图卡里没有「图片预读」"
+        );
+        assert!(
+            browse.contains("邻图 ±N + 缩略图条可见的那一屏"),
+            "{what}：两条来源的注释没跟着行一起挪"
+        );
+    }
+
+    #[test]
+    fn picture_prefetch_lives_in_the_browse_card() {
+        assert_prefetch_card(include_str!("settings/options.rs"), "现状");
+    }
+
+    /// m266 负向臂：拿 m265 的旧版式（预读行在 system_body）喂同一个断言，必须报红。
+    /// 也钉住断言本身——把 system 那一条删掉，这里不再 panic 而失败。
+    #[test]
+    #[should_panic(expected = "又写回系统与网络卡了")]
+    fn picture_prefetch_rejects_the_system_card() {
+        let old = r#"
+fn browse_body(h: &Handles) -> Element {
+    Element::col().child(check_row("适应长图", h.long_fit))
+}
+fn system_body(h: &Handles) -> Element {
+    Element::col()
+        .child(check_row("图片预读", h.prefetch))
+        .child(option_row("下载源", Element::dropdown(...)))
+}
+"#;
+        assert_prefetch_card(old, "m265 旧版式模拟");
+    }
+
+    /// m262：「外观 ▸」内部不许再有分隔线；三态档位必须走共用轴，不许就地硬编码。
+    #[test]
+    fn appearance_submenu_has_one_axis_and_no_separator() {
+        let src = production_src();
+        let body = src
+            .split("fn appearance_items")
+            .nth(1)
+            .expect("右键外观子菜单");
+        let end = body.find("\n    fn ").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            !body.contains("MenuItem::separator()"),
+            "外观子菜单不许画分隔线（父级已按开关区分过组）"
+        );
+        assert!(body.contains("settings::FILMSTRIP_POS"), "标签要取共用表");
+        assert!(
+            body.contains("settings::filmstrip_index"),
+            "当前档要取共用翻译"
+        );
+        assert!(
+            body.contains("settings::filmstrip_bools"),
+            "写回要取共用翻译"
+        );
+        assert!(
+            !body.contains("(0usize, \"关闭\")"),
+            "不许在菜单里再硬编码一份三态表"
+        );
+    }
+
+    /// ★ m256：双击分支必须**先问标题栏**、再问 `double_click` 设置。
+    ///
+    /// 这条是**接线**钉子：`double_click_action` 自己的用例绿了，不代表分支真在用它
+    /// （本仓已经栽过两次：m255 的 `to_canvas`、早先的 `left_drag`）。判据写成源码锚点，
+    /// 因为这一段的行为要靠构造一次真双击 + 真窗口才能观测。
+    #[test]
+    fn double_click_wiring_asks_the_title_strip_first() {
+        let src = production_src();
+        let ask = src
+            .find("let in_title = Chrome::in_title_strip(pos, self.work_tuple());")
+            .expect("双击分支必须自己判标题栏（判据单一来源 in_title_strip）");
+        let act = src
+            .find("double_click_action(in_title, self.config.borrow().dbl_click)")
+            .expect("双击结论必须经 double_click_action，不许在分支里手写 match 前的特例");
+        assert!(
+            ask < act,
+            "标题栏判据必须写在取 double_click 之前，否则设置又盖回标题栏"
+        );
+        assert!(
+            !src.contains("let dbl = self.config.borrow().dbl_click;"),
+            "裸取 double_click 的旧写法不许回来：那条路会让标题栏跟着设置走"
+        );
+    }
+
     /// 显示层调色只在上屏位图 gen / 六个参数 / Gamma 变化时才重算一次，不每帧重扫整图。
+    /// m280：角度进缓存键；连调 1°→2° 都从**同一份 src** 重算，
+    /// 绝不拿上一次的输出再转一次（`geometry::rotated_is_not_accumulated` 的几何负向臂
+    /// 在这里落到显示层）。
+    #[test]
+    fn angle_changes_recompute_from_source_not_from_previous_frame() {
+        use crate::core::pixels::{CHANNEL_NEUTRAL, GAMMA_NEUTRAL};
+        let src = RgbaImage::new(4, 4, (0..64).map(|i| (i * 3) as u8).collect());
+        let mut cache = TintCache::new();
+        assert!(cache
+            .obtain(&src, CHANNEL_NEUTRAL, GAMMA_NEUTRAL, 1)
+            .is_some());
+        assert_eq!(
+            cache.key,
+            Some((src.gen, CHANNEL_NEUTRAL, GAMMA_NEUTRAL, 1))
+        );
+        let g1 = cache.img.as_ref().unwrap().gen;
+
+        assert!(cache
+            .obtain(&src, CHANNEL_NEUTRAL, GAMMA_NEUTRAL, 2)
+            .is_some());
+        assert_ne!(cache.img.as_ref().unwrap().gen, g1, "角度变了必须重算");
+        assert_eq!(
+            cache.img.as_ref().unwrap().rgba.as_slice(),
+            crate::core::geometry::rotated(&src.rgba, 4, 4, 2).as_slice(),
+            "2° 必须是从源图一次算出来的，不是把 1° 的输出再转 1°"
+        );
+
+        // 同角度再来一次：命中缓存，一次都不重算。
+        let g2 = cache.img.as_ref().unwrap().gen;
+        assert!(cache
+            .obtain(&src, CHANNEL_NEUTRAL, GAMMA_NEUTRAL, 2)
+            .is_some());
+        assert_eq!(cache.img.as_ref().unwrap().gen, g2);
+    }
+
     #[test]
     fn tint_cache_only_recomputes_on_a_real_change() {
         use crate::core::pixels::GAMMA_NEUTRAL as G;
         let src = RgbaImage::new(2, 1, vec![0, 10, 200, 255, 100, 50, 20, 128]);
         let v: [i32; 6] = [-100, 100, 100, 255, 0, 0];
         let mut cache = TintCache::new();
-        assert!(cache.obtain(&src, v, G).is_some());
-        assert_eq!(cache.key, Some((src.gen, v, G)));
+        assert!(cache.obtain(&src, v, G, 0).is_some());
+        assert_eq!(cache.key, Some((src.gen, v, G, 0)));
         let first = cache.img.as_ref().unwrap();
         assert_eq!(
             &first.rgba[..],
@@ -2877,28 +4041,28 @@ mod tests {
         let gen = first.gen;
 
         // 同 gen + 同参数 + 同 Gamma：一次都不该重算。
-        assert!(cache.obtain(&src, v, G).is_some());
+        assert!(cache.obtain(&src, v, G, 0).is_some());
         assert_eq!(cache.img.as_ref().unwrap().gen, gen);
 
         // 参数变了：重算，且新像素按新参数来。
         let v2: [i32; 6] = [100, 100, 100, 0, 0, 0];
-        assert!(cache.obtain(&src, v2, G).is_some());
-        assert_eq!(cache.key, Some((src.gen, v2, G)));
+        assert!(cache.obtain(&src, v2, G, 0).is_some());
+        assert_eq!(cache.key, Some((src.gen, v2, G, 0)));
         assert_ne!(cache.img.as_ref().unwrap().gen, gen);
         assert_eq!(&cache.img.as_ref().unwrap().rgba[..], &src.rgba[..]);
 
         // ★ 只动 Gamma 也必须重算，且暗部按曲线抬起来（第七格不能漏进缓存键）。
         let gen_g = cache.img.as_ref().unwrap().gen;
-        assert!(cache.obtain(&src, v2, 180).is_some());
-        assert_eq!(cache.key, Some((src.gen, v2, 180)));
+        assert!(cache.obtain(&src, v2, 180, 0).is_some());
+        assert_eq!(cache.key, Some((src.gen, v2, 180, 0)));
         assert_ne!(cache.img.as_ref().unwrap().gen, gen_g);
         assert_eq!(&cache.img.as_ref().unwrap().rgba[..4], &[0, 42, 223, 255]);
 
         // 源位图换代（翻页/缩放）：同样必须重算。
         let next = RgbaImage::new(2, 1, vec![7, 8, 9, 255, 10, 11, 12, 255]);
         let gen2 = cache.img.as_ref().unwrap().gen;
-        assert!(cache.obtain(&next, v2, 180).is_some());
-        assert_eq!(cache.key, Some((next.gen, v2, 180)));
+        assert!(cache.obtain(&next, v2, 180, 0).is_some());
+        assert_eq!(cache.key, Some((next.gen, v2, 180, 0)));
         assert_ne!(cache.img.as_ref().unwrap().gen, gen2);
     }
 
@@ -2982,6 +4146,73 @@ mod tests {
         a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
     }
 
+    /// m268：滚轮符号 ≠ 清单方向。向上滚（+1）看前面，向下滚（-1）看后面；
+    /// 条上 m259 已由真机签收的 `- dir * step` 必须与新函数逐值等价。
+    #[test]
+    fn wheel_nav_dir_maps_wheel_down_to_the_next_picture() {
+        assert_eq!(wheel_nav_dir(1), -1, "向上滚该看前面");
+        assert_eq!(wheel_nav_dir(-1), 1, "向下滚该看后面");
+        assert_eq!(wheel_nav_dir(0), 0);
+        for d in [-2isize, -1, 0, 1, 2] {
+            assert_eq!(wheel_nav_dir(d), -d, "不得改坏条上的方向");
+        }
+    }
+
+    /// m268 源码级同源判据：条与翻页两支必须走同一根方向轴，且节奏闸与
+    /// `Viewer::step` 收的都是**翻好的步进方向**（欠账由 runtime 兜出去时也不能反）。
+    fn assert_wheel_nav_uses_one_axis(src: &str, what: &str) {
+        let start = src
+            .find("PointerKind::Wheel(delta) => {")
+            .unwrap_or_else(|| panic!("{what}：滚轮分支不见了"));
+        let end = src[start..]
+            .find("PointerKind::Enter | PointerKind::Move")
+            .unwrap_or_else(|| panic!("{what}：滚轮分支没有终点"))
+            + start;
+        let body = &src[start..end];
+        assert!(
+            body.contains("wheel_nav_dir(dir) * step"),
+            "{what}：缩略图条没走共用的方向轴"
+        );
+        assert!(
+            body.contains("let step_dir = wheel_nav_dir(dir);"),
+            "{what}：翻页没翻号（把滚轮符号直接喂给了 step）"
+        );
+        assert!(
+            body.contains("wheel_gate(step_dir)"),
+            "{what}：节奏闸存的必须是翻好的步进方向"
+        );
+        assert!(
+            body.contains("step(step_dir)"),
+            "{what}：Viewer::step 收的必须是翻好的步进方向"
+        );
+        assert!(
+            !body.contains("step(dir)"),
+            "{what}：不许把滚轮符号直接喂给 step"
+        );
+    }
+
+    #[test]
+    fn wheel_nav_uses_one_axis_in_both_branches() {
+        assert_wheel_nav_uses_one_axis(production_src(), "现状");
+    }
+
+    /// 负向臂 A：把翻号删掉（m267 的形状）必须报红。
+    #[test]
+    #[should_panic(expected = "翻页没翻号")]
+    fn wheel_nav_rejects_an_unflipped_step() {
+        let old =
+            production_src().replace("let step_dir = wheel_nav_dir(dir);", "let step_dir = dir;");
+        assert_wheel_nav_uses_one_axis(&old, "旧写法");
+    }
+
+    /// 负向臂 B：只翻 `step`、不翻节奏闸，被闸挂起的那一下仍会反着翻。
+    #[test]
+    #[should_panic(expected = "节奏闸存的必须是翻好的步进方向")]
+    fn wheel_nav_rejects_a_gate_that_keeps_the_raw_wheel_sign() {
+        let old = production_src().replace("wheel_gate(step_dir)", "wheel_gate(dir)");
+        assert_wheel_nav_uses_one_axis(&old, "闸里存旧符号");
+    }
+
     /// 滚轮碎增量攒够一格才给方向（A3 的前半条判据；节奏闸在 `Chrome::wheel_gate` 那条测试里）。
     #[test]
     fn wheel_detent_needs_a_full_detent() {
@@ -2995,6 +4226,195 @@ mod tests {
         assert_eq!(wheel_detent(0, -120), (0, -1));
         assert_eq!(wheel_detent(70, -200), (0, -1));
         assert_eq!(wheel_detent(-119, 1), (-118, 0), "差 1 就不算一格");
+    }
+
+    /// ★ m258：条内拖动换算。往左/往上拖 = 往后翻；整格取整；两端夹紧。
+    #[test]
+    fn strip_drag_moves_one_grid_per_pitch() {
+        assert_eq!(strip_drag_first(10, 0.0, 102.0, 50), 10, "没动就不动");
+        assert_eq!(
+            strip_drag_first(10, 102.0, 102.0, 50),
+            9,
+            "往右拖一格 = 看前面一格"
+        );
+        assert_eq!(
+            strip_drag_first(10, -204.0, 102.0, 50),
+            12,
+            "往左拖两格 = 往后两格"
+        );
+        assert_eq!(
+            strip_drag_first(10, 50.0, 102.0, 50),
+            10,
+            "半格以内不动——拖一点点就窜一格是错的手感"
+        );
+        assert_eq!(strip_drag_first(0, 5000.0, 102.0, 50), 0, "到顶不越界");
+        assert_eq!(strip_drag_first(50, -5000.0, 102.0, 50), 50, "到底不越界");
+        assert_eq!(
+            strip_drag_first(10, -3.0, 1.0, 50),
+            13,
+            "格距保底 1，不会除零"
+        );
+    }
+
+    /// ★ m259：拖滚动指示的滑块 —— 整条行程映射整份清单（大目录靠它才到得了远处）。
+    #[test]
+    fn scrubbing_the_bar_maps_the_whole_track_to_the_whole_list() {
+        let s = StripScrub {
+            grab_at: 100.0,
+            thumb0: 40.0,
+            span: 300.0,
+            max_first: 90,
+            horizontal: true,
+        };
+        // 指针不动 ⇒ 滑块不动（40/300×90 = 12）。
+        assert_eq!(scrub_first(&s, (100.0, 0.0)), 12);
+        // 拖到行程末端 ⇒ 末屏首格；拖回起点 ⇒ 0。
+        assert_eq!(scrub_first(&s, (400.0, 0.0)), 90);
+        assert_eq!(scrub_first(&s, (60.0, 0.0)), 0);
+        // 行程为 0（滑块占满轨道）⇒ 恒 0，不除零。
+        let zero = StripScrub { span: 0.0, ..s };
+        assert_eq!(scrub_first(&zero, (500.0, 0.0)), 0);
+        // 竖排看纵轴。
+        let v = StripScrub {
+            horizontal: false,
+            ..s
+        };
+        assert_eq!(scrub_first(&v, (0.0, 400.0)), 90);
+    }
+
+    /// ★ m259：点轨道空白 —— 滑块中心落到指针处（与拖动共用同一套行程映射）。
+    #[test]
+    fn clicking_the_track_jumps_to_that_spot() {
+        // 轨道从 100 起、长 300，滑块宽 60 ⇒ 行程 240。
+        assert_eq!(scrub_jump((100.0, 0.0), 100.0, 60.0, 240.0, 90, true), 0);
+        assert_eq!(scrub_jump((400.0, 0.0), 100.0, 60.0, 240.0, 90, true), 90);
+        // 中点 ⇒ 一半（浮点取整容 1 格）。
+        let mid = scrub_jump((250.0, 0.0), 100.0, 60.0, 240.0, 90, true);
+        assert!((44..=46).contains(&mid), "中点应在 45 附近，实际 {mid}");
+        // 竖排看纵轴。
+        assert_eq!(scrub_jump((0.0, 400.0), 100.0, 60.0, 240.0, 90, false), 90);
+    }
+
+    /// ★ m258 接线钉子：条内左键必须**先**被条接管，不许落到 `press_left`。
+    ///
+    /// 纯函数绿 ≠ 调用点接了它（本仓踩过两次：`left_drag` 与 `double_click`）。
+    /// 老代码只拦"命中格子"，落在格子缝里的一按会走拖图 ⇒ 在条上拖却动了主画面。
+    #[test]
+    fn strip_drag_is_claimed_before_the_pan_dispatch() {
+        let src = include_str!("canvas.rs");
+        let down = src
+            .find("PointerKind::Down if p.button == MouseButton::Left")
+            .expect("左键按下分支");
+        let rest = &src[down..];
+        let in_strip = rest
+            .find("self.in_strip_panel(pos)")
+            .expect("条内判据必须出现在左键分支里");
+        let drag = rest
+            .find("self.strip_drag.set(Some(StripDrag")
+            .expect("拖动起点要落进 strip_drag");
+        let press = rest.find("self.press_left(pos").expect("拖图分派");
+        assert!(
+            in_strip < press && drag < press,
+            "条内判据与拖动起点都必须排在 press_left 之前，否则拖条会动主画面"
+        );
+    }
+
+    /// ★ m260 接线钉子：换目录必须清锚点，同一目录内换图**不许**清。
+    ///
+    /// 不清的后果很具体：从 A 目录（条已滚到第 300 张）双击打开 B 目录的图，新目录也许
+    /// 只有十几张 ⇒ 条被夹到尽头、当前图根本不在视野里，看着像"条坏了"。反过来若把清
+    /// 零挂到"换图"上，用户辛苦滚到的位置一点就飞回去——所以判据必须是**目录**。
+    #[test]
+    fn changing_the_directory_resets_the_strip_anchor() {
+        let src = include_str!("canvas.rs");
+        let i = src.find("let dir_changed =").expect("换目录判据不见了");
+        let tail = &src[i..];
+        let j = tail.find("if dir_changed {").expect("判据没接到清零动作上");
+        assert!(
+            tail[..j].contains("gallery_dir"),
+            "判据必须问目录（`gallery_dir`），不许拿格数或别的近似值顶替"
+        );
+        let block = &tail[j..];
+        let end = block.find("\n        }\n").expect("清零块没闭合");
+        assert!(
+            block[..end].contains("self.strip_first.set(None)"),
+            "换目录要把滚动锚点归零，否则条停在旧目录的位置上"
+        );
+    }
+
+    /// ★ m261：手型只在能拖图的地上生效；缩略图条与四缘缩放带都得排除。
+    ///
+    /// `strip_canvas()` 的 `last` = 800×600、`last_work` = 800×504（底下 96 是条）。
+    /// 负向臂：画面正中必须**仍然**判可拖——收得太狠会把拖图功能一起关掉。
+    #[test]
+    fn pan_area_excludes_the_strip_and_the_resize_band() {
+        let c = strip_canvas();
+        assert!(c.in_pan_area((400.0, 250.0)), "画面正中要能拖图");
+        assert!(c.in_pan_area((400.0, 500.0)), "紧贴条上沿仍属画面");
+        assert!(!c.in_pan_area((400.0, 550.0)), "缩略图条不接手");
+        assert!(!c.in_pan_area((4.0, 250.0)), "左缘 8dp 是缩放带");
+        assert!(!c.in_pan_area((796.0, 250.0)), "右缘 8dp 是缩放带");
+        assert!(!c.in_pan_area((400.0, 4.0)), "上缘 8dp 是缩放带");
+        assert!(!c.in_pan_area((400.0, 504.0)), "条与画面的分界归条");
+        assert!(c.in_resize_band((400.0, 596.0)), "窗口底边那圈要认出来");
+        assert!(!c.in_resize_band((400.0, 550.0)), "条中间不是缩放带");
+    }
+
+    /// ★ m261 接线钉子：纯几何绿 ≠ `sync_hand` 真的用了它。
+    ///
+    /// 负向臂两条：不许再把 `strip_drag` / `strip_scrub` 塞回"拖动中=抓手"那一段，
+    /// 也不许把 `in_strip_panel && strip_scrollable` 那条"条上给开手"的分枝写回来。
+    #[test]
+    fn hand_cursor_is_gated_by_the_pan_area() {
+        let src = include_str!("canvas.rs");
+        let start = src.find("fn sync_hand(&self").expect("光标分派不见了");
+        let tail = &src[start..];
+        let end = tail.find("fn on_pointer").expect("分派函数没闭合");
+        let body = &tail[..end];
+        let gate = body
+            .find("if !self.in_pan_area(pos)")
+            .expect("必须先拿可拖区闸住手型");
+        let hand = body
+            .find("LeftDrag::PanImage => Some(false)")
+            .expect("开手那一支不见了");
+        assert!(gate < hand, "闸必须排在给手型之前");
+        assert!(
+            body.contains("if self.in_resize_band(pos)"),
+            "边框带要单独撤覆盖，不能顺手设成箭头"
+        );
+        assert!(
+            !body.contains("self.strip_drag.get().is_some()")
+                && !body.contains("self.strip_scrub.get().is_some()")
+                && !body.contains("self.in_strip_panel(pos) && self.strip_scrollable()"),
+            "拖条与条上悬停都不许再给手型"
+        );
+    }
+
+    /// ★ m256：标题栏双击恒等「最大化 / 恢复」，**不看** `double_click` 设置。
+    ///
+    /// 用户 2026-11-08 实机「秒退」：默认 `double_click=CloseWindow`，双击顶条把窗收了。
+    /// 这条钉的是**判据本身**，接线由 `double_click_wiring_asks_the_title_strip_first`
+    /// 按源码锚点兜住（纯函数绿 ≠ 调用点接了它，这是本仓踩过两次的老坑）。
+    #[test]
+    fn title_bar_double_click_always_toggles_maximize() {
+        use crate::core::config::DblClick;
+        for cfg in [
+            DblClick::Nothing,
+            DblClick::CloseWindow,
+            DblClick::Maximize,
+            DblClick::Fullscreen,
+        ] {
+            assert_eq!(
+                double_click_action(true, cfg),
+                DblClick::Maximize,
+                "标题栏双击必须恒为最大化/恢复，不能跟着 double_click 走"
+            );
+            assert_eq!(
+                double_click_action(false, cfg),
+                cfg,
+                "画面区照旧按 double_click 设置"
+            );
+        }
     }
 
     /// 拖拽升级成"拖窗口"的阈值**不许**把手抖算进去——判错一次，双击关窗就没了。
@@ -3018,29 +4438,29 @@ mod tests {
     fn left_drag_never_moves_the_window_in_fullscreen() {
         use LeftDrag::{None as NoDrag, PanImage, Window};
         assert_eq!(
-            left_drag(true, true, false, true),
+            left_drag(true, true, false, true, false, false),
             PanImage,
             "画布里仍可平移图"
         );
         assert_eq!(
-            left_drag(true, true, true, true),
+            left_drag(true, true, true, true, false, false),
             NoDrag,
             "顶条那一条不再拖窗口"
         );
         assert_eq!(
-            left_drag(false, true, false, true),
+            left_drag(false, true, false, true, false, false),
             NoDrag,
             "开关关掉也不拖窗口"
         );
         assert_eq!(
-            left_drag(true, false, false, true),
+            left_drag(true, false, false, true, false, false),
             NoDrag,
             "空窗也不拖窗口"
         );
-        assert_eq!(left_drag(false, true, true, true), NoDrag);
+        assert_eq!(left_drag(false, true, true, true, false, false), NoDrag);
         // 非全屏回归：顶条永远带走窗口，别把旧行为改坏。
-        assert_eq!(left_drag(true, true, true, false), Window);
-        assert_eq!(left_drag(false, false, false, false), Window);
+        assert_eq!(left_drag(true, true, true, false, false, false), Window);
+        assert_eq!(left_drag(false, false, false, false, false, false), Window);
     }
 
     /// 左键这一拖归谁：`drag_image` 开关 × 有没有可平移余量 × 是不是标题栏，**八格全钉**。
@@ -3054,29 +4474,78 @@ mod tests {
     fn left_drag_yields_the_window_unless_there_is_room_in_the_canvas() {
         use LeftDrag::{PanImage, Window};
         assert_eq!(
-            left_drag(true, true, false, false),
+            left_drag(true, true, false, false, false, false),
             PanImage,
             "本次功能的全部新行为"
         );
         assert_eq!(
-            left_drag(true, true, true, false),
+            left_drag(true, true, true, false, false, false),
             Window,
             "标题栏永远拖窗口"
         );
         assert_eq!(
-            left_drag(true, false, false, false),
+            left_drag(true, false, false, false, false, false),
             Window,
             "空窗（没有图）时别堵死拖窗口"
         );
-        assert_eq!(left_drag(true, false, true, false), Window);
+        assert_eq!(left_drag(true, false, true, false, false, false), Window);
         assert_eq!(
-            left_drag(false, true, false, false),
+            left_drag(false, true, false, false, false, false),
             Window,
             "开关关掉就是 2026-10-08 那套分工"
         );
-        assert_eq!(left_drag(false, true, true, false), Window);
-        assert_eq!(left_drag(false, false, false, false), Window);
-        assert_eq!(left_drag(false, false, true, false), Window);
+        assert_eq!(left_drag(false, true, true, false, false, false), Window);
+        assert_eq!(left_drag(false, false, false, false, false, false), Window);
+        assert_eq!(left_drag(false, false, true, false, false, false), Window);
+    }
+
+    /// m272：无边框形态**没有标题栏**，整块画面就是搬窗口的地。
+    ///
+    /// 用户 2026-11-08 实机原话：「无边框下拖窗口只有顶部那条 40dp 的隐形热区，
+    /// 没有任何提示」——那条热区是 `in_title_strip` 的几何残留，画面上根本看不见，
+    /// 等于那个形态搬不动窗口。新判据只留一条分界：图**溢出视口**（100% / 放大过）
+    /// 时归图片，否则归窗口；顶部那条在无边框下不再有特殊含义。
+    ///
+    /// 真全屏（m238）仍然先判：全屏 + 无边框也不许把窗口拖离显示器。
+    #[test]
+    fn borderless_drags_the_whole_canvas_as_a_title_bar() {
+        use LeftDrag::{None as NoDrag, PanImage, Window};
+        // 常态（图适应视口）：画面任意位置都搬窗口，包括顶部那条。
+        assert_eq!(
+            left_drag(true, true, false, false, true, false),
+            Window,
+            "无边框开图：整块画面搬窗口"
+        );
+        assert_eq!(
+            left_drag(true, true, true, false, true, false),
+            Window,
+            "顶部那条也搬窗口——这个形态没有标题栏可谈"
+        );
+        // 图真的溢出：回落到平移图片（与普通窗口"放大后画面拖图"同构）。
+        assert_eq!(
+            left_drag(true, true, false, false, true, true),
+            PanImage,
+            "100% / 放大过之后才拖图"
+        );
+        // 开关关掉：无边框下更该一律搬窗口，别留"拖不动"的形态。
+        assert_eq!(
+            left_drag(false, true, false, false, true, true),
+            Window,
+            "关掉 drag_image 就是纯搬窗口"
+        );
+        // 空窗（没有图 ⇒ overflows 恒假）：搬窗口。
+        assert_eq!(left_drag(true, false, false, false, true, false), Window);
+        // 全屏优先：无边框 + 全屏照样不许拖走窗口，但画布仍可平移。
+        assert_eq!(
+            left_drag(true, true, false, true, true, false),
+            PanImage,
+            "全屏 + 无边框：画布仍可平移图片"
+        );
+        assert_eq!(
+            left_drag(true, false, false, true, true, false),
+            NoDrag,
+            "全屏 + 无边框 + 拖不动：不响应，不留能拖的假象"
+        );
     }
 
     /// 接线自检：`ImageCanvas::press_left` 真的按 [`left_drag`] 的结论开局。
@@ -3617,6 +5086,152 @@ mod tests {
         assert!(!canvas.chrome.slideshow_on(), "按下左键之后必须停");
     }
 
+    /// ★ m267：Ctrl+滚轮必须走它自己那一档，不许被当成裸滚轮。
+    /// 用户实机「设置是切换图片，实际没效果」：windui 的 WM_MOUSEWHEEL 此前用
+    /// `PointerEvent::single`（Mods 全 false），宿主再怎么读 p.mods.ctrl 都白搭。
+    /// 用「缩放倍率有没有变」当探针：翻页不改 scale，缩放改 scale。
+    fn wheel_changes_scale(
+        wheel: crate::core::config::Wheel,
+        ctrl_wheel: crate::core::config::CtrlWheel,
+        mods: windui::event::Mods,
+    ) -> bool {
+        use windui::event::{MouseButton, PointerEvent, PointerKind};
+        use windui::geometry::Point;
+        let (mut canvas, viewer) = zoomed_canvas();
+        {
+            let mut c = canvas.config.borrow_mut();
+            c.wheel = wheel;
+            c.ctrl_wheel = ctrl_wheel;
+        }
+        let before = viewer.borrow().scale();
+        let ev = PointerEvent::single_with(
+            PointerKind::Wheel(120),
+            Point::new(100, 75),
+            MouseButton::Left,
+            mods,
+        );
+        windui::testing::run_with_ctx(|ctx| {
+            canvas.on_pointer(ctx, &ev);
+        });
+        let after = viewer.borrow().scale();
+        (after - before).abs() > 1e-6
+    }
+
+    #[test]
+    fn ctrl_wheel_routes_through_the_pointer_mods() {
+        use windui::event::Mods;
+        let zoom = crate::core::config::WheelAction::Zoom;
+        let flip = crate::core::config::WheelAction::Navigate;
+        let c_zoom = crate::core::config::WheelAction::Zoom;
+        let c_flip = crate::core::config::WheelAction::Navigate;
+        let none = Mods::default();
+        let ctrl = Mods {
+            ctrl: true,
+            ..Mods::default()
+        };
+        // 默认档：裸滚轮缩放、Ctrl+滚轮翻页。
+        assert!(
+            wheel_changes_scale(zoom, c_flip, none),
+            "裸滚轮（默认档）该缩放"
+        );
+        assert!(
+            !wheel_changes_scale(zoom, c_flip, ctrl),
+            "Ctrl+滚轮不该缩放，得翻页"
+        );
+        // 反配档：裸滚轮翻页、Ctrl+滚轮缩放，两条开关各管各的。
+        assert!(
+            !wheel_changes_scale(flip, c_zoom, none),
+            "裸滚轮（反配档）不该缩放"
+        );
+        assert!(
+            wheel_changes_scale(flip, c_zoom, ctrl),
+            "Ctrl+滚轮（反配档）该缩放"
+        );
+    }
+
+    /// m278 判据本体：四行滚轮各读自己那一档，不许四行都读裸滚轮档。
+    fn assert_four_wheel_rows(
+        c: &Config,
+        pick: impl Fn(&windui::event::Mods) -> crate::core::config::WheelAction,
+        what: &str,
+    ) {
+        use windui::event::Mods;
+        let none = Mods::default();
+        let alt = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+        let shift = Mods {
+            shift: true,
+            ..Mods::default()
+        };
+        assert_eq!(pick(&none), c.wheel, "{what}：裸滚轮档");
+        assert_eq!(pick(&alt), c.alt_wheel, "{what}：Alt+滚轮被裸滚轮档吃掉了");
+        assert_eq!(
+            pick(&shift),
+            c.shift_wheel,
+            "{what}：Shift+滚轮被裸滚轮档吃掉了"
+        );
+    }
+
+    #[test]
+    fn four_wheel_rows_are_independent_and_pairs_are_opposite() {
+        let d = Config::default();
+        // 出厂：裸滚轮缩放、Ctrl 换图、Alt / Shift 关闭。
+        assert_eq!(
+            wheel_action_for(&d, &windui::event::Mods::default()),
+            crate::core::config::WheelAction::Zoom
+        );
+        let c = Config {
+            alt_wheel: crate::core::config::WheelAction::Opacity,
+            shift_wheel: crate::core::config::WheelAction::Navigate,
+            ..Config::default()
+        };
+        assert_four_wheel_rows(&c, |m| wheel_action_for(&c, m), "现状");
+        // 一个值管上下两个方向：向下是下拉里写的那一头，向上是反向。
+        assert_eq!(
+            crate::core::config::WheelAction::Navigate.pair(),
+            Some((Action::Next, Action::Prev)),
+            "选「下一张 / 上一张」时另一方向必须是上一张"
+        );
+        assert_eq!(
+            crate::core::config::WheelAction::Opacity.pair(),
+            Some((Action::OpacityDown, Action::OpacityUp))
+        );
+        assert_eq!(
+            crate::core::config::WheelAction::None.pair(),
+            None,
+            "「无」不该有反向动作"
+        );
+    }
+
+    /// 负向臂：m278 之前的「四行都读裸滚轮档」喂同一个判据，必须当场红。
+    #[test]
+    #[should_panic(expected = "Alt+滚轮被裸滚轮档吃掉了")]
+    fn four_wheel_rows_reject_the_single_row_dispatch() {
+        let c = Config {
+            alt_wheel: crate::core::config::WheelAction::Opacity,
+            ..Config::default()
+        };
+        assert_four_wheel_rows(&c, |_| c.wheel, "旧实现");
+    }
+
+    /// m267 负向臂：平台层送 Mods::default()（补丁 027 之前的形状）时，
+    /// 「Ctrl+滚轮不该缩放」必须报红；同时也钉住断言本身有没有真在判。
+    #[test]
+    #[should_panic(expected = "Ctrl+滚轮不该缩放")]
+    fn ctrl_wheel_rejects_a_wheel_event_without_mods() {
+        use windui::event::Mods;
+        assert!(
+            !wheel_changes_scale(
+                crate::core::config::WheelAction::Zoom,
+                crate::core::config::WheelAction::Navigate,
+                Mods::default()
+            ),
+            "Ctrl+滚轮不该缩放"
+        );
+    }
+
     /// 指针拖出窗口再松手：所有按下/拖动位必须一起收掉，不能带回窗口继续拖。
     #[test]
     fn pointer_leave_cancels_stuck_drag_and_press_state() {
@@ -3802,7 +5417,7 @@ mod tests {
             dir.join("manifest.json"),
             r#"{
                 "schema":1,"id":"com.rupix.test.echo","name":"测试插件",
-                "version":"1.0.0","protocol":1,"min_host":"0.1.0",
+                "version":"1.0.0","protocol":1,"min_host":"0.0.1",
                 "kind":"command","entry":"echo.exe",
                 "capabilities":[],"platforms":["windows-x64"]
             }"#,
@@ -3997,13 +5612,42 @@ mod tests {
         );
     }
 
+    /// ★ m253：条换边之后，「扣哪一维」只许由 `work_of` 一处分派。
+    ///
+    /// 两边都必须从**完整 content** 推导：底条占满宽、左条占满高。这条钉子盯的是
+    /// "拿 work 再扣一次"那类错——那种错在底条上看不出来（work 宽 == content 宽），
+    /// 一贴左就立刻把画面扣窄两条。
+    #[test]
+    fn strip_side_decides_which_dimension_is_taken() {
+        let c = Rect::new(10, 20, 900, 700);
+
+        let b = work_of(c, filmstrip::Side::Bottom);
+        assert_eq!((b.x, b.y, b.w), (10, 20, 900), "底条只扣高，宽度原样");
+        assert_eq!(b.h, 700 - filmstrip::STRIP_H as i32);
+        assert_eq!(b.x + b.w, c.x + c.w);
+
+        let l = work_of(c, filmstrip::Side::Left);
+        assert_eq!((l.y, l.h), (20, 700), "左条只扣宽，高度原样");
+        assert_eq!(l.x, 10 + filmstrip::STRIP_W as i32, "画面要让出左边一条");
+        assert_eq!(l.w, 900 - filmstrip::STRIP_W as i32);
+        assert_eq!(l.y + l.h, c.y + c.h);
+
+        // 极端窄窗：扣到最后不许出现 0 宽/0 高（除零会造出 NaN 坐标）。
+        let tiny = Rect::new(0, 0, 10, 10);
+        assert!(work_of(tiny, filmstrip::Side::Left).w >= 1);
+        assert!(work_of(tiny, filmstrip::Side::Bottom).h >= 1);
+    }
+
     /// 缩略图格里的任何一点都不许被当成工具栏按钮——条开着时命中区下沉 96px
     /// 正好压进格子里（报障：点缩略图反而触发工具栏按钮，chrome 命中抢先于条）。
     #[test]
     fn pressing_a_filmstrip_item_never_hits_a_toolbar_button() {
         let canvas = strip_canvas();
         // `paint` 把格子摆在「完整视口」底部：与它同一份 view。
-        let items = filmstrip::layout((0.0, 0.0, 800.0, 600.0), filmstrip::capacity(800.0));
+        let items = filmstrip::layout(
+            filmstrip::Placement::new(filmstrip::Side::Bottom, (0.0, 0.0, 800.0, 600.0)),
+            filmstrip::capacity(filmstrip::Side::Bottom, 800.0),
+        );
         assert!(!items.is_empty());
         for (i, r) in items.iter().enumerate() {
             for fy in [0.1, 0.5, 0.9] {
@@ -4089,12 +5733,26 @@ mod tests {
     }
 
     #[test]
-    fn tool_submenu_exposes_picker_as_a_checkable_shortcut_item() {
+    fn current_image_submenu_keeps_four_items_and_the_picker_switch() {
         let (canvas, _) = zoomed_canvas();
-        let items = canvas.tool_items(true);
-        assert_eq!(items.len(), 1, "工具组目前只有取色器一项");
-        let it = &items[0];
-        assert_eq!(it.label, "取色器");
+        let items = canvas.current_image_items(true);
+        assert_eq!(items.len(), 5, "本图组 = 三项常驻 + 分隔线 + 取色器");
+        assert_eq!(items[0].label, "RAW 参数…");
+        assert_eq!(items[1].label, "跳转到…帧/页");
+        assert_eq!(items[2].label, "旋转角度…", "m280 新增的实时旋转入口");
+        assert!(items[3].separator, "三项动作与开关之间留一条分隔线");
+        assert_eq!(items[4].label, "取色器");
+
+        // 前两项按格式置灰：测试画布是静态合成图，既不是无头裸像素、
+        // 也没有第二帧/页可去。第三项只要求「有图」，所以是可点的。
+        assert!(
+            !items[0].enabled,
+            "普通图片不该能改 RAW 参数（相机 RAW 同理）"
+        );
+        assert!(!items[1].enabled, "静态图没有第二帧/页可跳");
+        assert!(items[2].enabled, "有图就能转，不挑格式");
+
+        let it = &items[4];
         assert!(it.checkable, "菜单里要能看出开没开");
         assert!(!it.checked, "默认关");
         assert!(it.enabled, "有图时可点");
@@ -4104,7 +5762,7 @@ mod tests {
             "快捷键提示该含 K，实得 {sc}"
         );
         assert!(
-            !canvas.tool_items(false)[0].enabled,
+            !canvas.current_image_items(false)[4].enabled,
             "空窗没有像素可采样，取色器必须置灰"
         );
     }

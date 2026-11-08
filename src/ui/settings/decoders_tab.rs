@@ -496,6 +496,7 @@ pub mod tests {
         let (ext_rows_all, ext_filter, ext_view) = decode_signals();
         let (decoders, decoder_filter, decoder_view, decoder_count) = installed_signals();
         let h = Handles {
+            update: UpdateState::new(),
             stay: sig(false),
             minimal_mode: sig(false),
             checker: sig(false),
@@ -504,14 +505,17 @@ pub mod tests {
             slide_secs: signal("3".into()),
             wheel: signal(0),
             ctrl_wheel: signal(0),
+            alt_wheel: signal(3),
+            shift_wheel: signal(3),
             init_win: signal(0),
+            borderless: sig(false),
             win_size: signal(String::new()),
             prefetch: signal(false),
             to_tray: sig(false),
             space_preview: sig(false),
             drag_image: sig(false),
             show_toolbar_buttons: sig(true),
-            filmstrip: sig(false),
+            filmstrip_pos: signal(0),
             allow_multiple: sig(false),
             opacity: signal(0.75),
             opacity_label: signal(String::new()),

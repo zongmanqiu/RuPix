@@ -30,6 +30,14 @@ REM                      its generated symbol index must equal what src/ says to
 REM                      Read-only too; --write is the fix. This is the gate that
 REM                      keeps the doc from rotting the way hand-edited numbers did
 REM                      (it claimed 46 files / 18,234 lines; disk had 45 / 19,108).
+REM   cargo doc - broken intra-doc links (m282). The six checks above read code,
+REM                      never doc comments, so 54 broken [`link`] targets sat in
+REM                      src/ unnoticed - rustdoc resolves them only when someone
+REM                      builds docs, which nobody does day to day. -D turns that
+REM                      into a judgement; -A rustdoc::private_intra_doc_links
+REM                      drops the "public doc links to a private item" noise
+REM                      (that one is not a defect). It writes HTML under
+REM                      %TARGET_DIR%\doc (inside .temp, never in main/).
 REM
 REM Either scanner reporting a violation makes this script return 1, which
 REM stops full.bat before it builds or deploys anything.
@@ -72,7 +80,7 @@ if not defined PY_EXE (
 
 echo   python : %PY_EXE%
 echo.
-echo [1/6] layering scan...
+echo [1/7] layering scan...
 "%PY_EXE%" "%~dp0layering_scan.py"
 if !ERRORLEVEL! neq 0 (
     echo.
@@ -83,7 +91,7 @@ if !ERRORLEVEL! neq 0 (
     exit /b 1
 )
 
-echo [2/6] hygiene scan...
+echo [2/7] hygiene scan...
 "%PY_EXE%" "%~dp0hygiene_scan.py"
 if !ERRORLEVEL! neq 0 (
     echo.
@@ -105,7 +113,7 @@ if errorlevel 1 (
     if not "!RUPIX_CHAINED!"=="1" pause
     exit /b 1
 )
-echo [3/6] cargo fmt --check...
+echo [3/7] cargo fmt --check...
 pushd "%MAIN_DIR%"
 cargo fmt --check
 set "FMT_RC=!ERRORLEVEL!"
@@ -124,7 +132,7 @@ REM ever ran clippy, so warnings piled up silently (the same 列而不行 mistak
 REM fmt row was on 2026-10-17). `-D warnings` is the part that makes it a gate:
 REM plain `cargo clippy` exits 0 WITH warnings, so "exit 0" proves nothing.
 REM Read-only like fmt; it does NOT produce a binary (K63 - deploy still needs 4_build).
-echo [4/6] cargo clippy -D warnings...
+echo [4/7] cargo clippy -D warnings...
 pushd "%MAIN_DIR%"
 cargo clippy --all-targets --release -- -D warnings
 set "CLIPPY_RC=!ERRORLEVEL!"
@@ -142,7 +150,7 @@ REM Structure-doc freshness. Read-only --check: the doc's counters and its
 REM generated symbol index must match src/ right now. A doc that lies about where
 REM a function lives is worse than no doc, so this fails the pipeline like any
 REM other gate - the fix is to run --write, never to hand-edit the numbers.
-echo [5/6] structure doc freshness...
+echo [5/7] structure doc freshness...
 "%PY_EXE%" "%~dp0structure_gen.py" --check
 if !ERRORLEVEL! neq 0 (
     echo.
@@ -159,11 +167,30 @@ REM evidence chain and nobody runs it day to day, so a silent regression there
 REM (e.g. the published-name -> CodeView-name mapping) surfaces only at 3 a.m.
 REM when a report has to be read. Its --selftest needs no symbol archive and no
 REM crash fixture, so it runs everywhere in under a second (m131).
-echo [6/6] dump_sym.py selftest...
+echo [6/7] dump_sym.py selftest...
 "%PY_EXE%" "%~dp0dump_sym.py" --selftest
 if !ERRORLEVEL! neq 0 (
     echo.
     echo   [ERROR] dump_sym.py selftest failed - the crash resolver is broken
+    echo.
+    cd /d "%SCRIPT_DIR%"
+    if not "!RUPIX_CHAINED!"=="1" pause
+    exit /b 1
+)
+
+REM Doc-link gate (m282). Reads comments, not code: every [`X`] target must
+REM resolve. --document-private-items is deliberate - it widens the check to
+REM private items instead of hiding them.
+echo [7/7] cargo doc - broken intra-doc links...
+pushd "%MAIN_DIR%"
+set "RUSTDOCFLAGS=-D rustdoc::broken_intra_doc_links -A rustdoc::private_intra_doc_links"
+cargo doc --no-deps --lib --document-private-items
+set "DOC_RC=!ERRORLEVEL!"
+popd
+if not "!DOC_RC!"=="0" (
+    echo.
+    echo   [ERROR] broken intra-doc link in src/ comments - point it at the real
+    echo           path or degrade it to a plain code span
     echo.
     cd /d "%SCRIPT_DIR%"
     if not "!RUPIX_CHAINED!"=="1" pause

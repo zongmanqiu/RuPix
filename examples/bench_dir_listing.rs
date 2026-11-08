@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rupix_lib::core::formats;
-use rupix_lib::core::gallery::Gallery;
+use rupix_lib::core::gallery::{Gallery, SortSpec};
 
 /// 夹具根目录（仓库根 `.temp`，与编译中间产物同处；源码目录不留中间产物）。
 const FIXTURE_ROOT: &str = "../.temp/b1-dirs";
@@ -97,8 +97,9 @@ fn ext_ok(p: &Path, declared: &HashSet<String>) -> bool {
 
 /// B 臂：整段自己写（判定换 `file_type()`、过滤前置），其余与生产一致。
 ///
-/// 排序用 `sort_by_cached_key` + 同一个 `natural_key`（`gallery::sort_natural` 是私有的；
-/// `bench_gallery_sort` 已证这两种写法等价）。
+/// 排序用 `sort_by_cached_key` + 已删除的 `natural_key` 复刻：m275 起生产排序改走系统
+/// `StrCmpLogicalW`（`gallery.rs`），这条臂的排序段**刻意停在被测那一刻的旧法**——
+/// 它比的是"枚举那一段"的钱，排序对两边是同一份成本（`bench_gallery_sort` 已交代过）。
 fn listing_no_stat(dir: &Path, declared: &HashSet<String>) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
     for e in fs::read_dir(dir).expect("B 臂读目录失败") {
@@ -173,9 +174,9 @@ fn listing_safe_no_stat(dir: &Path, declared: &HashSet<String>) -> Vec<PathBuf> 
     files
 }
 
-/// 与 `gallery.rs::natural_key` 字节级一致（同 `bench_gallery_sort` 里那份）。
-/// m111（O17）同步：数字段那两枚中间 String 换成 `write!` 直写排进键，
-/// 键本身逐字节不变，但**分配次数变了**——这份不跟着改，基准量的就是落地前的成本形状。
+/// 已删除的 `gallery.rs::natural_key` 的复刻（同 `bench_gallery_sort` 里那份）。
+/// ★ m275 起**没有生产实现要同步**：现行排序走系统 `StrCmpLogicalW`。
+/// m111（O17）那一版改动记录：数字段那两枚中间 String 换成 `write!` 直写排进键。
 fn natural_key(s: &OsStr) -> String {
     use std::fmt::Write as _;
     let s = s.to_string_lossy().to_lowercase();
@@ -308,7 +309,7 @@ fn links_case(declared: &HashSet<String>) {
     }
     // **夹具活性自检**：这条不成立就整组不算数——"两边都挡掉"不是等价性，是没测到。
     let alive = dir.join("sym.jpg").is_file();
-    let a = Gallery::from_file(&dir).expect("A 臂读链接夹具失败");
+    let a = Gallery::from_file(&dir, SortSpec::DEFAULT).expect("A 臂读链接夹具失败");
     let b = listing_no_stat(&dir, declared);
     let mut a_names: Vec<String> = (0..a.len())
         .map(|i| {
@@ -448,7 +449,7 @@ fn main() {
         );
         // ── 冷趟：只报，不参与裁决 ────────────────────────────────
         let t = Instant::now();
-        let cold_a = Gallery::from_file(&c.dir).expect("生产臂读不到夹具");
+        let cold_a = Gallery::from_file(&c.dir, SortSpec::DEFAULT).expect("生产臂读不到夹具");
         let cold_a_ms = t.elapsed().as_secs_f64() * 1000.0;
         let t = Instant::now();
         let cold_b = listing_no_stat(&c.dir, &declared);
@@ -501,7 +502,8 @@ fn main() {
                     let t = Instant::now();
                     match which {
                         0 => {
-                            let g = Gallery::from_file(&c.dir).expect("A 臂失败");
+                            let g =
+                                Gallery::from_file(&c.dir, SortSpec::DEFAULT).expect("A 臂失败");
                             a_ms.push(t.elapsed().as_secs_f64() * 1000.0);
                             black_box(g.len());
                         }

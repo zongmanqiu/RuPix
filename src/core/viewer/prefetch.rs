@@ -1,4 +1,8 @@
-//! 后台预读相邻图：窗口怎么排、什么条件算「这份够用」、两条闸（条数 / 字节）。
+//! 后台「图片预读」：邻图 ±N + 缩略图条可见的那一屏；什么条件算「这份够用」、两条闸（条数 / 字节）。
+//!
+//! ★ m265：下注集合不再只由当前索引推。条是独立滚动列表（m260），用户点格子能切到的图
+//!   全在**条上那一屏**里，这一屏可能离当前图几百张远。所以两种切图手势各有来源：
+//!   键盘 / 浮条连翻 → 方向邻居；鼠标点格子远跳 → 条可见范围。两者合并、去重、按份数封顶。
 //!
 //! 判据要点：混尺寸目录里"框的两条边都比"会永远驳回（fit 从不裁切），必须按
 //! 装进框后的**实际覆盖**判——m38 真机实测 12 次翻页有 10 次白解，就是这条写错。
@@ -10,12 +14,12 @@ impl Viewer {
 
     /// 预读偏移表的**优先级顺序**（先算的先预读）。
     ///
-    /// 同方向给满 [`PREFETCH_DEPTH`] 格、反方向只留 1 格：连续翻页的方向是可预测的
+    /// 同方向给满 `Config::prefetch_depth` 格、反方向只留 1 格：连续翻页的方向是可预测的
     /// （见 [`Self::last_dir`]），而反方向留一格是为了「A→B→A」来回翻仍然命中——
     /// 原来那份在翻到 B 时就被消费掉了。方向未定时退回**对称交错**（`+1,-1,+2,-2`），
     /// 两边都不赌。
     pub(super) fn prefetch_offsets(&self) -> Vec<isize> {
-        let d = PREFETCH_DEPTH as isize;
+        let d = self.config.borrow().prefetch_depth as isize;
         if self.last_dir > 0 {
             (1..=d).chain([-1]).collect()
         } else if self.last_dir < 0 {
@@ -25,21 +29,87 @@ impl Viewer {
         }
     }
 
-    /// 为当前图的邻居发起后台预读（同一时刻至多一个在途请求）。
+    /// 本轮「图片预读」的下注集合：按优先序、去重、有界，返回**清单索引**。
+    ///
+    /// 两条来源对应两种切图手势：
+    /// ① **邻图**：[`Self::prefetch_offsets`] 的方向感知 ±N —— 键盘 / 浮条连续翻页；
+    /// ② **缩略图条可见的那一屏** —— 鼠标点格子。m260 之后条是独立滚动列表，
+    ///    当前图可以完全不在视野里，这一屏没法由「当前索引 ±k」推出来。
+    ///
+    /// 条内按「离当前图由近到远」排：一屏里每格都是等价的点击目标，先落近的；
+    /// 合并后截到 [`PREFETCH_CAP`]，所以窗口再宽、目录再大，下注集合也不长。
+    pub(super) fn prefetch_targets(&self) -> Vec<usize> {
+        let Some(g) = self.gallery.as_ref() else {
+            return Vec::new();
+        };
+        let n = g.len();
+        if n <= 1 {
+            return Vec::new();
+        }
+        let cur = g.position().saturating_sub(1);
+        let mut out: Vec<usize> = Vec::with_capacity(PREFETCH_CAP);
+        {
+            // 当前图自己不必预读（它已经在屏上 / 正在解）。
+            let mut push = |idx: usize| {
+                if idx != cur && idx < n && !out.contains(&idx) {
+                    out.push(idx);
+                }
+            };
+            for off in self.prefetch_offsets() {
+                push((cur as isize + off).rem_euclid(n as isize) as usize);
+            }
+            if let Some((first, count)) = self.prefetch_strip {
+                let mut strip: Vec<usize> = (first..first.saturating_add(count))
+                    .filter(|&i| i < n)
+                    .collect();
+                strip.sort_by_key(|&i| i.abs_diff(cur));
+                for i in strip {
+                    push(i);
+                }
+            }
+        }
+        out.truncate(PREFETCH_CAP);
+        out
+    }
+
+    /// 缩略图条这一屏的索引窗口（由 [`Viewer::strip_window`] 每帧喂进来）。
+    ///
+    /// `n == 0` 表示条关着 / 窗口放不下：`prefetch_targets` 自动退回纯邻图，功能不退步。
+    /// 范围变了就是**新一轮下注**：旧一屏的位图不再有人会点，留着只会占住份数闸，
+    /// 入缓存时一淘汰就把 `prefetch_stopped` 置上（表现：滚两下连邻图都不预读了）。
+    pub fn set_prefetch_strip(&mut self, first: usize, n: usize) {
+        let now = (n > 0).then_some((first, n));
+        if self.prefetch_strip == now {
+            return;
+        }
+        self.prefetch_strip = now;
+        let keep: Vec<PathBuf> = self
+            .prefetch_targets()
+            .iter()
+            .filter_map(|&i| self.gallery.as_ref().and_then(|g| g.peek(i)).cloned())
+            .collect();
+        self.prefetched.retain(|e| keep.contains(&e.path));
+        self.prefetch_stopped = false;
+        self.request_prefetch();
+    }
+
+    /// 为下注集合里还缺的那一图发起后台预读（同一时刻至多一个在途请求）。
     ///
     /// 解码线程是串行的：预读请求排在当前解码之后，只在空闲时消耗 CPU，
     /// 不与正在看的图抢路。SVG 同样预读（整图路线，作首帧；翻到它后
     /// `tick` 会按可视区域 1:1 重渲接管清晰度）。
     ///
     /// ★ **方向感知**（m34）：偏移表按 [`Self::last_dir`] 排——刚往前翻，就把前面
-    /// 两张排在前面两张之前。同方向开 [`PREFETCH_DEPTH`] 格、反方向留 1 格：
+    /// 两张排在前面两张之前。同方向开 `Config::prefetch_depth` 格、反方向留 1 格：
     /// 连续翻页的方向是可预测的，而反方向留一格是为了「A→B→A」这种来回翻
     /// 仍能命中（原来那份在翻到 B 时就被消费掉了）。
+    /// ★ **条范围并入**（m265）：候选不再只有 `cur ± k`。用户快速点击切换时，
+    /// 点到的必然是条上那一屏里的某一格；把这一屏并进下注集合，远跳也能零解码。
     pub(super) fn request_prefetch(&mut self) {
         if self.prefetch_stopped || self.prefetch_seq.is_some() {
             return;
         }
-        // 用户关掉了「邻图预读」（ini `prefetch=0`）：一台安静的机器也是需求。
+        // 用户关掉了「图片预读」（ini `prefetch=0`）：一台安静的机器也是需求。
         // 关的是**发起**这一侧——已在途的那一枚照常回来、已缓存的那些照常命中，
         // 不做任何"顺手清空"，免得改一个开关把用户正看着的东西抖一下。
         if !self.config.borrow().prefetch {
@@ -57,21 +127,30 @@ impl Viewer {
         }
         // 与 [`Self::use_prefetched`] 同一框：预读要的就是视口档，命中判定才有意义。
         let (bw, bh) = self.viewport_pixels();
-        let n = g.len() as isize;
-        let cur = g.position() as isize - 1;
-        for off in self.prefetch_offsets() {
-            if self.prefetch_seq.is_some() {
-                break;
-            }
-            let idx = (cur + off).rem_euclid(n) as usize;
+        let plan = self.prefetch_targets();
+        let cur = g.current().cloned();
+        // 「计划内都齐了」按**路径**数，不按缓存长度：条滚走之后缓存里可能还留着
+        // 上一屏的位图，拿长度当就绪数会以为已经齐了、从此不再发新一屏的预读。
+        let ready = plan
+            .iter()
+            .filter(|&&i| {
+                g.peek(i)
+                    .is_some_and(|p| self.prefetched.iter().any(|e| &e.path == p))
+            })
+            .count();
+        if ready >= plan.len() {
+            return;
+        }
+        for idx in plan {
             let Some(p) = g.peek(idx) else { continue };
-            let p = p.clone();
-            if Some(&p) == g.current() || self.prefetched.iter().any(|e| e.path == p) {
+            if Some(p) == cur.as_ref() || self.prefetched.iter().any(|e| e.path == *p) {
                 continue;
             }
+            let p = p.clone();
             // ◆ 预读同样点亮降采样：它是"下一次翻页的首屏"，与主画面首解同一口径。
             //   视口那一框本来就够用，省下的解码时间正好让它在用户翻到之前就绪（m35）。
             self.prefetch_seq = Some(self.send_decode(&p, bw, bh, 0, ReqKind::Prefetch, true));
+            break;
         }
     }
 
@@ -122,12 +201,15 @@ impl Viewer {
 
     /// 预读结果入缓存（同路径覆盖，超限淘汰最旧的）。
     ///
+    /// m265 之后下注集合最多 [`PREFETCH_CAP`] 张，条数闸只在「旧一屏的位图还没
+    /// 换完血」这种过渡态才会触发；真正封驻留的仍是字节闸。
+    ///
     /// 尺寸账（2026-10-17 复算，见 `docs/踩坑记录/踩坑记录.md` K45）：这里存的是**视口档**，不是原图档——
     /// [`Self::request_prefetch`] 用的框是 `视口逻辑尺寸 × dpi`，解码器出来就经 `fit_to` 收到该框内，
     /// 所以一份预读 ≈ 视口像素 × 4 B（4K 满屏约 31.6 MiB）。
     ///
     /// **两条闸**（m34）：条数 [`PREFETCH_CAP`] + 字节 [`PREFETCH_BYTES`]。
-    /// 加字节闸是因为窗口从 ±1 扩到 ±[`PREFETCH_DEPTH`] 之后，"条数封顶"不再等价于
+    /// 加字节闸是因为窗口从 ±1 扩到 ±N（ini `prefetch_depth`）之后，"条数封顶"不再等价于
     /// "内存封顶"——4K 与 5K 屏上一份差近一倍，得让驻留有确定的字节上界。
     ///
     /// ★ `len() > 1` 这个前置条件不能省：单份就超预算时若也淘汰，缓存会被清空、

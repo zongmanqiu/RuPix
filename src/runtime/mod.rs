@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use windui::core::EventCtx;
 use windui::prelude::*;
 
-use crate::core::config::{clamp_window_size, Config, InitWindow};
+use crate::core::config::{Config, InitWindow};
 use crate::core::decode::{DecodeSink, Decoder, Done, MetaEvent};
 use crate::core::viewer::Viewer;
 use crate::platform::dir_watch::{DirEvent, DirWatcher};
@@ -86,7 +86,7 @@ fn submit_window_op(
     true
 }
 
-/// 还原固定尺寸只适用于固定尺寸档，不能盖掉自然尺寸档。
+/// 还原固定尺寸只适用于固定尺寸档，全屏档自己管还原。
 fn needs_restored_size(
     was_maximized: bool,
     maximized: bool,
@@ -96,12 +96,35 @@ fn needs_restored_size(
     was_maximized && !maximized && !fullscreen && mode == InitWindow::Fixed
 }
 
+/// 「图片尺寸」档的窗口客户区：图片原始像素等比缩进工作区（m269 起，m271 归到
+/// `InitWindow::Natural` 这一档，不再由无边框触发）。
+///
+/// ★ 等比是硬要求：框架 `set_client_size` 分别夹宽高，直接丢 6000×4000 会变成
+///   1920×1080 的 16:9 窗口，「窗口形状 = 图片形状」就不成立。下限 100 与
+///   `.min_size(100, 100)` 对齐；小图整体放大到最短边 100，仍然保形。
+fn fit_image_into(w: u32, h: u32, max_w: u32, max_h: u32) -> (i32, i32) {
+    let (mw, mh) = (max_w.max(100) as f64, max_h.max(100) as f64);
+    let (fw, fh) = (w.max(1) as f64, h.max(1) as f64);
+    let s = (mw / fw).min(mh / fh).min(1.0);
+    let (mut cw, mut ch) = ((fw * s).round(), (fh * s).round());
+    let s_min = (100.0 / cw).max(100.0 / ch);
+    if s_min > 1.0 {
+        cw *= s_min;
+        ch *= s_min;
+    }
+    (cw.round().max(1.0) as i32, ch.round().max(1.0) as i32)
+}
+
+fn fit_image_to_work_area(w: u32, h: u32) -> (i32, i32) {
+    let (aw, ah) = crate::platform::window_frame::work_area();
+    fit_image_into(w, h, aw, ah)
+}
+
 fn apply_pending_window(
     ctx: &mut EventCtx,
     sent: &mut bool,
     pending: &Cell<Option<(InitWindow, u32, u32)>>,
     applied: &Cell<(InitWindow, u32, u32)>,
-    dims: Option<(u32, u32)>,
 ) -> bool {
     let Some(cur @ (mode, w, h)) = pending.get() else {
         return false;
@@ -124,14 +147,10 @@ fn apply_pending_window(
                 ctx.set_window_size(w as i32 - fw, h as i32 - fh)
             })
         }
-        InitWindow::Natural => {
-            if let Some((w, h)) = dims.filter(|&(w, h)| w > 0 && h > 0) {
-                let (w, h) = clamp_window_size(w, h);
-                submit_window_op(ctx, sent, |ctx| ctx.set_window_size(w as i32, h as i32))
-            } else {
-                false // 未解码时不能消费自然尺寸待办。
-            }
-        }
+        // 「图片尺寸」档不在这条路上量尺寸：窗口要等解码知道图多大才算得出来，
+        // 由 `on_frame` 里的 `natural_size` 账每帧跟（换图才动手）。这里直接算完成，
+        // 免得一枚永远消费不掉的待办占着唯一的窗口操作槽。
+        InitWindow::Natural => true,
     };
     if completed {
         pending.set(None);
@@ -192,15 +211,25 @@ fn apply_minimal_mode(chrome: &Chrome, want: bool, applied: &Cell<bool>) -> bool
 fn apply_session_flags(chrome: &Chrome, cfg: &Config) -> bool {
     // m245：按钮显隐是全局配置的运行时镜像；值变了也要标脏，否则切换后不重绘。
     let mut changed = crate::ui::chrome::set_toolbar_buttons(cfg.show_toolbar_buttons);
+    // m269：形态开关也是全局镜像；值变了要标脏，否则切换后不重绘、热区也还旧着。
+    changed |= crate::ui::chrome::set_borderless(cfg.borderless);
+    let was_strip = (chrome.filmstrip.get(), chrome.filmstrip_left.get());
     for (slot, want) in [
         (&chrome.checker, cfg.checker),
         (&chrome.filmstrip, cfg.filmstrip),
+        (&chrome.filmstrip_left, cfg.filmstrip_left),
         (&chrome.locked, cfg.locked),
     ] {
         if slot.get() != want {
             slot.set(want);
             changed = true;
         }
+    }
+    // m254：条刚被打开 / 换了边，且现在是开着的 ⇒ 请 `paint` 检查一次
+    // 「放不下就先放大窗口」。只置一次，消费即清（见 `Chrome::strip_fit_request`）。
+    if chrome.filmstrip.get() && (chrome.filmstrip.get(), chrome.filmstrip_left.get()) != was_strip
+    {
+        chrome.strip_fit_request.set(true);
     }
     changed
 }
@@ -359,7 +388,11 @@ struct WinRt {
     applied_opacity: Cell<u8>,
     startup_ops: RefCell<Vec<StartOp>>,
     was_maximized: Cell<bool>,
-    natural_pending: Cell<bool>,
+    /// 无边框形态是否已经推给框架（框架默认不透明，故初值 false）。
+    borderless_applied: Cell<bool>,
+    /// 上次按哪张图、哪个自然尺寸调过窗口（仅「图片尺寸」档用；换图即重算，
+    /// 不每帧重复下发。与无边框无关——那是另一条轴）。
+    natural_size: RefCell<Option<(PathBuf, u32, u32)>>,
     size_settle: Cell<u32>,
     size_seen: Cell<(InitWindow, u32, u32)>,
     window_pending: Cell<Option<(InitWindow, u32, u32)>>,
@@ -394,10 +427,11 @@ impl WinRt {
             let c = config.borrow();
             chrome.checker.set(c.checker);
             chrome.filmstrip.set(c.filmstrip);
+            chrome.filmstrip_left.set(c.filmstrip_left);
             chrome.locked.set(c.locked);
         }
-        // 尺寸档的初值：装配期那份由 `startup_ops` / `natural_pending` 负责，
-        // 故这里取配置值，首帧不会重复下发。
+        // 尺寸档的初值：装配期那份由 `startup_ops` 负责，故这里取配置值，
+        // 首帧不会重复下发。
         let applied_window = Cell::new({
             let c = config.borrow();
             (c.init_window, c.window_w, c.window_h)
@@ -414,9 +448,11 @@ impl WinRt {
             }
             v
         });
-        let has_initial = initial.is_some();
-        let natural_pending =
-            Cell::new(has_initial && config.borrow().init_window == InitWindow::Natural);
+        // m269：框架默认建的是不透明窗，所以 applied 初值 false；盘上勾了无边框，
+        // 首帧自然会把透明形态推下去。m271：尺寸跟随改由「图片尺寸」档驱动，
+        // 按「路径 + 自然尺寸」记账，与无边框拆成两条轴。
+        let borderless_applied = Cell::new(false);
+        let natural_size: RefCell<Option<(PathBuf, u32, u32)>> = RefCell::new(None);
         let now = Instant::now();
         let (dir_tx, dir_rx) = channel::<DirEvent>();
         let me = Rc::new(Self {
@@ -432,7 +468,8 @@ impl WinRt {
             applied_opacity,
             startup_ops,
             was_maximized: Cell::new(false),
-            natural_pending,
+            borderless_applied,
+            natural_size,
             size_settle: Cell::new(0),
             size_seen: Cell::new({
                 let c = config.borrow();
@@ -521,7 +558,7 @@ impl WinRt {
         let hub = shared.hub.clone();
 
         // 宿主更新：后台线程只投递结果，弹窗 / 退出统一在活动窗口这一拍处理。
-        crate::runtime::update::poll(ctx, &config);
+        crate::runtime::update::poll(ctx, &config, &hub);
         // 安装轮询（下载/卸载进度）：250 ms 一次，提示落在活动窗口上。
         if shared.last_install_poll.get().elapsed() >= Duration::from_millis(250) {
             shared.last_install_poll.set(Instant::now());
@@ -712,6 +749,15 @@ impl WinRt {
         //   "活动的那一扇"在跑——于是后台窗口排的裸数据会一直等到它被点中才弹窗，
         //   用户看到的是"我拖进来的文件没反应"。窗口段每扇窗都跑，各取各的队。
         crate::ui::raw_dialog::poll_pending(ctx, &self.viewer, &config);
+        // 旋转角度（m280）：stepper 在独立对话框里改信号，这里拿的是**主窗**的 ctx，
+        // 标脏一定落到主窗；差分比对，同值零动作，不会让空闲窗口空转重绘。
+        // 与上面 `poll_pending` 同一条「窗口段每扇窗各跑各的」跨窗范式。
+        let deg = self.chrome.rotate_deg.get();
+        if (deg - self.chrome.rotate_seen.get()).abs() > f64::EPSILON {
+            self.chrome.rotate_seen.set(deg);
+            ctx.mark_dirty_all();
+        }
+
         // 一次性提示走顶部消息窗，不占浮条的状态格：那一格只放「图片进度 · 缩放百分比
         // [· 帧/页号]」，被一句话顶掉就丢了基础信息（用户 2026-11-06）。取走即清空，
         // 下一拍不会重复弹；每窗一份 Viewer，多开时各弹各的。
@@ -771,11 +817,7 @@ impl WinRt {
             if cur != last {
                 // 换档立即下发；固定尺寸文本框要等同一个值稳定 40 帧。
                 if mode != last.0 {
-                    // 用户已经改走别的档：启动期那枚"按首图开窗"的待办必须作废，
-                    // 否则首图解码落地时它会抢走唯一的窗口操作位，把用户刚选的尺寸顶掉。
-                    if mode != InitWindow::Natural {
-                        self.natural_pending.set(false);
-                    }
+                    // 换档立即下发（m269 后已无「按首图开窗」那枚启动待办）。
                     self.size_seen.set(cur);
                     self.window_pending.set(Some(cur));
                     self.size_settle.set(0);
@@ -794,21 +836,37 @@ impl WinRt {
                 self.size_settle.set(0);
             }
         }
-        let dims = self.viewer.borrow().info_dims();
+        let want_bl = config.borrow().borderless;
+        // m271：「图片尺寸」档的尺寸由本帧的跟随逻辑算（见下面 natural_size 那段），
+        // 档位差分下发的那一份要让路，否则一拍里两个 set_client_size 抢同一个槽。
+        // 顺手把 `applied_window` 对齐：不然它永远追不上 `cur`，每帧都要重设一遍待办。
+        if mode == InitWindow::Natural {
+            let c = config.borrow();
+            self.applied_window
+                .set((c.init_window, c.window_w, c.window_h));
+            self.window_pending.set(None);
+        }
         if apply_pending_window(
             ctx,
             &mut window_op_sent,
             &self.window_pending,
             &self.applied_window,
-            dims,
         ) {
-            self.natural_pending.set(false);
             self.restored_size_pending.set(false);
         }
         // 三个会话态（m53-L）：所有切换入口都当场写配置并推设置页，所以配置
         // 是唯一真值——这里每帧对齐一次，设置页勾「棋盘格」也就即时上屏。
         if apply_session_flags(&self.chrome, &config.borrow()) {
             ctx.mark_dirty();
+        }
+        // m254：条放不下时 `paint` 算好的放大目标在这里落地（物理像素，工作区由框架夹）。
+        // 窗口操作槽一拍只发一个：被占就放回去，下一拍再试。
+        if let Some((w, h)) = self.chrome.strip_resize.take() {
+            if submit_window_op(ctx, &mut window_op_sent, |ctx| ctx.set_window_size(w, h)) {
+                log::debug!("缩略图条放不下，窗口先放大到 {w}x{h}");
+            } else {
+                self.chrome.strip_resize.set(Some((w, h)));
+            }
         }
         // 不透明度：改动才下发（改样式/重算整帧都有成本，每帧重设没必要）。
         //
@@ -880,6 +938,13 @@ impl WinRt {
             //   结果包照收（不积压队列），只是不再发起新的解码请求；
             //   窗口恢复后 tick 自然把欠下的那份重解发了。
             arrived |= advance(&mut v, ctx.window_state().visible);
+            // ★ 排序（m275，ini 键 sort_by / sort_desc）：配置是唯一真值，每帧对齐一次——
+            //   右键「排序 ▸」改完当场重排，手改 ini 也在下一次 tick 生效。
+            //   重排**不动当前这张**（它是锚点），所以不必重解码、不用等下一帧画面。
+            //   与 `apply_session_flags` 同一个套路：比一比，变了才动手。
+            if v.sync_sort() {
+                dir_changed = true;
+            }
             // 看门狗巡检（P1.1 C1）：解码线程卡死时这里不会收到回包，
             // 所以巡检放在**兜底轮询**里（而不是回包泵里——那正是不会响的地方）。
             // 到点只记一条 warn，不弹提示：阈值没有现场数据校准过，误报比不报更坏。
@@ -891,7 +956,7 @@ impl WinRt {
         // 真的还原那一帧触发一次。
         let ws = ctx.window_state();
         // 有待办的窗口动作时让路：同一帧只有一个窗口操作位，先发这个会把
-        // 队列里那枚（全屏/图片尺寸）顶掉，而且 `window_pending` 已被清空、不会重试。
+        // 队列里那枚（全屏）顶掉，而且 `window_pending` 已被清空、不会重试。
         if self.restored_size_pending.get()
             && !ws.maximized
             && !ws.fullscreen
@@ -908,22 +973,43 @@ impl WinRt {
                 self.restored_size_pending.set(false);
             }
         }
-        // 图片尺寸档（init_window=3）：启动首图解码完成后按图片原始像素开窗
-        // （windui 自带夹工作区+居中；最大化/全屏态它自己会跳过，等还原后
-        // 下一轮再补）。翻页不跟随——置旗防重复。
-        //
-        // 判据改成**状态**（`info_dims` 有值）而不是"本帧有没有收到结果包"：
-        // 本帧可能因为启动动作占着唯一的窗口操作位而发不出去（见 `StartOp`），
-        // 按帧事件判据那一刀就永久丢了，按状态判据下一帧自然补上。
-        if self.natural_pending.get() && !window_op_sent && !ws.maximized && !ws.fullscreen {
-            let dims = self.viewer.borrow().info_dims();
-            if let Some((w, h)) = dims {
-                if w > 0 && h > 0 {
-                    let (cw, ch) = clamp_window_size(w, h);
+        // ★ m269 无边框形态：窗口贴图片尺寸、自绘 chrome 全隐、图片透明区透出桌面。
+        // 框架那侧只收一枚 bool（补丁 028）：alpha=255 仍走逐像素分层、底色透明、
+        // 最终 DIB 的 alpha 下限 1 ⇒ 看得见下层但鼠标落回本窗（**不穿透**）。
+        // 窗口操作槽一拍只发一个，被占就下一拍补，所以判据一律是「状态」不是「事件」。
+        if want_bl != self.borderless_applied.get()
+            && submit_window_op(ctx, &mut window_op_sent, |ctx| {
+                ctx.set_transparent_background(want_bl)
+            })
+        {
+            self.borderless_applied.set(want_bl);
+            // 形态切换会让自绘外框那圈有无变化，尺寸账作废重算一次。
+            *self.natural_size.borrow_mut() = None;
+            ctx.mark_dirty();
+        }
+        let ws = ctx.window_state();
+        // ★ m271「图片尺寸」档：窗口客户区跟着**当前这张图**走，与无边框正交。
+        //   换图（路径或自然尺寸变了）/ 改档 / 退出全屏都会重算；一拍只发一个窗口操作，
+        //   槽被占就下一拍补，所以判据一律是「状态」不是「事件」。
+        if mode != InitWindow::Natural || ws.maximized || ws.fullscreen {
+            // 离开该档、或正处在最大化/全屏：清账。回到常规态时按当前图重新开窗。
+            *self.natural_size.borrow_mut() = None;
+        } else if !window_op_sent {
+            let key = {
+                let v = self.viewer.borrow();
+                v.current_path().zip(v.info_dims())
+            };
+            if let Some((path, (w, h))) = key {
+                let fresh = self.natural_size.borrow().as_ref() != Some(&(path.clone(), w, h));
+                if fresh && w > 0 && h > 0 {
+                    let (cw, ch) = fit_image_to_work_area(w, h);
+                    // `set_client_size` 收的是**客户区**像素；frameless 窗那圈不显示的
+                    // 系统边框仍算进外框，减掉它可见窗口才恰好等于图片尺寸。
+                    let (fw, fh) = crate::platform::window_frame::frameless_frame();
                     if submit_window_op(ctx, &mut window_op_sent, |ctx| {
-                        ctx.set_window_size(cw as i32, ch as i32)
+                        ctx.set_window_size((cw - fw).max(1), (ch - fh).max(1))
                     }) {
-                        self.natural_pending.set(false);
+                        *self.natural_size.borrow_mut() = Some((path, w, h));
                     }
                 }
             }
@@ -1134,14 +1220,6 @@ pub fn run(initial: Option<PathBuf>) {
                     }
                 })
             },
-            {
-                let shared = shared.clone();
-                Rc::new(move |tctx: &mut TrayCtx| {
-                    for req in wake_requests(&shared, true, None) {
-                        tctx.open_window(req);
-                    }
-                })
-            },
         ));
     let tray_handle = app.tray_handle();
 
@@ -1338,15 +1416,45 @@ mod tests {
     }
 
     #[test]
-    fn host_audit_natural_restore_never_requests_fixed_size() {
+    fn host_audit_fullscreen_restore_never_requests_fixed_size() {
         assert!(!needs_restored_size(
             true,
             false,
             false,
-            InitWindow::Natural
+            InitWindow::Fullscreen
         ));
         assert!(needs_restored_size(true, false, false, InitWindow::Fixed));
         assert!(!needs_restored_size(true, true, false, InitWindow::Fixed));
+    }
+
+    /// m269：窗口形状必须等比跟着图片，不能被框架「分别夹宽高」拉变形。
+    #[test]
+    fn borderless_fit_keeps_aspect_and_clamps_to_work_area() {
+        assert_eq!(
+            fit_image_into(800, 600, 1920, 1080),
+            (800, 600),
+            "放得下就不缩"
+        );
+        assert_eq!(
+            fit_image_into(6000, 4000, 1920, 1080),
+            (1620, 1080),
+            "横图按高缩"
+        );
+        assert_eq!(
+            fit_image_into(4000, 6000, 1920, 1080),
+            (720, 1080),
+            "竖图按宽缩"
+        );
+        assert_eq!(
+            fit_image_into(32, 16, 1920, 1080),
+            (200, 100),
+            "小图放大仍保形"
+        );
+        assert_eq!(
+            fit_image_into(0, 0, 1920, 1080),
+            (100, 100),
+            "退化输入不产生 0 尺寸"
+        );
     }
 
     /// 关窗三条去路与优先级：锁定 > 还有别的窗口 > 关闭到托盘 > 退出。
@@ -1416,8 +1524,17 @@ mod tests {
         cfg.filmstrip = true;
         cfg.locked = true;
         assert!(apply_session_flags(&chrome, &cfg), "翻转要报重绘");
+        assert!(
+            chrome.strip_fit_request.get(),
+            "刚打开条要请 paint 检查一次「放不下先放大窗口」"
+        );
+        chrome.strip_fit_request.set(false); // 相当于 paint 消费掉
         assert!(chrome.checker.get() && chrome.filmstrip.get() && chrome.locked.get());
         assert!(!apply_session_flags(&chrome, &cfg), "已对齐后不该反复重绘");
+        assert!(
+            !chrome.strip_fit_request.get(),
+            "没有变化就不该反复请求放大（否则用户拉不小窗口）"
+        );
 
         cfg.checker = false;
         assert!(apply_session_flags(&chrome, &cfg));

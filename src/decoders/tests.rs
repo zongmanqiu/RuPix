@@ -8,7 +8,7 @@ use super::select::*;
 use super::*;
 
 /// 版本区间判定：v5 起「相等才收」改为「区间即收」——v5 之后的 DLL 不再因
-/// 宿主升级而集体作废（这是 ABI 前向兼容的核心承诺，见 [`MIN_ABI_VERSION`]）。
+/// 宿主升级而集体作废（这是 ABI 前向兼容的核心承诺，见 `MIN_ABI_VERSION`）。
 #[test]
 fn abi_version_is_range_checked_not_equal() {
     assert!(abi_compatible(5), "冻结点本身必须可载");
@@ -1096,13 +1096,20 @@ fn doc_natural_query_only_for_self_rendered_region_vectors() {
 // 用假的 `Z:\` 路径：锁表只按路径分格，碰不到真 DLL。
 
 /// 两线程抢同一枚 DLL ⇒ 严格排队（B 的"进"排在 A 的"出"之后）。
+///
+/// ★ 先后由**握手**决定，不由调度决定（m283 加固）。原来主线程 `sleep(15 ms)` 赌 A 已被
+/// 调度起来，机器忙时 A 还没醒，B 就先拿了锁 ⇒ 日志成 `["B-in","A-in","A-out"]` 假红
+/// （m281 那轮真遇到过）。现在 A 持锁后回一拍、拿到放行信号才松手，B 在另一条线程上等：
+/// A 松手时等锁的只有 B，所以"谁先进"是锁自己保证的，跟线程调度无关。
 #[test]
 fn dll_lock_serializes_two_threads_on_the_same_dll() {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
 
     let key = std::path::PathBuf::from(r"Z:\rupix-dll-lock\same\a.dll");
     let log = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let (held_tx, held_rx) = mpsc::channel::<()>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
 
     let inner = Arc::clone(&log);
     let k = key.clone();
@@ -1115,23 +1122,36 @@ fn dll_lock_serializes_two_threads_on_the_same_dll() {
         )
         .expect("第一笔应先拿到锁");
         inner.lock().unwrap().push("A-in");
-        std::thread::sleep(Duration::from_millis(80));
+        held_tx.send(()).expect("主线程不该先退出");
+        go_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("主线程应放行");
         inner.lock().unwrap().push("A-out");
     });
 
-    // 让第一笔先跑起来，否则下面那句可能抢在它前面（这条用例要的是"排队"，不是赛跑）。
-    std::thread::sleep(Duration::from_millis(15));
-    {
+    held_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("第一笔应在 5 s 内拿到锁");
+
+    let inner2 = Arc::clone(&log);
+    let k2 = key.clone();
+    let second = std::thread::spawn(move || {
         let _g = super::dll_lock::enter_within(
-            &key,
+            &k2,
             "bridge",
             Duration::from_secs(2),
             super::dll_lock::Class::Urgent,
         )
         .expect("第二笔应等到第一笔松开");
-        log.lock().unwrap().push("B-in");
-    }
+        inner2.lock().unwrap().push("B-in");
+    });
+
+    // 这 20 ms 只是让 B 尽早挂到等待队列上；它没挂上也一样——放行时只有 B 在等锁，
+    // 顺序不会翻（A 已经在 `A-out` 之后才 drop，B 只能在这个点之后进）。
+    std::thread::sleep(Duration::from_millis(20));
+    go_tx.send(()).expect("第一笔应还在等放行");
     first.join().expect("第一笔线程不该崩");
+    second.join().expect("第二笔线程不该崩");
 
     assert_eq!(
         *log.lock().unwrap(),

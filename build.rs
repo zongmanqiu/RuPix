@@ -66,7 +66,7 @@ fn main() {
 
         // 把 `assets/rupix.rc`（1 ICON "rupix.ico"）烙进 exe 的 .rsrc：资源管理器、
         // 任务管理器、固定快捷方式显示的图标来自这里；窗口/托盘/标题栏的图标走
-        // 运行时 SVG 光栅化（brand::logo_rgba），两条路同一份 image/icon.svg。
+        // 运行时 SVG 光栅化（brand::logo_rgba），两条路同一份 assets/icon.svg。
         // rc.exe 发现链：`RC_<target>`/`RC` env → Windows Kits 注册表 → PATH；
         // manifest_optional：无资源编译器时降级为警告而非硬失败（与 windui build.rs 同款）
         // ——真失败会被 brand 的 pe_icon_asset 测试与 deploy.py 的 PE 门禁拦住。

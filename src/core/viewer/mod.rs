@@ -14,12 +14,12 @@
 //! （由 base 本地面积采样派生，尺寸记在 [`Loaded::displayed`]）。两者分开是刻意的：
 //!
 //! - 首解仍按**视口档**要（小图一步到位，大图省一份常驻）；
-//! - 首解一落地，[`Self::tick`] 就**主动**补一次原图档升级（`send_decode(.., 0, 0, ..)`，
+//! - 首解一落地，`Self::tick` 就**主动**补一次原图档升级（`send_decode(.., 0, 0, ..)`，
 //!   不等用户放大——m58 实测慢翻臂 12/12 都在落地后发生），到手之后 base 就是整图，
 //!   **此后所有缩放都只做本地派生，不再碰解码器**。为什么不等放大：实测阶梯
 //!   30→50→80% 时"一次整解 + 两次本地换档"胜过"三次整解"（见下方数字与 §一 那条实测）。
 //! - ★ 但这次升级**给翻页让路**（m58）：连续翻页时这一张已不在屏上，而一次原图档整解要
-//!   独占唯一那条解码线程 150–500 ms 且不可抢占。判据见 [`Self::upgrade_can_wait`]。
+//!   独占唯一那条解码线程 150–500 ms 且不可抢占。判据见 `Self::upgrade_can_wait`。
 //!
 //! 为什么这样分：实测本解码器集不理 `target_w/target_h`（240×180 的缩略图也要整解一遍，
 //! 见 本仓历史记录 §七），"按视口档要"省不到解码时间，
@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use crate::core::config::Config;
 use crate::core::decode::{Decoder, Done, Meta, MetaEvent, RegionReq, ReqKind};
 use crate::core::error::ViewError;
-use crate::core::gallery::{Gallery, Jump};
+use crate::core::gallery::{Gallery, Jump, SortSpec};
 use crate::core::geometry::{downscale, fit_dims, transformed, RectI};
 use crate::core::pixels::{Anim, Decoded, Region, RgbaImage, MAX_PIXELS};
 use crate::core::thumbs::Thumbs;
@@ -96,19 +96,30 @@ pub(crate) const NOTE_STILL: &str = "这张图只有一帧";
 /// （见模块头「位图的两档」），不再用这条比例闸。
 const SHARP_ENOUGH: f32 = 0.90;
 
-/// 预读窗口深度（**每个方向**预取几张）。
-///
-/// 业界对"切图瞬切"的公认答案是**预解码邻居**，不是金字塔：QuickImageViewer 把它印在
-/// README 上当卖点（"Instant image switching ✅ pre-decoded neighbours"，`preloadLookaside`），
-/// viewskater 用滑窗 + 字节预算 LRU 实现同一件事。原来是前/后各 1 张：只要用户按得比
-/// 解码快一格，下一张就是冷解；多给后台一格余量，连续翻页就能一直吃到命中。
-///
-/// ★ 不是越大越好：解码线程是**串行**的，预取请求排在当前解码之后，加大深度只增加
-/// 后台工作量，不会让单张更快——超过某个深度反而把当前图的重解挤到队尾。
-const PREFETCH_DEPTH: usize = 2;
+// 预读窗口深度**不再是本模块的常量**：m281 起由 `Config::prefetch_depth` 给
+// （ini `prefetch_depth`，默认 3，范围 1..=4，**界面不出现**）。判据不在这里抄第二份：
+// `prefetch_offsets` 每轮换下注时直接读内存 Config，不在本模块另存一份常量。
+// 设置页改开关当场生效；**手改 ini 要重启**——文件只在启动时载入一次。
+//
+// 业界对"切图瞬切"的公认答案是**预解码邻居**，不是金字塔：QuickImageViewer 把它印在
+// README 上当卖点（"Instant image switching ✅ pre-decoded neighbours"，`preloadLookaside`），
+// viewskater 用滑窗 + 字节预算 LRU 实现同一件事。原来是前/后各 1 张：只要用户按得比
+// 解码快一格，下一张就是冷解；多给后台一格余量，连续翻页就能一直吃到命中。
+//
+// ★ 不是越大越好：解码线程是**串行**的，预取请求排在当前解码之后，加大深度只增加
+// 后台工作量，不会让单张更快——超过某个深度反而把当前图的重解挤到队尾。
+// 上限的理由与数值都记在 `core::config::PREFETCH_DEPTH_MAX`，这里不留第二份。
 
-/// 预读缓存上限（份）。装得下整个窗口即可：前后各 [`PREFETCH_DEPTH`]，另留 1 格余量。
-const PREFETCH_CAP: usize = 2 * PREFETCH_DEPTH + 1;
+/// 预读缓存上限（份）＝ **本轮下注集合的上界**。
+///
+/// m265 起「图片预读」有两条来源：方向邻居（未定向时最多 `2×深度` 格）、
+/// 缩略图条可见的那一屏（常规 7 格）。
+/// ★ m281：深度可配到 4 之后，下注集合最坏 `2×4 + 7 = 15`，给到 **16** 才不会让
+///   「邻图」把「能被点到的可见格」挤掉——这正是用户点名要的那条语义，算式写死在这里。
+///   这个数同时是**硬闸**：窗口拉得很宽、条一屏十几格时仍只取离当前图最近的 16 张，
+///   下注集合不随窗口宽度、更不随目录张数（几万张）增长。字节闸照旧封驻留：
+///   16 份 4K 视口档理论上 528 MiB，256 MiB 那道闸会先淘汰，实际驻留没变大。
+const PREFETCH_CAP: usize = 16;
 
 /// 预读缓存的**字节预算**——把"只按条数封顶"升级成条数与字节的双闸（m34）。
 ///
@@ -258,6 +269,12 @@ impl Prefetched {
 }
 
 pub struct Viewer {
+    /// 清单排序口径的**变更代数**（m275）。
+    ///
+    /// 排序的真值在 [`Config`] 里（`sort_by` / `sort_desc`），这里只记"变过一次"这件事：
+    /// 界面按**槽位**记的状态（缩略图条"用户滚到的首格"）在重排之后指的已经是另一张图，
+    /// 必须归零——而 `set_sort` 那一步在 `runtime` 里，画布够不着。
+    pub(super) sort_epoch: u64,
     pub(super) decoder: Rc<Decoder>,
     /// 共享配置（循环翻页 / 长图适应读这里）。设置窗改动即时生效。
     pub(super) config: Rc<RefCell<Config>>,
@@ -268,7 +285,7 @@ pub struct Viewer {
     pub(super) error: Option<String>,
     /// 查询阶段（`iv_render(out=NULL)`）先到的元信息，仅在 `loaded` 为空时
     /// 作为 info bar / 「按原始像素开窗」的**预览**来源；渲染结果一到就作废。
-    /// 契约：查询值不作数，以 [`Decoded.natural`] 为准（见 `decode::Meta`）。
+    /// 契约：查询值不作数，以 `Decoded.natural` 为准（见 `decode::Meta`）。
     pub(super) preview_meta: Option<crate::core::decode::Meta>,
 
     /// 查询阶段元信息的进程级缓存（path → Meta）。
@@ -285,8 +302,15 @@ pub struct Viewer {
     pub(super) prefetch_seq: Option<u64>,
     /// 本轮预算淘汰后停填；只有重新规划邻图才复位，动画/升级回包不能重启。
     pub(super) prefetch_stopped: bool,
-    /// 已预读完成的邻居图（LRU：尾端最近，字节预算见 [`PREFETCH_BYTES`]）。
+    /// 已预读完成的图（LRU：尾端最近，字节预算见 [`PREFETCH_BYTES`]）。
     pub(super) prefetched: Vec<Prefetched>,
+    /// 缩略图条当前可见的索引窗口 `(first, n)`；`None` = 条关着 / 还没画过。
+    ///
+    /// m265：这是「图片预读」的第二条下注来源。m260 之后条是**独立滚动列表**，
+    /// 当前图可以完全不在视野里，所以「点格子会切到哪张」没法由当前索引 ±k 推出来——
+    /// 只有把条那一屏的索引喂进来，两套几何才同源。由 [`Viewer::strip_window`] 每帧更新。
+    /// 只记索引不记路径：清单本来就在手里，`peek` 一下就取到，也不用养一份失效判据。
+    pub(super) prefetch_strip: Option<(usize, usize)>,
     /// 上次翻页的方向（+1 前进 / -1 后退 / 0 未定向，如直接打开或跳转）。
     ///
     /// 连续翻页的方向是**可预测**的：刚往前翻，下一张多半还是往前。
@@ -351,7 +375,7 @@ pub struct Viewer {
     /// 为什么只记翻页不记缩放/平移：让路的理由正是"用户的手还在翻页，这一张已经不
     /// 在屏上了"。缩放与平移不改变"当前这张就是用户看的那张"，所以它们不该重置宽限期。
     pub(super) last_nav_at: Cell<Option<Instant>>,
-    /// 已经为这张图发过**原图档**升级请求的 `(路径, 那一枚请求的 seq)`（见 [`Self::tick`]）。
+    /// 已经为这张图发过**原图档**升级请求的 `(路径, 那一枚请求的 seq)`（见 `Self::tick`）。
     ///
     /// 为什么需要这道闩：升级请求要的是"整图"（框 0 = 原始尺寸），而解码器若不如实给到
     /// 整图（未来按 `target` 降采样的解码器、或解码器本身的尺寸自限），`decoded` 就永远

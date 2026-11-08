@@ -23,9 +23,9 @@ use windows::Win32::Foundation::{
     COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
-    DwmExtendFrameIntoClientArea, DwmGetWindowAttribute, DwmSetWindowAttribute,
-    DWMWA_VISIBLE_FRAME_BORDER_THICKNESS, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT,
-    DWMWCP_DONOTROUND, DWMWCP_ROUND,
+    DwmExtendFrameIntoClientArea, DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_BORDER_COLOR,
+    DWMWA_COLOR_DEFAULT, DWMWA_COLOR_NONE, DWMWA_VISIBLE_FRAME_BORDER_THICKNESS,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_DONOTROUND, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, ClientToScreen, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject,
@@ -861,6 +861,18 @@ trait WinRenderBackend {
     fn set_window_alpha(&mut self, _alpha: u8) -> bool {
         false
     }
+
+    /// ★ RuPix 补丁 028 —— 无边框形态的后端钩子。默认实现 = 不支持逐像素透明
+    /// （D2D 后端走这条），只有软后端会真的接住它。
+    fn set_content_transparent(&mut self, _on: bool) -> bool {
+        false
+    }
+    fn content_transparent(&self) -> bool {
+        false
+    }
+    fn window_alpha(&self) -> u8 {
+        255
+    }
 }
 
 /// CPU 软件渲染后端：tiny-skia `Pixmap` 作后备缓冲，`SetDIBitsToDevice` 呈现。
@@ -887,6 +899,9 @@ struct SkiaBackend {
     /// <255 时呈现改走 `UpdateLayeredWindow`（每像素 alpha），`opaque_overlays`
     /// 列出的浮层（菜单面板）整块豁免——`LWA_ALPHA` 做不到这点。
     alpha: u8,
+    /// ★ RuPix 补丁 028 —— 无边框形态：底色透明 + alpha 下限 1（鼠标不穿透）。
+    /// 为真时 100% 不透明度也必须留在逐像素分层路径上。
+    transparent_bg: bool,
     /// alpha 变化或分层位图重建后为 true：下一帧必须整窗重算进分层位图。
     layered_fresh: bool,
     /// 分层呈现用的持久 DIB（预乘 BGRA）与其内存 DC。`bits` 指针由 DIB 拥有。
@@ -922,6 +937,7 @@ impl SkiaBackend {
             buf_w: 0,
             buf_h: 0,
             alpha: 255,
+            transparent_bg: false,
             layered_fresh: false,
             layer_dc: None,
             layer_bmp: None,
@@ -1043,24 +1059,34 @@ impl SkiaBackend {
         };
         self.ensure(w, h);
         self.ensure_layer_dib(lw, lh);
-        if self.alpha == 255 || self.layer_dc.is_none() {
+        // ★ 补丁 028：无边框形态下 100% 不透明也要走逐像素路径（底色透明 +
+        // alpha 下限 1），否则窗口会被摘回普通合成，透明背景就没了。
+        if (self.alpha == 255 && !self.transparent_bg) || self.layer_dc.is_none() {
             // 100% 或 DIB 建不出来：本帧回普通路径（样式由 set_window_opacity 管理）。
             return self.paint(hwnd, bg, handler);
         }
 
-        if self.fresh {
+        // 透明形态每帧都要重填底：局部帧只重画脏区，不整窗清就会把上一帧的
+        // 画面残留在已经移走的元素位置上。随之请求整帧、整窗搬运。
+        if self.fresh || self.transparent_bg {
             handler.request_full_frame();
         }
         let size = Size::new(self.buf_w, self.buf_h);
         let pixmap = self.pixmap.as_mut().unwrap();
-        if self.fresh {
-            pixmap.fill(to_skia_color(bg));
+        if self.fresh || self.transparent_bg {
+            // ★ 补丁 028：透明形态连底色都不填，让透明像素直接上屏。
+            let clear = if self.transparent_bg {
+                tiny_skia::Color::from_rgba8(0, 0, 0, 0)
+            } else {
+                to_skia_color(bg)
+            };
+            pixmap.fill(clear);
         }
         {
             let mut tgt = crate::render::PixmapTarget { pixmap };
             handler.render(&mut tgt, size);
         }
-        let drawn = match (self.fresh, handler.last_frame_damage()) {
+        let drawn = match (self.fresh || self.transparent_bg, handler.last_frame_damage()) {
             (false, Some(d)) => Some(d.intersect(&Rect::new(0, 0, self.buf_w, self.buf_h))),
             _ => None,
         };
@@ -1094,6 +1120,7 @@ impl SkiaBackend {
                 self.layer_h,
                 ox,
                 oy,
+                self.transparent_bg,
             );
         }
         self.layered_fresh = false;
@@ -1161,10 +1188,26 @@ impl WinRenderBackend for SkiaBackend {
         true
     }
 
+    // ★ RuPix 补丁 028：透明形态的三个后端钩子。
+    fn set_content_transparent(&mut self, on: bool) -> bool {
+        if self.transparent_bg != on {
+            self.transparent_bg = on;
+            self.layered_fresh = true;
+        }
+        true // 软后端支持逐像素 alpha
+    }
+    fn content_transparent(&self) -> bool {
+        self.transparent_bg
+    }
+    fn window_alpha(&self) -> u8 {
+        self.alpha
+    }
+
     unsafe fn paint(&mut self, hwnd: HWND, bg: Color, handler: &mut dyn AppHandler) -> bool {
         // ★ RuPix 补丁 03：逐像素 alpha 模式（窗口开了透明度）：呈现改走 UpdateLayeredWindow，
         // 菜单等浮层得以整块豁免整体透明度（见 paint_layered）。
-        if self.alpha < 255 {
+        // ★ 补丁 028：透明形态即使 alpha=255 也走逐像素上屏。
+        if self.alpha < 255 || self.transparent_bg {
             return self.paint_layered(hwnd, bg, handler);
         }
         let mut rc = RECT::default();
@@ -1536,6 +1579,8 @@ fn copy_premul_rows(
     dst_h: i32,
     dst_ox: i32,
     dst_oy: i32,
+    // ★ 补丁 028：无边框形态把 alpha=0 提到 1，让系统仍把鼠标判给本窗。
+    alpha_floor: bool,
 ) {
     debug_assert!(!dst_bits.is_null(), "分层 DIB 未建");
     let stride = buf_w as usize * 4;
@@ -1554,6 +1599,9 @@ fn copy_premul_rows(
                 let off = row + x * 4;
                 let s = &src[off..off + 4];
                 let a = (s[3] as u32 * alpha as u32) / 255;
+                // 1/255 ≈ 0.4%：与下层几乎不混合，肉眼看不出；但系统不再认为
+                // 「这里没有窗口」，命中测试因此落回本窗（curseen 同源技巧）。
+                let a = if alpha_floor && a == 0 { 1 } else { a };
                 let d = drow + x * 4;
                 dst[d] = ((s[2] as u32 * a) / 255) as u8;
                 dst[d + 1] = ((s[1] as u32 * a) / 255) as u8;
@@ -3045,7 +3093,9 @@ unsafe fn sync_outline(hwnd: HWND) {
     if !wanted || IsIconic(hwnd).as_bool() {
         return;
     }
-    let color = (!IsZoomed(hwnd).as_bool()).then(|| win10_outline_color(active));
+    // ★ 补丁 028：无边框形态不许留那圈 1px 自绘外框（用户口径「没有任何边框线」）。
+    let transparent = state_from(hwnd).is_some_and(|s| s.backend.content_transparent());
+    let color = (!transparent && !IsZoomed(hwnd).as_bool()).then(|| win10_outline_color(active));
     let changed = state_from(hwnd).is_some_and(|s| {
         let changed = std::mem::replace(&mut s.outline, color) != color;
         if changed {
@@ -3436,6 +3486,8 @@ unsafe fn run_window_op(hwnd: HWND, op: Option<WindowOp>) {
         Some(WindowOp::StartDrag) => start_window_drag(hwnd),
         Some(WindowOp::SetOpacity(percent)) => set_window_opacity(hwnd, percent),
         Some(WindowOp::SetClientSize(w, h)) => set_client_size(hwnd, w, h),
+        // ★ RuPix 补丁 028。
+        Some(WindowOp::SetTransparentBackground(on)) => set_transparent_background(hwnd, on),
         None => {}
     }
 }
@@ -3528,9 +3580,13 @@ unsafe fn set_window_opacity(hwnd: HWND, percent: u8) {
     let per_pixel = state_from(hwnd)
         .map(|s| s.backend.set_window_alpha(alpha))
         .unwrap_or(false);
+    // ★ RuPix 补丁 028：透明形态要求 100% 也留在逐像素分层路径上。
+    let transparent = state_from(hwnd)
+        .map(|s| s.backend.content_transparent())
+        .unwrap_or(false);
 
     let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-    if alpha == 255 {
+    if alpha == 255 && !transparent {
         if cur & WS_EX_LAYERED.0 != 0 {
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (cur & !WS_EX_LAYERED.0) as isize);
             // 样式改了必须让边框/合成重新计算，否则可能出现"透明残留"。
@@ -3559,13 +3615,93 @@ unsafe fn set_window_opacity(hwnd: HWND, percent: u8) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
     }
-    if !per_pixel {
+    if !per_pixel && !transparent {
         // 逐像素模式**不能**再调这个：LWA 与 UpdateLayeredWindow 互斥（后者会把
         // 常量 alpha 一并顶掉，反过来先设 LWA 会让第一帧之前整窗不可见）。
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
     }
     // 样式可能刚加上/呈现路径刚切换：强制一帧走新路径。
     let _ = InvalidateRect(Some(hwnd), None, false);
+}
+
+/// ★ RuPix 补丁 028 —— 无边框形态：背景真透明，但鼠标仍归本窗。
+///
+/// 逐像素分层窗里「视觉透明」与「命中归属」看的是同一个 alpha=0：Windows 会直接
+/// 跳过 alpha=0 的像素、把鼠标（含 hover）交给下层，判定发生在应用收到 WM_NCHITTEST
+/// 之前。要既能看见下层、又不让鼠标穿过去，只能在最终 DIB 里把 alpha 下限抬到 1
+/// （1/255 ≈ 0.4%，肉眼看不出），见 `copy_premul_rows`。所以 100% 不透明度也不能
+/// 摘 `WS_EX_LAYERED` —— 那是 `set_window_opacity` 里那一刀。
+unsafe fn set_transparent_background(hwnd: HWND, on: bool) {
+    let (per_pixel, alpha) = state_from(hwnd)
+        .map(|s| {
+            let ok = s.backend.set_content_transparent(on);
+            if ok {
+                // ★ 宿主自己的整窗清底也要跟着转透明，否则平台那一刀被盖掉。
+                s.handler.set_bg_transparent(on);
+            }
+            (ok, s.backend.window_alpha())
+        })
+        .unwrap_or((false, 255));
+    if !per_pixel {
+        return; // 后端不支持逐像素：不做半吊子的透明
+    }
+    // 开着形态，或本来就是半透明窗 ⇒ 必须分层；只有「关形态 + 100%」才摘回普通合成。
+    let want_layered = on || alpha != 255;
+    let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+    if want_layered && cur & WS_EX_LAYERED.0 == 0 {
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (cur | WS_EX_LAYERED.0) as isize);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    } else if !want_layered && cur & WS_EX_LAYERED.0 != 0 {
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (cur & !WS_EX_LAYERED.0) as isize);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
+    // ★ 补丁 029：DWM 自己还有一圈 1px 边框，透明形态下必须关掉。
+    set_dwm_frame_border(hwnd, !on);
+    let _ = InvalidateRect(Some(hwnd), None, false);
+}
+
+/// ★ RuPix 补丁 029 —— 无边框形态去掉 **DWM 自己画的那圈 1px 边框**。
+///
+/// 补丁 028 只关掉了「宿主自绘外框」（Win10 那条路：`self_outline`）。Win11 上
+/// `DWMWA_VISIBLE_FRAME_BORDER_THICKNESS` 查询成功 ⇒ `self_outline == false`，边框
+/// 是 **DWM** 画的，而且画在窗口矩形最外一圈**像素之内**——真机取证：无边框窗
+/// (500×300) 外圈第 0 行/列的像素是 (194,194,194) 与 (200,200,200)，图片从第 1 像素
+/// 才开始，窗口矩形与客户区矩形完全相等（`GetWindowRect == GetClientRect`）。
+/// 于是透明窗口四周永远套着一圈灰线，图片还被切掉 1px。
+///
+/// 关它的唯一正道是 `DWMWA_BORDER_COLOR = DWMWA_COLOR_NONE`（0xFFFFFFFE）：真机把这条
+/// 属性打上去之后，同一处采样变成纯图片像素，灰线整条消失。关形态时还原
+/// `DWMWA_COLOR_DEFAULT`（0xFFFFFFFF）交给系统按主题画，别把普通窗的边框也一起弄没。
+///
+/// 与圆角互不牵连：那条走 `DWMWA_WINDOW_CORNER_PREFERENCE`（补丁 026）。
+unsafe fn set_dwm_frame_border(hwnd: HWND, visible: bool) {
+    let color = if visible {
+        DWMWA_COLOR_DEFAULT
+    } else {
+        DWMWA_COLOR_NONE
+    };
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_BORDER_COLOR,
+        &color as *const _ as *const c_void,
+        size_of_val(&color) as u32,
+    );
 }
 
 /// ★ RuPix 补丁 026 —— 全屏时关掉 Win11 系统圆角。
@@ -4085,6 +4221,13 @@ unsafe fn handle_nc_mouse_move(hwnd: HWND, lparam: LPARAM) {
 }
 
 /// WM_MOUSEWHEEL：高位字为滚动量（±120/刻度），lParam 为屏幕坐标需转客户区。
+///
+/// ★ RuPix 补丁 027 —— 滚轮事件必须带上事件发生时按着的修饰键。此前用
+///   `PointerEvent::single`（`Mods` 全 false），宿主读 `p.mods.ctrl` 永远是
+///   false ⇒ Ctrl+滚轮的独立开关（翻页 / 缩放）形同虚设，缩略图条上的
+///   Shift+滚轮（一次一屏）也一起失效。与 `handle_pointer` 同源：既认消息自带的
+///   `MK_*` 位（MSDN：`LOWORD(wParam)`），也用 `GetKeyState` 兜住把低位留 0
+///   的合成消息（探针 / 辅助技术发的滚轮）。
 unsafe fn handle_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
     let delta = ((wparam.0 >> 16) & 0xffff) as i16 as i32;
     let mut pt = POINT {
@@ -4092,12 +4235,25 @@ unsafe fn handle_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
         y: ((lparam.0 >> 16) & 0xffff) as i16 as i32,
     };
     let _ = ScreenToClient(hwnd, &mut pt);
+    // MK_CONTROL = 0x0008 / MK_SHIFT = 0x0004（windows crate 未导入这两枚常量，
+    // 就地写位值比为此改 import 段更省，且与消息 ABI 一一对应）。
+    const MK_CONTROL_BIT: u32 = 0x0008;
+    const MK_SHIFT_BIT: u32 = 0x0004;
+    let keys = (wparam.0 as u32) & 0xffff;
+    let down = |vk: VIRTUAL_KEY| (GetKeyState(vk.0 as i32) as u16 & 0x8000) != 0;
+    let mods = crate::event::Mods {
+        ctrl: (keys & MK_CONTROL_BIT) != 0 || down(VK_CONTROL),
+        alt: down(VK_MENU),
+        shift: (keys & MK_SHIFT_BIT) != 0 || down(VK_SHIFT),
+        meta: down(VK_LWIN) || down(VK_RWIN),
+    };
     dispatch_pointer_event(
         hwnd,
-        PointerEvent::single(
+        PointerEvent::single_with(
             PointerKind::Wheel(delta),
             Point::new(pt.x, pt.y),
             MouseButton::Left,
+            mods,
         ),
     );
 }

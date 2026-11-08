@@ -1,16 +1,19 @@
 //! 快捷键的**数据模型与匹配**：动作枚举、单条快捷键、整组绑定。
 //!
 //! 参考 CurSeen 控制面板的「快捷键捕获框」（[`crate::ui::settings`] 里的
-//! `hotkey_box` 视觉正本）：用户点框进入捕获态，下一键被 [`Hotkey::from_event`]
-//! 抓成一条 [`Hotkey`] 写回配置；同一条键若已被别的功能占用，落盘时强制唯一
-//! （vacate 旧主，见 [`Hotkeys::set_binding`]）。
+//! `hotkey_box` 视觉正本）：用户点框进入捕获态，下一键被 `Hotkey::from_event`
+//! 抓成一条 `Hotkey` 写回配置；同一条键若已被别的功能占用，落盘时强制唯一
+//! （vacate 旧主，见 `Hotkeys::set_binding`）。
+//! ★ m278：**裸空格是保留键**，独占给「空格看图」（`platform::spacehook`）。那个钩子
+//! 恒 `CallNextHookEx`、永不吞键，所以把别的动作绑到裸空格会让一次按键同时触发
+//! 预览与该动作——真冲突。绑定 / ini 回读 / 插件热键 / 设置页捕获四处一律避开它。
 //!
 //! 设计要点：
 //! - 一个动作只绑**一条**键（2026-10-13 用户口径「只允许单个」；此前「上一张」
-//!   曾默认同时是 `←` 与 `PageUp`）。[`Hotkeys`] 仍以 `Vec<Hotkey>` 存储以保
+//!   曾默认同时是 `←` 与 `PageUp`）。`Hotkeys` 仍以 `Vec<Hotkey>` 存储以保
 //!   INI `hotkeys=动作id:键` 的格式兼容，但单条不变式由三个入口共同守住：
-//!   出厂默认只给一把、[`Hotkeys::from_ini`] 多键只取第一把、
-//!   [`Hotkeys::set_binding`] 整体替换。
+//!   出厂默认只给一把、`Hotkeys::from_ini` 多键只取第一把、
+//!   `Hotkeys::set_binding` 整体替换。
 //! - 修饰键 Ctrl/Alt/Shift/Win 与主键分开存；匹配时**精确**比对修饰键组合，
 //!   所以「按着 Ctrl 的 F」与裸 `F` 是两条不同的快捷键。
 //! - 持久化走 RuPix 现有手写 INI：整组序列化成 `hotkeys=` 一个键（见
@@ -84,7 +87,7 @@ pub enum Action {
     Rotate,
     /// 水平镜像。
     Flip,
-    /// 暂停/播放动画。
+    /// 暂停/继续动画。
     PauseAnim,
     /// 动画后退一帧（按下去自动进暂停态；见 `Viewer::step_anim`）。
     FramePrev,
@@ -135,7 +138,7 @@ pub enum Action {
     PanDown,
     /// 向右平移一步（m216）。
     PanRight,
-    /// 取色器开关（m217）。只进右键「工具 ▸ 取色器」，不进浮条按钮排。
+    /// 取色器开关（m217）。只进右键「本图 ▸ 取色器」，不进浮条按钮排。
     Picker,
 }
 
@@ -288,9 +291,9 @@ impl Action {
             Action::ActualSize => "1:1 原尺寸",
             Action::Rotate => "旋转 90°",
             Action::Flip => "水平镜像",
-            Action::PauseAnim => "暂停/播放动画",
-            Action::FramePrev => "动画上一帧",
-            Action::FrameNext => "动画下一帧",
+            Action::PauseAnim => "暂停/继续动画",
+            Action::FramePrev => "上一帧",
+            Action::FrameNext => "下一帧",
             Action::Filmstrip => "缩略图条",
             Action::Fullscreen => "全屏",
             Action::Open => "打开",
@@ -364,6 +367,12 @@ pub struct Hotkey {
 }
 
 impl Hotkey {
+    /// ★ m278：「空格看图」独占**裸空格**。带修饰键的 `Ctrl+Space` 之类不触发
+    /// 预览（spacehook 在 Ctrl/Alt/Shift/Win 按下时放过），所以只锁裸键。
+    pub fn is_reserved(&self) -> bool {
+        self.base == Base::Space && !self.ctrl && !self.alt && !self.shift && !self.win
+    }
+
     /// 把一次按键事件（带修饰键状态）抓成一条快捷键。
     ///
     /// - 主键是纯修饰键（`VKey::Alt` 等）或无法识别的键 → 返回 `None`：捕获态下
@@ -761,6 +770,12 @@ impl Hotkeys {
                 log::warn!("快捷键 {id} 的绑定「{specs}」无法解析，保留该动作默认绑定");
                 continue;
             };
+            // m278：老 ini 可能把裸空格绑给了某动作 —— 保留键优先，清掉该动作。
+            if h.is_reserved() {
+                log::warn!("快捷键 {id} 占用了保留键空格（空格看图），已清空");
+                hk.bindings[a.index()].clear();
+                continue;
+            }
             // 该动作以 ini 为准：清空（出厂默认或先前同 id 段）再填入解析到的键。
             // 不清空会叠加出重复绑定，破坏 `ini_round_trip_is_stable`。
             hk.bindings[a.index()].clear();
@@ -798,6 +813,12 @@ impl Hotkeys {
     /// 写入前先从**所有其它动作**清掉同一条键，保证「每个组合键同一时刻只属于一个
     /// 功能」（唯一性原则，对应需求"每种功能的快捷键基本是唯一的"）。
     pub fn set_binding(&mut self, a: Action, hk: Hotkey) {
+        // m278：保留键不许落到任何动作上。捕获路径已先拦一道，这里是最后一道
+        // （插件 / 程序化调用都走得进来），两处合起来才叫「锁死」。
+        if hk.is_reserved() {
+            log::warn!("快捷键：裸空格已保留给「空格看图」，忽略本次绑定");
+            return;
+        }
         let ai = a.index();
         for other in Action::ALL {
             if other.index() == ai {
@@ -1244,6 +1265,56 @@ mod tests {
         // 解绑
         hk.clear_binding(Action::Rotate);
         assert!(hk.bindings[Action::Rotate.index()].is_empty());
+    }
+
+    /// m278 判据本体：任何动作都不许持有裸空格。正向用例与负向臂共用这一处，
+    /// 免得"把规则在测试里复述一遍"那种永远不红的假绿。
+    fn assert_no_action_owns_space(hk: &Hotkeys, what: &str) {
+        assert!(
+            !Action::ALL
+                .iter()
+                .any(|a| hk.bindings[a.index()].iter().any(|b| b.is_reserved())),
+            "{what}：裸空格被动作占用了"
+        );
+    }
+
+    #[test]
+    fn only_bare_space_is_reserved() {
+        assert!(
+            Hotkey::from_spec("Space").unwrap().is_reserved(),
+            "裸空格要锁"
+        );
+        for spec in ["Ctrl+Space", "Alt+Space", "Shift+Space", "Escape", "F11"] {
+            let h = Hotkey::from_spec(spec).unwrap();
+            assert!(!h.is_reserved(), "{spec} 不该被锁：预览钩子不放过修饰键");
+        }
+    }
+
+    #[test]
+    fn reserved_space_gate_blocks_binding_and_legacy_ini() {
+        let mut bound = Hotkeys::default();
+        bound.set_binding(Action::Next, Hotkey::from_spec("Space").unwrap());
+        assert_no_action_owns_space(&bound, "set_binding 之后");
+        let from_ini = Hotkeys::from_ini("next:Space;prev:Left");
+        assert_no_action_owns_space(&from_ini, "from_ini 之后");
+        assert_eq!(
+            from_ini.bindings[Action::Prev.index()]
+                .first()
+                .map(|h| h.to_spec()),
+            Some("Left".to_string()),
+            "锁空格不该把同串里的其它键一起吃掉"
+        );
+        assert_no_action_owns_space(&Hotkeys::default(), "出厂默认");
+    }
+
+    /// 负向臂：手工绕过闸门把空格塞进绑定表，判据必须当场红。
+    /// 拿掉这道闸门（或判据自己写成恒真）这条就绿了 —— 说明上面的正向用例有牙齿。
+    #[test]
+    #[should_panic(expected = "裸空格被动作占用了")]
+    fn reserved_space_gate_rejects_a_binding_that_bypassed_it() {
+        let mut hk = Hotkeys::default();
+        hk.bindings[Action::Next.index()] = vec![Hotkey::from_spec("Space").unwrap()];
+        assert_no_action_owns_space(&hk, "绕过闸门的旧实现");
     }
 
     /// Esc 现为可绑定主键：捕获→序列化→回读三端一致，展示用 "Esc"。

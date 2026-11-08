@@ -8,7 +8,7 @@ use super::*;
 /// 「首选解码器」卡的三件基础信号：全量数据、搜索词、**派生过滤视图**。
 ///
 /// 视图是派生信号（挂搜索词版本）：打字即时重算，无需定时器与差分状态——这是
-/// 过滤实时性的正主。行集变更（进页/重扫）由 [`Handles::decode_refresh`] 借
+/// 过滤实时性的正主。行集变更（进页/重扫）由 `Handles::decode_refresh_from` 借
 /// 「同值写」bump 搜索词版本驱动重算（`Signal::set` 无条件自增版本并通知）。
 pub fn decode_signals() -> (Signal<Vec<ExtRow>>, Signal<String>, Signal<Vec<ExtRow>>) {
     let all = signal(Vec::<ExtRow>::new());
@@ -32,7 +32,7 @@ pub struct ExtRow {
     pub(crate) current: usize,
 }
 
-/// 从解码器扫描结果 + 内置库登记表构建「首选解码器」行（纯函数，[`Handles::decode_refresh`] 的本体）。
+/// 从解码器扫描结果 + 内置库登记表构建「首选解码器」行（纯函数，`Handles::decode_refresh_from` 的本体）。
 ///
 /// `builtins` 传 `crate::core::formats::available_builtins()`（已接入的那些）：
 /// 内置解码库从此**有身份**——出现在候选下拉里、可被 `decoders_preferred` 点名（m56）。
@@ -160,14 +160,14 @@ pub struct DecodeRow {
 
 thread_local! {
     /// 「首选解码器」行信号表：`扩展名 → {选中信号, 候选快照}`。整张表建一次终身复用，
-    /// 行的增删由 [`Handles::decode_refresh`] 对齐（retain 掉消失的扩展名）。
+    /// 行的增删由 `Handles::decode_refresh_from` 对齐（retain 掉消失的扩展名）。
     /// `BTreeMap::new()` 是 const fn，const 初始化免掉每线程首次访问的懒构造（clippy）。
     pub(crate) static DECODE_ROWS: RefCell<BTreeMap<String, DecodeRow>> =
         const { RefCell::new(BTreeMap::new()) };
 }
 
 /// 取（必要时建）某扩展名行的选中信号。只服务测试与兜底路径——正常流程里
-/// [`Handles::decode_refresh`] 会先把表填好，`ext_row` 只是按名领取。
+/// `Handles::decode_refresh_from` 会先把表填好，`ext_row` 只是按名领取。
 pub fn decode_row_sig(ext: &str, current: usize) -> Signal<usize> {
     DECODE_ROWS.with(|m| {
         let mut g = m.borrow_mut();
@@ -294,6 +294,7 @@ pub mod tests {
     fn test_handles() -> Handles {
         let (ext_rows_all, ext_filter, ext_view) = decode_signals();
         Handles {
+            update: UpdateState::new(),
             stay: sig(false),
             minimal_mode: sig(false),
             checker: sig(false),
@@ -302,14 +303,17 @@ pub mod tests {
             slide_secs: signal("3".into()),
             wheel: signal(0),
             ctrl_wheel: signal(0),
+            alt_wheel: signal(3),
+            shift_wheel: signal(3),
             init_win: signal(0),
+            borderless: sig(false),
             win_size: signal(String::new()),
             prefetch: signal(false),
             to_tray: sig(false),
             space_preview: sig(false),
             drag_image: sig(false),
             show_toolbar_buttons: sig(true),
-            filmstrip: sig(false),
+            filmstrip_pos: signal(0),
             allow_multiple: sig(false),
             opacity: signal(0.75),
             opacity_label: signal(String::new()),

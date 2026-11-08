@@ -924,7 +924,7 @@ RuPix 每次启动都有一段与格式、与图片尺寸都无关的固定开�
 → 宿主 `ui/brand.rs` 的闭包 → `Image::from_svg_bytes` → `svg_tree_cached`；托盘 `tray::install`
 同一条路。而 `svg_tree_cached`（补丁 06 的成果）里 `opt.fontdb = svg_fontdb();` 是**无条件**的，
 `svg_fontdb()` 第一次取值就是整轮 `fontdb::Database::load_system_fonts()`（补丁 06 自己的注释
-写着「扫一遍全系统字体（实测 ~900ms）」）。**本仓 `main/image/` 三枚 SVG 实测零 `<text`**——
+写着「扫一遍全系统字体（实测 ~900ms）」）。**本仓 `main/assets/` 的 SVG 实测零 `<text`**——
 一张文字都没有的矢量图标，把约 300 ms 压在了每次开机的关键路径上。
 ★ 补丁 06 把库收成全局 `OnceLock` 是对的（它消灭的是"每个线程各扫一遍"），漏的是**该不该扫**
 这一维：全局化让"只付一次"成立，但那次付款落在了启动上。后台预热也救不了——主线程几十毫秒
@@ -1420,3 +1420,171 @@ W1（m238 收起全屏顶条）之后用户看到的仍是「假全屏」：**�
 `cargo fmt` 无差异 · layering_scan `violations: 0` · hygiene_scan `violations: 0` ·
 main `cargo test --lib` **119 passed** · `cargo test --test docs_consistency` **7 passed** ·
 windui `cargo test --lib` **1075 passed**。
+
+
+---
+
+## 补丁 027 —— WM_MOUSEWHEEL 把修饰键送进 PointerEvent（`single_with`）
+
+- 编号：027
+- 涉及上游文件：`wind-ui-rust-0.23.0/src/platform/win32/mod.rs`
+  （`handle_wheel` 改用 `PointerEvent::single_with`，从 `LOWORD(wParam)` 取
+  `MK_CONTROL` / `MK_SHIFT` 位，`GetKeyState` 兜底，填 `Mods { ctrl, alt, shift, meta }`）
+- 应用侧接线：无（宿主 `canvas.rs` 早已读 `p.mods.ctrl` / `p.mods.shift`，补丁后自然生效）
+
+### 问题（用户实机，2026-11-08）
+设置 → 快捷键 → 鼠标 里「Ctrl+鼠标滚轮」是「切换图片」，按住 Ctrl 滚轮却没有换图。
+同一处还影响缩略图条里的 Shift+滚轮（一屏）——按了也只滚一格。
+
+### 根因（源码定位，非推测）
+`handle_wheel` 用 `PointerEvent::single(...)` 造事件，该构造器把 `mods` 填成
+`Mods::default()`（四个 bool 全 false）；而 `handle_pointer`（鼠标按键 / 移动）
+那一支用 `GetKeyState` 填了 `Mods`。于是宿主 `on_pointer` 里
+`if p.mods.ctrl { ctrl_wheel } else { wheel }` 永远走 else：默认档
+`wheel = Zoom` ⇒ Ctrl+滚轮被当成裸滚轮缩放，看起来「没效果」。
+`p.mods.shift`（条上一屏）同理恒 false。
+
+### 修复
+1. 滚轮事件改走 `PointerEvent::single_with(...)`，`mods` 与 `handle_pointer` 同源：
+   `ctrl` / `shift` 取 `LOWORD(wParam)` 的 `MK_CONTROL`(0x0008) / `MK_SHIFT`(0x0004)
+   位，**OR** `GetKeyState(VK_CONTROL/VK_SHIFT)` 兜底合成消息（低位常留 0 的探针
+   与辅助技术）；`alt` / `meta` 仍取 `GetKeyState`。
+2. 不新增状态、不改 `PointerKind::Wheel(delta)` 语义、不碰 `ScreenToClient`。
+
+### 判据
+- 真机：默认档（`wheel=缩放`、`ctrl_wheel=翻页`）按住 Ctrl 滚一格换下一张，
+  松开 Ctrl 滚一格是缩放；反配档两条手势各自对调。
+- 宿主单测 `ctrl_wheel_routes_through_the_pointer_mods`：用 `single_with` 造带
+  Ctrl 的事件，按「scale 有没有变」区分翻页 / 缩放，默认档与反配档四臂。
+  负向臂喂 `Mods::default()` 必须报红（复刻补丁前的形状）。
+- 文档门禁 `j15_wheel_event_carries_modifier_keys`：读 `.3rd` 的 `handle_wheel`
+  函数体，钉住 `single_with` 与 `ctrl:` / `shift:`；负向臂拿补丁前的 `single()`
+  源码喂同一断言。
+- 归档 `patches/` 与 `.3rd` 逐字节由 `j13` 守；章节 ↔ 标记由 hygiene 第 7 查守。
+
+### 门禁行
+`cargo check --all-targets` 0 error · `cargo fmt --check` 无差异 · clippy `-D warnings` 0 ·
+hygiene 第 7 查 `patch_parity: 0` · j13 归档逐字节 ok ·
+宿主 lib 771 passed / docs_consistency 17 passed / 集成 25 / 6_deploy OK。
+真机：默认档裸滚轮 `73/103 · 118%`（缩放、不换图），
+带 `MK_CONTROL` 的滚轮 `74/103 · 93%`（换下一张）。
+详见 `docs/待办.md §47` 与当日工作日志。
+
+
+## 补丁 028 —— 无边框形态：背景逐像素透明，但鼠标不穿透
+
+- 编号：028
+- 涉及上游文件：
+  - `wind-ui-rust-0.23.0/src/event.rs`（新增 `WindowOp::SetTransparentBackground(bool)`）
+  - `wind-ui-rust-0.23.0/src/core.rs`（`EventCtx::set_transparent_background`）
+  - `wind-ui-rust-0.23.0/src/platform/mod.rs`（`AppHandler::set_bg_transparent` 空实现）
+  - `wind-ui-rust-0.23.0/src/app/mod.rs`（`UiHost::bg_transparent` + 整窗清底转透明）
+  - `wind-ui-rust-0.23.0/src/platform/win32/mod.rs`（`WinRenderBackend` 三个钩子、
+    `SkiaBackend::transparent_bg`、`copy_premul_rows` 的 alpha 下限、
+    `paint_layered` / `paint` / `set_window_opacity` / `sync_outline` / `run_window_op`）
+- 应用侧接线：`Config::borderless` → `runtime` 每帧下发一枚 `set_transparent_background`；
+  `ui::chrome::BORDERLESS` 收口自绘 chrome 显隐与命中；`ui::canvas` 不画底色、不摆条；
+  `ui::window` 的根节点**不再铺 `empty_bg`**（那份底色由宿主清底负责，铺两层会把透明底盖掉）。
+
+### 问题（用户口径，2026-11-08）
+「无边框」要像空格看图那样**背景透明能看见下一层**，但**禁止鼠标穿透**——
+鼠标悬停、点击、右键、缩放一律只和看图窗交互。同时窗口形状跟着当前图片变、
+四周不许有边框线，功能（锁定 / 置顶 / 切图）全部保留。
+
+### 根因（源码定位，非推测）
+补丁 03 的 `UpdateLayeredWindow(AC_SRC_ALPHA)` 是逐像素上屏：图片透明像素 alpha=0，
+而 Windows 对分层窗的**命中测试直接跳过 alpha=0 像素**，把鼠标交给下层，判定发生在
+应用收到 `WM_NCHITTEST` 之前。所以「视觉透明」与「鼠标穿透」在这套窗口里是同一件事。
+补丁 04 又在 `alpha == 255`（默认 `opacity=100`）时把 `WS_EX_LAYERED` 摘掉走普通合成，
+于是默认配置连逐像素路径都进不去。
+
+### 修复
+1. `SkiaBackend::transparent_bg`：形态开启时 `paint` / `paint_layered` 无条件走逐像素路径；
+   `set_window_opacity` 只在 `alpha == 255 && !transparent_bg` 时摘分层样式。
+2. `paint_layered` 用 `from_rgba8(0,0,0,0)` 清底，并每帧请求整帧、整窗搬运 DIB
+   （局部帧不清底会把移走的元素残留在透明底上）。
+3. `copy_premul_rows` 加 `alpha_floor`：该形态下把最终 `a == 0` 提到 **1**。1/255 ≈ 0.4%，
+   与下层几乎不混合、肉眼看不出，但系统不再认为「这里没有窗口」，鼠标落回本窗。
+   这条是 curseen `drawing/controller.rs` 的「隐形命中底」同源做法。
+4. `sync_outline` 在透明形态下不画那圈 1px 自绘外框。
+5. 新增 `set_transparent_background(hwnd, on)`：开形态或本来半透明 ⇒ 保证 `WS_EX_LAYERED`；
+   关形态且 100% ⇒ 摘回普通合成。后端不支持逐像素时直接不做，不半吊子透明。
+6. **整窗清底还有第二处，实测才露出来**：平台层把 pixmap 清成透明之后，宿主的
+   `UiHost::render` 会在整窗帧再 `pixmap.fill(self.bg)` 一遍——那一层是 opaque 的
+   `empty_bg`，于是"透明区"看上去仍是一片 (15,15,15) 实心色（真机逐像素采样：
+   透明源像素 98.9% 命中 (15,15,15)，只有旧客户区那一小块是透的）。
+   因此 `WindowOp::SetTransparentBackground` 现在同时调用
+   `AppHandler::set_bg_transparent`：`UiHost` 记一枚 `bg_transparent` 并把整窗清底换成
+   `Color::rgba(0,0,0,0)`（`bg()` 也一并返回透明，平台清屏读的是同一份）。
+   判据：纯色背景（整屏品红 Form）下采样 12.4 万个透明源像素——透明前后
+   **命中 (15,15,15) 的比例由 98.9% 降到 0.0%**，47.2% 直接露出品红、其余露出背后的窗口。
+
+### 判据
+- 真机：勾「无边框」打开带 alpha 的 `图片1.png`，透明区能看到桌面/下层窗口，
+  但把鼠标移过去不会触发下层 hover，点击落在本窗（右键菜单可弹）；关掉勾选后
+  窗口恢复启动窗口档的尺寸、底色与整套 chrome 回来。
+- 宿主单测 `borderless_fit_keeps_aspect_and_clamps_to_work_area`：窗口形状等比跟随图片。
+- 文档门禁 `j16_borderless_transparency_never_lets_mouse_through`：钉住透明底色、
+  alpha 下限 1、100% 仍分层、WindowOp 落地、宿主清底转透明五条；负向臂喂「漏掉 alpha 下限」的
+  源码必须报红（那正是鼠标会穿透的形状）。
+- 归档 `patches/` 与 `.3rd` 逐字节由 `j13` 守；章节 ↔ 标记由 hygiene 第 7 查守。
+
+### 门禁行
+`cargo check --all-targets` 0 error · `cargo fmt --check` 无差异 · clippy `-D warnings` 0 ·
+hygiene 第 7 查 `patch_parity: 0` · j13 归档逐字节 ok · j16 正向 + 负向通过。
+详见 `docs/待办.md §49` 与当日工作日志。
+
+## 补丁 029 —— 无边框形态去掉 DWM 那圈 1px 边框（`set_dwm_frame_border`）
+
+- 编号：029
+- 涉及上游文件：
+  - `wind-ui-rust-0.23.0/src/platform/win32/mod.rs`
+    （新增 `set_dwm_frame_border`；`set_transparent_background` 末尾按形态回调它；
+    导入 `DWMWA_BORDER_COLOR` / `DWMWA_COLOR_DEFAULT` / `DWMWA_COLOR_NONE`）
+- 应用侧接线：无——形态标志复用补丁 028 的 `set_transparent_background`，宿主一行不改。
+
+### 问题（用户实机，2026-11-08）
+
+m269 交付后用户开启无边框：窗口形状确实跟着图片了、透明确实生效了，但**四周仍然留着
+一圈灰色边框线**。用户原话：「我们的无边框看图时，主窗口依然有边框线啊....灰色的」。
+
+### 根因（源码定位 + 真机取证）
+
+补丁 028 只关了**宿主自绘**的那圈外框（`sync_outline` 里 `self_outline` 为真的分支，
+那是 Win10 的兜底）。Win11 上建窗时 `DwmGetWindowAttribute(DWMWA_VISIBLE_FRAME_BORDER_
+THICKNESS)` 查询成功 ⇒ `self_outline = false`，边框改由 **DWM** 画，而且这圈 1px 画在
+**窗口矩形最外一圈像素之内**：
+
+| 取证（`.temp/borderless_edge_probe.ps1`，无边框 + 纯红 500×300 测试图） | 值 |
+|---|---|
+| `GetWindowRect` / `GetClientRect` | 都是 `710,366 500x300`（二者相等） |
+| `DwmGetWindowAttribute(37)` | `rc=0 thickness=1` |
+| 屏幕采样：内容第 0 行（中列） | `(194,194,194)` ← 灰线，图片从第 1 行才开始 |
+| 屏幕采样：内容第 0 列（中行） / 最右列 | `(200,200,200)` / `(200,200,200)` |
+
+即：透明窗四周恒有一圈灰线，**并且图片被切掉 1px**（左右上下各一）。
+
+### 修复
+
+`DWMWA_BORDER_COLOR`（属性号 34，Win11 22000+）设为 `DWMWA_COLOR_NONE`（0xFFFFFFFE）。
+`set_transparent_background(hwnd, on)` 末尾按形态下发：`on` ⇒ NONE；`off` ⇒
+`DWMWA_COLOR_DEFAULT`（0xFFFFFFFF，交回系统按主题画，别把普通窗的边框也弄没）。
+新函数 `set_dwm_frame_border(hwnd, visible)` 只做这一件事，与圆角（补丁 026 走属性号 33）
+互不牵连。Win10 不认属性号 34，`DwmSetWindowAttribute` 返回 `E_INVALIDARG`，丢弃即可
+得到想要的降级（Win10 本来就没有 DWM 边框，那边靠补丁 028 关掉的自绘外框）。
+
+### 判据
+
+- 真机（`.temp/borderless_dwm_border_probe.ps1`，同一枚纯红测试图，只差属性打没打）：
+  打属性前外圈第 0 行 `(194,194,194)`、第 0 列 `(200,200,200)`、最右列 `(200,200,200)`、
+  最后一行 `(76,79,82)`；打属性后同一批采样**全部是 `(255,0,0)`**，灰线整条消失。
+- 关形态必须还原：`visible == true` 走 `DWMWA_COLOR_DEFAULT`，普通窗的边框照旧。
+- 文档门禁 `j16`：钉住 `set_dwm_frame_border(hwnd, !on)` 这行与 `DWMWA_COLOR_NONE`；
+  负向臂喂「只关了自绘外框、没关 DWM 边框」的源码必须报红。
+- 归档 `patches/` 与 `.3rd` 逐字节由 `j13` 守；章节 ↔ 标记由 hygiene 第 7 查守。
+
+### 门禁行
+
+`cargo check --all-targets` 0 error · `cargo fmt --check` 无差异 · clippy `-D warnings` 0 ·
+hygiene 第 7 查 `patch_parity: 0` · j13 归档逐字节 ok · j16 正向 + 三条负向通过。
+详见 `docs/待办.md §50`。

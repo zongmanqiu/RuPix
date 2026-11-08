@@ -5,9 +5,9 @@
 //! 并把等待超时包成扩展编排需要的形状。
 //!
 //! 扩展进程**不继承**宿主的标准输入：IPC 走命名管道。
-//! 标准输出/错误有两种去法（见 [`spawn`] 与 [`spawn_logged`]）：
-//! - [`spawn`]：丢弃（`Stdio::null()`）——父进程退出后子进程不该继续持有控制台句柄。
-//! - [`spawn_logged`]：**抽进宿主日志**——插件崩了、卡了、写了诊断信息，
+//! 标准输出/错误有两种去法（见 `spawn` 与 `spawn_logged`）：
+//! - `spawn`：丢弃（`Stdio::null()`）——父进程退出后子进程不该继续持有控制台句柄。
+//! - `spawn_logged`：**抽进宿主日志**——插件崩了、卡了、写了诊断信息，
 //!   只有一条线索时，丢掉输出等于把线索扔了（这是插件体系可运维性的地基）。
 //!   抽取线程在子进程退出、管道关闭后自行结束，不留悬挂线程。
 
@@ -67,7 +67,7 @@ impl Child {
 
 /// 启动扩展。`cwd` 固定为扩展目录，`entry` 由 manifest 校验过必须是相对路径。
 ///
-/// 标准输出与错误**丢弃**（`Stdio::null()`）。要留线索用 [`spawn_logged`]。
+/// 标准输出与错误**丢弃**（`Stdio::null()`）。要留线索用 `spawn_logged`。
 pub fn spawn(entry: &Path, args: &[String], cwd: &Path) -> Result<Child, String> {
     if !entry.is_file() {
         return Err(format!("入口不存在：{}", entry.display()));

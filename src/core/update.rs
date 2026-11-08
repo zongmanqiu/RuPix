@@ -1,13 +1,15 @@
 //! 宿主本体自更新：**纯逻辑层**（版本 / 清单 / 两条判据）。
 //!
-//! 本层离屏可跑：不碰窗口、不碰 Win32、不碰文件系统、不联网。线程的活全在
+//! 本层离屏可跑：不碰窗口、不碰 Win32、不联网。线程的活全在
 //! [`crate::runtime::update`]，这里只回答「这份清单说了什么」「这个包能不能装」。
+//! 唯一的文件系统动作是**清单本地缓存**（`load_cached` / `save_cached`）：
+//! 断网时靠它判「已是最新」，关于页启动时也靠它给一句话。
 //!
 //! # 只有两条判据（用户 2026-11-07 拍板）
 //!
 //! 1. **文件名对得上**：下载地址末段必须是 `RuPix_<version>.zip`；ZIP 里只允许
 //!    `RuPix_<version>/` 这一层顶层目录（或干脆没有顶层），其内只允许
-//!    [`PACKAGE_FILES`] 那四个精确名字，且必须有 `rupix.exe`。
+//!    `PACKAGE_FILES` 那四个精确名字，且必须有 `rupix.exe`。
 //! 2. **版本号对得上**：清单 `version` 与下载地址文件名、ZIP 顶层目录名里解析出的
 //!    版本逐字一致，且高于当前版本。
 //!
@@ -37,6 +39,31 @@ pub const MANIFEST_MAX_BYTES: usize = 1 << 20;
 
 /// 更新包的响应体 / 解包量上限。防 zip bomb 与内存爆的护栏，不与清单比大小。
 pub const PACKAGE_MAX_BYTES: usize = 64 << 20;
+
+/// 清单本地缓存的文件名，落在 `<exe>/docs/` 下（与两份解码器清单同目录）。
+pub const MANIFEST_CACHE: &str = "update.json";
+
+/// 读上一次成功拉到的清单原文。
+///
+/// 两个用处：断网时不把「离线」当故障（照缓存判新旧），以及关于页启动时的那句话。
+pub fn load_cached() -> Option<String> {
+    let p = crate::core::paths::docs_dir()?.join(MANIFEST_CACHE);
+    std::fs::read_to_string(p).ok()
+}
+
+/// 原子覆盖缓存：先写 `.part` 再改名，半截文件不会顶掉旧缓存。
+pub fn save_cached(text: &str) {
+    let Some(p) = crate::core::paths::docs_dir().map(|d| d.join(MANIFEST_CACHE)) else {
+        return;
+    };
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let part = p.with_extension("json.part");
+    if std::fs::write(&part, text.as_bytes()).is_ok() {
+        let _ = std::fs::rename(&part, &p);
+    }
+}
 
 /// 清单地址只放行两个官方仓的 raw 域；下载资产只放行两个官方仓的 release 域。
 /// ini 允许用户改地址，但改到第三方也不会被拿去覆盖自己的 exe。

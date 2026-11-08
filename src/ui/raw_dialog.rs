@@ -1,8 +1,8 @@
-//! 裸数据参数窗：打开无魔数文件时收集 宽/高/像素布局。
+//! 裸数据参数窗（窗口标题按菜单入口叫「RAW 参数」）：打开无魔数文件时收集 宽/高/像素布局。
 //!
 //! 裸像素文件没有头，但**首开不逼用户手填**：后缀给出布局，文件长度用常见宽度
 //! 反推出整数高度，能推出就直接打开；推不出才弹参数窗（带推断/上次默认值）。
-//! 打开后可在右键「RAW 参数…」里改，确认后参数写进会话 store
+//! 打开后可在右键「本图 ▸ RAW 参数…」里改，确认后参数写进会话 store
 //! （[`crate::core::decode::set_raw_params`]）+「上次使用值」落盘
 //! （[`crate::core::config::Config::raw_last`]），再走正常的 `viewer.open`。
 //!
@@ -26,7 +26,8 @@ use crate::core::decode::RawParams;
 use crate::core::pixels::MAX_EDGE;
 use crate::core::viewer::Viewer;
 
-use super::tokens::{to_color, BG, DIALOG_FIT_MIN};
+use super::settings::option_row_inset;
+use super::tokens::{to_color, BG, CONTROL_GROUP_W, DIALOG_FIT_MIN, DIALOG_W};
 
 /// 「宽 / 高」输入框的解析：只认 `1…MAX_EDGE` 的整数，别的（空、负号、字母、超大值）
 /// 一律 `None` 交给调用方去说明——不猜、不静默、不悄悄夹到边界值。
@@ -59,7 +60,7 @@ pub fn is_headerless_path(path: &Path) -> bool {
     decode::is_headerless_path(path)
 }
 
-/// 右键「RAW 参数…」是否可点：没有当前文件、或有文件头（相机 RAW / 普通图片）都置灰。
+/// 右键「本图 ▸ RAW 参数…」是否可点：没有当前文件、或有文件头（相机 RAW / 普通图片）都置灰。
 ///
 /// 菜单项本身**常驻**（用户 2026-10-28 口径）；这里只回答"这一格亮不亮"。
 pub fn menu_enabled(path: Option<&Path>) -> bool {
@@ -115,7 +116,7 @@ pub fn poll_pending(
     config: &Rc<RefCell<Config>>,
 ) {
     let scope = super::singleton::window_scope(viewer);
-    // 参数窗**每窗一份**（m232）：键带窗口标识，否则 B 窗的「RAW 参数…」会命中 A 窗
+    // 参数窗**每窗一份**（m232）：键带窗口标识，否则 B 窗的「本图 ▸ RAW 参数…」会命中 A 窗
     // 已经开着的那扇（平台对已登记的单例键只聚焦），用户点了像没反应。
     //
     // 单实例语义仍然成立：**本窗**参数窗开着就先不取——取了也开不出第二个窗，那条
@@ -153,7 +154,7 @@ pub fn open_current_params(
         return;
     };
     if !is_headerless_path(&path) {
-        ctx.toast_err("当前格式有文件头，不需要裸数据参数");
+        ctx.toast_err("当前格式有文件头，不需要 RAW 参数");
         return;
     }
     let scope = super::singleton::window_scope(viewer);
@@ -229,7 +230,7 @@ fn open_params_window(
     let cancel = |ctx: &mut EventCtx| ctx.request_close();
 
     ctx.open_window(
-        Window::new("裸数据参数", 340, 210)
+        Window::new("RAW 参数", DIALOG_W, 210)
             .bg(to_color(BG))
             .resizable(false)
             .centered(true)
@@ -239,14 +240,26 @@ fn open_params_window(
             .owned(true)
             .single(super::singleton::scoped("raw-params", scope))
             .content(move || {
-                // 版式全交给 `dialog_footer::shell`（见 `docs/界面版式规范.md` §2）。
+                // 版式全交给共享底层函数（见 `docs/界面版式规范.md` §2）：
+                // `dialog_footer::shell` 给壳与底栏，内容行一律 `option_row_inset(...,0)`
+                // + `CONTROL_GROUP_W`，与插件设置窗 / 跳转窗同一套两列。
                 super::dialog_footer::shell(
                     vec![
-                        Element::field("宽度", Element::text_input(w_sig, "如 1920")),
-                        Element::field("高度", Element::text_input(h_sig, "如 1080")),
-                        Element::field(
+                        option_row_inset(
+                            "宽度",
+                            Element::text_input(w_sig, "如 1920").width(CONTROL_GROUP_W),
+                            0,
+                        ),
+                        option_row_inset(
+                            "高度",
+                            Element::text_input(h_sig, "如 1080").width(CONTROL_GROUP_W),
+                            0,
+                        ),
+                        option_row_inset(
                             "像素布局",
-                            Element::dropdown(LAYOUT_LABELS.to_vec(), layout_sig),
+                            Element::dropdown(LAYOUT_LABELS.to_vec(), layout_sig)
+                                .width(CONTROL_GROUP_W),
+                            0,
                         ),
                     ],
                     vec![

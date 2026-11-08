@@ -319,6 +319,9 @@ fn progid_is_ours(pid: &str, ext: &str, exe: &Path) -> bool {
 }
 
 /// 这个后缀现在是不是已经指向 RuPix（读 `.ext` 默认值比对 ProgId）。
+///
+/// **当前只由测试覆盖（m282 调用图）**：设置页不再显示「已关联」状态。保留它是因为
+/// 私有实现 `is_ours_with` 需要一条生产入口——只剩测试用会更糟。
 pub fn is_ours(ext: &str) -> bool {
     is_ours_with(CLASSES_ROOT, ext)
 }

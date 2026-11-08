@@ -1,4 +1,4 @@
-//! 「快捷键」页：单键捕获框与两组鼠标行为。
+//! 「快捷键」页：单键捕获框（含一行只读的「空格看图」）与五档定制鼠标行为。
 //!
 //! ★ 2026-10-17 审计第二轮的前置拆分：`ui/settings.rs`（2699 行）大到没法逐行精读，
 //!   本文件是其中**一页/一窗**的纯搬动切片——不改行为、不改文案、不改版式。
@@ -41,6 +41,27 @@ pub fn hotkey_box(
         .clickable()
         .on_click(on_click)
         .on_blur(on_blur)
+}
+
+/// 「空格看图」的**只读行**：与 [`hotkey_box`] 同一套视觉，但没有 `clickable()`。
+///
+/// m278：空格是保留键（`Hotkey::is_reserved`），不进 `Action::ALL` 也不占捕获框。
+/// 放在键盘卡第一行是为了让人一眼看见"空格去哪了"——否则用户把别的动作绑到
+/// 空格会被静默拒绝，还以为设置坏了。
+fn readonly_hotkey_box(text: &str) -> Element {
+    Element::stack()
+        .child(
+            Element::label(text)
+                .font_size(FONT_MD)
+                .fg(to_color(TEXT))
+                .align(Align::Center),
+        )
+        .width(CONTROL_GROUP_W)
+        .height(CONTROL_H)
+        .bg(to_color(CARD_HEADER_BG))
+        .border(to_color(BORDER), 1)
+        .corner(CORNER_CONTROL)
+        .align(Align::Center)
 }
 
 /// 把「配置 + 捕获态」推到快捷键页各行的显示文本信号（值没变不 set，避免无谓
@@ -187,12 +208,13 @@ pub fn sync_plugin_hotkey_texts(config: &Config, capturing: Option<&str>) {
 }
 
 /// Shortcuts 页：两组快捷键，**各占一张可折叠卡片**——「键盘快捷键」（每个功能
-/// **一个捕获框、至多一把键**）与「鼠标快捷键」（双击 / 滚轮 / Ctrl+滚轮，自选项页
-/// 迁入）。卡片与「解码器」页那三张同款（[`section_card`]）。
+/// **一个捕获框、至多一把键**；另有一行只读的「空格看图」）与「鼠标快捷键」
+/// （双击 + 滚轮 / Ctrl / Alt / Shift 四档，m278 起共用一张**定制的成对动作**下拉）。
+/// 卡片与「解码器」页那三张同款（[`section_card`]）。
 ///
 /// ★ 2026-10-26 由「横线 + 红字段名」分段改成卡片（用户口径「快捷键部分也采用折叠
 ///   卡片的形式，刚好两组」）：两组本来就是两件事，卡片让任一组能整组收起，页也不会
-///   一打开就摊出 29 行键位。段名不再另写一行红字——卡片标题条就是段名，`group_label`
+///   一打开就摊出 36 行键位。段名不再另写一行红字——卡片标题条就是段名，`group_label`
 ///   因此退场（它在全项目只剩这一处调用点）。
 ///
 /// 单键化（2026-10-13 用户口径「只允许单个」）：不再有 ±绑定位杂件，行版式走
@@ -201,7 +223,7 @@ pub fn sync_plugin_hotkey_texts(config: &Config, capturing: Option<&str>) {
 /// 失焦/Esc 留「（空）」，这也是唯一的解绑通道。
 ///
 /// 捕获逻辑在窗口级 `Window::on_shortcut`（见 `open_settings`）：焦点在本窗口时，
-/// 下一键被 [`Hotkey::from_event`] 抓取写回配置；与别的功能撞键时由
+/// 下一键被 `Hotkey::from_event` 抓取写回配置；与别的功能撞键时由
 /// [`crate::core::hotkey::Hotkeys::set_binding`] 强制唯一（vacate 旧主）。
 ///
 /// `capturing`：当前正在捕获的动作下标；`texts`：每行框里的显示文本信号——
@@ -218,7 +240,9 @@ pub fn shortcuts_page(
     // 建树时从配置回灌一遍文本（开窗外配置被改过也能从正确值起显）。
     sync_hotkey_texts(&config.borrow(), capturing.get(), &texts);
 
-    let mut rows: Vec<Element> = Vec::with_capacity(Action::COUNT);
+    let mut rows: Vec<Element> = Vec::with_capacity(Action::COUNT + 1);
+    // m278：这不是 Action —— 空格看图走常驻钩子，键位锁死，只在此处露一次脸。
+    rows.push(option_row("空格看图", readonly_hotkey_box("空格（固定）")));
     for (i, a) in Action::ALL.into_iter().enumerate() {
         let ai = a.index();
         let cfg_click = config.clone();
@@ -248,7 +272,15 @@ pub fn shortcuts_page(
         rows.push(option_row(a.name(), box_el));
     }
 
-    // 鼠标行为两行（自「选项」页迁来，与键盘快捷键同一标签列对齐）。
+    // 鼠标行为五行（m278）：四行滚轮共用**同一张定制下拉**，只有成对动作能进来；
+    // 左键双击没有「上下」两个方向，保持自己的小下拉，不硬塞进成对表。
+    // 与键盘快捷键同一标签列对齐。
+    let wheel_labels = || {
+        crate::core::config::WheelAction::ALL
+            .iter()
+            .map(|w| w.label().to_string())
+            .collect::<Vec<String>>()
+    };
     let mouse_rows = [
         choice_row(
             "鼠标左键双击",
@@ -258,23 +290,14 @@ pub fn shortcuts_page(
                 .collect(),
             h.dcb,
         ),
-        choice_row(
-            "鼠标滚轮",
-            Wheel::ALL.iter().map(|w| w.label().to_string()).collect(),
-            h.wheel,
-        ),
-        choice_row(
-            "Ctrl+鼠标滚轮",
-            CtrlWheel::ALL
-                .iter()
-                .map(|w| w.label().to_string())
-                .collect(),
-            h.ctrl_wheel,
-        ),
+        choice_row("鼠标滚轮", wheel_labels(), h.wheel),
+        choice_row("Ctrl+鼠标滚轮", wheel_labels(), h.ctrl_wheel),
+        choice_row("Alt+鼠标滚轮", wheel_labels(), h.alt_wheel),
+        choice_row("Shift+鼠标滚轮", wheel_labels(), h.shift_wheel),
     ];
 
-    // 恢复默认（**整页**）：一键把本页全部复位——键盘快捷键那一批 + 鼠标三档下拉
-    // （双击 / 滚轮 / Ctrl+滚轮）一起回到出厂值。范围与「页面顶部」这个位置相称。
+    // 恢复默认（**整页**）：一键把本页全部复位——键盘快捷键那一批 + 鼠标五档下拉
+    // （双击 + 四行滚轮）一起回到出厂值。范围与「页面顶部」这个位置相称。
     // 出厂值单一来源取 `Config::default()`，将来默认值调整这里自动跟随，不写死数字。
     // 必须用 Element::button：label 上叠 clickable() 违反 windui 契约（clickable 仅限
     // 容器），release 下会把 Label 静默替换成空壳、debug 下断言 panic。
@@ -290,6 +313,8 @@ pub fn shortcuts_page(
             c.dbl_click = def.dbl_click;
             c.wheel = def.wheel;
             c.ctrl_wheel = def.ctrl_wheel;
+            c.alt_wheel = def.alt_wheel;
+            c.shift_wheel = def.shift_wheel;
         }
         crate::core::config::mark_dirty();
         // 下拉框选中项由信号驱动：写信号即刷 UI；config 也同步改掉，sync 时二者相等、
@@ -297,6 +322,8 @@ pub fn shortcuts_page(
         h.dcb.set(def.dbl_click.index() as usize);
         h.wheel.set(def.wheel.index() as usize);
         h.ctrl_wheel.set(def.ctrl_wheel.index() as usize);
+        h.alt_wheel.set(def.alt_wheel.index() as usize);
+        h.shift_wheel.set(def.shift_wheel.index() as usize);
         sync_hotkey_texts(&cfg_def.borrow(), cap_def.get(), &texts_def);
     });
 
@@ -369,7 +396,7 @@ pub fn shortcuts_page(
                     Element::col().fill().spacing(0).children(plugin_rows),
                 ))
                 // 「恢复默认」**压在页末**（2026-10-26 用户口径：不要放在顶部）。
-                // 它复位的范围仍是**整页**（键盘绑定 + 鼠标三档一起回出厂值），
+                // 它复位的范围仍是**整页**（键盘绑定 + 鼠标五档一起回出厂值），
                 // 摆在两张卡之后——页首整块留给卡片本身，不让人还没看到内容就先撞上
                 // 一颗会清掉全部改动的按钮；而"整页复位"摆在一页的末尾，范围与位置
                 // 同样是相称的（它下面是这一页的尽头，不会看着像只管最后一张卡）。
@@ -410,7 +437,7 @@ mod tests {
     /// ① 三张卡的标题条都在且都是 `CARD_HEADER_H`（卡片本体塌 0 = 整页看不见）；
     /// ② 竖向节奏只有一格 `GAP`（页四周 / 行↔卡 / 卡↔卡 / 卡头↔正文）；
     /// ③ 展开信号真能收起正文（点了没反应是最容易漏的一类 UI bug）；
-    /// ④ 29 行键位必定溢出视口，**真的派发滚轮**验偏移量（布局对但事件没人处理的老病）。
+    /// ④ 36 行键位必定溢出视口，**真的派发滚轮**验偏移量（布局对但事件没人处理的老病）。
     #[test]
     fn shortcuts_page_three_cards_survive_layout_and_collapse() {
         use windui::core::Tree;
@@ -422,6 +449,7 @@ mod tests {
         let (ext_rows_all, ext_filter, ext_view) = decode_signals();
         let (decoders, decoder_filter, decoder_view, decoder_count) = installed_signals();
         let h = Handles {
+            update: UpdateState::new(),
             stay: sig(false),
             minimal_mode: sig(false),
             checker: sig(false),
@@ -430,14 +458,17 @@ mod tests {
             slide_secs: signal("3".into()),
             wheel: signal(0),
             ctrl_wheel: signal(0),
+            alt_wheel: signal(3),
+            shift_wheel: signal(3),
             init_win: signal(0),
+            borderless: sig(false),
             win_size: signal(String::new()),
             prefetch: signal(false),
             to_tray: sig(false),
             space_preview: sig(false),
             drag_image: sig(false),
             show_toolbar_buttons: sig(true),
-            filmstrip: sig(false),
+            filmstrip_pos: signal(0),
             allow_multiple: sig(false),
             opacity: signal(0.75),
             opacity_label: signal(String::new()),
@@ -544,12 +575,16 @@ mod tests {
 
         // ③ 正文行数 = 功能数，且真的有高度（host/col 在无限高度下量不出内容就塌了）。
         let keys_kids = tree.get(keys_body).expect("键盘正文").children.clone();
-        assert_eq!(keys_kids.len(), Action::COUNT, "键盘卡应为每个功能一行");
+        assert_eq!(
+            keys_kids.len(),
+            Action::COUNT + 1,
+            "键盘卡应为每个功能一行，再加一行只读的「空格看图」"
+        );
         let mouse_body = tree.get(kids[1]).expect("卡").children[1];
         assert_eq!(
             tree.get(mouse_body).expect("鼠标正文").children.len(),
-            3,
-            "鼠标卡应为「双击 / 滚轮 / Ctrl+滚轮」三行"
+            5,
+            "鼠标卡应为「双击 / 滚轮 / Ctrl / Alt / Shift」五行"
         );
         assert!(
             tree.get(keys_body).expect("键盘正文").bounds.h > ROW_H,
@@ -589,7 +624,7 @@ mod tests {
             "正文高度只剩一行：列容器在无限高度下没量出内容"
         );
 
-        // ⑤ 整页滚动：29 行键位必定溢出，滚轮必须被消费且 scroll_y 真的动。
+        // ⑤ 整页滚动：36 行键位必定溢出，滚轮必须被消费且 scroll_y 真的动。
         let content_h = tree.get(page_id).expect("页面").content_h;
         assert!(
             content_h > size.h,

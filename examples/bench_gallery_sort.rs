@@ -1,6 +1,11 @@
-//! 大目录排序耗时基准：模拟 `Gallery::from_file` 的自然序排序段。
+//! 大目录排序耗时基准：**m275 之前**那一版自然序排序段的历史对照。
 //!
-//! 用途：B1.1（大目录自然序排序键预计算）的前后对比——比较器每次现算 `natural_key`
+//! ★ 现行实现已经不是这套键了（m275）：`core::gallery` 直接调系统
+//! `StrCmpLogicalW` 比 UTF-16 名（3000 项实测 2.8 ms，与本文件里"预计算键"那一臂同量级），
+//! `natural_key` / `sort_natural` 都已删除。所以下面这份复刻**没有需要同步的生产代码**，
+//! 留在这里只为复现"每比较一次就现算键"到底贵多少。
+//!
+//! 用途（历史）：B1.1（大目录自然序排序键预计算）的前后对比——比较器每次现算 `natural_key`
 //! 的代价 vs 预计算键（Schwartzian transform）。条目出自已随 m47 删除的「手感断点清单」。
 //!
 //! 跑法：`cargo run --release --example bench_gallery_sort`
@@ -11,8 +16,8 @@ use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-/// 与 `gallery.rs::natural_key` 字节级一致的复刻实现（example 不能访问 crate 私有函数）。
-/// 修改 `gallery.rs::natural_key` 时**必须同步**——否则基准测的是错的键。
+/// 已删除的 `gallery.rs::natural_key` 的字节级复刻（example 够不到 crate 私有函数）。
+/// ★ m275 起**不再有生产实现要同步**：现行排序走系统 `StrCmpLogicalW`。
 fn natural_key(s: &OsStr) -> String {
     use std::fmt::Write as _;
     let s = s.to_string_lossy().to_lowercase();

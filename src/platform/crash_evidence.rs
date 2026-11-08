@@ -20,7 +20,7 @@
 //!    exe 路径 + 大小 + 构建时间、**exe 基址与 RVA**、栈回溯、运行日志尾部、转储路径。
 //! 2. `temp\` 里一枚 `crash-<今天>-<时分秒>.dmp`（`MiniDumpWriteDump`，`MiniDumpNormal`：
 //!    带线程栈与异常上下文，几百 KB，不带整堆）。两道闸门都在：最近 [`KEEP_DUMPS`] 份，
-//!    外加**文件名日期**过 [`KEEP_DAYS`](crate::core::paths::KEEP_DAYS) 天的一次清理（[`prepare_diagnostics`]）。
+//!    外加**文件名日期**过 `KEEP_DAYS` 天的一次清理（[`prepare_diagnostics`]）。
 //!
 //! 报告为什么必须带**基址**：异常地址是含 ASLR 的绝对地址，没有基址就换不出 RVA，
 //! 拿着同版本符号也对不上行（只写"崩在 `0x7ff6…`"等于没写）。
@@ -70,7 +70,7 @@ pub const KEEP_DUMPS: usize = 5;
 /// 而崩溃报告要回答"崩之前在做什么"——那一句只有历史日志能给。GUI 程序把日志只写向
 /// 控制台等于没写。
 ///
-/// **写满即停，不截断重写**（闸门是 [`RUN_LOG_MAX_BYTES`]）：到顶就落一条标记然后收手。
+/// **写满即停，不截断重写**（闸门是 `RUN_LOG_MAX_BYTES`）：到顶就落一条标记然后收手。
 /// 为什么不停下来而是丢掉后续：截断重写吃掉的是**当天开头**那几行——会话头（版本 /
 /// 构建时间 / exe 路径）与解码器清单，那正是"这份日志是哪一版落下来的、配哪一枚 PDB"的
 /// 唯一依据；丢了它，后面写得再多也没法判读。755 字节的日常会话离上限差着三个数量级，
@@ -84,7 +84,7 @@ pub const KEEP_DUMPS: usize = 5;
 pub struct RunLogSink {
     file: Option<std::fs::File>,
     len: u64,
-    /// 本枚日志的容量闸门（`new()` 取 [`RUN_LOG_MAX_BYTES`]；测试注入小值才测得到边界）。
+    /// 本枚日志的容量闸门（`new()` 取 `RUN_LOG_MAX_BYTES`；测试注入小值才测得到边界）。
     cap: u64,
     /// 已经写满并落过标记：置真之后不再碰盘（标记因此**只有一条**）。
     stopped: bool,
@@ -677,7 +677,7 @@ pub(crate) fn newest_run_log_in(dir: &Path) -> Option<PathBuf> {
     best
 }
 
-/// 启动时的一次保留清理：删掉 `temp\` 里**文件名日期**早于「今天 − [`KEEP_DAYS`](crate::core::paths::KEEP_DAYS)」的日志与转储。
+/// 启动时的一次保留清理：删掉 `temp\` 里**文件名日期**早于「今天 − `KEEP_DAYS`」的日志与转储。
 ///
 /// `today_days` 由调用方给：判据不许自己读时钟，否则这条规则要等 8 天之后才测得了
 /// （与 `core::config` 防抖同一个定式）。**认不出日期的名字一律不动**——`rupix.run`

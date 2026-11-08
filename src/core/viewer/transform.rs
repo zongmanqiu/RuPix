@@ -20,6 +20,24 @@ pub(super) fn strip_window_first(len: usize, cur: usize, n: usize) -> usize {
     cur.saturating_sub((n - 1) / 2).min(len - n)
 }
 
+/// 用户自己滚过之后（`strip_first = Some`）的窗口首序号：**只把锚点夹进合法区间**，
+/// 不跟随当前图（m260）。
+///
+/// ★ m258 第一版在这里写了"当前图跑出视野就把它带回来"。看着合理，实际等于**拖不动**：
+///   拖条本身不换图，所以只要一拖到当前格看不见，下一帧就被拽回原处——用户实测
+///   2026-11-08 报的就是这句「我们当前看的图好像必须出现在缩略图里面？」
+///   现在口径：条的位置只由用户的手决定（拖动 / 滚轮 / 拖滑块），换图（点格子、
+///   键盘、浮条、自动播放）一律不动它；想回到"跟着当前图"就换边或关掉条（锚点归零）。
+///
+/// `anchor` 越界（目录变短）时夹进合法区间，所以调用方不必预夹。
+pub(super) fn strip_window_anchored(len: usize, n: usize, anchor: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let n = n.clamp(1, len);
+    anchor.min(len - n)
+}
+
 // ── 像素层视图变换（旋转 / 镜像）────────────────────────────────
 
 /// 归一化显示矩形 → 图像矩形（区域请求用；[`rect_map_display`] 的逆）。

@@ -690,3 +690,271 @@ fn size_figures(text: &str) -> Vec<String> {
     }
     out
 }
+
+/// ⑮ windui 的滚轮事件必须把修饰键送上来（补丁 027）。
+/// 宿主 `canvas.rs` 用 `p.mods.ctrl` 分派 Ctrl+滚轮、用 `p.mods.shift` 判条上一屏；
+/// 平台层若还用 `PointerEvent::single`（Mods 全 false），这两条手势就一起失效。
+fn assert_wheel_mods_forwarded(body: &str, what: &str) {
+    assert!(
+        body.contains("single_with"),
+        "{what}：滚轮仍用 single()，修饰键全丢"
+    );
+    assert!(body.contains("ctrl:"), "{what}：Mods 没填 ctrl");
+    assert!(body.contains("shift:"), "{what}：Mods 没填 shift");
+}
+
+#[test]
+fn j15_wheel_event_carries_modifier_keys() {
+    let main = main_dir();
+    let root = main.parent().expect("main 没有上级目录");
+    let p = root.join(".3rd/wind-ui-rust-0.23.0/src/platform/win32/mod.rs");
+    let src = read(&p);
+    let rest = src
+        .split("unsafe fn handle_wheel")
+        .nth(1)
+        .unwrap_or_else(|| panic!("找不到 handle_wheel"));
+    let end = rest.find("\n}\n").unwrap_or(rest.len());
+    assert_wheel_mods_forwarded(&rest[..end], "现状");
+}
+
+/// 负向臂：补丁 027 之前的 handle_wheel 形状喂同一个断言，必须报红；
+/// 也钉住断言本身——删掉 single_with 那一条，这里不再 panic 而失败。
+#[test]
+#[should_panic(expected = "修饰键全丢")]
+fn j15_wheel_mods_reject_the_old_single_constructor() {
+    let old = r#"
+unsafe fn handle_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
+    let delta = ((wparam.0 >> 16) & 0xffff) as i16 as i32;
+    dispatch_pointer_event(hwnd, PointerEvent::single(PointerKind::Wheel(delta), pt, MouseButton::Left));
+}
+"#;
+    assert_wheel_mods_forwarded(old, "补丁 027 之前");
+}
+
+/// m269 / 补丁 028：无边框形态的平台侧落地判据。
+///
+/// 少任何一条都会退化成「空格看图」那种鼠标穿透窗，或者退化成不透明窗。
+/// 逐字节归档另由 `j13` 守，这里只钉形状。
+fn assert_transparent_bg_wired(src: &str, what: &str) {
+    assert!(
+        src.contains("transparent_bg: bool"),
+        "{what}：后端没有形态标志"
+    );
+    assert!(
+        src.contains("alpha_floor && a == 0 { 1 }"),
+        "{what}：DIB 没有 alpha 下限 1（鼠标会穿透）"
+    );
+    assert!(
+        src.contains("self.alpha == 255 && !self.transparent_bg"),
+        "{what}：100% 不透明时仍会摘掉分层"
+    );
+    assert!(
+        src.contains(
+            "WindowOp::SetTransparentBackground(on)) => set_transparent_background(hwnd, on)"
+        ),
+        "{what}：WindowOp 没有落到 win32 执行体"
+    );
+    assert!(
+        src.contains("tiny_skia::Color::from_rgba8(0, 0, 0, 0)"),
+        "{what}：底色没有清成透明"
+    );
+    // ★ 宿主那一层必须被通知到：平台清完透明，`UiHost::render` 的整窗帧还会
+    //   `pixmap.fill(self.bg)` 一遍，没这条就还是实心底色（真机实测症状）。
+    assert!(
+        src.contains("s.handler.set_bg_transparent(on)"),
+        "{what}：没把透明交给宿主（整窗清底会把透明盖掉）"
+    );
+    // ★ 补丁 029：DWM 自己那圈 1px 边框。补丁 028 关的只是 Win10 那条自绘外框，
+    //   Win11 上边框是 DWM 画的，且画在窗口矩形最外一圈像素之内（真机采样 (194,194,194)）。
+    assert!(
+        src.contains("set_dwm_frame_border(hwnd, !on)"),
+        "{what}：DWM 那圈 1px 边框没关（透明窗四周会留灰线）"
+    );
+    assert!(
+        src.contains("DWMWA_COLOR_NONE"),
+        "{what}：DWM 边框色没有置成「无」"
+    );
+}
+
+/// 宿主侧：`UiHost` 要真的能把整窗清底切成全透明。
+fn assert_host_clear_goes_transparent(src: &str, what: &str) {
+    assert!(
+        src.contains("bg_transparent: bool"),
+        "{what}：宿主没有透明清底标志"
+    );
+    assert!(
+        src.contains("fn set_bg_transparent(&mut self, on: bool)"),
+        "{what}：宿主没实现 set_bg_transparent"
+    );
+    assert!(
+        src.contains("let bg = if self.bg_transparent {"),
+        "{what}：整窗清底没走透明分支"
+    );
+    assert!(
+        src.contains("Color::rgba(0, 0, 0, 0)"),
+        "{what}：透明清底用的不是全透明"
+    );
+}
+
+#[test]
+fn j16_borderless_transparency_never_lets_mouse_through() {
+    let main = main_dir();
+    let root = main.parent().expect("main 没有上级目录");
+    let base = root.join(".3rd/wind-ui-rust-0.23.0/src");
+    assert_transparent_bg_wired(&read(&base.join("platform/win32/mod.rs")), "现状");
+    assert_host_clear_goes_transparent(&read(&base.join("app/mod.rs")), "现状");
+}
+
+/// 负向臂：只漏掉「alpha 下限 1」这一刀的源码喂同一断言，必须报红——
+/// 那是补丁 028 最容易丢、也最不容易被肉眼发现的一条。
+#[test]
+#[should_panic(expected = "DIB 没有 alpha 下限 1")]
+fn j16_rejects_transparency_without_the_alpha_floor() {
+    let old = r#"
+struct SkiaBackend { alpha: u8, transparent_bg: bool }
+unsafe fn paint_layered(...) {
+    if (self.alpha == 255 && !self.transparent_bg) { return self.paint(hwnd, bg, handler); }
+    pixmap.fill(tiny_skia::Color::from_rgba8(0, 0, 0, 0));
+    s.handler.set_bg_transparent(on);
+}
+fn copy_premul_rows(...) { let a = (s[3] as u32 * alpha as u32) / 255; }
+unsafe fn run_window_op(...) {
+    Some(WindowOp::SetTransparentBackground(on)) => set_transparent_background(hwnd, on),
+}
+"#;
+    assert_transparent_bg_wired(old, "漏掉 alpha 下限的假补丁");
+}
+
+/// 负向臂 2：宿主那一刀漏掉时也必须报红。这条比 alpha 下限更隐蔽——
+/// 平台侧四条全在、窗口也是分层窗，只有"透明区仍然是一片实心底色"这一个症状。
+#[test]
+#[should_panic(expected = "宿主没有透明清底标志")]
+fn j16_rejects_a_host_that_keeps_painting_its_own_background() {
+    let old = r#"
+struct UiHost { bg: Color }
+impl UiHost {
+    fn render(&mut self, target: &mut dyn RenderTarget, size: Size) {
+        target.begin_damage(None, self.bg);
+    }
+}
+"#;
+    assert_host_clear_goes_transparent(old, "没接透明清底的假宿主");
+}
+
+/// 负向臂 3（补丁 029）：透明做对了、自绘外框也关了，唯独没关 DWM 那圈 1px 边框。
+/// 症状只有一条——透明窗四周一条灰线、图片还被切掉 1px，肉眼看像"没做干净"，
+/// 却骗过前六条断言。用户实机就是这么撞上的。
+#[test]
+#[should_panic(expected = "DWM 那圈 1px 边框没关")]
+fn j16_rejects_a_transparent_window_that_keeps_the_dwm_frame() {
+    let old = r#"
+struct SkiaBackend { transparent_bg: bool }
+unsafe fn paint_layered(...) {
+    if (self.alpha == 255 && !self.transparent_bg) { return self.paint(hwnd, bg, handler); }
+    pixmap.fill(tiny_skia::Color::from_rgba8(0, 0, 0, 0));
+}
+fn copy_premul_rows(...) {
+    let a = if alpha_floor && a == 0 { 1 } else { a };
+}
+unsafe fn sync_outline(hwnd: HWND) {
+    let color = (!transparent).then(|| win10_outline_color(active));
+}
+unsafe fn run_window_op(...) {
+    Some(WindowOp::SetTransparentBackground(on)) => set_transparent_background(hwnd, on),
+}
+unsafe fn set_transparent_background(hwnd: HWND, on: bool) {
+    s.handler.set_bg_transparent(on);
+}
+"#;
+    assert_transparent_bg_wired(old, "只关了自绘外框的假补丁");
+}
+
+/// 判据⑰：同一功能在用户看得见的地方只许有一个名字。
+///
+/// 范围 = UI 源码的**非注释行** + README。内部标识符（ini 键 `space_preview`、
+/// 模块 `spacehook`、类型 `RawParams`）与源码注释里的技术术语不在此列：
+/// 改它们会破坏兼容与检索，那不是文案问题。HISTORY / 待办按体例要记录旧名，同样豁免。
+const RETIRED_UI_LABELS: &[(&str, &str)] = &[
+    ("上一帧", "动画上一帧"),
+    ("下一帧", "动画下一帧"),
+    ("暂停/继续动画", "暂停/播放动画"),
+    ("空格看图", "空格预览"),
+    ("RAW 参数", "裸数据参数"),
+    ("适应长图", "长图模式"),
+    ("最小化到托盘", "关闭到托盘"),
+];
+
+const LABEL_SURFACES: &[&str] = &[
+    "src/core/hotkey.rs",
+    "src/ui/chrome.rs",
+    "src/ui/canvas.rs",
+    "src/ui/settings/options.rs",
+    "src/ui/settings/shortcuts.rs",
+    "src/ui/raw_dialog.rs",
+    "README.md",
+];
+
+/// 统一后的名字必须真的落在正本里——只查"旧名不出现"会被"两边都删掉"骗过。
+const UNIFIED_ANCHORS: &[(&str, &str)] = &[
+    ("src/core/hotkey.rs", "Action::FramePrev => \"上一帧\""),
+    (
+        "src/core/hotkey.rs",
+        "Action::PauseAnim => \"暂停/继续动画\"",
+    ),
+    ("src/ui/settings/options.rs", "check_row(\"空格看图\""),
+    ("src/ui/raw_dialog.rs", "Window::new(\"RAW 参数\""),
+    ("README.md", "**适应长图**"),
+    ("README.md", "**最小化到托盘**"),
+];
+
+fn visible_lines(src: &str) -> String {
+    src.lines()
+        // 只扫**生产区**：`#[cfg(test)]` 之后的负向臂按设计会复刻旧名做假数据，
+        // 那不是用户看得见的文案，扫进去会自己把自己判红。
+        .take_while(|l| !l.trim_start().starts_with("#[cfg(test)]"))
+        .filter(|l| {
+            let s = l.trim_start();
+            !s.is_empty() && !(s.starts_with("//") || s.starts_with("*") || s.starts_with("/*!"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn assert_no_retired_label(surfaces: &[(String, String)], what: &str) {
+    for (new, old) in RETIRED_UI_LABELS {
+        for (path, text) in surfaces {
+            assert!(
+                !text.contains(old),
+                "{what}：{path} 出现退役文案「{old}」（统一为「{new}」）"
+            );
+        }
+    }
+}
+
+#[test]
+fn j17_user_visible_labels_share_one_name() {
+    let mut surfaces = Vec::new();
+    for rel in LABEL_SURFACES {
+        let full = main_dir().join(rel);
+        surfaces.push((rel.to_string(), visible_lines(&read(&full))));
+    }
+    assert_no_retired_label(&surfaces, "现状");
+    for (rel, anchor) in UNIFIED_ANCHORS {
+        let full = main_dir().join(rel);
+        assert!(
+            read(&full).contains(anchor),
+            "{rel} 里找不到统一后的文案锚点「{anchor}」"
+        );
+    }
+}
+
+/// 负向臂：把旧名塞回任一界面，同一判据必须当场红。
+#[test]
+#[should_panic(expected = "出现退役文案「动画上一帧」")]
+fn j17_rejects_a_label_that_drifted_back() {
+    let fake = vec![(
+        "src/core/hotkey.rs".to_string(),
+        "Action::FramePrev => \"动画上一帧\"".to_string(),
+    )];
+    assert_no_retired_label(&fake, "旧实现");
+}

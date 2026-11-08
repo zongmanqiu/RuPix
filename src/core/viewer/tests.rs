@@ -128,23 +128,25 @@ fn decoded_sized(w: u32, h: u32) -> Decoded {
     }
 }
 
-/// 预读窗口跟着翻页方向走（m34）：刚往前翻就把前面两张排在最前，
+/// 预读窗口跟着翻页方向走（m34）：刚往前翻就把前面 N 张排在最前，
 /// 反方向留一格保「A→B→A」；方向未定时退回对称交错。
+/// m281：N 来自 ini `prefetch_depth`（出厂默认 3），这里按默认值写期望；
+/// 「手改 ini 会不会真的跟着变」由 `prefetch_depth_comes_from_config_*` 钉住。
 #[test]
 fn prefetch_window_follows_last_direction() {
     let mut v = viewer_with_image();
     v.last_dir = 1;
     assert_eq!(
         v.prefetch_offsets(),
-        vec![1, 2, -1],
-        "前进：同方向两格 + 反方向一格"
+        vec![1, 2, 3, -1],
+        "前进：同方向三格 + 反方向一格"
     );
     v.last_dir = -1;
-    assert_eq!(v.prefetch_offsets(), vec![-1, -2, 1], "后退：镜像");
+    assert_eq!(v.prefetch_offsets(), vec![-1, -2, -3, 1], "后退：镜像");
     v.last_dir = 0;
     assert_eq!(
         v.prefetch_offsets(),
-        vec![1, -1, 2, -2],
+        vec![1, -1, 2, -2, 3, -3],
         "未定向：两边都不赌"
     );
 }
@@ -156,7 +158,7 @@ fn prefetch_budget_eviction_stops_automatic_refill() {
     let pd = dir.join("d.svg");
     std::fs::write(&pd, b"").unwrap();
     let mut v = viewer_with_image();
-    v.gallery = Some(Gallery::from_file(&pa).unwrap());
+    v.gallery = Some(Gallery::from_file(&pa, SortSpec::DEFAULT).unwrap());
     v.view = (0.0, 0.0, 5120.0, 5120.0);
     v.last_dir = 1;
     v.cache_prefetch(pb, decoded_sized(5120, 5120));
@@ -545,6 +547,42 @@ fn can_pan_tracks_the_room_clamp_pan_uses() {
         Rc::new(RefCell::new(Config::default())),
     );
     assert!(!empty.can_pan(), "没有图就没有可拖的东西");
+}
+
+/// `overflows` 判的是"有没有看不见的部分"，与 `can_pan`（拖得动）**不是一把尺子**。
+///
+/// 唯一消费方是无边框形态的左键分工（m272）：那个形态没有标题栏、整块画面搬窗口，
+/// 只有图真溢出视口（按 `1` 到 100% / 放大过）才轮到平移。判错方向的两个后果都很难受——
+/// 常态下搬不动窗口（用户原话「没有任何提示」），或者放大后拖不动图。
+#[test]
+fn overflows_tells_a_fitted_image_apart_from_a_zoomed_one() {
+    let mut v = viewer_with_image(); // 4×4 位图
+    v.on_viewport(0.0, 0.0, 100.0, 100.0, 1.0);
+    assert!(
+        !v.overflows(),
+        "适应窗口：4×4 铺满 100×100，一个像素都不在画外"
+    );
+    assert!(
+        v.can_pan(),
+        "同一刻仍然拖得动——两把尺子各说各的事（overscroll 允许拖到只剩衣角）"
+    );
+
+    v.zoom_at_center(12.5);
+    assert!(!v.overflows(), "缩到 50×50：整张都在画面里");
+
+    v.zoom_at_center(64.0);
+    assert!(
+        v.overflows(),
+        "放到 256×256：两边都溢出，这时才有画外的东西"
+    );
+
+    // 空窗：没有图就没有"溢出"可言。
+    let (tx, _rx) = std::sync::mpsc::channel::<crate::core::decode::Done>();
+    let empty = Viewer::new(
+        Rc::new(crate::core::decode::Decoder::spawn_with(tx)),
+        Rc::new(RefCell::new(Config::default())),
+    );
+    assert!(!empty.overflows(), "没有图就谈不上溢出");
 }
 
 /// m216：WASD 平移的步进。三件事各钉一条：
@@ -2491,6 +2529,29 @@ fn strip_window_centering_and_clamping() {
     assert_eq!(strip_window_first(0, 0, n), 0);
 }
 
+/// ★ m260：用户滚过之后（`anchor = Some`）条**就停在滚到的地方**，哪怕当前图完全在
+/// 视野之外——这是用户 2026-11-08 要的「拖动滚动条移动，直接切换到很远的图」。
+///
+/// m258 第一版在这里写了"当前图跑出视野就把它带回来"。看着合理，实际等于**拖不动**：
+/// 拖条本身不换图，一拖到当前格看不见，下一帧就被拽回原处。现在这条函数**签名里
+/// 根本没有 `cur`**——结构上就不存在把当前图拽回来的可能，比任何注释都硬。
+#[test]
+fn strip_window_anchored_never_pulls_the_current_picture_back() {
+    // 锚点在中间：原样返回。
+    assert_eq!(strip_window_anchored(40, 8, 8), 8);
+    // 锚点远离当前图（当前图无论在第几张都查不到、也不需要查）：依旧原样。
+    assert_eq!(strip_window_anchored(40, 8, 30), 30);
+    assert_eq!(strip_window_anchored(40, 8, 0), 0);
+    // 锚点越界（目录变短）⇒ 先夹进合法区间（最后一屏的起点）。
+    assert_eq!(strip_window_anchored(40, 8, 999), 32);
+    // 目录比一屏还少 ⇒ 恒 0；空目录不许 panic。
+    assert_eq!(strip_window_anchored(5, 8, 3), 0);
+    assert_eq!(strip_window_anchored(0, 8, 0), 0);
+    // 单格窗口：锚点就是那一张。
+    assert_eq!(strip_window_anchored(40, 1, 20), 20);
+    assert_eq!(strip_window_anchored(40, 1, 999), 39);
+}
+
 /// ★ m100：`strip_window` 交出的**序号**与 `strip_path` 交出的**路径**必须是同一张图。
 ///
 /// 本轮把"整排 `PathBuf` 交给画布"换成"画布按序号来借"，代价是这两句之间多了一条
@@ -2514,7 +2575,7 @@ fn the_strip_window_indices_and_the_borrowed_paths_are_the_same_pictures() {
     );
     // 停在第 4 张（`d`）：7 张目录、5 格窗口 → 窗口既不是从 0 开始，也没贴到末尾。
     v.open(&dir.join("d.svg"));
-    let (first, n) = v.strip_window(5);
+    let (first, n) = v.strip_window(5, None);
     assert_eq!((first, n), (1, 5), "当前图居中：前面留 2 ⇒ 起点是第 2 张");
     let g = v.gallery.as_ref().unwrap();
     let want: Vec<PathBuf> = (first..first + n)
@@ -2690,6 +2751,82 @@ fn step_anim_miss_asks_the_decoder_by_index() {
     v.step_anim(-1);
     assert!(v.anim_paused(), "按逐帧即进暂停态");
     assert_ne!(v.want_seq, seq, "未命中必须发一次按号请求");
+}
+
+/// 跳到第 N 张：一次按号请求（不是连按 N 下），越界夹到末张，且先自动暂停。
+#[test]
+fn jump_anim_asks_by_index_and_clamps() {
+    let (mut v, pa) = anim_viewer();
+    v.apply(anim_done(pa.clone(), v.want_seq, 0, 340));
+    let seq = v.want_seq;
+    assert!(v.jump_anim(199), "第 200 页要能跳");
+    assert!(
+        v.anim_paused(),
+        "跳转即进暂停态（否则下一帧调度立刻把画面拽走）"
+    );
+    assert_ne!(v.want_seq, seq, "必须发一次按号请求");
+    assert_eq!(
+        v.step_target,
+        Some(199),
+        "界面 1 起、核心 0 起：第 200 = 199"
+    );
+    // 越界：夹到末张，不拒、不 panic（输入框那一层已经拒过一次，这里是第二道）。
+    assert!(v.jump_anim(9999));
+    assert_eq!(v.step_target, Some(339));
+}
+
+/// 总数未知（`count == 0`）与静图都不受理：按号跳无从夹取，宁可不动。
+#[test]
+fn jump_anim_is_ignored_without_a_known_last_frame() {
+    let (mut v, pa) = anim_viewer();
+    v.apply(anim_done(pa.clone(), v.want_seq, 0, 0));
+    let seq = v.want_seq;
+    assert!(!v.jump_anim(5), "总数未知不该猜");
+    assert_eq!(v.want_seq, seq, "不该发请求");
+
+    // 静图：`has_index()` 为假（count=1 / delay=0），同样不受理。
+    use crate::core::pixels::{Anim, Bitmap, Decoded};
+    let still = Done {
+        seq: v.want_seq,
+        path: pa,
+        out: Ok(Decoded {
+            natural: (10, 10),
+            region: None,
+            anim: Anim::STATIC,
+            bitmap: Bitmap {
+                width: 10,
+                height: 10,
+                rgba: vec![0; 10 * 10 * 4],
+            },
+        }),
+    };
+    v.apply(still);
+    assert!(!v.jump_anim(1));
+}
+
+/// 排序口径从配置来、落到清单上：**代数要涨**（界面据此归零按槽位记的状态），
+/// 当前这张不许换（它是锚点）。
+#[test]
+fn sync_sort_reorders_the_listing_and_bumps_the_epoch() {
+    let (mut v, pa) = anim_viewer();
+    v.apply(anim_done(pa.clone(), v.want_seq, 0, 2));
+    let before = v.sort_epoch();
+    assert_eq!(v.sort(), SortSpec::DEFAULT, "出厂口径是文件名升序");
+    assert!(!v.sync_sort(), "配置没变就不该重排");
+
+    v.config.borrow_mut().sort_by = crate::core::gallery::SortBy::Size;
+    assert!(v.sync_sort(), "配置变了要重排");
+    assert_eq!(
+        v.sort_epoch(),
+        before + 1,
+        "代数要涨（界面据此清缩略图条锚点）"
+    );
+    assert_eq!(
+        v.gallery.as_ref().unwrap().current().cloned(),
+        Some(pa),
+        "重排不许换掉当前这张"
+    );
+    assert!(!v.sync_sort(), "同一口径第二次不该再重排");
 }
 
 /// ★ 连按不许丢步：后退一步可能要付一次「重建 + 快进」，这期间屏幕上还是旧帧。
@@ -3284,4 +3421,194 @@ fn pick_at_inverse_maps_rotation_and_matches_the_pixel_it_shows() {
         [(p.at.0 * 60) as u8, (p.at.1 * 60) as u8, 100, 255],
         "颜色与坐标必须指向同一枚原图像素"
     );
+}
+
+// ── m265/m281：图片预读 = 邻图 ±N（ini 可配） + 缩略图条可见一屏 ──────
+
+/// 造一个有 `n` 张图的目录（文件名补零，清单顺序 == 数组顺序）。
+fn gallery_many(tag: &str, n: usize) -> (PathBuf, Vec<PathBuf>) {
+    let dir = crate::core::paths::test_scratch_root()
+        .join(format!("sv-m265-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let paths: Vec<_> = (0..n)
+        .map(|i| {
+            let p = dir.join(format!("{i:03}.svg"));
+            std::fs::File::create(&p).unwrap();
+            p
+        })
+        .collect();
+    (dir, paths)
+}
+
+fn viewer_for(paths: &[PathBuf]) -> Viewer {
+    let (tx, _rx) = std::sync::mpsc::channel::<Done>();
+    let mut v = Viewer::new(
+        Rc::new(Decoder::spawn_with(tx)),
+        Rc::new(RefCell::new(Config::default())),
+    );
+    v.open(&paths[0]);
+    v.on_viewport(0.0, 0.0, 100.0, 100.0, 1.0);
+    v
+}
+
+/// 判据共用：条上那一屏的**每一格**都得在下注集合里。
+fn assert_covers_strip(plan: &[usize], first: usize, n: usize, what: &str) {
+    for i in first..first + n {
+        assert!(
+            plan.contains(&i),
+            "{what}：条上第 {} 格（索引 {i}）没被预读：{plan:?}",
+            i + 1
+        );
+    }
+}
+
+/// 当前图第 1 张，条滚到 8–12（当前图完全不在视野里）：两种切图手势都得接住。
+#[test]
+fn picture_prefetch_bets_on_neighbours_and_the_visible_strip() {
+    let (dir, paths) = gallery_many("strip-scope", 14);
+    let mut v = viewer_for(&paths);
+    v.last_dir = 1;
+    v.prefetch_strip = Some((7, 5));
+    let plan = v.prefetch_targets();
+    for i in [1usize, 2, 13] {
+        assert!(plan.contains(&i), "方向邻居 {i} 必须在下注集合里：{plan:?}");
+    }
+    assert_covers_strip(&plan, 7, 5, "图片预读");
+    assert!(plan.len() <= PREFETCH_CAP, "下注集合必须有界：{plan:?}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// 负向臂：把「只写邻图」的旧下注集合喂同一个断言，必须报红。
+#[test]
+#[should_panic(expected = "条上第")]
+fn picture_prefetch_rejects_neighbours_only_plan() {
+    let only_neighbours = vec![1usize, 2, 13];
+    assert_covers_strip(&only_neighbours, 7, 5, "旧「邻图预读」");
+}
+
+/// 目录几十张、条一屏几十格 ⇒ 下注集合仍恰好封顶，且留近不留远。
+#[test]
+fn picture_prefetch_plan_is_bounded_and_keeps_the_nearest() {
+    let (dir, paths) = gallery_many("bounded", 40);
+    let mut v = viewer_for(&paths);
+    v.prefetch_strip = Some((0, 40));
+    let plan = v.prefetch_targets();
+    assert_eq!(plan.len(), PREFETCH_CAP, "下注集合必须按份数封顶：{plan:?}");
+    assert!(plan.contains(&1), "离当前图最近的要先下注：{plan:?}");
+    assert!(!plan.contains(&20), "最远的必须被截掉：{plan:?}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// 条画出来的那一屏真的喂进了预读；关条时自动退回纯邻图。
+#[test]
+fn strip_window_feeds_the_prefetch_scope_and_closing_it_falls_back() {
+    let (dir, paths) = gallery_many("feed", 14);
+    let mut v = viewer_for(&paths);
+    let (first, n) = v.strip_window(5, Some(7));
+    assert_eq!((first, n), (7, 5));
+    assert_eq!(v.prefetch_strip, Some((first, n)));
+    assert_covers_strip(&v.prefetch_targets(), first, n, "条开着");
+    v.set_prefetch_strip(0, 0);
+    assert_eq!(v.prefetch_strip, None, "关条 = 没有可见的那一屏");
+    // 关条后只剩邻图：直接和偏移表比，别把「3..=11 之外」写死——m281 深度可配到 3
+    // 之后，±3 本来就会落进那段范围，写死区间是假红而不是判据。
+    let expected: Vec<usize> = v
+        .prefetch_offsets()
+        .iter()
+        .map(|&o| o.rem_euclid(paths.len() as isize) as usize)
+        .collect();
+    assert_eq!(v.prefetch_targets(), expected, "关条后只剩邻图");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// m281：深度来自配置——默认 3（对称交错 6 格）、改成 4 是 8 格、改成 1 只剩 2 格。
+/// 行为读者就在这里：配置里的值必须真的改变偏移表，不是「解得开但没人读」。
+#[test]
+fn prefetch_depth_comes_from_config_not_a_hardcoded_constant() {
+    let (dir, paths) = gallery_many("depth", 30);
+    let mut v = viewer_for(&paths);
+    assert_eq!(
+        v.prefetch_offsets(),
+        vec![1, -1, 2, -2, 3, -3],
+        "出厂默认 3 ⇒ 未定向时对称交错 6 格"
+    );
+    v.config.borrow_mut().prefetch_depth = 4;
+    assert_eq!(
+        v.prefetch_offsets(),
+        vec![1, -1, 2, -2, 3, -3, 4, -4],
+        "ini 改成 4 当场生效"
+    );
+    v.last_dir = 1;
+    assert_eq!(
+        v.prefetch_offsets(),
+        vec![1, 2, 3, 4, -1],
+        "方向已定：同方向给满 4 格、反方向留 1 格"
+    );
+    v.config.borrow_mut().prefetch_depth = 1;
+    assert_eq!(
+        v.prefetch_offsets(),
+        vec![1, -1],
+        "ini 改成 1 只剩最少的一格"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// m281：深度拉到上限 4 时，常规可见一屏（7 格）仍**全部**在下注集合里。
+/// CAP=16 的算式 `2×4 + 7 + 1` 就是为这一条存在的。
+#[test]
+fn max_depth_never_crowds_out_the_visible_strip() {
+    let (dir, paths) = gallery_many("cap", 30);
+    let mut v = viewer_for(&paths);
+    v.config.borrow_mut().prefetch_depth = 4;
+    v.prefetch_strip = Some((10, 7));
+    let plan = v.prefetch_targets();
+    assert_eq!(plan.len(), 15, "8 格邻图 + 7 格可见屏，去重后 15：{plan:?}");
+    assert_covers_strip(&plan, 10, 7, "深度 4");
+    assert!(plan.len() <= PREFETCH_CAP, "16 的硬闸要留得住这一屏");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// 负向臂：拿生产下注集合按**旧 CAP=12** 截断，喂同一个「每格都得在」判据，必须红。
+/// 这正是 m281 把 CAP 提到 16 的理由——不提，深度调大就会挤掉可点的格子。
+#[test]
+#[should_panic(expected = "条上第")]
+fn old_cap_of_twelve_crowds_out_visible_cells_at_max_depth() {
+    let (dir, paths) = gallery_many("old-cap", 30);
+    let mut v = viewer_for(&paths);
+    v.config.borrow_mut().prefetch_depth = 4;
+    v.prefetch_strip = Some((10, 7));
+    let mut old = v.prefetch_targets();
+    old.truncate(12);
+    assert_covers_strip(&old, 10, 7, "旧 CAP=12");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// 滚条 = 新一轮下注：旧一屏的位图不许占着份数闸，停填闸也要松开。
+#[test]
+fn moving_the_strip_replans_and_drops_stale_cached_pages() {
+    let (dir, paths) = gallery_many("replan", 20);
+    let mut v = viewer_for(&paths);
+    v.prefetch_strip = Some((10, 5));
+    v.prefetched.push(Prefetched {
+        path: paths[4].clone(),
+        img: decoded4(paths[4].clone()).out.unwrap(),
+    });
+    v.prefetched.push(Prefetched {
+        path: paths[6].clone(),
+        img: decoded4(paths[6].clone()).out.unwrap(),
+    });
+    v.prefetch_stopped = true;
+    v.set_prefetch_strip(5, 5);
+    assert_eq!(v.prefetch_strip, Some((5, 5)));
+    assert!(!v.prefetch_stopped, "滚动条之后必须重新开闸");
+    assert!(
+        v.prefetched.iter().all(|e| e.path != paths[4]),
+        "上一屏的旧位图不该留着占份数闸"
+    );
+    assert!(
+        v.prefetched.iter().any(|e| e.path == paths[6]),
+        "新一屏里已解好的要留着"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
 }

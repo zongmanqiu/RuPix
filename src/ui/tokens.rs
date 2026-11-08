@@ -123,9 +123,14 @@ pub const GAP: i32 = 8;
 /// 页顶/页底留白 = 同一格节奏（各页共用，改一处全页跟着走）。
 pub const PAGE_TOP_MARGIN: i32 = GAP;
 
-/// 自绘对话框（裸数据参数、插件设置）的四边留白。**两扇窗共用同一格**：
+/// 自绘对话框（裸数据参数、插件设置、跳转）的四边留白。**三扇窗共用同一格**：
 /// 用户 2026-10-31 点名"底部按钮离边框的距离要一样" —— 各写各的数字就会走散。
 pub const DIALOG_PAD: i32 = 16;
+/// 两列版式对话框的窗宽：**唯一来源**，插件设置窗与跳转窗都吃这一个数。
+/// 标签左缘 = `DIALOG_PAD` = 16，控件右缘 = 16 + `COL1_W`(208) +
+/// `CONTROL_GROUP_W`(200) = 424，右边再留 40 给行尾的 `flex_spacer`。
+/// 不写死 480：前三个令牌谁改了窗宽都跟着走，不会两扇窗各算一遍然后漂开。
+pub const DIALOG_W: i32 = DIALOG_PAD * 2 + COL1_W + CONTROL_GROUP_W + 40;
 /// `fit_content` 的下限。只防"空窗"，不参与排版：内容自己撑多高就多高，
 /// 给大了就会在按钮下面留一条谁也不认领的空白（用户点名的正是这一条）。
 pub const DIALOG_FIT_MIN: i32 = 120;
@@ -224,6 +229,10 @@ struct Overlay {
     slot_hover: [u8; 4],
     /// 缩略图格（当前图）。
     slot_cur: [u8; 4],
+    /// 缩略图条滚动指示的轨道（只在目录长于一屏时出现）。
+    strip_track: [u8; 4],
+    /// 缩略图条滚动指示的滑块。
+    strip_thumb: [u8; 4],
     /// 浮层上的正文。
     text: [u8; 3],
     /// 浮层上的次要文字（时间 / 尺寸那类）。
@@ -257,6 +266,8 @@ const DARK_OVERLAY: Overlay = Overlay {
     slot_bg: [255, 255, 255, 12],
     slot_hover: [255, 255, 255, 34],
     slot_cur: [255, 255, 255, 22],
+    strip_track: [255, 255, 255, 20],
+    strip_thumb: [255, 255, 255, 78],
     text: [208, 208, 208],
     text_muted: [140, 140, 140],
     text_active: [126, 201, 126],
@@ -289,6 +300,8 @@ const LIGHT_OVERLAY: Overlay = Overlay {
     slot_bg: [0, 0, 0, 10],
     slot_hover: [0, 0, 0, 28],
     slot_cur: [0, 0, 0, 16],
+    strip_track: [0, 0, 0, 14],
+    strip_thumb: [0, 0, 0, 62],
     text: [42, 48, 52],
     text_muted: [110, 118, 124],
     text_active: [40, 150, 80],
@@ -369,6 +382,14 @@ pub fn slot_hover() -> Color {
 pub fn slot_cur() -> Color {
     to_color4(overlay().slot_cur)
 }
+/// 缩略图条滚动指示的轨道。
+pub fn strip_track() -> Color {
+    to_color4(overlay().strip_track)
+}
+/// 缩略图条滚动指示的滑块。
+pub fn strip_thumb() -> Color {
+    to_color4(overlay().strip_thumb)
+}
 /// 浮层正文。
 pub fn overlay_text() -> Color {
     to_color(overlay().text)
@@ -405,6 +426,17 @@ const OVERLAY_SLIDING_BG: [u8; 4] = [224, 86, 78, 215];
 /// 关闭按钮悬停：红底（唯一一枚"危险"底，与浅色系 `TEXT_ACCENT` 是两套语义）。
 /// 两套主题共用——危险色不该因为换了主题就换个红法。
 const OVERLAY_BTN_DANGER_HOVER: [u8; 4] = [232, 17, 35, 220];
+/// 缩略图**序号**的字：纯黑。
+///
+/// 压在缩略图的像素上（内容任意），所以归"恒定"这一组。用户 2026-11-08 两次口径合起来
+/// 才完整：「里面是黑色，外面要包裹 1px 的白色」「不是一整个矩形区域都是其它颜色背景」
+/// —— 所以要的是**描边文字**，不是色块标签。
+const OVERLAY_BADGE_TEXT: [u8; 3] = [0, 0, 0];
+/// 序号文字四周那 1px **白描边**（同一个字画八遍再压一遍黑字）。
+///
+/// 一黑一白互为退路：浅色照片上黑字自己就够，深色照片上黑字会融进背景、靠这圈白边
+/// 勾出字形轮廓。没有底色块，缩略图不会被遮掉一块。
+const OVERLAY_BADGE_HALO: [u8; 3] = [255, 255, 255];
 
 /// 双层框线的外层（黑）。绘制顺序恒为「先 `STROKE_DARK` 后 `STROKE_LIGHT`」。
 pub const STROKE_DARK: Color = to_color(OVERLAY_STROKE_DARK);
@@ -416,6 +448,10 @@ pub const NAV_FILL: Color = to_color4(OVERLAY_NAV_FILL);
 pub const SLIDING_BG: Color = to_color4(OVERLAY_SLIDING_BG);
 /// 危险（关闭）按钮悬停底色。
 pub const BTN_DANGER_HOVER: Color = to_color4(OVERLAY_BTN_DANGER_HOVER);
+/// 缩略图序号的字（黑）。
+pub const BADGE_TEXT: Color = to_color(OVERLAY_BADGE_TEXT);
+/// 缩略图序号的白描边。
+pub const BADGE_HALO: Color = to_color(OVERLAY_BADGE_HALO);
 
 // ── 转换 ──────────────────────────────────────────────────────────────
 

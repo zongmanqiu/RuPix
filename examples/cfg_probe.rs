@@ -17,7 +17,7 @@
 
 use std::path::PathBuf;
 
-use rupix_lib::core::config::{Config, DblClick, Wheel};
+use rupix_lib::core::config::{Config, DblClick, WheelAction};
 use rupix_lib::core::paths;
 use rupix_lib::core::util::fmt_bytes;
 use rupix_lib::decoders::catalog;
@@ -57,7 +57,7 @@ fn main() {
     let c = Config {
         stay_on_top: true,
         dbl_click: DblClick::Fullscreen,
-        wheel: Wheel::Switch,
+        wheel: WheelAction::Navigate,
         opacity: 30,
         ..Config::default()
     };
@@ -70,7 +70,7 @@ fn main() {
     let back = Config::load();
     let same = back.stay_on_top
         && back.dbl_click == DblClick::Fullscreen
-        && back.wheel == Wheel::Switch
+        && back.wheel == WheelAction::Navigate
         && back.opacity == 30;
     println!("[3] 往返一致 : {}", if same { "PASS" } else { "FAIL" });
     ok &= same;

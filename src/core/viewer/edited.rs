@@ -6,7 +6,7 @@
 //! 原始 base 并清掉登记。
 //!
 //! 几何不重排是整个设计的支点：插件**收到的与回传的都是同一尺寸**（"屏上朝向"那一份，
-//! 见 [`Viewer::whole_image_for_plugin`]），宿主在落地前把它转回源朝向——所以 `natural` 恒不变，
+//! 见 `Viewer::whole_image_for_plugin`），宿主在落地前把它转回源朝向——所以 `natural` 恒不变，
 //! 缩放 / 平移 / 旋转 / 鸟瞰的全部账目照旧成立。
 
 use super::*;
@@ -194,7 +194,7 @@ impl Viewer {
 
     /// 编辑型回包落地：把**屏上朝向**的回传像素还原成源朝向，再交 [`Viewer::install_edited`]。
     ///
-    /// `orient` 是 [`Viewer::whole_image_for_plugin`] 那一刻冻结的朝向。不许图省事改读
+    /// `orient` 是 `Viewer::whole_image_for_plugin` 那一刻冻结的朝向。不许图省事改读
     /// `self.rot/self.flip`：用户在插件窗口里待着的时候，主窗口完全可能被再转一次——
     /// 那样还原用的就不是当初发出去的那个变换，回写会带上一次多余旋转（屏幕上歪 90°，
     /// 而像素数量对得上，任何尺寸校验都挡不住）。

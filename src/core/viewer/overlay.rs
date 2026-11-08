@@ -63,7 +63,7 @@ impl Viewer {
     ///   不划算（判据见 本仓历史记录）。
     ///
     /// 路径请用 [`Self::strip_path`] 按索引取（借用的有效区就是这次调用之后、下一次改动之前）。
-    pub fn strip_window(&mut self, cap: usize) -> (usize, usize) {
+    pub fn strip_window(&mut self, cap: usize, anchor: Option<usize>) -> (usize, usize) {
         let Some(g) = self.gallery.as_ref() else {
             return (0, 0);
         };
@@ -74,12 +74,21 @@ impl Viewer {
         let n = cap.clamp(1, len);
         // g.position() 是 1-based，strip_window_first 期望 0-based，需减 1
         let cur_0based = g.position().saturating_sub(1);
-        let first = strip_window_first(len, cur_0based, n);
+        // `None` = 没滚过，跟着当前图居中；`Some` = 用户滚过，条就停在他滚到的地方
+        // （m260：**不再**把当前图拽回视野，见 `strip_window_anchored`）。
+        let first = match anchor {
+            None => strip_window_first(len, cur_0based, n),
+            Some(a) => strip_window_anchored(len, n, a),
+        };
         let refs: Vec<&Path> = (first..first + n)
             .filter_map(|i| g.peek(i).map(PathBuf::as_path))
             .collect();
+        let n = refs.len();
         self.thumbs.ensure(&self.decoder, &refs);
-        (first, refs.len())
+        // m265：这一屏同时也是「图片预读」的下注范围。条滚到哪儿，预读跟到哪儿；
+        // 点格子能切到的图就全在这一屏里，不需要按当前索引去猜。
+        self.set_prefetch_strip(first, n);
+        (first, n)
     }
 
     /// 清单里第 `idx` 张的路径（**按引用**，与 [`Self::strip_window`] 配对使用）。

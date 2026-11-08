@@ -922,6 +922,14 @@ pub trait AppHandler {
     /// 强调色变化时重设；默认空实现（Linux 走平台层的 `paint_rim`）。
     fn set_window_outline(&mut self, _color: Option<Color>) {}
 
+    /// ★ RuPix 补丁 028 —— 无边框形态：宿主整窗清底改用全透明。
+    ///
+    /// 平台后端已经把 pixmap 清成透明，但**整窗帧的最终清底由宿主做**
+    /// （见 `UiHost::render`）：宿主不跟着转透明，平台那一刀等于白做，透明区会被
+    /// 实心填成窗口底色（实测就是这个顺序：先清透明、再被宿主的 fill 盖掉）。
+    /// 默认空实现：只有 win32 的逐像素分层窗会调它。
+    fn set_bg_transparent(&mut self, _on: bool) {}
+
     /// 焦点文本控件的光标位置（**物理像素**，相对客户区左上角）+ 高度：`(x, y_top, height)`。
     /// 平台层据此定位输入法候选窗。无文本焦点时返回 None。
     fn ime_caret(&self) -> Option<(i32, i32, i32)> {

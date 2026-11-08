@@ -1,8 +1,9 @@
 //! 配置兼容门禁（CurSeen Phase 5）：老配置必须被现行解析器完整直读——
 //! 现行键生效、淘汰键静默忽略、看不懂的值回退默认、绝不 panic。
 
-use rupix_lib::core::config::{Config, CtrlWheel, DblClick, InitWindow, SourceId, UiTheme, Wheel};
+use rupix_lib::core::config::{Config, DblClick, InitWindow, SourceId, UiTheme, WheelAction};
 use rupix_lib::core::decode::RawParams;
+use rupix_lib::core::gallery::SortBy;
 use rupix_lib::core::hotkey::Hotkeys;
 use std::collections::BTreeMap;
 use std::fs;
@@ -38,12 +39,18 @@ fn legacy_ini_loads_without_loss() {
         // 旧版 fixture 不含 checker/filmstrip/locked → 全部回默认（关）。
         checker: false,
         filmstrip: false,
+        filmstrip_left: false,
         locked: false,
         long_image_fit: true,
-        wheel: Wheel::Switch,
+        wheel: WheelAction::Navigate,
         // 旧版 fixture 不含 ctrl_wheel 键 → 回退默认（翻页）。
-        ctrl_wheel: CtrlWheel::Switch,
+        ctrl_wheel: WheelAction::Navigate,
+        // m278 两个新键在旧 fixture 里同样不存在 → 回默认「无」。
+        alt_wheel: WheelAction::None,
+        shift_wheel: WheelAction::None,
         init_window: InitWindow::Fullscreen,
+        // 旧 fixture 不含 borderless（m269 新增）→ 回默认关。
+        borderless: false,
         window_w: 1024,
         window_h: 768,
         opacity: 40,
@@ -60,6 +67,8 @@ fn legacy_ini_loads_without_loss() {
         // 这正是"加了新设置项也不能读坏老配置"的兼容判据之一。
         decoders_preferred: BTreeMap::new(),
         prefetch: false,
+        // m281 隐藏键：旧 fixture 不含 ⇒ 回默认 3（老配置升级后深度不变）。
+        prefetch_depth: 3,
         close_to_tray: true,
         // 旧版 fixture 不含 space_preview 键 → 回默认（关）。
         space_preview: false,
@@ -96,6 +105,10 @@ fn legacy_ini_loads_without_loss() {
         // 与 `drag_image` 那条相反方向的判据：这张表里"缺键"表示**没有收起的卡**，
         // 所以老配置升级后不该突然看到一页折叠起来的卡片。
         ui_cards_expanded: Vec::new(),
+        // 旧 fixture 不含排序两键（m275 新增）→ 回默认「文件名升序」。
+        // 老配置升级后清单次序必须和升级前一模一样，不能因为多了个维度就重排。
+        sort_by: SortBy::Name,
+        sort_desc: false,
     };
     assert_eq!(cfg, expected, "老配置直读结果与预期不符");
 }

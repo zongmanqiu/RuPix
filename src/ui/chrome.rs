@@ -28,6 +28,7 @@
 //! 等下一个别的重绘源，真机上就是用户 2026-10-19 报的"不流畅、移开有时不隐藏"。
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
@@ -36,6 +37,7 @@ use std::time::{Duration, Instant};
 use windui::geometry::Rect;
 use windui::render::image::{Fit, Image};
 use windui::render::{Canvas, Paint};
+use windui::signal::{signal, Signal};
 use windui::spec::Align;
 use windui::text::TextStyle;
 
@@ -148,8 +150,25 @@ pub fn set_toolbar_buttons(on: bool) -> bool {
     TOOLBAR_BUTTONS.swap(on, Ordering::Relaxed) != on
 }
 
+/// ★ m269 无边框形态（ini 键 `borderless` 的运行时镜像）。
+///
+/// 与 `TOOLBAR_BUTTONS` 一样放模块级：**绘制、几何、命中三处都读同一个
+/// `toolbar_buttons()`**，一处收口就不会出现「按没画了还点得着」。
+/// 唯一写点 = [`set_borderless`]，由 `runtime::apply_session_flags` 从 `Config` 回灌。
+static BORDERLESS: AtomicBool = AtomicBool::new(false);
+
+/// 写镜像，返回「值变没变」（调用方据此标脏）。
+pub fn set_borderless(on: bool) -> bool {
+    BORDERLESS.swap(on, Ordering::Relaxed) != on
+}
+
+/// 当前是不是无边框形态。画布（不画底色、不摆缩略图条）与命中都读这一份。
+pub fn borderless() -> bool {
+    BORDERLESS.load(Ordering::Relaxed)
+}
+
 fn toolbar_buttons() -> bool {
-    TOOLBAR_BUTTONS.load(Ordering::Relaxed)
+    TOOLBAR_BUTTONS.load(Ordering::Relaxed) && !BORDERLESS.load(Ordering::Relaxed)
 }
 
 /// [`Btn::ALL`] 现生成，加一个新按钮两处同时出现，不会只改一半。
@@ -253,19 +272,31 @@ impl Btn {
     /// 悬停提示文字（图标按钮没有文字标签，悬停时浮出小条说明）。
     ///
     /// 也是右键菜单「操作」子菜单的项名——两处同文使人一眼对得上。
+    ///
+    /// ★ m279：**从 [`Self::action`] 对应的 `Action::name()` 派生**，不再另抄一张表。
+    /// 快捷键页（行名）、浮条（悬停名）、右键「操作 ▸」（项名）从此共用一份正本。
+    /// 以前是三处各写一遍，于是「动画上一帧」与「上一帧」、「暂停/播放动画」与
+    /// 「暂停/继续动画」这种漂移没人能发现。名字取短名：快捷键页里「上一张」与
+    /// 「上一帧」已经靠"张 / 帧"分得开，「动画」是冗余前缀；播放中按下去是"继续"
+    /// 而不是"播放"，故统一成「暂停/继续动画」。
     pub fn name(self) -> &'static str {
+        self.action().name()
+    }
+
+    /// 这颗按钮对应的动作：名字、快捷键显示、执行分派都从这里认人。
+    pub fn action(self) -> crate::core::hotkey::Action {
+        use crate::core::hotkey::Action;
         match self {
-            Btn::Out => "缩小",
-            Btn::In => "放大",
-            Btn::Fit => "适应窗口",
-            Btn::Actual => "1:1 原尺寸",
-            Btn::Fullscreen => "全屏",
-            Btn::Rotate => "旋转 90°",
-            Btn::Mirror => "水平镜像",
-            Btn::FrameBack => "上一帧",
-            // 双状态按钮的名字写成两态：图标已经表示当前态，名字负责说"按了会去哪"。
-            Btn::PlayPause => "暂停/继续动画",
-            Btn::FrameFwd => "下一帧",
+            Btn::Out => Action::ZoomOut,
+            Btn::In => Action::ZoomIn,
+            Btn::Fit => Action::Fit,
+            Btn::Actual => Action::ActualSize,
+            Btn::Fullscreen => Action::Fullscreen,
+            Btn::Rotate => Action::Rotate,
+            Btn::Mirror => Action::Flip,
+            Btn::FrameBack => Action::FramePrev,
+            Btn::PlayPause => Action::PauseAnim,
+            Btn::FrameFwd => Action::FrameNext,
         }
     }
 
@@ -274,19 +305,7 @@ impl Btn {
     ///
     /// 多个绑定用 " / " 连接；无任何绑定返回 `None`（不画快捷键列）。
     pub fn shortcut(self, hk: &Hotkeys) -> Option<String> {
-        let a = match self {
-            Btn::Out => crate::core::hotkey::Action::ZoomOut,
-            Btn::In => crate::core::hotkey::Action::ZoomIn,
-            Btn::Fit => crate::core::hotkey::Action::Fit,
-            Btn::Actual => crate::core::hotkey::Action::ActualSize,
-            Btn::Fullscreen => crate::core::hotkey::Action::Fullscreen,
-            Btn::Rotate => crate::core::hotkey::Action::Rotate,
-            Btn::Mirror => crate::core::hotkey::Action::Flip,
-            Btn::FrameBack => crate::core::hotkey::Action::FramePrev,
-            Btn::PlayPause => crate::core::hotkey::Action::PauseAnim,
-            Btn::FrameFwd => crate::core::hotkey::Action::FrameNext,
-        };
-        hk.display(a)
+        hk.display(self.action())
     }
 
     /// 工具栏按钮全集。浮条布局、命中测试、右键菜单「操作」子菜单都从这里生成。
@@ -327,16 +346,38 @@ pub struct Chrome {
     pub minimal_mode: Cell<bool>,
     /// 棋盘格透明背景开关（右键菜单与工具栏共用；m53 起落盘，ini 键 `checker`）。
     pub checker: Cell<bool>,
-    /// 取色器开关（m217，右键「工具 ▸ 取色器」）。会话临时态，同极简模式，不落盘。
+    /// 取色器开关（m217，右键「本图 ▸ 取色器」）。会话临时态，同极简模式，不落盘。
     /// 只进菜单不进浮条——用户口径「一排按钮已经很多了」。
+    /// 旋转角度（整数度数，m280）。会话临时态、按看图窗分格、**不落盘**。
+    ///
+    /// 显示层、`rotate_dialog` 的 stepper 与另存路径共用这一份信号；主窗
+    /// `window_tick` 差分它来标脏。放在这里而不是 `Config`：这不是偏好设置，
+    /// 是"这张图当前被转成什么样"，同取色器 / 极简模式。
+    pub rotate_deg: Signal<f64>,
+    /// 这份角度属于哪张图：换图后自动失效，不用定时器清、不会串到另一扇窗
+    /// （与 `LiveTint.path` 同一条判据）。`None` = 从未设过角度。
+    pub rotate_path: Signal<Option<PathBuf>>,
+    /// `window_tick` 上一拍已处理过的角度，差分用（同值零动作、不空转重绘）。
+    pub rotate_seen: Cell<f64>,
     pub picker: Cell<bool>,
     /// 取色器当前的指针位置（画布逻辑坐标）。关模式、换图、指针离窗时清掉；
     /// 浮层绘制与点击复制读的是同一份，不许另存第二正本。
     pub picker_at: Cell<Option<(f32, f32)>>,
-    /// 底部缩略图条开关（T 键 / 右键菜单）。
+    /// 缩略图条开关（T 键 / 右键菜单）。
     ///
     /// 会话态但**落盘**（m53-L，ini 键 `filmstrip`）：开着关窗，下次启动照样开着。
     pub filmstrip: Cell<bool>,
+    /// 缩略图条贴左边（m253，ini 键 `filmstrip_left`）：会话镜像，
+    /// 唯一写点是 `runtime::apply_session_flags`（与 `filmstrip` 同一条通道）。
+    pub filmstrip_left: Cell<bool>,
+    /// 条**刚**被打开或换了边、但窗口放不下 ⇒ 请下一帧的 `paint` 算一次放大目标（m254）。
+    ///
+    /// ★ 一次性旗：`apply_session_flags` 只在变化那一帧置位，`paint` 消费即清。
+    ///   于是用户自己把窗口拉小（条自动隐藏）不会被反向顶大——那种拉不动的窗口很讨厌。
+    pub strip_fit_request: Cell<bool>,
+    /// 待落地的客户区放大目标（**物理像素**）：`paint` 写、`window_tick` 取走发
+    /// `SetClientSize`。放这里而不是直接调 `ctx` —— `paint` 手上没有 `EventCtx`。
+    pub strip_resize: Cell<Option<(i32, i32)>>,
     /// 锁定（🔒）：会话态但**落盘**（m53-L，ini 键 `locked`）。
     /// 锁定后整窗交互封锁，只留锁住按钮解锁——语义与拦截地图见
     /// `docs/superpowers/specs/2026-10-12-titlebar-topmost-lock-design.md`。
@@ -521,10 +562,16 @@ impl Chrome {
     pub fn new(minimal_mode: bool) -> Rc<Self> {
         std::rc::Rc::new(Self {
             minimal_mode: Cell::new(minimal_mode),
+            rotate_deg: signal(0.0),
+            rotate_path: signal(None),
+            rotate_seen: Cell::new(0.0),
             picker: Cell::new(false),
             picker_at: Cell::new(None),
             checker: Cell::new(false),
             filmstrip: Cell::new(false),
+            filmstrip_left: Cell::new(false),
+            strip_fit_request: Cell::new(false),
+            strip_resize: Cell::new(None),
             locked: Cell::new(false),
             anim: Cell::new(false),
             paused: Cell::new(false),
@@ -898,6 +945,14 @@ impl Chrome {
             .spawn(move || {
                 // 只带走像素快照，保存成功/失败都不能清掉 viewer 的编辑覆盖。
                 // 另存是后台线程，不必为速度让体积（见 `encode_png_compact` 的注释）。
+                //
+                // ★ 落盘一律用 `fs::write`（= `File::create`，Windows 上是 `CREATE_ALWAYS`，
+                //   **先截断**）。别改成复用句柄的 `OpenOptions::new().write(true)`：那样
+                //   覆盖一张比原来短的图时，旧数据的尾巴会留在新文件后面，裁掉的部分能
+                //   整块恢复回来——这就是 aCropalypse（CVE-2023-21036 / CVE-2023-28303，
+                //   Windows 截图工具与 Pixel Markup 都栽在这上面）。
+                //   我们**没有**原地保存的入口（只有「另存为」），所以本就没这个洞；
+                //   这条注释是给下一次改动的：把它改成不截断就当场开洞。
                 let out =
                     crate::platform::clipboard::encode_png_compact(w, h, &rgba).and_then(|bytes| {
                         std::fs::write(&dest, bytes).map_err(|e| format!("写入失败：{e}"))
@@ -1047,8 +1102,13 @@ impl Chrome {
     /// "标题栏的按钮亮着、而那一按拖的是图片"——同一块面积两套说法。
     pub fn in_title_strip(pos: (f32, f32), view: (f32, f32, f32, f32)) -> bool {
         let (abs_x, abs_y) = pos;
-        let (_, _, vw, _) = view;
-        abs_y >= 0.0 && abs_y < (STRIP_H + 8) as f32 && abs_x >= 0.0 && abs_x < vw
+        let (vx, _, vw, _) = view;
+        // ★ m257：x 的两端都按**视口原点**算。原来右端写成 `abs_x < vw`（相对宽当绝对上界），
+        // 缩略图条贴左时 `vx=112`、`vw` 少 112，于是最右侧那一条（正是五颗标题钮所在）
+        // 被判成「不在标题栏」——极简模式下悬停那里不浮现，可 `hit` 的按钮矩形是绝对的、
+        // 点下去照样关窗（2026-11-08 用户实机报障）。底条时 `vx=0`，两者恰好相等，
+        // 这个错从引入贴左起就藏着。
+        abs_y >= 0.0 && abs_y < (STRIP_H + 8) as f32 && abs_x >= vx && abs_x < vx + vw
     }
 
     /// 指针活动（Enter/Move/Down 时调用）。更新各区域悬停状态。
@@ -1083,10 +1143,8 @@ impl Chrome {
         // 而且这帧可能根本没画——零矩形）。固定估宽（旧 MAX_W=200）与画出来的那块错位：
         // 文本短时 hover 比画的宽，文本长/窗口窄没画时 hover 还在亮。
         // 常态那一格在浮条里面，上面 `hover_toolbar` 已经覆盖它了。
-        let (ix, iy, iw, ih) = self.info_rect.get();
-        // `info_rect` 存的是窗口绝对坐标（paint 用 `local()` 转画布坐标），
-        // 这里不能拿已经减过 `vx/vy` 的 `x/y` 去比。
-        let info = iw > 0.0 && abs_x >= ix && abs_x < ix + iw && abs_y >= iy && abs_y < iy + ih;
+        // 判据与"点它能不能开跳转窗"共用 [`Chrome::in_info_cell`]。
+        let info = self.in_info_cell(pos);
         // 翻页箭头：该侧 [`ARROW_ZONE`] 边带内就浮现。用边带而不是箭头那个圆，是为了
         // "图形完全不画"的时候鼠标还能凭"靠边就出现"找到它；圆只管点击（`hit` 不变）。
         // 边带宽度与浮条让位用的是同一个常量，避免出现两套"靠边"的线。
@@ -1176,8 +1234,7 @@ impl Chrome {
         let (px, py, pw, ph) = Chrome::pill(viewport, self.anim.get(), self.info_cell.get());
         let in_toolbar = x >= px && x < px + pw && y >= py && y < py + ph;
         // 信息条：与 hover 同源，读 draw 回写的真实矩形（零矩形 = 这帧没画，不算命中）
-        let (ix, iy, iw, ih) = self.info_rect.get();
-        let in_info = iw > 0.0 && abs_x >= ix && abs_x < ix + iw && abs_y >= iy && abs_y < iy + ih;
+        let in_info = self.in_info_cell(self.last_pos.get());
         if in_title || in_toolbar || in_info || in_frame {
             return expired;
         }
@@ -1294,6 +1351,19 @@ impl Chrome {
         (x, 0.0, BTN_W, BTN_H)
     }
 
+    /// 指针落在状态格（`12/340`）里吗？
+    ///
+    /// 读 `paint` 每帧回写的**真实**矩形：零矩形 = 这帧根本没画（极简模式收起 /
+    /// 无边框形态 / 没有状态文本），天然不可点也不可悬停，调用点不用各判一次。
+    ///
+    /// ★ 存的是**画布绝对坐标**（`paint` 里经 [`to_canvas`] 换算后才回写），所以这里
+    ///   直接拿窗口绝对坐标比、**不再减视口原点**。贴左缩略图条时 `vx=112`，减一次就
+    ///   整块左移一条——这正是 m255 那族"画在哪点不到哪"的老毛病，底条（`vx=0`）看不出来。
+    pub fn in_info_cell(&self, pos: (f32, f32)) -> bool {
+        let (ix, iy, iw, ih) = self.info_rect.get();
+        iw > 0.0 && pos.0 >= ix && pos.0 < ix + iw && pos.1 >= iy && pos.1 < iy + ih
+    }
+
     /// 命中测试：视口内某点落在哪个按钮 / 箭头 / 标题栏按钮上。
     pub fn hit(&self, pos: (f32, f32), view: (f32, f32, f32, f32)) -> Option<Press> {
         // 调用方给的是窗口绝对坐标；下面所有几何（title_btn_rect/btn_rect/arrow_center）
@@ -1308,6 +1378,11 @@ impl Chrome {
             } else {
                 None
             };
+        }
+        // m269：无边框形态没有自绘 chrome，热区也必须一起撤 —— 否则「画没了
+        // 还点得着」。画布手势（切图 / 缩放 / 拖动 / 右键）不经过这里，全部照常。
+        if borderless() {
+            return None;
         }
         // 命中顺序必须跟**绘制顺序相反**（后画的在上）：浮条 → 箭头 → 标题栏。
         // 正常尺寸三者不重叠；窗口压到 100–119 高时箭头圆会压到标题按钮上，
@@ -1398,7 +1473,7 @@ pub(crate) enum InfoPlace {
 /// 同批帧号形态 207）；再往上的病态输入（一个目录 12345 张 → 232、一张图 12345 帧 → 237）
 /// 走 `clip_text` 收成省略号，宁可少看一位数也不为它多付浮条宽。
 /// 改状态文案格式就重跑 `examples/text_measure.rs`；这条数有单测拿真实排版守着
-/// （[`tests::the_status_cell_actually_fits_the_worst_string`]），不许只活在注释里。
+/// （`tests::the_status_cell_actually_fits_the_worst_string`），不许只活在注释里。
 const INFO_TEXT_MAX: f32 = 212.0;
 /// 文本左内边距（浮条自身那 8 px 胶囊边距之外再留的）。
 const INFO_PAD_L: f32 = 8.0;
@@ -1489,12 +1564,22 @@ fn title_visible(fullscreen_on: bool, minimal_mode: bool, hover_title: bool) -> 
     }
 }
 
+/// 视口**相对**坐标 → 画布坐标（= 窗口绝对坐标）。
+///
+/// ★ 与 [`Chrome::hit`] 里的 `pos - view.0` **互为逆运算**：画在哪、点哪就必须命中哪。
+///   底条时 `vx/vy` 恒为 0，这条恒等式怎么写都看不出来；贴左（m253）之后 `vx=112`，
+///   方向写反就是整块界面平移一条、而命中仍在原位（2026-11-08 用户报障）。
+fn to_canvas(view: (f32, f32, f32, f32), rel: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+    let (vx, vy, _, _) = view;
+    (rel.0 + vx, rel.1 + vy, rel.2, rel.3)
+}
+
 /// 画悬浮层：箭头 + 工具栏 + 信息小条。
 ///
 /// `view` 是画布摆图/悬浮层共用的视口矩形 (x, y, w, h)；`info` 是右侧信息文本（"3/12 · 100%"）；
 /// `has_prev/has_next` 控制箭头是否画；其余是开关态。
 /// `minimal_mode` 为 true 时：各元素仅在悬停时显示；false 时：始终显示。
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // 11 个参数：绘制需要的开关态，合并成结构体反而更难读
 pub fn paint(
     canvas: &mut dyn Canvas,
     view: (f32, f32, f32, f32),
@@ -1509,8 +1594,9 @@ pub fn paint(
     title: &str,
 ) {
     let (vx, vy, vw, _vh) = view;
-    // 视口绝对坐标 → 画布原点相对坐标。
-    let local = |x: f32, y: f32, w: f32, h: f32| (x - vx, y - vy, w, h);
+    // 视口**相对**坐标 → 画布坐标。下面所有几何（title_btn_rect / btn_rect /
+    // arrow_center / pill / above）都是相对视口原点的，这里统一搬一次。
+    let local = |x: f32, y: f32, w: f32, h: f32| to_canvas(view, (x, y, w, h));
     let small = TextStyle::new(12.0);
     // 图标字形：指定图标字体族，PUA 码位才会落在这个字体里（默认字体是方块）。
     let icon_ts = TextStyle {
@@ -1518,15 +1604,20 @@ pub fn paint(
         ..TextStyle::new(17.0)
     };
     // 计算各元素是否显示
-    let show_title = title_visible(fullscreen_on, minimal_mode, chrome.hover_title.get());
+    // m269/m271：无边框形态把**所有** chrome 都收掉——顶条、底部浮条（按钮与信息一起）、
+    // 缩略图条、底色。留下的是画面本身和全部操作入口（右键 / 快捷键 / 拖动 / 缩放），
+    // 这正是它和「空格预览」的分界：那边连操作都没有。
+    let bl = borderless();
+    let show_title = !bl && title_visible(fullscreen_on, minimal_mode, chrome.hover_title.get());
     // 悬停信息条也算"在浮条上"：整行档（窄窗）就住在那儿。不认它的后果是极简模式下
     // 指针停在状态那一行 2 秒后整组消失、且再也悬不回来（`info_rect` 只有画出来才非零）。
     // 三条来源取或：常驻（传统模式）／指针在浮条上（`activity` 现算）／状态刚变
     // （`wake_on_status_change` 自己的到期时刻，指针通道清不掉它）。
-    let show_toolbar = !minimal_mode
-        || chrome.hover_toolbar.get()
-        || chrome.hover_info.get()
-        || chrome.status_alive();
+    let show_toolbar = !bl
+        && (!minimal_mode
+            || chrome.hover_toolbar.get()
+            || chrome.hover_info.get()
+            || chrome.status_alive());
     // 状态跟着浮条走（用户 2026-10-18 拍板"并进浮条"）：浮条在它就画，浮条收它就收。
     // 不再单独跟着标题栏显示——那一档已经取消。
     let show_info = show_toolbar && !info.is_empty();
@@ -1561,13 +1652,13 @@ pub fn paint(
     let above = if place == InfoPlace::Above && show_info {
         let w = info_w.min(vw - 2.0 * INFO_GAP);
         // m245：常态贴左是给按钮让位；按钮一隐，整行档的信息胶囊也水平居中。
-        let ix = if buttons {
-            vx + INFO_GAP
-        } else {
-            vx + (vw - w) / 2.0
-        };
-        let iy = vy + py - INFO_H - INFO_GAP;
-        chrome.info_rect.set((ix, iy, w, INFO_H));
+        // ★ 这里是**视口相对**坐标（整块 `above` 后面统一过 `local`），`iy` 也一样——
+        //   旧写法把 `vy` 先加进 `iy`，`local` 又加一次，成了 `2*vy`（底条 `vy=0`
+        //   看不出来，与 m255 那族是同一个错）。
+        let ix = if buttons { INFO_GAP } else { (vw - w) / 2.0 };
+        let iy = py - INFO_H - INFO_GAP;
+        // 回写的必须是**画布绝对坐标**（`in_info_cell` 拿绝对坐标比）。
+        chrome.info_rect.set(to_canvas(view, (ix, iy, w, INFO_H)));
         Some((ix, iy, w))
     } else {
         None
@@ -1678,7 +1769,7 @@ pub fn paint(
         //   不许放进会自动消失的浮层（§八.7 同一条判据）——隐藏等于没有指示。
         //   热区一寸没动（[`Chrome::hit`] 与绘制同源），变的只是这一颗画不画、用哪档底色。
         let sliding = chrome.slideshow_on() && matches!(a, Arrow::Next);
-        if !has || (minimal_mode && !(revealed || sliding)) {
+        if !has || bl || (minimal_mode && !(revealed || sliding)) {
             continue;
         }
         let (cx, cy) = Chrome::arrow_center(a, view);
@@ -1757,7 +1848,8 @@ pub fn paint(
                 );
                 let (sx, sy, sw, sh) = local(tx + tw + INFO_GAP_L, py + 10.0, 1.0, ph - 20.0);
                 canvas.fill_rect(sx, sy, sw, sh, &Paint::fill(tk::pill_sep()));
-                chrome.info_rect.set((tx, py, tw, ph));
+                // 绝对坐标（见 [`Chrome::in_info_cell`]）：点状态格开跳转窗靠它。
+                chrome.info_rect.set(local(tx, py, tw, ph));
             } else {
                 // m245：只剩信息 ⇒ 整条浮条的宽度都给它，文字水平居中，分隔线不存在。
                 // 文本框 = 浮条内缩 8，Align::Center 使文本中心恰为浮条（= 窗口）中心。
@@ -1771,7 +1863,7 @@ pub fn paint(
                     Align::Center,
                     &info_ts,
                 );
-                chrome.info_rect.set((px, py, pw, ph));
+                chrome.info_rect.set(local(px, py, pw, ph));
             }
         }
 
@@ -1821,14 +1913,18 @@ pub fn paint(
             let w = chrome.measure_w(canvas, text, &small) + 16.0;
             let h = 24.0;
             // 以按钮为中心，横向夹在视口内；顶上放不下就并入按钮内（不画）。
-            let tx = (bx + (bw - w) / 2.0).max(vx + 4.0).min(vx + vw - w - 4.0);
+            // `bx` 是**视口相对**坐标（`btn_rect` 的返回值），夹紧边界同样要相对——
+            // 混进 `vx` 的话，贴左时提示条会被推到右边去（与 2026-11-08 同一类错）。
+            let tx = (bx + (bw - w) / 2.0).max(4.0).min(vw - w - 4.0);
             // 窄窗那一档，状态整行就住在浮条上方；提示条再往上让一层，否则两条叠在
             // 一起（整行是后画的，会把提示条盖掉半截）。
             let ty = match above {
                 Some((_ix, iy, _w)) => iy - h - 6.0,
                 None => py - h - 6.0,
             };
-            if ty > vy {
+            // `ty` 与 `above.iy` 都是**视口相对**坐标（与上面 `tx` 同一份约定）：
+            // "顶上放得下"的边界是视口顶 = 0，不是 `vy`（底条 `vy=0` 时两者恰好相同）。
+            if ty > 0.0 {
                 let (lx, ly, lw, lh) = local(tx, ty, w, h);
                 canvas.fill_round_rect(lx, ly, lw, lh, 6.0, &Paint::fill(tk::pill_bg()));
                 canvas.draw_text(
@@ -1871,6 +1967,41 @@ pub fn paint(
 mod tests {
     use super::*;
     use windui::geometry::Color;
+
+    /// m279 判据本体：十颗按钮的名字必须与它对应动作的名字**逐字相同**。
+    /// 快捷键页读 `Action::name()`、浮条与右键「操作 ▸」读 `Btn::name()`——
+    /// 以前两张表各写一遍，改一处忘一处就是用户看到的「动画上一帧 / 上一帧」。
+    fn assert_btn_names_follow_actions(pick: impl Fn(Btn) -> &'static str, what: &str) {
+        for b in Btn::ALL {
+            assert_eq!(
+                pick(b),
+                b.action().name(),
+                "{what}：「{}」的文案与动作名脱节",
+                b.action().name()
+            );
+        }
+    }
+
+    #[test]
+    fn btn_names_share_one_source_with_action_names() {
+        assert_btn_names_follow_actions(|b| b.name(), "现状");
+    }
+
+    /// 负向臂：模拟 m279 之前「另抄一张表且其中一条用旧名」的形状，判据必须当场红。
+    #[test]
+    #[should_panic(expected = "文案与动作名脱节")]
+    fn btn_names_reject_a_second_hardcoded_table() {
+        assert_btn_names_follow_actions(
+            |b| {
+                if b == Btn::FrameBack {
+                    "动画上一帧"
+                } else {
+                    b.name()
+                }
+            },
+            "旧实现",
+        );
+    }
 
     /// ★ 用户 2026-11-06：静态位图没有帧/页号 ⇒ 浮条与「操作▸」菜单都不挂播放组。
     #[test]
@@ -2094,6 +2225,32 @@ mod tests {
         assert!(!Chrome::in_title_strip((800.0, 10.0), view), "右缘是开区间");
     }
 
+    /// ★ m257：**每一颗标题钮的中心都必须落在标题栏那一条里**，底条与贴左两种视口都要成立。
+    ///
+    /// 自 2026-11-08 用户实机报障反推：贴左时 `vw` 少一条宽，而 x 判据拿它当绝对上界，
+    /// 于是最右那条（五颗钮全在里面）被判成「不在标题栏」——极简模式悬停不浮现，
+    /// 可 `hit` 的矩形是绝对的、点下去照样关窗。判据写成「钮在哪、标题栏就得在哪」，
+    /// 不依赖任何具体数字，以后再挪几何也不会漏。
+    #[test]
+    fn every_title_button_lies_inside_the_title_strip_for_both_viewports() {
+        for view in [(0.0, 0.0, 900.0, 600.0), (112.0, 0.0, 788.0, 600.0)] {
+            for tb in TitleBtn::ALL {
+                let (x, y, w, h) = Chrome::title_btn_rect(tb, view);
+                // 矩形是视口的相对坐标，判据吃的是窗口绝对坐标 ⇒ 搬一次。
+                let center = (view.0 + x + w / 2.0, view.1 + y + h / 2.0);
+                assert!(
+                    Chrome::in_title_strip(center, view),
+                    "{tb:?} 的中心 {center:?} 不在标题栏里（view={view:?}）"
+                );
+            }
+        }
+        // 贴左时左侧那一条是缩略图条，不属于标题栏。
+        assert!(
+            !Chrome::in_title_strip((111.0, 10.0), (112.0, 0.0, 788.0, 600.0)),
+            "缩略图条那一条不算标题栏"
+        );
+    }
+
     /// 「操作」子菜单按 [`Btn::ALL`] 生成，故每个按钮都必须自带标签与字形——
     /// 少一个就是菜单里出现空行或豆腐块。
     #[test]
@@ -2231,6 +2388,139 @@ mod tests {
     }
 
     /// 5 颗标题按钮：各自矩形中央必须命中自己（与工具栏同款口径）。
+    /// ★ m255：`to_canvas`（画）与 `hit` 的 `pos - view.0`（点）必须互逆。
+    ///
+    /// 底条时 `view.0 == 0`，方向写反也看不出来；缩略图条贴左后 `view.0 = 112`，
+    /// 写反就是「按钮画在左边、点右上角却能关窗」（2026-11-08 用户报障）。
+    /// 这条钉子故意用 `vx != 0`，就是这个坑的专用哨兵。
+    /// 本文件的生产代码文本（`include_str!` 会把测试自身也包进来）。
+    fn production_src() -> &'static str {
+        let all = include_str!("chrome.rs");
+        let cut = all
+            .find(
+                "
+#[cfg(test)]",
+            )
+            .unwrap_or(all.len());
+        &all[..cut]
+    }
+
+    /// ★ m255：绘制坐标只能经 `to_canvas` 搬（相对 → 绝对），不许在本地再减一次原点。
+    ///
+    /// 这条是**接线**钉子：`to_canvas` 自己的用例绿了，不代表 `paint` 真在用它——
+    /// 旧写法 `|x, y, w, h| (x - vx, y - vy, w, h)` 就这么藏了一整年（底条时
+    /// `vx/vy` 恒为 0，减 0 看不出来），缩略图条一贴左就整块平移一条。
+    #[test]
+    fn paint_moves_geometry_through_to_canvas_only() {
+        let src = production_src();
+        assert!(
+            src.contains("to_canvas(view, (x, y, w, h))"),
+            "paint 的 local 必须走 to_canvas（相对 → 绝对）"
+        );
+        assert!(
+            !src.contains("h: f32| (x - vx"),
+            "绘制不许再减视口原点：底条看不出来，贴左就整块平移一条"
+        );
+    }
+
+    #[test]
+    fn what_is_painted_is_what_gets_hit_when_the_origin_is_not_zero() {
+        let view = (112.0, 0.0, 800.0, 600.0);
+        let chrome = Chrome::new(true);
+        for tb in TitleBtn::ALL {
+            let rel = Chrome::title_btn_rect(tb, view);
+            let (ax, ay, aw, ah) = to_canvas(view, rel);
+            assert_eq!(
+                chrome.hit((ax + aw / 2.0, ay + ah / 2.0), view),
+                Some(Press::TitleBtn(tb)),
+                "{tb:?} 画在 ({ax}, {ay}) 却点不到"
+            );
+            // 少加一次原点（= 把方向写反）的位置不该命中任何标题按钮。
+            assert_ne!(
+                chrome.hit((rel.0 + rel.2 / 2.0, ay + ah / 2.0), view),
+                Some(Press::TitleBtn(tb)),
+                "{tb:?} 未加原点的位置不该命中"
+            );
+        }
+    }
+
+    /// ★ m275：状态格（`12/340`）是颗按钮（点它开「跳转到…帧/页」窗），所以"画在哪"必须
+    /// 就是"点在哪"。贴左缩略图条时 `vx=112`——`info_rect` 若存**相对**坐标，整块
+    /// 命中区就左移一条：点真格没反应，点左边的图反而弹窗（m255 那族的老毛病）。
+    ///
+    /// 两条判据各对应绘制里的两档：`Pill`（常态，格子住在浮条左端）与 `Above`
+    /// （窄窗，整个浮条塞不下，单独占浮条上方一行）。**必须拿 `Chrome::pill` 现算的
+    /// 相对几何去比**，不能只比"在视口内"——格子在浮条中部时，相对坐标也照样落在
+    /// 视口里，那样写这条用例就永远不会红。
+    #[test]
+    fn status_cell_is_hittable_exactly_where_it_is_painted() {
+        // ── 常态档：格子跟着浮条走 ──
+        let view = (112.0, 0.0, 800.0, 600.0);
+        let chrome = Chrome::new(false);
+        let mut spy = MeasureCount::new();
+        paint(
+            &mut spy,
+            view,
+            &chrome,
+            "12/340 · 100%",
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            "一张图.jpg",
+        );
+        let (ix, iy, iw, ih) = chrome.info_rect.get();
+        assert!(iw > 0.0 && ih > 0.0, "状态格得真画出来，实得 {iw}×{ih}");
+        let (px, _, pw, _) = Chrome::pill(view, chrome.anim.get(), chrome.info_cell.get());
+        assert!(
+            ix >= px + view.0 - 0.5 && ix + iw <= px + view.0 + pw,
+            "状态格得落在浮条（画布 x {}…{}）里，实得 {}…{}：存了相对坐标就整块左移 {}",
+            px + view.0,
+            px + view.0 + pw,
+            ix,
+            ix + iw,
+            view.0
+        );
+        let mid = (ix + iw / 2.0, iy + ih / 2.0);
+        assert!(chrome.in_info_cell(mid), "画在哪就要点在哪");
+        assert!(
+            !chrome.in_info_cell((mid.0 - view.0, mid.1)),
+            "少加一次视口原点的位置不许命中——那正是旧写法错开的那一格"
+        );
+        // 零矩形 = 这帧没画（极简收起 / 无边框 / 没状态文本）：不许还点得着。
+        chrome.info_rect.set((0.0, 0.0, 0.0, 0.0));
+        assert!(!chrome.in_info_cell(mid), "没画出来的时候不许命中");
+
+        // ── 窄窗档（`Above`）：整条浮条只有一格宽，信息单独占上面一行 ──
+        let narrow = (112.0, 0.0, 400.0, 300.0);
+        let chrome = Chrome::new(false);
+        paint(
+            &mut spy,
+            narrow,
+            &chrome,
+            "12/340 · 100%",
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            "一张图.jpg",
+        );
+        let (ix, iy, iw, ih) = chrome.info_rect.get();
+        assert!(iw > 0.0, "窄窗这一档也该把状态格画出来");
+        assert!(
+            ix >= narrow.0 && ix + iw <= narrow.0 + narrow.2,
+            "窄窗档的状态格跑到视口外：x={ix} w={iw}（这一档存的是纯相对坐标）"
+        );
+        assert!(
+            chrome.in_info_cell((ix + iw / 2.0, iy + ih / 2.0)),
+            "窄窗档画在哪也要点在哪"
+        );
+    }
+
     #[test]
     fn every_title_button_hits_its_own_rect() {
         let view = (0.0, 0.0, 800.0, 600.0);

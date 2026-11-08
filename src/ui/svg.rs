@@ -2,7 +2,7 @@
 //! ★ `svgz` 的 gzip 壳由**宿主**自己剥（见下方 `SVGZ_MAX_DECOMPRESSED` 那一段）：windui 的
 //!   resvg 没开 `svgz` feature，直接喂压缩包会得到 "enable the svgz cargo feature"。
 //!
-//! `core::decode` 只认 [`decode::SvgDecodeFn`] 这个函数指针（启动时经
+//! `core::decode` 只认 `decode::SvgDecodeFn` 这个函数指针（启动时经
 //! [`crate::install_decode_stack`] 注入）——core 因此不 import windui，
 //! 矢量渲染的具体实现停在上屏层。
 //!

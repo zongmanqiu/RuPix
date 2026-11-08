@@ -27,6 +27,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Com::{CoCreateInstance, IServiceProvider, CLSCTX_LOCAL_SERVER};
 use windows::Win32::System::Variant::{VARIANT, VT_I4};
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Shell::{
     IEnumIDList, IFolderView, IShellBrowser, IShellWindows, IWebBrowser2, SHGetPathFromIDListW,
     SID_STopLevelBrowser, SVGIO_SELECTION, SWC_DESKTOP, SWFO_NEEDDISPATCH,
@@ -336,25 +337,63 @@ unsafe fn foreground_is_desktop(fg: HWND) -> bool {
         .unwrap_or(false)
 }
 
-/// 前台窗口所在显示器的工作区 `(x, y, w, h)`。取不到时退主屏全屏尺寸。
-/// 预览窗的尺寸与居中都按这块区域算（UI 线程取好，工作线程只解码）。
-pub fn monitor_work_area_of_foreground() -> (i32, i32, i32, i32) {
+/// 前台窗口所在显示器的三样度量：**整块屏幕**矩形、**工作区**矩形、有效 DPI。
+///
+/// 预览窗要按主窗「启动窗口」两档取尺寸（见 `spacehook::preview_box`）：
+/// 全屏档要整块屏幕（主窗全屏铺的就是 `rcMonitor`，含任务栏那一条），
+/// 固定档要工作区（居中的参照），DPI 用来把 ini 里的 dp 换算成物理像素。
+/// 取不到时退主屏 + 96 DPI（与系统默认缩放一致，不会把窗口算成 0）。
+pub fn monitor_metrics_of_foreground() -> MonitorMetrics {
+    let fallback = MonitorMetrics {
+        mon: (0, 0, unsafe { GetSystemMetrics(SM_CXSCREEN) }, unsafe {
+            GetSystemMetrics(SM_CYSCREEN)
+        }),
+        work: (0, 0, unsafe { GetSystemMetrics(SM_CXSCREEN) }, unsafe {
+            GetSystemMetrics(SM_CYSCREEN)
+        }),
+        dpi: 96,
+    };
     unsafe {
         let fg = GetForegroundWindow();
         let monitor = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_invalid() {
+            return fallback;
+        }
         let mut info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
-        if monitor.is_invalid() || !GetMonitorInfoW(monitor, &mut info).as_bool() {
-            return (
-                0,
-                0,
-                GetSystemMetrics(SM_CXSCREEN),
-                GetSystemMetrics(SM_CYSCREEN),
-            );
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return fallback;
         }
-        let r = info.rcWork;
-        (r.left, r.top, r.right - r.left, r.bottom - r.top)
+        let rect = |r: windows::Win32::Foundation::RECT| {
+            (r.left, r.top, r.right - r.left, r.bottom - r.top)
+        };
+        // DPI 只影响固定档的换算。取不到就按 96 算——宁可窗口略小，也不猜一个更大的数
+        // 把预览撑出屏幕。
+        let (mut dx, mut dy) = (0u32, 0u32);
+        let dpi = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dx, &mut dy)
+            .ok()
+            .filter(|_| dx > 0)
+            .map(|_| dx)
+            .unwrap_or(96);
+        MonitorMetrics {
+            mon: rect(info.rcMonitor),
+            work: rect(info.rcWork),
+            dpi,
+        }
     }
+}
+
+/// [`monitor_metrics_of_foreground`] 的返回值：`(x, y, w, h)` 各一组，外加有效 DPI。
+///
+/// DPI 以整数百分比口径存（96 = 100%），换算公式 `px = dp * dpi / 96` 四舍五入。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MonitorMetrics {
+    /// 整块显示器（含任务栏那一条）。
+    pub mon: (i32, i32, i32, i32),
+    /// 工作区（减任务栏）。
+    pub work: (i32, i32, i32, i32),
+    /// 有效 DPI（96 = 100%，120 = 125%）。
+    pub dpi: u32,
 }

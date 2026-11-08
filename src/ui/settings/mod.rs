@@ -17,6 +17,7 @@ use windui::core::EventCtx;
 use windui::prelude::*;
 use windui::signal::{signal, Signal};
 
+use super::update_state::UpdateState;
 use crate::core::config::{
     clamp_window_size, opacity_to_slider, slider_to_opacity, Config, CtrlWheel, DblClick,
     InitWindow, SourceId, UiTheme, Wheel,
@@ -148,6 +149,31 @@ impl Card {
     }
 }
 
+/// 缩略图条三态的标签（m262）：设置页下拉与右键「外观 ▸ 缩略图条」**共用这一根轴**，
+/// 下标就是档位。配置层仍是 `filmstrip` + `filmstrip_left` 两个 bool ini 键，
+/// 翻译只在这两个函数里发生一次，两处 UI 不许各写一套。
+pub(crate) const FILMSTRIP_POS: [&str; 3] = ["关闭", "下方", "左侧"];
+
+/// 两个 ini 键 → 三态下标。关条时 `filmstrip_left` 留着上次选的边。
+pub(crate) fn filmstrip_index(c: &Config) -> usize {
+    if !c.filmstrip {
+        0
+    } else if c.filmstrip_left {
+        2
+    } else {
+        1
+    }
+}
+
+/// 三态下标 → 两个 ini 键。选位置必然把条打开（0 才关）。
+pub(crate) fn filmstrip_bools(idx: usize) -> (bool, bool) {
+    match idx {
+        0 => (false, false),
+        2 => (true, true),
+        _ => (true, false),
+    }
+}
+
 /// 设置窗全部控件信号的句柄。
 #[derive(Clone, Copy)]
 pub struct Handles {
@@ -155,10 +181,13 @@ pub struct Handles {
     pub minimal_mode: Signal<bool>,
     /// 棋盘格透明背景（ini 键 checker；m53 起落盘，勾选即时作用于当前窗口）。
     pub checker: Signal<bool>,
-    /// 底部缩略图条（ini 键 filmstrip；m53 起落盘）。m246 起设置页「外观」卡
-    /// 也有这一项；`runtime::apply_session_flags` 每帧把配置推给窗口信号，
-    /// 不需要第二份状态，也不会把菜单的临时切换覆写回去。
-    pub filmstrip: Signal<bool>,
+    /// 缩略图条**三态**（m262：0 = 关闭 / 1 = 下方 / 2 = 左侧）。
+    ///
+    /// 下标即 [`FILMSTRIP_POS`] 的项序；设置页下拉与右键子菜单共用，不再各写一套枚举。
+    /// 写盘仍折成 `filmstrip` + `filmstrip_left` 两个 bool（[`filmstrip_index`] /
+    /// [`filmstrip_bools`]），配置层与 `runtime::apply_session_flags` 一个字没改。
+    /// 关条时 `filmstrip_left` 留着上次选的边，快捷键 T 再开就回到那边。
+    pub filmstrip_pos: Signal<usize>,
     pub long_fit: Signal<bool>,
     pub dcb: Signal<usize>,
     /// 「幻灯片间隔（秒）」文本框（ini 键 slide_interval）。
@@ -168,10 +197,20 @@ pub struct Handles {
     pub slide_secs: Signal<String>,
     pub wheel: Signal<usize>,
     pub ctrl_wheel: Signal<usize>,
+    /// Alt+滚轮（m278）：与上面两行共用同一张定制下拉，出厂「无」。
+    pub alt_wheel: Signal<usize>,
+    /// Shift+滚轮（m278）：同上；缩略图条内的 Shift+滚轮仍归条自己（一屏）。
+    pub shift_wheel: Signal<usize>,
     pub init_win: Signal<usize>,
+    /// 无边框形态（ini 键 `borderless`，m269）。窗口贴图片尺寸、隐藏整套自绘
+    /// chrome、图片透明区透出桌面；鼠标不穿透，交互功能一条不砍。
+    /// ★ 与 `init_win` 正交：那个只管「启动时怎么开窗」。
+    pub borderless: Signal<bool>,
     /// 「固定尺寸 (宽, 高)」组合输入，如 `800, 600`。
     pub win_size: Signal<String>,
-    /// 邻图预读开关（ini 键 prefetch 的 UI 写点）。默认开：关掉它是给低配机/省电用的。
+    /// 图片预读开关（ini 键 prefetch 的 UI 写点）：邻图 ±N + 缩略图条可见一屏。
+    /// 默认开：关掉它是给低配机 / 省电用的。
+    /// ★ m266：这一行住「看图」卡（m273 前叫「看图与操作」），与「适应长图」「幻灯片间隔」同组。
     pub prefetch: Signal<bool>,
     pub to_tray: Signal<bool>,
     /// 空格预览总开关（ini 键 space_preview 的 UI 写点）。默认关：抢占空格是强行为。
@@ -179,7 +218,7 @@ pub struct Handles {
     /// 左键拖动的分工（ini 键 drag_image 的 UI 写点）。默认开 = 画布里拖图片、
     /// 标题栏拖窗口；判据本体在 `ui::canvas::left_drag`。
     pub drag_image: Signal<bool>,
-    /// 底部浮条显不显示按钮（ini 键 show_toolbar_buttons，m245）。默认开；
+    /// 底部浮条显不显示操作按钮（ini 键 show_toolbar_buttons，m245）。默认开；
     /// 关掉 = 只留信息并水平居中。同一个开关也在右键「外观 ▸」里。
     pub show_toolbar_buttons: Signal<bool>,
     /// 多开开关（ini 键 allow_multiple 的 UI 写点）。默认关 = 单窗口（二次启动就地换图）；
@@ -237,11 +276,16 @@ pub struct Handles {
     /// 改动走 [`Handles::sync`] 的差分落盘；**生效不需要重建窗口**——`runtime` 每帧
     /// 把 `config.ui_theme` 推给渲染令牌（[`crate::ui::tokens::set_theme`]），变化即重绘。
     pub ui_theme: Signal<usize>,
+    /// 宿主更新的 4 枚信号（状态行 / 进度 / 忙 / 下载中）。
+    ///
+    /// ★ 随 `Handles` 常驻而不是随关于页新建：更新是后台发起、页面可能关着的动作，
+    ///   页面重开时要读到最新状态。唯一写点是 `runtime::update::poll`（UI 线程）。
+    pub update: UpdateState,
     /// 「可下载」状态行**显示**文案（派生：清单摘要 + 搜索时的匹配数）。
     pub remote_status: Signal<String>,
     /// 「插件」页的全部信号（已安装 / 可下载 / 来源 / 状态 / 进度）。
     pub plugin: PluginUi,
-    /// 「首选解码器」**全量**后缀行（过滤的数据源；切页/重扫时由 [`Handles::decode_refresh`] 写）。
+    /// 「首选解码器」**全量**后缀行（过滤的数据源；切页/重扫时由 `Handles::decode_refresh_from` 写）。
     pub ext_rows_all: Signal<Vec<ExtRow>>,
     /// 「首选解码器」过滤视图（**派生信号**：挂在搜索词版本上，打字即时重算——实时性来源）。
     pub ext_view: Signal<Vec<ExtRow>>,
@@ -255,13 +299,13 @@ pub struct Handles {
     pub card_download: Signal<bool>,
     /// 「首选解码器」卡展开态。
     pub card_preferred: Signal<bool>,
-    /// 快捷键页「键盘快捷键」卡展开态（29 行键位，默认展开——它是这一页的主角）。
+    /// 快捷键页「键盘快捷键」卡展开态（35 个动作 + 1 行只读的空格看图，默认展开——它是这一页的主角）。
     pub card_keys: Signal<bool>,
-    /// 快捷键页「鼠标快捷键」卡展开态（三档下拉）。
+    /// 快捷键页「鼠标快捷键」卡展开态（m278：五行，四行滚轮共用一张定制的成对动作下拉）。
     pub card_mouse: Signal<bool>,
     /// 「插件快捷键」卡（第三张，2026-10-31 用户点名）。
     pub card_plugins: Signal<bool>,
-    /// 「选项」页四张卡的展开态（m224）：外观 / 窗口 / 看图与操作 / 系统与网络。
+    /// 「选项」页四张卡的展开态（m224）：外观 / 窗口 / 看图（m273 前叫「看图与操作」）/ 系统与网络。
     pub card_appearance: Signal<bool>,
     pub card_window: Signal<bool>,
     pub card_browse: Signal<bool>,
@@ -315,7 +359,10 @@ impl Handles {
         set(&mut dirty, &mut c.stay_on_top, self.stay.get());
         set(&mut dirty, &mut c.minimal_mode, self.minimal_mode.get());
         set(&mut dirty, &mut c.checker, self.checker.get());
-        set(&mut dirty, &mut c.filmstrip, self.filmstrip.get());
+        // m262：三选一一根轴折成两个 ini 键；选位置必然把条打开。
+        let (film, left) = filmstrip_bools(self.filmstrip_pos.get());
+        set(&mut dirty, &mut c.filmstrip, film);
+        set(&mut dirty, &mut c.filmstrip_left, left);
         set(&mut dirty, &mut c.long_image_fit, self.long_fit.get());
         let dcb = DblClick::from_index(self.dcb.get() as i64);
         if c.dbl_click != dcb {
@@ -337,12 +384,25 @@ impl Handles {
             c.wheel = wh;
             dirty = true;
         }
-        // ini 键：ctrl_wheel（Ctrl+滚轮：0 缩放 / 1 翻页，与裸滚轮各自独立）
+        // ini 键：ctrl_wheel（Ctrl+滚轮：四档与裸滚轮同表，各自独立）
         let cw = CtrlWheel::from_index(self.ctrl_wheel.get() as i64);
         if c.ctrl_wheel != cw {
             c.ctrl_wheel = cw;
             dirty = true;
         }
+        // m278：Alt / Shift 两行走同一条通道（Config 唯一正本）。
+        let aw = crate::core::config::WheelAction::from_index(self.alt_wheel.get() as i64);
+        if c.alt_wheel != aw {
+            c.alt_wheel = aw;
+            dirty = true;
+        }
+        let sw = crate::core::config::WheelAction::from_index(self.shift_wheel.get() as i64);
+        if c.shift_wheel != sw {
+            c.shift_wheel = sw;
+            dirty = true;
+        }
+        // m269：无边框是独立形态开关，不与启动窗口档位互相折写。
+        set(&mut dirty, &mut c.borderless, self.borderless.get());
         let iw = InitWindow::from_ui_index(self.init_win.get());
         if c.init_window != iw {
             c.init_window = iw;
@@ -496,19 +556,22 @@ impl Handles {
                 slot.set(v);
             }
         };
+        put_b(&self.borderless, c.borderless);
         put_b(&self.stay, c.stay_on_top);
         put_b(&self.minimal_mode, c.minimal_mode);
         put_b(&self.checker, c.checker);
-        put_b(&self.filmstrip, c.filmstrip);
         put_b(&self.long_fit, c.long_image_fit);
         let put_u = |slot: &Signal<usize>, v: usize| {
             if slot.get() != v {
                 slot.set(v);
             }
         };
+        put_u(&self.filmstrip_pos, filmstrip_index(c));
         put_u(&self.dcb, c.dbl_click.index() as usize);
         put_u(&self.wheel, c.wheel.index() as usize);
         put_u(&self.ctrl_wheel, c.ctrl_wheel.index() as usize);
+        put_u(&self.alt_wheel, c.alt_wheel.index() as usize);
+        put_u(&self.shift_wheel, c.shift_wheel.index() as usize);
         put_u(&self.init_win, c.init_window.ui_index());
         put_u(&self.ui_theme, c.ui_theme.ui_index());
         put_u(&self.download_source, c.download_source.ui_index());
@@ -587,21 +650,6 @@ impl Handles {
             Err(e) => {
                 // 清单异常已经是一句行动指引（“请「刷新」”），原样显示。
                 self.set_remote_state(e);
-            }
-        }
-    }
-
-    /// 起一次后台刷新（只由「刷新」按钮调）：联网 → 解析 → 覆盖本地 `docs/decoders.json`。
-    ///
-    /// 不进 UI 线程：WinHTTP 四阶段超时叠加起来足够让设置窗"未响应"。结果由设置窗的
-    /// 250 ms 定时器经 [`Handles::remote_poll`] 取走。
-    pub fn remote_refresh(&self, c: &Config) {
-        // 地址取配置里那一条（ini 键 decoder_index_*，用户可改），不是常量。
-        match crate::decoders::remote::start_refresh_for(c) {
-            Ok(()) => self.set_remote_state("更新中…".to_string()),
-            Err(e) => {
-                log::warn!("清单更新未能开始：{e}");
-                self.set_remote_state(e.ui_text().to_string());
             }
         }
     }
@@ -821,13 +869,16 @@ pub(crate) fn settings_window(config: &Rc<RefCell<Config>>, hub: &Hub) -> Window
             stay: sig(c.stay_on_top),
             minimal_mode: sig(c.minimal_mode),
             checker: sig(c.checker),
-            filmstrip: sig(c.filmstrip),
+            filmstrip_pos: signal(filmstrip_index(&c)),
             long_fit: sig(c.long_image_fit),
             dcb: signal(c.dbl_click.index() as usize),
             slide_secs: signal(c.slide_interval.to_string()),
             wheel: signal(c.wheel.index() as usize),
             ctrl_wheel: signal(c.ctrl_wheel.index() as usize),
+            alt_wheel: signal(c.alt_wheel.index() as usize),
+            shift_wheel: signal(c.shift_wheel.index() as usize),
             init_win: signal(c.init_window.ui_index()),
+            borderless: sig(c.borderless),
             win_size: signal(format!("{}, {}", c.window_w, c.window_h)),
             prefetch: sig(c.prefetch),
             to_tray: sig(c.close_to_tray),
@@ -870,6 +921,7 @@ pub(crate) fn settings_window(config: &Rc<RefCell<Config>>, hub: &Hub) -> Window
             card_ext_available: sig(expanded(Card::PluginsAvailable)),
             ui_theme: signal(c.ui_theme.ui_index()),
             download_source: signal(c.download_source.ui_index()),
+            update: UpdateState::new(),
         };
         drop(c);
         *hub.borrow_mut() = Some(h);
@@ -949,6 +1001,17 @@ pub(crate) fn settings_window(config: &Rc<RefCell<Config>>, hub: &Hub) -> Window
                 let Some(hk) = Hotkey::from_event(&ki) else {
                     return true;
                 };
+                // m278：裸空格保留给「空格看图」，插件也不许占（钩子永不吞键，
+                // 占了就是一次按键同时跑两件事）。拒绝后清捕获态，框回到「（空）」。
+                if hk.is_reserved() {
+                    log::warn!("插件快捷键：裸空格已保留给「空格看图」");
+                    if let Some(u) = plugin_cap {
+                        u.capturing.set(None);
+                    }
+                    let cfg = cfg_sc.borrow();
+                    shortcuts::sync_plugin_hotkey_texts(&cfg, None);
+                    return true;
+                }
                 let key = crate::extensions::plugin_hotkey_items(&cfg_sc.borrow())
                     .into_iter()
                     .find(|(pid, _, _, _)| pid == &id)
@@ -983,6 +1046,14 @@ pub(crate) fn settings_window(config: &Rc<RefCell<Config>>, hub: &Hub) -> Window
             let Some(hk) = Hotkey::from_event(&ki) else {
                 return true;
             };
+            // m278：宿主捕获同样不许抓裸空格。快捷键页里有只读行「空格看图 /
+            // 空格（固定）」说明去向，这里只负责"抓到也不写回"。
+            if hk.is_reserved() {
+                log::warn!("快捷键：裸空格已保留给「空格看图」");
+                cap_sc.set(None);
+                sync_hotkey_texts(&cfg_sc.borrow(), cap_sc.get(), &texts_sc);
+                return true;
+            }
             let Some(a) = Action::from_index(a_idx) else {
                 cap_sc.set(None);
                 sync_hotkey_texts(&cfg_sc.borrow(), cap_sc.get(), &texts_sc);
@@ -1005,7 +1076,7 @@ pub(crate) fn settings_window(config: &Rc<RefCell<Config>>, hub: &Hub) -> Window
                 shortcuts_page(&h, config.clone(), capturing, texts),
                 decoders_page(&h, config.clone()),
                 extensions_page(&config, &h),
-                about_page(),
+                about_page(&h),
             ];
             let mut stack = Element::stack().fill().weight(1.0);
             for (i, page) in pages.into_iter().enumerate() {
@@ -1092,6 +1163,50 @@ pub fn open_settings(ctx: &mut EventCtx, config: &Rc<RefCell<Config>>, hub: &Hub
 pub(crate) mod tests {
     use super::*;
 
+    /// m262：缩略图条三选一是**一根轴**，两个 ini 键与两处 UI 之间只许有一份翻译。
+    ///
+    /// 负向验证：把 0 当「下方」、1 当「左侧」的旧二选一写法，第 0 档就红；
+    /// 把 push 写回 `c.filmstrip_left as usize`，左侧那档也红。
+    #[test]
+    fn filmstrip_tristate_roundtrips_through_two_ini_keys() {
+        for idx in 0..3 {
+            let (film, left) = filmstrip_bools(idx);
+            let mut c = Config {
+                filmstrip: !film,
+                filmstrip_left: !left,
+                ..Default::default()
+            };
+
+            // sync：UI 信号 → 配置（从反着的初值出发，必须真的翻过来）
+            let h = test_handles();
+            h.filmstrip_pos.set(idx);
+            let _ = h.sync(&mut c);
+            assert_eq!(
+                (c.filmstrip, c.filmstrip_left),
+                (film, left),
+                "sync 档位 {idx}"
+            );
+
+            // 配置 → 档位 → push 回 UI 信号，三处同值
+            assert_eq!(filmstrip_index(&c), idx, "两个 ini 键 → 档位 {idx}");
+            let h2 = test_handles();
+            h2.filmstrip_pos.set(99);
+            h2.push(&c);
+            assert_eq!(h2.filmstrip_pos.get(), idx, "push 档位 {idx}");
+        }
+        // 快捷键 T 只翻 filmstrip：关掉再开必须回到原来那一侧，不许掉回「下方」。
+        let mut c = Config {
+            filmstrip: true,
+            filmstrip_left: true,
+            ..Default::default()
+        };
+        assert_eq!(filmstrip_index(&c), 2);
+        c.filmstrip = false;
+        assert_eq!(filmstrip_index(&c), 0);
+        c.filmstrip = true;
+        assert_eq!(filmstrip_index(&c), 2, "关了再开要回到左侧");
+    }
+
     /// 布局用例共用的一套信号：取值与真实配置无关，只用来把整页的 widget 树建出来。
     ///
     /// `pub(crate)`：`extensions_tab` 的页面构建用例也要一套（插件页的卡片展开态
@@ -1102,13 +1217,16 @@ pub(crate) mod tests {
             stay: sig(false),
             minimal_mode: sig(false),
             checker: sig(false),
-            filmstrip: sig(false),
+            filmstrip_pos: signal(0),
             long_fit: sig(false),
             dcb: signal(0),
             slide_secs: signal("3".into()),
             wheel: signal(0),
             ctrl_wheel: signal(0),
+            alt_wheel: signal(3),
+            shift_wheel: signal(3),
             init_win: signal(0),
+            borderless: sig(false),
             win_size: signal(String::new()),
             prefetch: signal(false),
             to_tray: sig(false),
@@ -1149,6 +1267,7 @@ pub(crate) mod tests {
             card_ext_available: sig(true),
             ui_theme: signal(0),
             download_source: signal(0),
+            update: UpdateState::new(),
             plugin: PluginUi::new(&Config::default()),
         }
     }
@@ -1283,7 +1402,7 @@ pub(crate) mod tests {
             shortcuts_page(&h, config.clone(), capturing, texts),
             decoders_page(&h, config.clone()),
             extensions_page(&config, &h),
-            about_page(),
+            about_page(&h),
         ];
         let mut stack = Element::stack().fill().weight(1.0);
         for p in pages {
@@ -1358,11 +1477,17 @@ pub(crate) mod tests {
         assert_eq!(
             cards.len(),
             4,
-            "选项页应有四张卡：外观 / 窗口 / 看图与操作 / 系统与网络"
+            "选项页应有四张卡：外观 / 窗口 / 看图 / 系统与网络"
         );
         // m244：系统与网络卡 2→3（新增「文件关联」入口行——它没有 ini 键，状态住注册表）。
         // m246：外观卡 5→6（补「缩略图条」），整页 17→18 行。
-        let want = [6, 5, 4, 3];
+        // m253：外观卡 6→7（补「缩略图条在左侧」），整页 18→19 行。
+        // m262：外观卡 7→6（勾选 + 位置下拉合成三选一），整页 19→18 行。
+        // m266：图片预读「系统与网络」→「看图」，两卡 3/4 变 2/5，整页仍 18 行。
+        // m269：窗口卡 5→6（新增「无边框」），启动窗口同时收成二选一；整页 18→19 行。
+        // m273：只重排窗口卡与看图卡的卡内项序、第三张卡改名「看图」——**行数一个没变**，
+        //   所以下面这组数是"重排没顺手丢一项 / 没顺手多塞一项"的守门员。
+        let want = [6, 6, 5, 2];
         let mut rows = 0;
         for (i, (card, n)) in cards.iter().zip(want).enumerate() {
             let node = tree.get(*card).expect("卡");
@@ -1376,7 +1501,7 @@ pub(crate) mod tests {
             assert_eq!(got, n, "卡 {i} 行数不对（分组串位了？）");
             rows += got;
         }
-        assert_eq!(rows, 18, "18 项一项都不能在分组里丢");
+        assert_eq!(rows, 19, "19 项一项都不能在分组里丢");
 
         let expanded_card_h = tree.get(cards[1]).expect("窗口卡").bounds.h;
         let expanded_content_h = tree.get(root).expect("页面").content_h;

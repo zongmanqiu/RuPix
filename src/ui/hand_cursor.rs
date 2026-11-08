@@ -1,4 +1,4 @@
-//! 抓手光标：把 `image/cursor-*.svg` 光栅化成 `HCURSOR`，按指针状态切换。
+//! 抓手光标：把 `assets/cursor-*.svg` 光栅化成 `HCURSOR`，按指针状态切换。
 //!
 //! # 为什么由宿主自己管，不走框架的 `Widget::cursor()`
 //!
@@ -17,7 +17,7 @@
 //! 两件事都很贵，各缓存一次：光栅化结果按系统光标边长缓存，句柄在平台层缓存。
 //! 之后每次移动只是 `SetCursor`，可以放心地每帧调。
 //!
-//! 缓存**按尺寸失效**（[`refresh_for_dpi`]）：把窗口拖到另一块不同缩放的显示器后，
+//! 缓存**按尺寸失效**（`refresh_for_dpi`）：把窗口拖到另一块不同缩放的显示器后，
 //! 光标边长会变，旧位图继续用就是一块放大的糊图。两边都是 `Mutex<Option<…>>`
 //! 而不是 `OnceLock`，正是为了能丢掉重造。
 
@@ -27,9 +27,9 @@ use std::sync::{Arc, Mutex};
 use windui::render::image::Image;
 
 /// 松手：可拖区域悬停时。
-const GRAB_SVG: &[u8] = include_bytes!("../../image/cursor-grab.svg");
+const GRAB_SVG: &[u8] = include_bytes!("../../assets/cursor-grab.svg");
 /// 抓手：按住左键拖动时。
-const GRABBING_SVG: &[u8] = include_bytes!("../../image/cursor-grabbing.svg");
+const GRABBING_SVG: &[u8] = include_bytes!("../../assets/cursor-grabbing.svg");
 
 /// 两枚图的坐标系边长（`viewBox="0 0 32 32"`），热点按它换算比例。
 const GRID: f32 = 32.0;
@@ -65,6 +65,18 @@ pub fn apply(hand: Option<bool>) {
         Ordering::Relaxed,
     );
     apply_now(hand);
+}
+
+/// 只**撤掉自绘覆盖**，不设任何光标。
+///
+/// 窗口四缘那圈是非客户区：框架刚在 `WM_SETCURSOR` 里按 `HTLEFT/HTBOTTOM/…`
+/// 设好了缩放光标，而 `WM_NCMOUSEMOVE` 补发的 Move 紧接着会走到宿主这里。
+/// 走 `apply` 的 `None` 分支会调 `use_arrow()` 把那枚缩放光标顶成箭头
+/// （2026-11-08 用户实报「光标移到边框线没反应」）；这里只清覆盖，光标交给框架。
+/// `LAST` 一并归零，免得 DPI 重建时又把一枚手型还回来。
+pub fn release() {
+    LAST.store(0, Ordering::Relaxed);
+    windui::platform::set_cursor_override(None);
 }
 
 /// DPI 变了就按新边长重造两枚光标，并把状态复原。
@@ -170,6 +182,26 @@ fn raster(cell: &'static Mutex<Option<(u32, Rgba)>>, svg: &[u8], size: u32) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 四缘缩放带要走 `release`：只撤覆盖、不设箭头，否则框架那枚缩放光标会被顶掉。
+    /// 负向臂：`apply(None)` 仍要主动收成箭头（客户区里不能留着上一帧的手）。
+    #[test]
+    fn release_only_clears_the_override() {
+        apply(Some(false));
+        assert!(
+            windui::platform::cursor_override().is_some(),
+            "前置：手型已经登记成覆盖"
+        );
+        release();
+        assert!(
+            windui::platform::cursor_override().is_none(),
+            "进非客户区前必须把覆盖撤干净"
+        );
+        assert_eq!(LAST.load(Ordering::Relaxed), 0, "DPI 重建时不许还回手型");
+        apply(Some(true));
+        release();
+        assert_eq!(LAST.load(Ordering::Relaxed), 0);
+    }
 
     /// 两枚 svg 都要能被 resvg 光栅化成**正方形**的 RGBA。
     /// 这条是接线的地基：图坏了或者 viewBox 被改成非正方形，抓手就永远不出现，

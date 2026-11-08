@@ -98,45 +98,6 @@ pub fn show(ctx: &mut EventCtx, key: &str, title: &str, text: &str) {
     );
 }
 
-/// 带底栏动作的纯文本窗：正文沿用 [`show`] 的记事本式文本区，按钮一律走
-/// `dialog_footer::action` + `dialog_footer::shell`（hygiene 第 14 查的唯一入口）。
-///
-/// `actions` 是**工厂**而不是 `Vec<Element>`：`Window::content` 的闭包会被重复调用，
-/// 每次都要新建按钮，所以这里不缓存 Element。
-pub fn show_with_actions<F>(ctx: &mut EventCtx, key: &str, title: &str, text: &str, actions: F)
-where
-    F: Fn() -> Vec<Element> + 'static,
-{
-    let body = text.to_string();
-    let h = (height_for(text) + 48).max(WINDOW_MIN_H);
-    let sig = signal(body);
-    let title = title.to_string();
-    let (old_key, win_key) = super::singleton::recycle(key);
-    ctx.close_window(old_key);
-    ctx.open_window(
-        Window::new(title, W, h)
-            .bg(to_color(BG))
-            .resizable(true)
-            .min_size(MIN_W, MIN_H)
-            .centered(true)
-            .owned(true)
-            .single(win_key)
-            .content(move || {
-                let rows = vec![Element::text_input(sig, "")
-                    .multiline()
-                    .wrap(true)
-                    .frameless_input()
-                    .select_range(0, 0)
-                    .font_size(FONT_MD)
-                    .padding_xy(PAD_X, 6)
-                    .weight(1.0)
-                    .fill()
-                    .width_match()];
-                super::dialog_footer::shell(rows, actions())
-            }),
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

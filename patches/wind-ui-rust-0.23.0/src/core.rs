@@ -2238,6 +2238,11 @@ impl EventCtx<'_> {
         }
         self.out.window_op = Some(WindowOp::SetClientSize(w, h));
     }
+    /// ★ RuPix 补丁 028 —— 请求进入 / 退出「背景透明但鼠标不穿透」的无边框形态。
+    /// 见 `event::WindowOp::SetTransparentBackground`。
+    pub fn set_transparent_background(&mut self, on: bool) {
+        self.out.window_op = Some(WindowOp::SetTransparentBackground(on));
+    }
     /// 当前窗口的状态与能力快照（是否最大化、能否最大化/最小化）。
     ///
     /// 读的是宿主在本次分发前注入的线程局部，见 [`crate::event::window_state`]。

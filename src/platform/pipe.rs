@@ -7,7 +7,7 @@
 //!
 //! - 同步阻塞读写；超时/取消在进程编排层做（P0.1b 后续），不在本模块里塞线程。
 //! - 单实例、字节模式；一次只服务一个扩展进程。
-//! - `accept` 后管道句柄交给 [`Connection`]，`PipeServer` 不再持有。
+//! - `accept` 后管道句柄交给 `Connection`，`PipeServer` 不再持有。
 //!
 //! 句柄用 `isize` 存而不是 `HANDLE`：`HANDLE` 内含裸指针，自动化 trait 不是 `Send`；
 //! 扩展进程编排需要把 server 移进接受线程，故在边界处做一次显式数值化。

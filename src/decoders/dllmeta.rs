@@ -26,7 +26,7 @@ use super::*;
 /// 而那正是"加法式升级"要避免的事。
 pub(super) const MIN_ABI_VERSION: u32 = 5;
 
-/// 解码器自述的 ABI 版本能否被本宿主接受（区间判定，见 [`MIN_ABI_VERSION`]）。
+/// 解码器自述的 ABI 版本能否被本宿主接受（区间判定，见 `MIN_ABI_VERSION`）。
 pub(super) fn abi_compatible(got: u32) -> bool {
     (MIN_ABI_VERSION..=IV_ABI_VERSION).contains(&got)
 }

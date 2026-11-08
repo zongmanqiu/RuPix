@@ -8,13 +8,13 @@
 //!
 //! # 边界条件都显式处理
 //!
-//! - **超时**（[`DEFAULT_TIMEOUT_MS`]）：四个阶段都设，缺一个都能挂到天荒地老
+//! - **超时**（`DEFAULT_TIMEOUT_MS`）：四个阶段都设，缺一个都能挂到天荒地老
 //!   （典型是 TCP 连上了但服务器不回，只设 connect 超时的代码会永远等下去）。
 //! - **响应体上限**：调用方传入 `max_bytes`，超了立即报错并关连接——不解压、不落盘，
 //!   一份"清单"不该有几十 MB。
 //! - **状态码**：非 200 一律报错并带上码值。gitee 的 raw 地址在文件不存在时返回 404 页面，
 //!   不查状态码就会把一页 HTML 当 JSON 去解析，报出来的错完全指错方向。
-//! - **句柄**：`session → connect → request` 三级全部走 RAII（[`Handle`]），
+//! - **句柄**：`session → connect → request` 三级全部走 RAII（`Handle`），
 //!   任何一步提前 `return` 都不会漏关——漏关的句柄在设置窗反复开关时会攒成泄漏。
 //!
 //! 重定向交给 WinHTTP 的默认策略：清单源用 CDN 直链（Gitee `raw.giteeusercontent.com` /
@@ -27,8 +27,8 @@ use windows::core::PCWSTR;
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
     WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
-    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
-    WINHTTP_QUERY_STATUS_CODE,
+    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_CONTENT_LENGTH,
+    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
 };
 
 /// 默认超时（毫秒，四个阶段各一份）。
@@ -121,17 +121,37 @@ fn wide(s: &str) -> Vec<u16> {
 /// `max_bytes` 是硬上限：超过即报错（不截断——截断的 JSON 会在解析阶段报一个
 /// 与真正原因无关的"第 N 字节"错误，更难查）。
 pub fn get(url: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
-    get_with_progress(url, max_bytes, |_| {})
+    fetch(url, max_bytes, |_, _| {})
 }
 
 /// 同 [`get`]，每读到一个块就回调一次**已收字节数**（用于下载进度）。
 ///
 /// 回调在调用方的线程上同步执行（DLL 下载时就是那个后台下载线程）；不要在里面
-/// 做 UI 操作。总字节数由调用方自己知道（清单里的 `size`），这里不猜 Content-Length。
+/// 做 UI 操作。要总字节数就用 [`get_with_progress_total`]。
 pub fn get_with_progress(
     url: &str,
     max_bytes: usize,
     mut on_progress: impl FnMut(u64),
+) -> Result<Vec<u8>, String> {
+    fetch(url, max_bytes, move |got, _total| on_progress(got))
+}
+
+/// 同 [`get_with_progress`]，但回调同时给**总字节数**。
+///
+/// 总量取响应头 `Content-Length`：服务端没给（分块传输）就是 `0`，调用方据此走
+/// "不确定"态。这是**显示用**的量，不参与任何身份判据——宿主更新只认文件名与版本号。
+pub fn get_with_progress_total(
+    url: &str,
+    max_bytes: usize,
+    on_progress: impl FnMut(u64, u64),
+) -> Result<Vec<u8>, String> {
+    fetch(url, max_bytes, on_progress)
+}
+
+fn fetch(
+    url: &str,
+    max_bytes: usize,
+    mut on_progress: impl FnMut(u64, u64),
 ) -> Result<Vec<u8>, String> {
     let u = split_url(url)?;
     let agent = wide(AGENT);
@@ -206,6 +226,19 @@ pub fn get_with_progress(
             return Err(format!("HTTP {status}"));
         }
 
+        // 总字节数（只在给进度条用；服务端没给就是 0）。查不到不算错——分块传输本来
+        // 就没有这个头，此时界面走"不确定"态，只报已下载的量。
+        let mut total: u64 = 0;
+        let mut tlen = std::mem::size_of::<u64>() as u32;
+        let _ = WinHttpQueryHeaders(
+            req.raw(),
+            WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+            PCWSTR::null(),
+            Some(&mut total as *mut u64 as *mut c_void),
+            &mut tlen,
+            std::ptr::null_mut(),
+        );
+
         let mut body: Vec<u8> = Vec::new();
         let mut buf = vec![0u8; 16 * 1024];
         loop {
@@ -221,7 +254,7 @@ pub fn get_with_progress(
                 break;
             }
             body.extend_from_slice(&buf[..got as usize]);
-            on_progress(body.len() as u64);
+            on_progress(body.len() as u64, total);
             if body.len() > max_bytes {
                 return Err(format!(
                     "响应超过 {max_bytes} 字节上限（这不是一份清单该有的大小）"

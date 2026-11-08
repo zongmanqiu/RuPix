@@ -1,11 +1,11 @@
 //! 缩略图条（filmstrip）的后台解码状态。
 //!
 //! 与主画面共用**同一条**解码线程，所以在途数量有硬上限：一次最多
-//! [`MAX_INFLIGHT`] 个请求——留着它是为了不让一次翻页把队列灌满陈旧格子，
+//! `MAX_INFLIGHT` 个请求——留着它是为了不让一次翻页把队列灌满陈旧格子，
 //! "正在看的那张"排在缩略图后面这件事已由解码线程的**主画面插队**兜住
 //! （[`crate::core::decode`] 的 `Queue::pop`，2026-10-17 修放大糊图时加）。
 //!
-//! 存的是内存里那份 [`RgbaImage`]（本模块的 `map`）；跨会话没有磁盘那一层了——
+//! 存的是内存里那份 `RgbaImage`（本模块的 `map`）；跨会话没有磁盘那一层了——
 //! 2026-10-19 撤掉解码缓存，缩略图本来也达不到它的门槛（240×180×4 ≈ 172 KB）。
 
 use std::cell::Cell;
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use crate::core::decode::{Decoder, Done};
+use crate::core::decode::{self, Decoder, Done, RawParams, ReqKind};
 use crate::core::pixels::RgbaImage;
 
 /// 缩略图的目标框（设备像素）。
@@ -57,6 +57,10 @@ pub struct Thumbs {
     slots: HashMap<PathBuf, (Slot, Cell<u64>)>,
     /// 在途请求的 `seq → 路径`：回包据此认领，认领不到就不是缩略图的。
     inflight: HashMap<u64, PathBuf>,
+    /// 裸像素路径 → 上次发缩略图请求时用的参数。参数窗改了宽 / 高 / 布局之后，
+    /// 旧格子里那张是按旧参数解的，必须重发；`None` 表示「推不出参数，当时发的普通请求」。
+    /// 非裸像素路径不进这张表，也就不参与比较。
+    raw_used: HashMap<PathBuf, Option<RawParams>>,
     stamp: Cell<u64>,
 }
 
@@ -65,6 +69,7 @@ impl Thumbs {
         Self {
             slots: HashMap::new(),
             inflight: HashMap::new(),
+            raw_used: HashMap::new(),
             stamp: Cell::new(0),
         }
     }
@@ -89,25 +94,54 @@ impl Thumbs {
         n
     }
 
-    /// 为**还没有着落**的路径发起后台解码，受 [`MAX_INFLIGHT`] 约束。
+    /// 为**还没有着落**的路径发起后台解码，受 `MAX_INFLIGHT` 约束。
     ///
     /// 已有的（含在途与失败的）一律跳过，所以每帧调用也只会在真正缺图时发请求。
     /// ★ 收的是 `&[&Path]` 而不是 `&[PathBuf]`（m100）：调用方（`Viewer::strip_window`）
     ///   手里只有清单里那些路径的**引用**，旧签名逼它先克隆一份整屏的 `PathBuf`——
     ///   一帧 12 格就是 12 次分配，而这笔克隆在这条路上没有任何下游需要拥有权。
+    ///
+    /// ★ 裸像素没有文件头：早期这里对所有路径都发 `decoder.request`（`raw = None`），
+    ///   解码器只会回「没有尺寸信息」，那一格被记成 `Failed` 后**永不重发**，于是
+    ///   `.bgra/.rgb/.yuv/…` 在条上永远是空的（2026-11-08 用户实报 `noise.bgra`）。
+    ///   现在与主画面共用 [`decode::ensure_raw_params`] 的推断 / 会话值，并走
+    ///   `request_raw(..., Thumb)`；参数一变就把旧格子作废重发。
     pub fn ensure(&mut self, decoder: &Decoder, paths: &[&Path]) {
         for p in paths {
+            let headerless = decode::is_headerless_path(p);
+            let raw = if headerless {
+                decode::ensure_raw_params(p)
+            } else {
+                None
+            };
+            // 参数变了才重发；普通图不进表，也不该被"没有参数"这件事影响。
+            if headerless && self.raw_used.get(*p).copied() != Some(raw) {
+                self.raw_used.insert(p.to_path_buf(), raw);
+                self.forget(p);
+            }
             if self.slots.contains_key(*p) {
                 continue;
             }
             if self.inflight.len() >= MAX_INFLIGHT {
                 break;
             }
-            let seq = decoder.request(p, THUMB_W, THUMB_H);
+            let seq = match raw {
+                Some(_) => decoder.request_raw(p, THUMB_W, THUMB_H, ReqKind::Thumb),
+                None => decoder.request(p, THUMB_W, THUMB_H),
+            };
             let owned = p.to_path_buf();
             self.inflight.insert(seq, owned.clone());
             self.put(owned, Slot::Pending);
         }
+    }
+
+    /// 丢掉某路径的格子与它在途登记（换参数后重发用）。
+    ///
+    /// 晚到的旧回包会因 `wants(seq) == false` 被判成过期丢掉，不会盖掉新参数那张
+    /// ——与 `clear()` 在换目录时清 `inflight` 是同一条口径。
+    fn forget(&mut self, path: &Path) {
+        self.slots.remove(path);
+        self.inflight.retain(|_, p| p != path);
     }
 
     /// 这个回包是不是缩略图的（`true` 时调用方应交给 [`Self::take`]）。
@@ -139,6 +173,7 @@ impl Thumbs {
     pub fn clear(&mut self) {
         self.slots.clear();
         self.inflight.clear();
+        self.raw_used.clear();
     }
 
     fn put(&mut self, path: PathBuf, slot: Slot) {
@@ -264,6 +299,84 @@ mod tests {
         assert!(t.get(&paths[0]).is_some(), "就绪那张不受影响");
     }
 
+    /// ★ 用户 2026-11-08 实报「有的图在缩略图条里面是空的，例如 noise.bgra」。
+    ///
+    /// 裸像素没有文件头：以前缩略图一律发 `decoder.request`（`raw = None`），
+    /// 解码器回「没有尺寸信息」，`Failed` 格子又被账本永久记住 ⇒ 那一格永远空着。
+    /// 负向臂同时钉住普通图**不许**被塞进裸数据通道。
+    #[test]
+    fn headerless_thumbnails_go_through_the_raw_channel() {
+        let d = crate::core::decode::tests::stub_decoder();
+        let raw_path = PathBuf::from("thumbs-gate/noise.bgra");
+        let params = RawParams {
+            width: 616,
+            height: 464,
+            layout: 8,
+        };
+        // 参数窗确认值 / 首开推断值都在会话 store 里；这里不必造真文件。
+        decode::set_raw_params(&raw_path, params);
+        let plain = PathBuf::from("thumbs-gate/noise.jpg");
+
+        let mut t = Thumbs::new();
+        t.ensure(&d, &[raw_path.as_path(), plain.as_path()]);
+        let reqs = crate::core::decode::tests::pending_reqs(&d);
+        assert_eq!(reqs.len(), 2, "两张都该发请求");
+        assert_eq!(reqs[0].0, raw_path);
+        assert_eq!(reqs[0].1, Some(params), "裸像素缩略图必须带宽高布局");
+        assert_eq!(reqs[0].2, ReqKind::Thumb, "仍是缩略图，不许挤成 Main");
+        assert_eq!((reqs[0].3, reqs[0].4), (THUMB_W, THUMB_H));
+        assert_eq!(reqs[1].0, plain);
+        assert_eq!(reqs[1].1, None, "有文件头的图不许被塞进裸数据通道");
+        assert_eq!(reqs[1].2, ReqKind::Thumb);
+        assert!(t.raw_used.contains_key(&raw_path));
+        assert!(!t.raw_used.contains_key(&plain), "普通图不进参数对照表");
+    }
+
+    /// 参数窗改了宽 / 高 / 布局 ⇒ 旧格子（含失败格）必须作废重发；参数没变则不重发。
+    ///
+    /// 负向臂：`Failed` 格子在没有参数变化时**不能**每帧重发——否则一张真坏图
+    /// 会把唯一那条解码线程永久灌满。
+    #[test]
+    fn only_changed_raw_params_reissue_a_failed_thumbnail() {
+        let d = crate::core::decode::tests::stub_decoder();
+        let p = PathBuf::from("thumbs-gate/edited.bgra");
+        let p1 = RawParams {
+            width: 640,
+            height: 480,
+            layout: 8,
+        };
+        let p2 = RawParams {
+            width: 800,
+            height: 600,
+            layout: 8,
+        };
+        decode::set_raw_params(&p, p1);
+        let mut t = Thumbs::new();
+        t.ensure(&d, &[p.as_path()]);
+        let seq1 = *t.inflight.keys().next().expect("第一笔请求");
+        assert!(
+            t.take(done(seq1, &p, false)),
+            "先让它解失败，格子记成 Failed"
+        );
+
+        t.ensure(&d, &[p.as_path()]);
+        assert_eq!(
+            crate::core::decode::tests::pending_reqs(&d).len(),
+            1,
+            "参数没变，失败的格子不许每帧重发"
+        );
+
+        decode::set_raw_params(&p, p2);
+        t.ensure(&d, &[p.as_path()]);
+        let reqs = crate::core::decode::tests::pending_reqs(&d);
+        assert_eq!(reqs.len(), 2, "改了参数就该重发一笔");
+        assert_eq!(reqs[1].1, Some(p2), "重发要带新参数");
+        assert_eq!(t.inflight.len(), 1, "旧在途登记要摘掉，别留孤儿");
+        let seq2 = *t.inflight.keys().next().expect("第二笔请求");
+        assert_ne!(seq1, seq2);
+        assert!(matches!(t.slots.get(&p), Some((Slot::Pending, _))));
+    }
+
     /// 超过上限时淘汰**最久未用**的那一格——写入和读到都算「用过」。
     ///
     /// 这条测试原本是反过来钉的（「淘汰的是最久未写入的，不是最近刚用到的」），
@@ -298,9 +411,11 @@ mod tests {
         let mut t = Thumbs::new();
         t.put(PathBuf::from("a.png"), Slot::Ready(Rc::new(img(2, 2))));
         t.inflight.insert(5, PathBuf::from("b.png"));
+        t.raw_used.insert(PathBuf::from("c.bgra"), None);
         t.clear();
         assert!(t.slots.is_empty());
         assert!(t.inflight.is_empty());
+        assert!(t.raw_used.is_empty(), "换目录后参数对照表也要清");
         assert!(!t.wants(5));
     }
 }

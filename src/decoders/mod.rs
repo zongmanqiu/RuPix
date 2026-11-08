@@ -25,7 +25,7 @@
 //! | 防护 | 这里怎么落 |
 //! |------|-----------|
 //! | 防 DLL 劫持 | 加载前 `SetDefaultDllDirectories`，走绝对路径 `LoadLibraryExW` |
-//! | 加载前校验 | 读 `iv_abi_version()` 做区间判定（见 [`MIN_ABI_VERSION`]），出界即拒载 |
+//! | 加载前校验 | 读 `iv_abi_version()` 做区间判定（见 `MIN_ABI_VERSION`），出界即拒载 |
 //! | 每次 FFI 包 catch_unwind + SEH | 每个导出函数调用都过 [`invoke`]，先用 C 的
 //!   `__try/__except` 拦下真正的访问违规（Access Violation），再交 `catch_unwind` 接 Rust panic |
 //! | 崩溃三振出局 | 返回 [`ERR_PANIC`] **或** SEH 硬故障累计 3 次 → 会话黑名单，不再加载 |

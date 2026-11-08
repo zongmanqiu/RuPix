@@ -1,12 +1,13 @@
 //! 打开与导航：装新图、翻页、跳转、目录重扫、尺寸口径。
 //!
 //! 「切图不闪烁」的时序前提在这里：`reset_view` **不许**清 `loaded`，旧图要留屏到
-//! 新解码结果由 [`Viewer::apply`](super::Viewer::apply) 原子替换（见 `tests.rs` 的用例）。
+//! 新解码结果由 `Viewer::apply` 原子替换（见 `tests.rs` 的用例）。
 use super::*;
 
 impl Viewer {
     pub fn new(decoder: Rc<Decoder>, config: Rc<RefCell<Config>>) -> Self {
         Self {
+            sort_epoch: 0,
             decoder,
             config,
             gallery: None,
@@ -18,6 +19,7 @@ impl Viewer {
             prefetch_stopped: false,
             meta_cache: std::collections::HashMap::new(),
             prefetched: Vec::new(),
+            prefetch_strip: None,
             last_dir: 0,
             main_sent_at: Cell::new(None),
             stall_logged: Cell::new(false),
@@ -82,7 +84,7 @@ impl Viewer {
             self.navigate();
             return;
         }
-        match Gallery::from_file(path) {
+        match Gallery::from_file(path, self.sort()) {
             Ok(g) => {
                 log::debug!(
                     "[open] 清单就绪（{} 项，{} ms）→ 请求解码",
@@ -93,9 +95,10 @@ impl Viewer {
                 self.error = None;
                 // 换图 = 用户已经在看新东西，旧提示立刻作废（m50-C）。
                 self.note = None;
-                // 换了目录，旧预读全部作废。
+                // 换了目录，旧预读全部作废；条那一屏的索引也换了目录，一并清掉。
                 self.prefetch_seq = None;
                 self.prefetched.clear();
+                self.prefetch_strip = None;
                 // 缩略图同理：旧目录那批再也看不见，别占着内存。
                 self.thumbs.clear();
                 self.anim_next_at = None;
@@ -182,6 +185,42 @@ impl Viewer {
         self.bump_image_gen();
     }
 
+    /// 当前排序口径（真值在 `Config`：ini 键 `sort_by` + `sort_desc`）。
+    pub fn sort(&self) -> SortSpec {
+        self.config.borrow().sort_spec()
+    }
+
+    /// 排序口径的变更代数。界面据此把**按槽位**记的状态（缩略图条的首格）归零。
+    pub fn sort_epoch(&self) -> u64 {
+        self.sort_epoch
+    }
+
+    /// 把配置里的排序口径落到清单上——每帧对齐一次，与 `runtime::apply_session_flags`
+    /// 同一套路（配置是唯一真值，菜单与手改 ini 都从这里生效）。
+    ///
+    /// 返回 `true` = 这次真的重排过（调用方标脏）。**不重解码、不重置视图**：当前这张
+    /// 还是同一张（[`Gallery::set_sort`] 拿它当锚点），变的只是它两侧是谁。
+    /// 清单还没建（空窗）时什么也不做：口径会在 `open` 那一刻从配置读。
+    pub fn sync_sort(&mut self) -> bool {
+        let want = self.sort();
+        let Some(g) = self.gallery.as_mut() else {
+            return false;
+        };
+        if g.sort() == want {
+            return false;
+        }
+        self.sort_epoch = self.sort_epoch.wrapping_add(1);
+        g.set_sort(want);
+        log::debug!(
+            "[sort] 重排 {:?}（倒序 {}）→ 当前 {}/{}",
+            want.by,
+            want.desc,
+            g.position(),
+            g.len()
+        );
+        true
+    }
+
     /// 目录被外部（资源管理器）增删 / 改名后，重扫当前目录并尽量保留当前位置。
     ///
     /// 返回 `true` 表示清单或当前项变了（调用方据此刷新缩略图条 / 状态栏 / 标题）。
@@ -210,7 +249,7 @@ impl Viewer {
         };
         let started = Instant::now();
         let dir = g.dir().to_path_buf();
-        let (res, shared) = match crate::core::gallery::listing_for_event(&dir) {
+        let (res, shared) = match crate::core::gallery::listing_for_event(&dir, g.sort()) {
             Ok((files, scanned)) => (g.rescan_from(files), !scanned),
             Err(e) => (Err(e), false),
         };
@@ -304,7 +343,7 @@ impl Viewer {
     /// 视口状态复位：旋转/镜像归零、缩放回适应、平移归位——翻图恒重置变换。
     ///
     /// ★ **不清 `loaded`**（用户报障 2026-10-09「切图闪烁」的根因）：旧图必须
-    /// 一直留在屏上，直到新图解码完成由 [`Viewer::apply`] 原子替换。提前清掉，
+    /// 一直留在屏上，直到新图解码完成由 `Viewer::apply` 原子替换。提前清掉，
     /// 从翻页到 Done 之间画布只剩背景——大图几十毫秒，肉眼就是一闪。
     /// rot/flip 的归零只落在**目标**上：屏上那张旧图继续按它自己的朝向画着，
     /// 直到新图的解码结果 [`Self::install`] 原子替换。这里不重建旧图——原图档在
@@ -364,6 +403,7 @@ impl Viewer {
         self.loaded = None;
         self.prefetched.clear();
         self.prefetch_seq = None;
+        self.prefetch_strip = None;
         self.thumbs.clear();
         // 复位视图（它会把 error 清成 None）——错误文本由调用方按需补。
         self.reset_view();

@@ -31,9 +31,11 @@
 //! 5. 控制线程收到消息后才碰跨进程 COM（选中项、后缀核验、解码派发）——钩子回调
 //!    始终微秒级返回，不会撞 `LowLevelHooksTimeout`（超时会被系统**静默摘钩**）。
 //!
-//! 分层：platform 禁 windui ✓（本文件零 UI 框架依赖）；对 core 只向下取格式清单与
-//! 解码（core < platform 方向合法）。选中探测与显示器工作区复用
+//! 分层：platform 禁 windui ✓（本文件零 UI 框架依赖）；对 core 只向下取格式清单、配置
+//! 与解码（core < platform 方向合法）。选中探测与显示器度量（屏幕/工作区/DPI）复用
 //! [`crate::platform::shell_selection`] 的经典 Shell COM 三跳（语言无关、不读本地化文本）。
+//! 预览尺寸与主窗「启动窗口」两档同源：全屏档铺 `rcMonitor`、固定档按主窗客户区
+//! （`preview_box`，纯函数 + 单测）。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -68,8 +70,107 @@ const MSG_READY: u32 = WM_APP + 22;
 const ON: usize = 1;
 const OFF: usize = 0;
 
-/// 预览图占前台显示器工作区的比例上限（与一轮口径一致，四周留一拍呼吸感）。
-const WORK_AREA_RATIO: f32 = 0.85;
+/// 预览图的**目标框**：与主窗「窗口尺寸」三档同源（`InitWindow`），不再按工作区比例
+/// 拍一个 `0.85` 的常数——用户要的是"空格看图打开的图片大小和主窗口一样"。
+///
+/// - `Fullscreen`：整块显示器。主窗全屏铺的就是 `rcMonitor`（`toggle_fullscreen` 按
+///   `MonitorFromWindow` 取），含任务栏那一条。
+/// - `Fixed`：主窗**客户区**。ini 的 `window_w × window_h` 是**整窗**尺寸（`Window::size`
+///   收的是整窗 dp），要先减掉系统边框与标题栏（`frameless_frame` 给的 96 DPI 口径），
+///   与 `runtime` 里 `set_client_size(w - fw, h - fh)` 是同一笔账；再按显示器 DPI 换成
+///   物理像素。少这一步，800×600 的窗口会被算成 800×600 的图片区，比主窗大一整圈。
+/// - `Natural`：框只当**夹取上限与居中基准**用（取工作区）；真正的窗口尺寸由解码出来
+///   的图片决定（[`preview_fit`] 的 `Native`）——这一档与主窗一样是「窗口贴图」。
+///
+/// 结果夹到显示器尺寸以内、居中于工作区：ini 里填 6000×4000 时不会把预览开出屏幕。
+/// 纯函数（不碰任何 FFI），尺寸口径由单测钉死。
+fn preview_box(
+    init: crate::core::config::InitWindow,
+    window_w: u32,
+    window_h: u32,
+    m: &crate::platform::shell_selection::MonitorMetrics,
+    frame: (i32, i32),
+) -> (i32, i32, i32, i32) {
+    use crate::core::config::InitWindow;
+    let (mon_x, mon_y, mon_w, mon_h) = m.mon;
+    let (work_x, work_y, work_w, work_h) = m.work;
+    let (w, h) = match init {
+        InitWindow::Fullscreen => (mon_w, mon_h),
+        InitWindow::Fixed => {
+            // dp（整窗）→ 减外框 → 按 DPI 换物理像素；四舍五入用 +dpi/2。
+            let scale = |dp: u32, frame_dp: i32| -> i32 {
+                let client = (dp as i32 - frame_dp).max(1) as i64;
+                let px = (client * m.dpi as i64 + 48) / 96;
+                px.clamp(1, i32::MAX as i64) as i32
+            };
+            (scale(window_w, frame.0), scale(window_h, frame.1))
+        }
+        // 图片尺寸档：框只负责「别开出屏幕」和「居中在哪」。
+        InitWindow::Natural => (work_w, work_h),
+    };
+    let w = w.clamp(1, mon_w.max(1));
+    let h = h.clamp(1, mon_h.max(1));
+    let (x, y) = if matches!(init, InitWindow::Fullscreen) {
+        (mon_x, mon_y)
+    } else {
+        (work_x + (work_w - w) / 2, work_y + (work_h - h) / 2)
+    };
+    (x, y, w, h)
+}
+
+/// 预览窗的取景策略：窗口取「框」还是取「图」。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PreviewFit {
+    /// 固定 / 全屏：图片**适应**这个框——小图放大铺满、大图缩小装下，与主窗同一口径。
+    Adapt,
+    /// 图片尺寸：窗口就是图片原始像素（超出屏幕才缩），1:1 不放大。
+    Native,
+}
+
+fn preview_fit(init: crate::core::config::InitWindow) -> PreviewFit {
+    match init {
+        crate::core::config::InitWindow::Natural => PreviewFit::Native,
+        _ => PreviewFit::Adapt,
+    }
+}
+
+/// 预乘 BGRA 的**双线性放大**（缩那半边由解码器做，这里只管放大）。
+///
+/// 在预乘空间插值：全透明像素的 RGB 本来就是 0，不会把边缘拉出一圈黑边；插值后
+/// alpha 与颜色仍然自洽，`UpdateLayeredWindow` 直接吃。
+///
+/// 为什么不用 GDI 的 `StretchBlt(HALFTONE)`：它会把 alpha 通道一起糊，透明区边上
+/// 会出现半透明毛边；而且还要多一张 DC 与一次拷回。纯 CPU 这一份是确定的。
+fn scale_premul(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    let mut out = vec![0u8; dw as usize * dh as usize * 4];
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        return out;
+    }
+    let (xr, yr) = (sw as f32 / dw as f32, sh as f32 / dh as f32);
+    let at = |x: u32, y: u32| -> &[u8] {
+        let o = ((y.min(sh - 1) * sw + x.min(sw - 1)) * 4) as usize;
+        &src[o..o + 4]
+    };
+    for y in 0..dh {
+        let fy = ((y as f32 + 0.5) * yr - 0.5).max(0.0);
+        let y0 = fy.floor() as u32;
+        let (y1, ty) = ((y0 + 1).min(sh - 1), fy - y0 as f32);
+        for x in 0..dw {
+            let fx = ((x as f32 + 0.5) * xr - 0.5).max(0.0);
+            let x0 = fx.floor() as u32;
+            let (x1, tx) = ((x0 + 1).min(sw - 1), fx - x0 as f32);
+            let (p00, p10) = (at(x0, y0), at(x1, y0));
+            let (p01, p11) = (at(x0, y1), at(x1, y1));
+            let o = ((y * dw + x) * 4) as usize;
+            for c in 0..4 {
+                let top = p00[c] as f32 * (1.0 - tx) + p10[c] as f32 * tx;
+                let bot = p01[c] as f32 * (1.0 - tx) + p11[c] as f32 * tx;
+                out[o + c] = (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
+}
 
 /// 用户开关（跨线程读写：UI 线程 `set_enabled` 写，钩子回调与本线程读）。
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -559,15 +660,47 @@ fn dispatch_pick_and_decode() {
             && crate::core::decode::get_raw_params(&path).is_none()
         {
             let Some(params) = crate::core::decode::infer_raw_params(&path) else {
-                log::debug!("spacehook：裸像素推不出宽高，预览跳过（右键「RAW 参数…」可手工指定）");
+                log::debug!(
+                    "spacehook：裸像素推不出宽高，预览跳过（右键「本图 ▸ RAW 参数…」可手工指定）"
+                );
                 return;
             };
             crate::core::decode::set_raw_params(&path, params);
         }
-        let (mx, my, mw, mh) = crate::platform::shell_selection::monitor_work_area_of_foreground();
-        let box_w = ((mw as f32) * WORK_AREA_RATIO).max(1.0) as u32;
-        let box_h = ((mh as f32) * WORK_AREA_RATIO).max(1.0) as u32;
-        let Ok(decoded) = crate::core::decode::probe_decode(&path, box_w, box_h) else {
+        // 尺寸口径跟主窗「启动窗口」两档走（`preview_box`）；ini 现场读一遍——
+        // 用户在设置页刚改的档位，下一颗空格就生效，不必重启。
+        let cfg = crate::core::config::Config::load();
+        let metrics = crate::platform::shell_selection::monitor_metrics_of_foreground();
+        let (bx, by, bw, bh) = preview_box(
+            cfg.init_window,
+            cfg.window_w,
+            cfg.window_h,
+            &metrics,
+            crate::platform::window_frame::frameless_frame(),
+        );
+        let fit = preview_fit(cfg.init_window);
+        // 尺寸口径写进日志：用户问"预览怎么这么大/这么小"时，先看这一行对不对，
+        // 不必再去猜 ini 是哪个档、当时那块屏多少 DPI。
+        log::info!(
+            "空格预览：{} / {}（目标框 {}x{}@({}, {})｜屏幕 {}x{} 工作区 {}x{} DPI {}，ini {}x{}）",
+            cfg.init_window.label(),
+            match fit {
+                PreviewFit::Adapt => "适应目标框（含放大小图）",
+                PreviewFit::Native => "原始像素 1:1",
+            },
+            bw,
+            bh,
+            bx,
+            by,
+            metrics.mon.2,
+            metrics.mon.3,
+            metrics.work.2,
+            metrics.work.3,
+            metrics.dpi,
+            cfg.window_w,
+            cfg.window_h
+        );
+        let Ok(decoded) = crate::core::decode::probe_decode(&path, bw as u32, bh as u32) else {
             // 解码失败静默：清单认领了却解不出属解码器层错误路径（主窗打开同样会
             // 报错），预览不出窗即可——一轮口径原样保留。
             return;
@@ -575,11 +708,27 @@ fn dispatch_pick_and_decode() {
         if GEN.load(Ordering::SeqCst) != gen {
             return; // 连按空格：这份已过期。
         }
+        let natural = decoded.natural;
         let bmp = decoded.bitmap;
-        let (w, h) = (bmp.width.max(1) as i32, bmp.height.max(1) as i32);
-        let premul = rgba_to_premul_bgra(&bmp.rgba);
-        let x = mx + (mw - w) / 2;
-        let y = my + (mh - h) / 2;
+        let (mut w, mut h) = (bmp.width.max(1), bmp.height.max(1));
+        let mut premul = rgba_to_premul_bgra(&bmp.rgba);
+        // ★ m271：固定 / 全屏档要**适应**目标框——小图放大铺满、大图缩小装下，与主窗
+        //   里同一档的观感一致（`probe_decode` 只负责缩，放大的这一半在这里补）。
+        //   图片尺寸档保持 1:1：小图就是小图，窗口贴着它。
+        if fit == PreviewFit::Adapt {
+            let (nw, nh) = (natural.0.max(1) as f32, natural.1.max(1) as f32);
+            let s = (bw as f32 / nw).min(bh as f32 / nh);
+            let tw = ((nw * s).round() as u32).clamp(1, bw.max(1) as u32);
+            let th = ((nh * s).round() as u32).clamp(1, bh.max(1) as u32);
+            if tw > w + 1 || th > h + 1 {
+                premul = scale_premul(&premul, w, h, tw, th);
+                (w, h) = (tw, th);
+            }
+        }
+        let (w, h) = (w as i32, h as i32);
+        // 窗口贴图尺寸（预览窗是逐像素分层窗，没有可画的留白），在目标框里居中。
+        let x = bx + (bw - w) / 2;
+        let y = by + (bh - h) / 2;
         let ready = Box::new(Ready {
             premul,
             w,
@@ -915,6 +1064,92 @@ mod tests {
         assert_eq!(&out[8..12], &[p(50), p(100), p(200), 128]);
         assert!(rgba_to_premul_bgra(&[1, 2, 3]).is_empty());
         assert!(rgba_to_premul_bgra(&[]).is_empty());
+    }
+
+    /// 预览尺寸口径（m270）：跟主窗「启动窗口」两档走，固定档要扣掉系统外框再按 DPI
+    /// 换算，两条都必须夹到显示器以内。
+    #[test]
+    fn preview_box_follows_the_two_init_window_entries() {
+        use crate::core::config::InitWindow;
+        use crate::platform::shell_selection::MonitorMetrics;
+        let m = MonitorMetrics {
+            mon: (0, 0, 1920, 1080),
+            work: (0, 0, 1920, 1040),
+            dpi: 96,
+        };
+        // 全屏档：整块屏幕，连任务栏那一条也铺。
+        assert_eq!(
+            preview_box(InitWindow::Fullscreen, 800, 600, &m, (16, 39)),
+            (0, 0, 1920, 1080),
+            "全屏档必须按 rcMonitor 而不是工作区"
+        );
+        // 固定档：800×600 是整窗尺寸，客户区 784×561，居中于工作区。
+        assert_eq!(
+            preview_box(InitWindow::Fixed, 800, 600, &m, (16, 39)),
+            ((1920 - 784) / 2, (1040 - 561) / 2, 784, 561),
+            "固定档必须扣掉系统外框（否则比主窗客户区大一整圈）"
+        );
+        // 125% DPI：dp → 物理像素乘 1.25。
+        let m125 = MonitorMetrics { dpi: 120, ..m };
+        assert_eq!(
+            preview_box(InitWindow::Fixed, 800, 600, &m125, (16, 39)),
+            ((1920 - 980) / 2, (1040 - 701) / 2, 980, 701),
+            "125% 下客户区按物理像素算"
+        );
+        // 夹到显示器以内：ini 填 6000×4000 不会把预览开出屏幕。
+        let big = preview_box(InitWindow::Fixed, 6000, 4000, &m, (16, 39));
+        assert_eq!((big.2, big.3), (1920, 1080), "超出屏幕必须夹到显示器尺寸");
+        // 退化的 ini（比外框还小）不出 0 或负数。
+        let tiny = preview_box(InitWindow::Fixed, 10, 10, &m, (16, 39));
+        assert!(tiny.2 >= 1 && tiny.3 >= 1, "退化输入必须保底 1 像素");
+    }
+
+    /// m271：图片尺寸档的框只当「夹取上限 + 居中基准」（取工作区），窗口由图片定；
+    /// 取景策略必须是 1:1，另外两档才是「适应框」。
+    #[test]
+    fn preview_box_and_fit_cover_the_three_entries() {
+        use crate::core::config::InitWindow;
+        use crate::platform::shell_selection::MonitorMetrics;
+        let m = MonitorMetrics {
+            mon: (0, 0, 1920, 1080),
+            work: (0, 0, 1920, 1040),
+            dpi: 96,
+        };
+        assert_eq!(
+            preview_box(InitWindow::Natural, 800, 600, &m, (16, 39)),
+            (0, 0, 1920, 1040),
+            "图片尺寸档的框取工作区（居中与夹取都以它为准）"
+        );
+        assert_eq!(preview_fit(InitWindow::Natural), PreviewFit::Native);
+        assert_eq!(preview_fit(InitWindow::Fixed), PreviewFit::Adapt);
+        assert_eq!(preview_fit(InitWindow::Fullscreen), PreviewFit::Adapt);
+    }
+
+    /// 放大用双线性且活在**预乘**空间：混合处颜色与 alpha 同比例，透明一侧不拉黑。
+    #[test]
+    fn scale_premul_interpolates_without_a_black_halo() {
+        // 2×2 预乘 BGRA：左列不透明纯白，右列全透明。
+        let white = [255u8, 255, 255, 255];
+        let clear = [0u8, 0, 0, 0];
+        let src = [white, clear, white, clear].concat();
+        let out = scale_premul(&src, 2, 2, 4, 4);
+        assert_eq!(out.len(), 4 * 4 * 4);
+        let px = |x: usize, y: usize| -> [u8; 4] {
+            let o = (y * 4 + x) * 4;
+            [out[o], out[o + 1], out[o + 2], out[o + 3]]
+        };
+        // 最左一列仍是整白，最右一列仍是全透明。
+        assert_eq!(px(0, 0), white);
+        assert_eq!(px(3, 0), clear);
+        // 中间列是过渡：alpha 既不 0 也不 255，且颜色与 alpha 同步下降（预乘自洽）。
+        let mid = px(1, 1);
+        assert!(
+            mid[3] > 0 && mid[3] < 255,
+            "中间列必须是过渡 alpha：{mid:?}"
+        );
+        for c in 0..3 {
+            assert_eq!(mid[c], mid[3], "预乘空间里白点的 BGR 必须等于 alpha");
+        }
     }
 
     /// 外壳类名表（QuickLook 口径的静态锚）：四个类名与 defView 守卫不能从源码里漂走。

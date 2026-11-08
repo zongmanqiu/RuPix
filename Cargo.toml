@@ -1,6 +1,6 @@
 [package]
 name = "rupix"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 rust-version = "1.94"
 description = "RuPix — Windows 上小巧极速的看图器（解码全部由 decoders 目录的 DLL 解码器承担，SVG 内置）"

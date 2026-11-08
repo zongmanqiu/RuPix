@@ -8,7 +8,7 @@
 //! - **设置型**（manifest 声明 `settings_ui` 才有，见 `run_settings`）：插件自己画设置窗，
 //!   同样不设响应超时；回传的 `settings` 由宿主合并落盘。
 //!
-//! 所有阻塞都发生在后台线程，UI 只通过 [`poll`] 取结果并弹提示。
+//! 所有阻塞都发生在后台线程，UI 只通过 `poll` 取结果并弹提示。
 //! 正在运行的任务以 manifest id 为键登记在 [`RUNNING`]，右键菜单据此把条目换成
 //! 「取消」；超时与取消都会终止进程并打断阻塞中的 accept，不留悬挂线程或句柄。
 
@@ -381,9 +381,9 @@ fn log_pixels(
     }
 }
 
-/// 在后台启动一次命令插件调用。立即返回，结果用 [`poll`] 取。
+/// 在后台启动一次命令插件调用。立即返回，结果用 `poll` 取。
 ///
-/// `image` 是**屏上朝向**的当前整图（[`Viewer::whole_image_for_plugin`] 那一家的返回值，
+/// `image` 是**屏上朝向**的当前整图（`Viewer::whole_image_for_plugin` 那一家的返回值，
 /// 类型见 [`ForPlugin`]）：声明了 `image.read` 的**命令型**插件从此也能收到像素，不必自己
 /// 再去解文件——这正对应用户那句"只要能解开的都能体检 / 都能扫码"。拿不到整图（切片态）
 /// 或超过 [`EDITOR_MAX_PIXELS`] 时**照旧只发路径**：老插件的行为因此是子集，不会突然变坏。
@@ -426,7 +426,7 @@ pub fn start_command(
     Ok(())
 }
 
-/// 在后台启动一次编辑型插件调用。立即返回，结果用 [`poll`] 取。
+/// 在后台启动一次编辑型插件调用。立即返回，结果用 `poll` 取。
 ///
 /// 送的是 [`ForPlugin`]——**屏上朝向**的整图（`Viewer::whole_image_for_plugin` 那一份）：
 /// 回传必须同尺寸，落地按里面冻结的 `orient` 转回源朝向再套成编辑覆盖（理由见
@@ -1026,7 +1026,7 @@ mod tests {
         use crate::core::ext::Manifest;
         let plain = Manifest::parse(
             r#"{"schema":1,"id":"test.settings.plain","name":"P","version":"1.0.0",
-                "protocol":1,"min_host":"0.1.0","kind":"command","entry":"x.exe",
+                "protocol":1,"min_host":"0.0.1","kind":"command","entry":"x.exe",
                 "capabilities":[],"platforms":["windows-x64"]}"#,
         )
         .expect("manifest");
@@ -1052,7 +1052,7 @@ mod tests {
         let mk = |kind: &str| {
             let manifest = Manifest::parse(&format!(
                 r#"{{"schema":1,"id":"test.kind.{kind}","name":"P","version":"1.0.0",
-                    "protocol":1,"min_host":"0.1.0","kind":"{kind}","entry":"x.exe",
+                    "protocol":1,"min_host":"0.0.1","kind":"{kind}","entry":"x.exe",
                     "capabilities":[],"platforms":["windows-x64"]}}"#
             ))
             .expect("manifest");

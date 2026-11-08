@@ -1,15 +1,21 @@
 //! 宿主本体自更新的**编排层**：后台线程、下载、解压、进程外覆盖。
 //!
 //! 纯判据在 [`crate::core::update`]（离屏可测），这里只负责把活挪出 UI 线程并把结果
-//! 送回 `global_tick`。一次只允许一条任务在跑（[`SLOT`] 的 `busy` 旗），不会叠线程。
+//! 送回 `global_tick`。一次只允许一条任务在跑（`Slot::phase` 的任务位），不会叠线程。
 //!
 //! ## 流程
 //!
-//! 「关于」页点检查 → [`start_check`] 在后台拉 `update.json`（双源、成功才缓存）→
-//! [`Event::Available`] 弹说明窗 → 用户点「立即更新」→ [`start_download`] 后台下 ZIP →
-//! 按「文件名 + 版本号」两条判据验收 → 解压到 `<exe>/temp/update-stage/` →
-//! 写 [`BAT_NAME`] → [`Event::Ready`] → [`launch`] 起脚本、`ctx.quit_app()` 退出 →
-//! 脚本等进程消失后覆盖 4 个白名单文件并重启。
+//! 「关于」页点检查 → `start_check_urls` 在后台拉 `update.json`（双源、成功才缓存）→
+//! `Event::Available` 弹说明窗（`ui::update_window`）→ 用户点「更新」→
+//! `start_download` 后台下 ZIP → 按「文件名 + 版本号」两条判据验收 →
+//! 解压到 `<exe>/temp/update-stage/` → 写 `BAT_NAME` → `Event::Ready` →
+//! `launch` 起脚本、`ctx.quit_app()` 退出 → 脚本等进程消失后覆盖 4 个白名单文件并重启。
+//!
+//! ## 界面反馈（2026-11-08 对齐 CurSeen，别再改回 toast）
+//!
+//! 一切反馈都写进关于页那 4 枚信号（状态行 / 进度 / 忙 / 下载中），见 `apply`：
+//! 检查与下载的进展写在卡的**状态行**，下载时「检查更新」原地让位给**进度条**。
+//! **不许**再往主窗口弹提示——用户明确说过那位置是错的。
 //!
 //! **不算哈希、不比文件大小、不比下载字节数**（用户 2026-11-07 口径）。
 //! 响应体 / 解包量上限只是防内存爆的护栏，不与任何期望值比对。
@@ -28,13 +34,14 @@ use windui::core::EventCtx;
 use crate::core::config::Config;
 use crate::core::paths;
 use crate::core::update::{self, Plan, Version};
+use crate::ui::settings::Hub;
+use crate::ui::update_state::UpdateState;
 
 /// 进程外覆盖脚本名（放在 exe 同级，成功后自删）。
 pub const BAT_NAME: &str = "rupix_update.bat";
 /// 下载暂存与解压目录名（都在 `<exe>/temp/` 下，脚本用 `%~dp0` 推导，不把中文路径写进文本）。
 const ZIP_NAME: &str = "rupix-update.zip";
 const STAGE_NAME: &str = "update-stage";
-const MANIFEST_CACHE: &str = "update.json";
 /// 后台 → UI 回投队列上限（总纲 §6.4 / §6.10）：满了丢中间进度帧，终态永不丢。
 const MAX_EVENTS: usize = 8;
 /// 下载进度回投节流（总纲 §16 数字表：50~100 ms 一次足够）。
@@ -82,14 +89,20 @@ static SLOT: Mutex<Slot> = Mutex::new(Slot {
     events: Vec::new(),
 });
 
-/// 后台线程送回 UI 的结果。
+/// 后台线程送回 UI 的结果（文案映射见 `apply`，逐条对齐 CurSeen）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// 任务位刚抢到、线程还没起：状态行立刻换成「正在检查更新…」。
+    CheckStarted,
     UpToDate(String),
     Available(Plan),
     CheckFailed(String),
+    /// 下载线程已经起来：关于页的按钮立刻让位给进度条。
     DownloadStarted,
-    DownloadProgress(u64),
+    DownloadProgress {
+        received: u64,
+        total: u64,
+    },
     DownloadFailed(String),
     /// staging 与 bat 都已就位：起脚本、退出进程。
     Ready,
@@ -165,12 +178,13 @@ fn spawn(name: &str, f: impl FnOnce() + Send + 'static) -> Result<(), String> {
 }
 
 /// 取走全部待处理事件（由 `global_tick` 每帧调）。
-pub fn poll(ctx: &mut EventCtx, config: &Rc<RefCell<Config>>) {
+///
+/// ★ 这里**一个主窗口 toast 都不弹**：更新的一切反馈都写进关于页那 4 枚信号
+/// （状态行 / 进度 / 忙 / 下载中），与 CurSeen 同一条通道（用户 2026-11-08 点名）。
+pub fn poll(ctx: &mut EventCtx, config: &Rc<RefCell<Config>>, hub: &Hub) {
     // UI 只往 core 投一个空请求；地址一律从 Config（ini 的唯一正本）读，
     // 两个 update_index_* 键因此有真实的行为读者，不会变成第二份正本。
     if let Some(req) = update::take_request() {
-        // 抢到任务位时的即时反馈分两种：检查要真联网，下载已经有进度提示。
-        let checking = matches!(req, update::Request::Check);
         let r = match req {
             update::Request::Check => {
                 let c = config.borrow();
@@ -179,15 +193,9 @@ pub fn poll(ctx: &mut EventCtx, config: &Rc<RefCell<Config>>) {
             }
             update::Request::Download(p) => start_download(&p),
         };
-        match r {
-            // 原来这里什么都不说：用户点一下没反应，只能再点一次，然后看到
-            // 「任务没能启动」。检查最长要跑两个 30 s 超时，必须立刻给一拍反馈。
-            Ok(()) if checking => ctx.toast("正在检查更新…".to_string()),
-            Ok(()) => {}
-            Err(e) => {
-                log::warn!("发起更新任务失败：{e}");
-                ctx.toast(e);
-            }
+        if let Err(e) = r {
+            log::warn!("发起更新任务失败：{e}");
+            set_status(hub, e);
         }
     }
     let events: Vec<Event> = {
@@ -195,60 +203,122 @@ pub fn poll(ctx: &mut EventCtx, config: &Rc<RefCell<Config>>) {
         std::mem::take(&mut g.events)
     };
     for ev in events {
-        match ev {
-            Event::UpToDate(v) => ctx.toast(format!("已是最新版本 {v}")),
-            Event::Available(p) => show_notes(ctx, &p),
-            Event::CheckFailed(e) => {
-                log::warn!("检查更新失败：{e}");
-                ctx.toast("检查更新失败，请稍后重试".to_string());
-            }
-            Event::DownloadStarted => ctx.toast("正在下载更新…".to_string()),
-            // 进度帧只进 debug 日志：状态格是恒定的图片信息区，不拿它刷下载字节数。
-            Event::DownloadProgress(got) => log::debug!("更新包下载中：{got} 字节"),
-            Event::DownloadFailed(e) => {
-                log::warn!("下载更新失败：{e}");
-                ctx.toast("更新下载失败，程序没有改动".to_string());
-            }
-            Event::Ready => match launch() {
-                Ok(()) => ctx.quit_app(),
-                Err(e) => {
-                    log::warn!("启动更新脚本失败：{e}");
-                    ctx.toast("更新已下载，但无法启动替换，程序没有改动".to_string());
-                }
-            },
-        }
+        apply(ctx, hub, ev);
     }
 }
 
-/// 说明窗：`text_window` 的纯文本骨架 + `dialog_footer::shell` 底栏。
-fn show_notes(ctx: &mut EventCtx, p: &Plan) {
-    let text = format!("发现新版本 {}\n\n{}", p.version, p.notes);
-    let plan = p.clone();
-    crate::ui::text_window::show_with_actions(
-        ctx,
-        "update-notes",
-        "发现新版本",
-        &text,
-        move || {
-            let go = plan.clone();
-            vec![
-                crate::ui::dialog_footer::action("立即更新", move |ctx| {
-                    // 走和「检查更新」同一条单向投递槽：抢不到任务位时由 `poll`
-                    // 用同一句话告诉用户，不会在这里被一句 log 吞掉。
-                    if let Err(e) = update::request(update::Request::Download(go.clone())) {
-                        log::warn!("发起更新下载失败：{e}");
+/// 关于页那 4 枚信号；设置页还没打开过时是 `None`（没处显示，只留日志）。
+fn signals(hub: &Hub) -> Option<UpdateState> {
+    hub.borrow().as_ref().map(|h| h.update)
+}
+
+fn set_status(hub: &Hub, text: impl Into<String>) {
+    if let Some(up) = signals(hub) {
+        up.status.set(text.into());
+    }
+}
+
+/// 把一条后台结果落到信号上。文案逐条对齐 CurSeen 的 `apply_update_event`。
+fn apply(ctx: &mut EventCtx, hub: &Hub, ev: Event) {
+    let up = signals(hub);
+    match ev {
+        Event::CheckStarted => {
+            if let Some(up) = up {
+                up.busy.set(true);
+                up.downloading.set(false);
+                up.progress.set(-1.0);
+                up.status.set("正在检查更新…".to_string());
+            }
+        }
+        Event::UpToDate(latest) => {
+            log::info!("检查更新：已是最新 {latest}");
+            if let Some(up) = up {
+                up.busy.set(false);
+                up.downloading.set(false);
+                up.status.set(format!("已是最新版本 {latest}"));
+            }
+        }
+        Event::Available(p) => {
+            log::info!("检查更新：发现新版本 {}", p.version);
+            if let Some(up) = up {
+                up.busy.set(false);
+                up.downloading.set(false);
+                up.status
+                    .set(format!("发现新版本 {}，已打开更新说明", p.version));
+            }
+            crate::ui::update_window::open(ctx, &p);
+        }
+        Event::CheckFailed(e) => {
+            log::warn!("检查更新失败：{e}");
+            if let Some(up) = up {
+                up.busy.set(false);
+                up.downloading.set(false);
+                up.status.set(format!("检查失败：{e}"));
+            }
+        }
+        Event::DownloadStarted => {
+            // 点下「更新」后的第一帧反馈：按钮立刻换成进度条，不必等网络。
+            if let Some(up) = up {
+                up.busy.set(true);
+                up.downloading.set(true);
+                up.progress.set(0.0);
+                up.status.set("正在下载… 0%".to_string());
+            }
+        }
+        Event::DownloadProgress { received, total } => {
+            // `total == 0`：服务端没给长度，只报已下载的量，进度条走不确定态。
+            if let Some(up) = up {
+                if total == 0 {
+                    up.progress.set(-1.0);
+                    up.status
+                        .set(format!("正在下载… {:.1} MB", received as f64 / 1_048_576.0));
+                } else {
+                    let p = (received as f32 / total as f32).clamp(0.0, 1.0);
+                    up.progress.set(p);
+                    up.status
+                        .set(format!("正在下载… {}%", (p * 100.0).round() as i32));
+                }
+            }
+        }
+        Event::DownloadFailed(e) => {
+            log::warn!("下载更新失败：{e}");
+            if let Some(up) = up {
+                up.busy.set(false);
+                up.downloading.set(false);
+                up.progress.set(-1.0);
+                up.status.set(format!("下载失败：{e}"));
+            }
+        }
+        Event::Ready => {
+            if let Some(up) = up {
+                up.progress.set(1.0);
+                up.busy.set(true);
+                up.status.set("下载完成，正在重启以完成更新…".to_string());
+            }
+            match launch() {
+                Ok(()) => {
+                    if let Some(up) = up {
+                        up.status.set("更新脚本已启动，程序即将退出…".to_string());
                     }
-                    ctx.request_close();
-                }),
-                crate::ui::dialog_footer::action("稍后", |ctx| ctx.request_close()),
-            ]
-        },
-    );
+                    ctx.quit_app();
+                }
+                Err(e) => {
+                    log::warn!("启动更新脚本失败：{e}");
+                    if let Some(up) = up {
+                        up.busy.set(false);
+                        up.downloading.set(false);
+                        up.status.set(format!("启动更新脚本失败：{e}"));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// 内部入口：地址已由 UI 从 ini 读出、经 `core::update::Request` 投递过来。
 fn start_check_urls(urls: &[String; 2], source: usize) -> Result<(), String> {
     begin(Phase::Check)?;
+    send(Event::CheckStarted);
     let first = source.min(1);
     let ordered = [urls[first].clone(), urls[1 - first].clone()];
     let spawned = spawn("rupix-update-check", move || {
@@ -284,7 +354,7 @@ fn check_job(urls: &[String; 2], source: usize) -> Result<update::Outcome, Strin
             .and_then(|t| update::parse_manifest(&t).map(|m| (m, t)))
         {
             Ok((m, text)) => {
-                save_cache(&text);
+                update::save_cached(&text);
                 return update::plan(&m, Version::current(), source);
             }
             Err(e) => {
@@ -294,7 +364,7 @@ fn check_job(urls: &[String; 2], source: usize) -> Result<update::Outcome, Strin
         }
     }
     // 断网时用上一次成功拉到的原文判「已是最新」，不把离线当故障。
-    if let Some(text) = load_cache() {
+    if let Some(text) = update::load_cached() {
         if let Ok(m) = update::parse_manifest(&text) {
             log::info!("更新清单联网失败，使用本地缓存 {}", m.version);
             return update::plan(&m, Version::current(), source);
@@ -303,29 +373,10 @@ fn check_job(urls: &[String; 2], source: usize) -> Result<update::Outcome, Strin
     Err(last)
 }
 
-fn cache_path() -> Option<PathBuf> {
-    paths::docs_dir().map(|d| d.join(MANIFEST_CACHE))
-}
-
-fn save_cache(text: &str) {
-    let Some(p) = cache_path() else { return };
-    if let Some(parent) = p.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    // 原子覆盖：先写 .part 再改名，半截文件不会顶掉旧缓存。
-    let part = p.with_extension("json.part");
-    if fs::write(&part, text.as_bytes()).is_ok() {
-        let _ = fs::rename(&part, &p);
-    }
-}
-
-fn load_cache() -> Option<String> {
-    fs::read_to_string(cache_path()?).ok()
-}
-
-/// 用户点「立即更新」后才下载。首选源失败自动换备用源。
+/// 用户点说明窗里的「更新」后才下载。首选源失败自动换备用源。
 pub fn start_download(p: &Plan) -> Result<(), String> {
     begin(Phase::Download)?;
+    send(Event::DownloadStarted);
     let plan = p.clone();
     let spawned = spawn("rupix-update-fetch", move || {
         log::info!("开始下载更新包 {}：{}", plan.version, plan.urls[0]);
@@ -368,14 +419,20 @@ fn download_job(p: &Plan) -> Result<(), String> {
         }
         // 进度回投 50 ms 节流：既不把 UI 队列灌满，也不让下载期间界面零反馈。
         let mut last = Instant::now();
-        let result =
-            crate::platform::http::get_with_progress(url, update::PACKAGE_MAX_BYTES, |got| {
+        let result = crate::platform::http::get_with_progress_total(
+            url,
+            update::PACKAGE_MAX_BYTES,
+            |got, total| {
                 let now = Instant::now();
                 if now.duration_since(last) >= PROGRESS_INTERVAL {
                     last = now;
-                    send(Event::DownloadProgress(got));
+                    send(Event::DownloadProgress {
+                        received: got,
+                        total,
+                    });
                 }
-            });
+            },
+        );
         match result {
             Ok(b) => {
                 bytes = Some(b);
@@ -516,10 +573,22 @@ mod tests {
     fn bounded_queue_drops_progress_but_never_a_terminal_event() {
         let mut q: Vec<Event> = Vec::new();
         for i in 0..(MAX_EVENTS as u64 * 4) {
-            bounded_push(&mut q, Event::DownloadProgress(i));
+            bounded_push(
+                &mut q,
+                Event::DownloadProgress {
+                    received: i,
+                    total: 0,
+                },
+            );
         }
         assert_eq!(q.len(), MAX_EVENTS, "中间帧必须被有界丢弃");
-        assert!(q.iter().all(|e| matches!(e, Event::DownloadProgress(_))));
+        assert!(q.iter().all(|e| matches!(
+            e,
+            Event::DownloadProgress {
+                received: _,
+                total: _
+            }
+        )));
         assert!(bounded_push(&mut q, Event::Ready), "终态不许被丢");
         assert_eq!(q, vec![Event::Ready], "终态顶掉全部中间帧");
     }

@@ -134,7 +134,7 @@ pub fn note_done(seq: u64) {
 /// 只用于「窗口没了」这一种情形（`Decoder::drop`）。平时一笔一笔走 [`note_done`]：
 /// 那条路是"收到回包"，这里是"永远不会有回包了"。
 ///
-/// ★ 与 [`Queue::discard_pending`](crate::core::decode::Queue) 的分工：那边清的是
+/// ★ 与 `Queue::discard_pending` 的分工：那边清的是
 /// **还没开始**的请求，这边连**正在解的那一笔**一起摘——它的结果会发给一个已经关掉的
 /// 通道，谁也收不着，账不摘掉就只能在 10 s 后变成一条假告警。
 pub fn forget_owner(owner: u64) -> usize {

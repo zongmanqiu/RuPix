@@ -24,7 +24,7 @@ use windui::ui::Slider;
 
 use super::settings::option_row_inset;
 use super::settings::shortcuts::hotkey_box;
-use super::tokens::{to_color, BG, CONTROL_GROUP_W, DIALOG_FIT_MIN};
+use super::tokens::{to_color, BG, CONTROL_GROUP_W, DIALOG_FIT_MIN, DIALOG_W};
 use crate::core::config::Config;
 use crate::core::ext::{SettingKind, SettingSpec};
 use crate::core::ext_protocol::Settings;
@@ -132,13 +132,10 @@ fn hotkey_spec_indices(specs: &[SettingSpec]) -> Vec<usize> {
         .collect()
 }
 
-/// 窗宽：两列版式吃满所需的宽度 + 一点余量。
-///
-/// 标签左缘 = 外层 `DIALOG_PAD`(16)，**与底栏按钮同一条竖线**（`dialog_footer::shell`
-/// 给的四边留白，见 `docs/界面版式规范.md` §2）；控件右缘 = 16 + `COL1_W`(208) +
-/// `CONTROL_GROUP_W`(200) = 424，右边再留
-/// 40 给 `flex_spacer`，控件不会被顶到窗框。
-const DIALOG_W: i32 = 480;
+// 窗宽走 `tokens::DIALOG_W`（与跳转窗共用同一格两列版式），本文件不再自己算一遍。
+// 标签左缘 = 外层 `DIALOG_PAD`(16)，**与底栏按钮同一条竖线**（`dialog_footer::shell`
+// 给的四边留白，见 `docs/界面版式规范.md` §2）；控件右缘 = 16 + `COL1_W`(208) +
+// `CONTROL_GROUP_W`(200) = 424，右边再留 40 给 `flex_spacer`，控件不会被顶到窗框。
 
 /// 一次实时调色：绑定当前图片路径，换图后自动失效（不靠定时器清）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1166,7 +1163,7 @@ mod tests {
     fn live_ext() -> Extension {
         let json = r#"{
             "schema":1,"id":"t.ch","name":"通道调色","version":"1.0.0","protocol":1,
-            "min_host":"0.1.0","kind":"editor","entry":"t.exe",
+            "min_host":"0.0.1","kind":"editor","entry":"t.exe",
             "capabilities":["image.read","image.write","settings.read","settings.write"],
             "platforms":["windows-x64"],
             "settings":[

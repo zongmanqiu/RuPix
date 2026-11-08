@@ -270,6 +270,11 @@ pub fn bind_host_action(
     a: crate::core::hotkey::Action,
     hk: crate::core::hotkey::Hotkey,
 ) {
+    // m278：保留键在 vacate 之前拦掉——否则会先把别人的绑定清掉、自己又绑不上。
+    if hk.is_reserved() {
+        log::warn!("宿主快捷键：裸空格已保留给「空格看图」");
+        return;
+    }
     vacate_hotkey(config, &hk, None);
     config.hotkeys.set_binding(a, hk);
     crate::core::config::mark_dirty();
@@ -331,6 +336,10 @@ pub fn vacate_hotkey(
 /// 两个入口改的是**同一个文件**（`plugins/<id>/settings.json`），谁写都一样——
 /// 这就是"两处同步"的实现方式：不是互相同步，而是**只有一个真源**。
 pub fn set_plugin_hotkey(plugin_id: &str, spec_key: &str, spec: &str) -> Result<(), String> {
+    // m278：程序化写入也验一次保留键（捕获路径已先拦，这里是最后一道）。
+    if crate::core::hotkey::Hotkey::from_spec(spec).is_some_and(|h| h.is_reserved()) {
+        return Err("裸空格已保留给「空格看图」".to_string());
+    }
     let mut items = settings::load(plugin_id);
     match items.iter_mut().find(|(k, _)| k == spec_key) {
         Some(slot) => slot.1 = spec.to_string(),
@@ -580,6 +589,10 @@ pub fn host_supports(min_host: &str) -> bool {
 }
 
 /// 读取默认清单 `<exe>/docs/plugins.json`。
+///
+/// **预留（m282 调用图确认无调用方）**：绿色版可随包带 `docs/plugins.json` 做离线清单；
+/// 当前「插件」页走远程 `plugins.json`（`extensions::remote`），所以这条离线入口还没接。
+/// 按 `docs/待办.md §62` 登记为扩展点，UI 接上之前不删。
 pub fn discover_available(installed_ids: &[String]) -> Vec<AvailablePlugin> {
     let Some(path) = crate::core::paths::plugin_catalog_path() else {
         return Vec::new();
@@ -749,6 +762,9 @@ fn local_package_manifest(entry: &AvailablePlugin) -> Option<Manifest> {
 /// 从 `docs/<file>` 安装一个 ZIP 包到 `<exe>/plugins/<id>/`。
 ///
 /// 解压到隐藏 staging，校验 manifest / 入口后再整目录 rename；失败不留半装状态。
+///
+/// **预留（m282 调用图确认无调用方）**：与 [`discover_available`] 配套，是「离线包」
+/// 那条路的安装端；当前 UI 只走远程 `extensions::install::start`。登记见 `docs/待办.md §62`。
 pub fn install_local(entry: &AvailablePlugin) -> Result<(), String> {
     let docs = crate::core::paths::docs_dir().ok_or("取不到 exe 目录，插件无处安装")?;
     let root = crate::core::paths::plugin_dir().ok_or("取不到 exe 目录，插件无处安装")?;
@@ -895,7 +911,7 @@ mod tests {
         use zip::write::SimpleFileOptions;
         let manifest = r#"{
             "schema":1,"id":"com.example.ocr","name":"OCR","version":"1.0.0",
-            "protocol":1,"min_host":"0.1.0","kind":"command","entry":"x.exe",
+            "protocol":1,"min_host":"0.0.1","kind":"command","entry":"x.exe",
             "capabilities":[],"platforms":["windows-x64"]
         }"#;
         let mut buf = Cursor::new(Vec::new());
@@ -924,7 +940,7 @@ mod tests {
         let text = format!(
             r#"{{
                 "schema":1,"id":"{id}","name":"{id}","version":"{version}","protocol":1,
-                "min_host":"0.1.0","kind":"command","entry":"x.exe",
+                "min_host":"0.0.1","kind":"command","entry":"x.exe",
                 "capabilities":["image.read"],"platforms":["windows-x64"]
             }}"#
         );
@@ -1086,7 +1102,7 @@ mod tests {
     fn ext_with(id: &str, kind: &str, hotkey: &str) -> Extension {
         let text = format!(
             r#"{{"schema":1,"id":"{id}","name":"{id}","version":"1.0.0","protocol":1,
-                "min_host":"0.1.0","kind":"{kind}","entry":"x.exe",
+                "min_host":"0.0.1","kind":"{kind}","entry":"x.exe",
                 "capabilities":["image.read"],"platforms":["windows-x64"],
                 "hotkey":"{hotkey}"}}"#
         );
