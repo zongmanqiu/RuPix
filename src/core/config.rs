@@ -761,14 +761,20 @@ pub struct Config {
     ///
     /// 登记在 [`CONFIG_ONLY_KEYS`]：只有慢盘 / 超大文件这类场景需要手改 ini。
     pub decode_timeout_s: u64,
-    /// 设置页各张卡的**展开**列表（卡 id，`;` 分隔存盘，ini 键 `ui_cards`）。
+    /// 设置页各张卡的**收起**列表（卡 id，`;` 分隔存盘，ini 键 `ui_cards`）。
     ///
-    /// 空 = 全部收起（出厂默认，用户 2026-11-07 拍板）。存"展开的"而不是"收起的"：
-    /// 卡片会随版本增删，存收起集就得替每一枚新卡决定一个默认值；存展开集意味着
-    /// **新卡天然是收起的**（与"默认全收"一致），老 ini 里没有它就不展开。
+    /// 空 = 全部展开（出厂默认）。存"收起的"而不是"展开的"：卡片会随版本增删，存展开集就得
+    /// 替每一枚新卡决定一个默认值；存收起集意味着**新卡天然是展开的**，老 ini 里没有它就不收
+    /// （`m168` 方案 §口径对照表：用户 10-31 原本要「默认全收回」，落地时改成「默认全展开 +
+    /// 存收起侧」，理由是升级不会把老用户的一页卡突然折叠）。
+    ///
+    /// ★ 本字段此前叫 `ui_cards_expanded`、doc 也写成"展开列表 / 空 = 全部收起 / 新卡天然收起"，
+    /// 与实现**三处全反**（UI 侧 `settings::mod::sync` 一直存的是 `collapsed`）——m283 改名并订正。
+    /// 判据：`ui::settings::Card` 的 `expanded()` 是 `!collapsed.contains(id)`，空列表 ⇒ 十二张卡全开。
+    ///
     /// id 表在界面层（`ui::settings::Card`）——`core` 不认识界面，只保管这串字符串；
     /// 认不出的 id 在回填时被静默忽略，下一次 `Handles::sync` 按现有卡重新收集时自动消失。
-    pub ui_cards_expanded: Vec<String>,
+    pub ui_cards_collapsed: Vec<String>,
 }
 
 /// 预读深度的**唯一默认值正本**（m281）。Default、from_ini 回落、首启 ini 模板都读它。
@@ -830,7 +836,7 @@ impl Default for Config {
             hotkeys: crate::core::hotkey::Hotkeys::default(),
             allow_multiple: false,
             decode_timeout_s: 20,
-            ui_cards_expanded: Vec::new(),
+            ui_cards_collapsed: Vec::new(),
         }
     }
 }
@@ -1061,7 +1067,7 @@ impl Config {
                 // 界面层回填时按自己的卡表匹配，匹配不上就是"没有那张卡"，
                 // 下一次 `Handles::sync` 按现有卡重收集时会把它清掉。
                 "ui_cards" => {
-                    cfg.ui_cards_expanded = v
+                    cfg.ui_cards_collapsed = v
                         .split(';')
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
@@ -1193,7 +1199,7 @@ impl Config {
             self.allow_multiple as i32,
             self.decode_timeout_s,
             // 分号分隔的卡 id；空串 = 全部展开。
-            self.ui_cards_expanded.join(";"),
+            self.ui_cards_collapsed.join(";"),
         );
         // 原子写（M2）：写临时文件 → **flush 到盘** → 改名覆盖。
         //
@@ -1939,20 +1945,20 @@ mod tests {
     fn ui_cards_survive_a_disk_round_trip() {
         let p = temp_ini("cards");
         let mut c = Config {
-            ui_cards_expanded: vec!["options.window".into(), "plugins.available".into()],
+            ui_cards_collapsed: vec!["options.window".into(), "plugins.available".into()],
             ..Config::default()
         };
         c.save_to(&p);
         assert_eq!(
-            Config::load_from(&p).ui_cards_expanded,
-            c.ui_cards_expanded,
+            Config::load_from(&p).ui_cards_collapsed,
+            c.ui_cards_collapsed,
             "ui_cards 写盘再读回变了样（顺序或分隔符对不上）"
         );
         // 空表（全部展开）也不许写成 `;` 或别的残渣。
-        c.ui_cards_expanded.clear();
+        c.ui_cards_collapsed.clear();
         c.save_to(&p);
         assert!(
-            Config::load_from(&p).ui_cards_expanded.is_empty(),
+            Config::load_from(&p).ui_cards_collapsed.is_empty(),
             "全部展开时读回来必须是空表"
         );
         let _ = std::fs::remove_file(&p);
@@ -2210,7 +2216,7 @@ plugin_source=github
         assert_eq!(c.plugin_index_github, "https://b.example/p.json");
         // 分号分隔、顺序照 ini 原样（界面层回填按自己的卡表匹配，这里只管搬字符串）。
         assert_eq!(
-            c.ui_cards_expanded,
+            c.ui_cards_collapsed,
             vec!["options.appearance".to_string(), "keys.plugins".to_string()],
             "ui_cards 没有消费方"
         );

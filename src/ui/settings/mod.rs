@@ -514,14 +514,14 @@ impl Handles {
         let mut idx = 0usize;
         for card in Card::ALL {
             if !self.card(card).get() {
-                if c.ui_cards_expanded.get(idx).map(String::as_str) != Some(card.id()) {
+                if c.ui_cards_collapsed.get(idx).map(String::as_str) != Some(card.id()) {
                     same = false;
                     break;
                 }
                 idx += 1;
             }
         }
-        if same && idx != c.ui_cards_expanded.len() {
+        if same && idx != c.ui_cards_collapsed.len() {
             same = false;
         }
         if !same {
@@ -531,7 +531,7 @@ impl Handles {
                     collapsed.push(card.id().to_string());
                 }
             }
-            c.ui_cards_expanded = collapsed;
+            c.ui_cards_collapsed = collapsed;
             dirty = true;
         }
         // ★ 落盘标记放在**所有**差分之后：它原先是夹在 `preferred_dirty` 那段前面，
@@ -592,7 +592,7 @@ impl Handles {
         // 卡片展开态（ini 键 ui_cards）：盘上存的是**收起**的 id，命中就收起；
         // ini 里没提到的卡 = 展开。只在值不同时写信号——否则每帧 `push` 都会标脏。
         for card in Card::ALL {
-            let collapsed = c.ui_cards_expanded.iter().any(|x| x == card.id());
+            let collapsed = c.ui_cards_collapsed.iter().any(|x| x == card.id());
             put_b(&self.card(card), !collapsed);
         }
     }
@@ -864,7 +864,7 @@ pub(crate) fn settings_window(config: &Rc<RefCell<Config>>, hub: &Hub) -> Window
         let plugin = PluginUi::new(&c);
         // 卡片展开态初始值：直接读 ini 里那组"收起的卡"，别先全展开再等 `push` 收敛
         // （开窗那一帧会闪一下十张卡全摊开的样子）。
-        let expanded = |card: Card| !c.ui_cards_expanded.iter().any(|x| x == card.id());
+        let expanded = |card: Card| !c.ui_cards_collapsed.iter().any(|x| x == card.id());
         let h = Handles {
             stay: sig(c.stay_on_top),
             minimal_mode: sig(c.minimal_mode),
@@ -1280,13 +1280,13 @@ pub(crate) mod tests {
         let mut c = Config::default();
         // 出厂状态：全展开 ⇒ 盘上那串是空的（一个 id 都不写）。
         h.sync(&mut c);
-        assert!(c.ui_cards_expanded.is_empty(), "默认不该有收起的卡");
+        assert!(c.ui_cards_collapsed.is_empty(), "默认不该有收起的卡");
         // 收起两张，**故意选不同页**：枚举与字段要是按位置瞎对，这四行会串页。
         h.card(Card::OptionsWindow).set(false);
         h.card(Card::PluginsAvailable).set(false);
         h.sync(&mut c);
         assert_eq!(
-            c.ui_cards_expanded,
+            c.ui_cards_collapsed,
             vec![
                 "options.window".to_string(),
                 "plugins.available".to_string()
@@ -1305,7 +1305,7 @@ pub(crate) mod tests {
         assert!(!h2.card(Card::PluginsAvailable).get());
         assert!(h2.card(Card::KeysMouse).get(), "没被收起的卡必须展开");
         // ini 里那串清掉（用户手删 / 全部展开）⇒ 下一次 push 全部恢复展开。
-        c.ui_cards_expanded.clear();
+        c.ui_cards_collapsed.clear();
         h2.push(&c);
         assert!(
             h2.card(Card::OptionsWindow).get(),

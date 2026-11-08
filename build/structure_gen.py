@@ -449,7 +449,11 @@ def main() -> int:
         print(f"structure doc in sync with src（{files} 个 .rs / 符号索引 {rows} 项）")
         return 0
     if "--write" in sys.argv:
-        DOC.write_text(rebuilt, encoding="utf-8")
+        # newline="\n" 是硬要求：Windows 上 `Path.write_text` 默认把 `\n` 翻成 `\r\n`，
+        # 而 `.gitattributes` 声明 `*.md text eol=lf` ⇒ 每次重生成都会在提交时冒
+        # "CRLF will be replaced by LF" 警告，且工作区与索引长期不一致（m283 修）。
+        with DOC.open("w", encoding="utf-8", newline="\n") as f:
+            f.write(rebuilt)
         print("structure doc refreshed ->", DOC.name)
         return 0
     old, new = original.splitlines(), rebuilt.splitlines()

@@ -104,7 +104,7 @@ fn legacy_ini_loads_without_loss() {
         // 旧 fixture 不含 ui_cards 键 → 回空表（= 设置页各卡全部展开）。
         // 与 `drag_image` 那条相反方向的判据：这张表里"缺键"表示**没有收起的卡**，
         // 所以老配置升级后不该突然看到一页折叠起来的卡片。
-        ui_cards_expanded: Vec::new(),
+        ui_cards_collapsed: Vec::new(),
         // 旧 fixture 不含排序两键（m275 新增）→ 回默认「文件名升序」。
         // 老配置升级后清单次序必须和升级前一模一样，不能因为多了个维度就重排。
         sort_by: SortBy::Name,
