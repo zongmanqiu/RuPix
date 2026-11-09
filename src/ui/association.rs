@@ -1,6 +1,6 @@
 //! 文件关联窗（m244）：全后缀勾选网格 + 一次性写入。
 //!
-//! 设计（用户 2026-11-07 定稿）：独立窗口从「选项 → 系统与网络」进；4 列网格一屏
+//! 设计（用户 2026-11-07 定稿）：独立窗口从「选项 → 系统」进；4 列网格一屏
 //! 扫完 150+ 后缀；**打开时全不勾**（一次性快照）；「全选/取消全选」双态按钮 +
 //! 「应用」——点一次 = 按当前勾选写入覆盖一次，完成后弹文本结果窗（成功 N /
 //! 本就是默认 M / 候选已挂 K+名单），勾选复位全不勾。写入本体在
@@ -31,7 +31,7 @@ use windui::prelude::*;
 use super::dialog_footer;
 use super::singleton;
 use super::text_window;
-use super::tokens::{to_color, BG, DIALOG_PAD, GAP, PAGE_TOP_MARGIN, ROW_H};
+use super::tokens::{to_color, BG, DIALOG_PAD, GAP, PAGE_TOP_MARGIN, ROW_H, TEXT_ACCENT};
 use crate::core::formats;
 use crate::platform::association;
 
@@ -42,7 +42,7 @@ const GRID_ROW_H: i32 = 30;
 /// 列数（4 = 一屏 30 行 × 4 ≈ 120 项，余下靠搜索与滚动）。
 const COLS: usize = 4;
 
-/// 打开文件关联窗。入口唯一：选项页「系统与网络」卡的管理按钮。
+/// 打开文件关联窗。入口唯一：选项页「系统」卡的管理按钮。
 pub(crate) fn show(ctx: &mut EventCtx) {
     // 后缀全集 = 解码器自述并集（与解码器页同一来源）；排序保证每次开窗顺序稳定。
     let mut exts: Vec<String> = formats::declared_exts()
@@ -80,6 +80,19 @@ fn filtered_rows(exts: &[String], query: &str) -> Vec<Vec<usize>> {
         .filter(|&i| q.is_empty() || exts[i].contains(&q))
         .collect();
     visible.chunks(COLS).map(|c| c.to_vec()).collect()
+}
+
+/// 底栏计数文案（纯函数，供测试钉住）：没勾 = 「共 N 种后缀」；勾了 = 「已选中 x/N」。
+///
+/// 两个数都指**全集**（解码器自述并集），不是搜索框过滤后的可见集——搜索只让人找得快，
+/// 不改变"一共有多少种 / 你选中了几种"这件事。每帧现算一遍 150 次布尔读，成本可忽略；
+/// 不另存一份计数状态（第二份状态迟早与勾选框漂）。
+fn count_text(selected: usize, total: usize) -> String {
+    if selected == 0 {
+        format!("共 {total} 种后缀")
+    } else {
+        format!("已选中 {selected}/{total}")
+    }
 }
 
 /// 窗体内容：滚动页（搜索 + 4 列网格，设置页同款骨架）+ 固定底栏。
@@ -174,6 +187,16 @@ fn build(
             }
         }))
         .child(Element::flex_spacer())
+        // 计数（m288，用户口径）：全选左侧、**红字**——没勾读「共 N 种后缀」，
+        // 勾了就报「已选中 x/N」。红字用浅色系的 `TEXT_ACCENT`（与解码器页「已安装 N」
+        // 的计数同色，色值只在 tokens 一处）；每帧现算，不存第二份状态。
+        .child(
+            Element::label(count_text(
+                sigs.iter().filter(|s| s.get()).count(),
+                sigs.len(),
+            ))
+            .fg(to_color(TEXT_ACCENT)),
+        )
         .child(select_all)
         .child(apply);
 
@@ -225,6 +248,21 @@ mod tests {
         assert_eq!(filtered_rows(&exts, "").len(), 2); // 5 项 → 2 行（4+1）
     }
 
+    /// m288：底栏计数文案，两态四例。两个数都指**全集**，与搜索框无关。
+    #[test]
+    fn count_text_reports_total_or_selected() {
+        assert_eq!(count_text(0, 150), "共 150 种后缀");
+        assert_eq!(count_text(3, 150), "已选中 3/150");
+        // 全选也要报 x/y（读数一致），不要退化回"共 N"。
+        assert_eq!(count_text(150, 150), "已选中 150/150");
+        assert_eq!(count_text(1, 1), "已选中 1/1");
+        // 红字：计数那一格必须走 tokens 的强调色，UI 里不许出现字面色值。
+        assert!(
+            include_str!("association.rs").contains(".fg(to_color(TEXT_ACCENT))"),
+            "计数没上红字（或改用字面色值了）"
+        );
+    }
+
     /// ★ 两件事一次量死：① 底栏与所有对话框同线（右缘 −16、下缘 −16、行高 40、
     /// 间距 8）；② **滚动节点右缘 = 窗右缘**（垂直滚动条贴右，与设置页一致；
     /// 2026-10-17 全 UI 统一，用户 18:34 实测「距离右侧间隔太大」的那颗钉子）。
@@ -241,6 +279,8 @@ mod tests {
             .spacing(GAP)
             .child(dialog_footer::action("系统默认应用设置", |_| {}))
             .child(Element::flex_spacer())
+            // m288：与生产底栏同构——计数红字在全选左侧（缺了它这条布局钉子就不再描述现状）。
+            .child(Element::label("共 150 种后缀").fg(to_color(TEXT_ACCENT)))
             .child(dialog_footer::action("全选", |_| {}))
             .child(dialog_footer::action("应用", |_| {}));
         let root = Element::col()

@@ -3956,7 +3956,7 @@ mod tests {
         );
     }
 
-    /// m266：「图片预读」归哪张卡的**唯一断言**。先查它有没有跑回「系统与网络」，
+    /// m266：「图片预读」归哪张卡的**唯一断言**。先查它有没有跑回「系统」卡，
     /// 再查它是不是真在「看图」卡（m273 前叫「看图与操作」）；两条来源的注释必须跟着
     /// 行一起挪。
     fn assert_prefetch_card(src: &str, what: &str) {
@@ -3971,7 +3971,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{what}：找不到 system_body 段"));
         assert!(
             !system.contains("check_row(\"图片预读\""),
-            "{what}：「图片预读」又写回系统与网络卡了"
+            "{what}：「图片预读」又写回系统卡了"
         );
         assert!(
             browse.contains("check_row(\"图片预读\""),
@@ -3991,7 +3991,7 @@ mod tests {
     /// m266 负向臂：拿 m265 的旧版式（预读行在 system_body）喂同一个断言，必须报红。
     /// 也钉住断言本身——把 system 那一条删掉，这里不再 panic 而失败。
     #[test]
-    #[should_panic(expected = "又写回系统与网络卡了")]
+    #[should_panic(expected = "又写回系统卡了")]
     fn picture_prefetch_rejects_the_system_card() {
         let old = r#"
 fn browse_body(h: &Handles) -> Element {

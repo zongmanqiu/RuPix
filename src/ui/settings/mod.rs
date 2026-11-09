@@ -305,7 +305,8 @@ pub struct Handles {
     pub card_mouse: Signal<bool>,
     /// 「插件快捷键」卡（第三张，2026-10-31 用户点名）。
     pub card_plugins: Signal<bool>,
-    /// 「选项」页四张卡的展开态（m224）：外观 / 窗口 / 看图（m273 前叫「看图与操作」）/ 系统与网络。
+    /// 「选项」页四张卡的展开态（m224）：外观 / 窗口 / 看图（m273 前叫「看图与操作」）/
+    /// 系统（m288 前叫「系统与网络」）。
     pub card_appearance: Signal<bool>,
     pub card_window: Signal<bool>,
     pub card_browse: Signal<bool>,
@@ -1477,7 +1478,7 @@ pub(crate) mod tests {
         assert_eq!(
             cards.len(),
             4,
-            "选项页应有四张卡：外观 / 窗口 / 看图 / 系统与网络"
+            "选项页应有四张卡：外观 / 窗口 / 看图 / 系统"
         );
         // m244：系统与网络卡 2→3（新增「文件关联」入口行——它没有 ini 键，状态住注册表）。
         // m246：外观卡 5→6（补「缩略图条」），整页 17→18 行。
