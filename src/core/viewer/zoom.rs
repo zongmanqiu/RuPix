@@ -28,6 +28,50 @@ pub(super) fn overscroll(view: f32, img: f32) -> f32 {
     ((view + img) / 2.0 - keep).max(0.0)
 }
 
+/// 单轴平移区间（两头都含）。
+///
+/// 为什么不写成"一个上限 × 正负"：顶部那条自绘标题栏是**压在画布上**的浮层，它只遮一侧。
+/// 于是"看图的上缘"那一侧要多收一条标题栏的高度，另一侧一个像素都不动——对称的上限
+/// 做不到这件事，硬做成对称就会变成"底部也拖不到边"（m290）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct PanRange {
+    pub min: f32,
+    pub max: f32,
+}
+
+impl PanRange {
+    /// 还没有图 / 视口还没量出来。
+    pub(super) const NONE: Self = Self { min: 0.0, max: 0.0 };
+
+    /// 两头等长（`span` 就是 [`overscroll`] 的返回值）。
+    pub(super) fn symmetric(span: f32) -> Self {
+        Self {
+            min: -span,
+            max: span,
+        }
+    }
+
+    /// 顶部被 chrome 遮住 `head` 的那一轴：把「看图的上缘」那一侧往里收 `head`。
+    ///
+    /// 为什么收的是 `min` 侧：`pan` 是"图心相对内容区中心的偏移"，`pan = min` 时图整体上移、
+    /// **图的下缘**被推到画布顶部——那正是会被标题栏吃掉的那一枚衣角。
+    ///
+    /// `head` 超过整段行程的一半时按一半算：再收下去 `min` 就变正数了，等于要求"图必须
+    /// 往下挪"，荒谬。这种尺寸下本来就该整张留在画面里，交给 [`overscroll`] 的退化分支。
+    pub(super) fn with_head(span: f32, head: f32) -> Self {
+        let head = head.clamp(0.0, 2.0 * span.max(0.0));
+        Self {
+            min: -span + head,
+            max: span,
+        }
+    }
+
+    /// 这一轴到底动不动得了（上限归零就是动不了）。
+    pub(super) fn movable(&self) -> bool {
+        self.max > 0.0
+    }
+}
+
 impl Viewer {
     // ── 缩放 / 平移 ──────────────────────────────────────────────
 
@@ -511,19 +555,23 @@ impl Viewer {
     ///   并让整个图片继续向上移动"。旧口径 `|图 - 视口| / 2` 的含义是"永远不许露出黑边"，
     ///   那正是把图钉死在窗口里的那道界。
     ///
-    /// 仍然返回 `(0, 0)` 的只有：还没有图，或视口还没量出来（首帧之前）。
+    /// 仍然返回 [`PanRange::NONE`] 的只有：还没有图，或视口还没量出来（首帧之前）。
     ///
     /// ★ 夹取与"能不能拖"共用这一份算法：两处各写一遍就会出现"夹出来其实拖不动、
     /// 但判据说可拖"的手感（按下、拖动、画面一动不动）。
-    pub(super) fn pan_limits(&self) -> (f32, f32) {
+    ///
+    /// ★ m290：纵向那一轴**不再对称**。顶部标题栏画在画布之上（浮层），`view.3` 含它
+    /// 那一块 ⇒ 旧写法让衣角被推到标题栏底下、画面看起来全空。现在把被遮的高度
+    /// （[`Self::chrome_top`]）从"看图上缘"那一侧扣掉，另一侧不动。
+    pub(super) fn pan_limits(&self) -> (PanRange, PanRange) {
         let (nw, nh) = self.eff_dims();
         if nw <= 0.0 {
-            return (0.0, 0.0);
+            return (PanRange::NONE, PanRange::NONE);
         }
         let s = self.scale();
         (
-            overscroll(self.view.2, nw * s),
-            overscroll(self.view.3, nh * s),
+            PanRange::symmetric(overscroll(self.view.2, nw * s)),
+            PanRange::with_head(overscroll(self.view.3, nh * s), self.chrome_top),
         )
     }
 
@@ -532,8 +580,8 @@ impl Viewer {
     /// 溢出上限改成 [`overscroll`] 之后，这条几乎总是真：只剩"没有图"与"视口还没量出来"
     /// 两种拖不动的情况，那一按留着拖窗口（**不许把拖窗口这条路堵死**）。
     pub fn can_pan(&self) -> bool {
-        let (mx, my) = self.pan_limits();
-        mx > 0.0 || my > 0.0
+        let (rx, ry) = self.pan_limits();
+        rx.movable() || ry.movable()
     }
 
     /// 图片**此刻真的比视口大**吗（任一轴溢出）。
@@ -558,11 +606,28 @@ impl Viewer {
         nw * s > self.view.2 + 0.5 || nh * s > self.view.3 + 0.5
     }
 
-    /// 平移夹取：上限来自 [`Self::pan_limits`]——图边可以越过窗口边，
-    /// 但画面里永远还剩 [`PAN_KEEP_VISIBLE`]（图比衣角还小就整张留在画面里）。
+    /// 平移夹取：区间来自 [`Self::pan_limits`]——图边可以越过窗口边，
+    /// 但画面里永远还剩 [`PAN_KEEP_VISIBLE`]（图比衣角还小就整张留在画面里），
+    /// 而且那枚衣角不会被顶部标题栏吃掉。
     pub(super) fn clamp_pan(&mut self) {
-        let (max_x, max_y) = self.pan_limits();
-        self.pan.0 = self.pan.0.clamp(-max_x, max_x);
-        self.pan.1 = self.pan.1.clamp(-max_y, max_y);
+        let (rx, ry) = self.pan_limits();
+        self.pan.0 = self.pan.0.clamp(rx.min, rx.max);
+        self.pan.1 = self.pan.1.clamp(ry.min, ry.max);
+    }
+
+    /// 视口顶部被自绘 chrome（标题栏）遮住的高度，逻辑像素；不画时传 0。
+    ///
+    /// 由 UI 在每帧 `paint` 里喂（`ui::chrome::title_strip_h`，与"画不画标题栏"同一条判据）。
+    /// 变化时**立刻重夹一次 `pan`**：切全屏 / 切无边框会让这段高度变 0，上限随之变宽；
+    /// 不重夹的话图会停在旧口径算出来的位置，直到用户下一次拖动才"跳"一下。
+    ///
+    /// 0.5dp 容差与 [`Self::overflows`] 同一条理由：`fit` 档的倍率是除出来的。
+    pub fn set_chrome_top(&mut self, px: f32) {
+        let px = if px.is_finite() { px.max(0.0) } else { 0.0 };
+        if (self.chrome_top - px).abs() < 0.5 {
+            return;
+        }
+        self.chrome_top = px;
+        self.clamp_pan();
     }
 }

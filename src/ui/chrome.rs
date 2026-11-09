@@ -1564,6 +1564,23 @@ fn title_visible(fullscreen_on: bool, minimal_mode: bool, hover_title: bool) -> 
     }
 }
 
+/// 这一帧标题栏实际占掉的高度（逻辑像素）；不画时为 0。**m290**。
+///
+/// 与 [`paint`] 里那句 `show_title` 是**同一条判据**——两处必须同源，`paint` 也走这个
+/// 函数。分开写就会重演 m255 / m275 那族坐标错位：平移上限按一个高度算、标题栏按另一个
+/// 高度画，于是衣角要么被吃掉、要么多留一截。
+///
+/// 唯一消费方是 `ui::canvas`，喂给 [`Viewer::set_chrome_top`](crate::core::viewer::Viewer)。
+pub fn title_strip_h(fullscreen_on: bool, minimal_mode: bool, chrome: &Chrome) -> f32 {
+    let show =
+        !borderless() && title_visible(fullscreen_on, minimal_mode, chrome.hover_title.get());
+    if show {
+        STRIP_H as f32
+    } else {
+        0.0
+    }
+}
+
 /// 视口**相对**坐标 → 画布坐标（= 窗口绝对坐标）。
 ///
 /// ★ 与 [`Chrome::hit`] 里的 `pos - view.0` **互为逆运算**：画在哪、点哪就必须命中哪。
@@ -1608,7 +1625,9 @@ pub fn paint(
     // 缩略图条、底色。留下的是画面本身和全部操作入口（右键 / 快捷键 / 拖动 / 缩放），
     // 这正是它和「空格预览」的分界：那边连操作都没有。
     let bl = borderless();
-    let show_title = !bl && title_visible(fullscreen_on, minimal_mode, chrome.hover_title.get());
+    // m290：判据收进 `title_strip_h`，与"给平移上限算标题栏挡了多少"共用同一份。
+    // 两处各写一遍就会错位——衣角要么被吃掉、要么多留一截。
+    let show_title = title_strip_h(fullscreen_on, minimal_mode, chrome) > 0.0;
     // 悬停信息条也算"在浮条上"：整行档（窄窗）就住在那儿。不认它的后果是极简模式下
     // 指针停在状态那一行 2 秒后整组消失、且再也悬不回来（`info_rect` 只有画出来才非零）。
     // 三条来源取或：常驻（传统模式）／指针在浮条上（`activity` 现算）／状态刚变

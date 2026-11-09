@@ -32,6 +32,7 @@ impl Viewer {
             want_flip: false,
             pan: (0.0, 0.0),
             view: (0.0, 0.0, 1.0, 1.0),
+            chrome_top: 0.0,
             dpi: 1.0,
             want_seq: 0,
             need_at: None,

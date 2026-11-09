@@ -56,25 +56,24 @@ pub struct ExifInfo {
 
 /// 从文件路径读 EXIF；任何错误 / 无 EXIF → 全空 [`ExifInfo`]。
 ///
-/// **只读文件头**（K41 那条），上限**按容器分档**：默认 [`EXIF_HEAD_CAP`]，只有 WebP
-/// 允许读到 [`EXIF_WEBP_CAP`]。本函数在 **UI 线程**同步调用（属性窗每换一张图走一次，
-/// 解码器解码路再走一次只为取 274），所以"读多少"就是"冻多久"。
+/// **只读文件头**（K41 那条），**两档**：先读 [`EXIF_HEAD_CAP`]，头里找不到 TIFF 起点
+/// 再补读 [`EXIF_DEEP_CAP`]。本函数在 **UI 线程**同步调用，全仓只有一个调用点——
+/// `ui::settings::metadata` 的属性窗，每换一张图走一次。解码路的朝向走的是解码器回报的
+/// `DecodedInfo::orientation`，**不走这里**。
 ///
-/// 为什么默认档从 12 MiB 收到 256 KiB：那个数从来不是"EXIF 会在那儿"，而是"别把 UI
-/// 线程冻死"的兜底，而兜底本身就是代价——m104 探针（跑在测试二进制里，每档 5 遍取最小、
-/// 热缓存，8 枚真文件）逐档量过：**4 KiB 15–18 µs / 256 KiB 23–25 µs / 4 MiB 1.4–1.7 ms /
-/// 12 MiB 4.2–4.7 ms** ⇒ 属性窗开着时每翻一页，UI 线程白读 12 MiB、白分配 12 MiB。
-/// 这条只读"白付多少字节"的量级，不拿来宣称端点变快（端点判据见 [`read_exif`] 下方用例与
-/// 本仓历史记录：朝向仍要到位）。
-/// 而"EXIF 到底在第几字节"这条不是猜的：本机 94 枚带 EXIF 标记的真文件（`.temp/m104_exif_scan.py`，
-/// 只搜前 4 MiB）里，最深的一枚**非 HEIC** 落在 **19,087 B**（PNG 的 `eXIf`），JPEG APP1 全在
-/// 头几十 KB；只有两枚 HEIC 在 2,500,433 B——可那容器今天根本不解，读多深都是空。
-/// ★ 已知缺口（两条一起看，都不假装没有）：
-/// - WebP 的 `EXIF` chunk 常落在文件**尾部** ⇒ 它单独保留深档，这条不收紧。
-/// - **本轮新收的一条**：JPEG / PNG / TIFF 里 EXIF 落在 256 KiB 之后的，拍摄信息照实
-///   显示为**空**（12 MiB 时代读得到）。这类文件的真实存在率没测过（上面那 94 枚里一枚没有，
-///   但那只是本机语料）⇒ 配三条用例把边界钉住：头内的必须解析出来，头外的必须空而不是猜，
-///   WebP 尾部的必须还读得到。
+/// **为什么先 256 KiB**：那个数从来不是"EXIF 会在那儿"，而是"别把 UI 线程冻死"的兜底。
+/// m104 探针（跑在测试二进制里，每档 5 遍取最小、热缓存，8 枚真文件）逐档量过：
+/// **4 KiB 15–18 µs / 256 KiB 23–25 µs / 4 MiB 1.4–1.7 ms / 12 MiB 4.2–4.7 ms**。
+/// 而"EXIF 到底在第几字节"不是猜的：本机 94 枚带 EXIF 标记的真文件
+/// （`.temp/m104_exif_scan.py`）里，最深的一枚**非 HEIC** 落在 **19,087 B**（PNG 的 `eXIf`），
+/// JPEG APP1 全在头几十 KB；只有两枚 HEIC 在 2,500,433 B——可那容器今天根本不解。
+///
+/// **为什么失败要补读深档**（m290）：头里找不到时**不看容器**再读 12 MiB。拍摄信息是
+/// 看图要看的东西，不能为了省那一次 4 ms 就整段留空；而这笔钱只在"头里确实没有"时才付，
+/// 绝大多数文件连深档都不会走到。WebP 的 `EXIF` chunk 本来就常在尾部，这条对它照旧成立。
+///
+/// 边界钉在用例里，三条：头内的必须解析出来；**头外但在深档内的也必须解析出来**
+/// （m104 曾把这条反过来钉成"照实为空"，m290 按用户口径翻正）；真没有 EXIF 的必须空。
 pub fn read_exif(path: &Path) -> ExifInfo {
     let bytes = match read_head(path, EXIF_HEAD_CAP) {
         Ok(b) => b,
@@ -83,10 +82,11 @@ pub fn read_exif(path: &Path) -> ExifInfo {
     if let Some(tiff) = locate_tiff(&bytes) {
         return parse_tiff(&bytes[tiff..]);
     }
-    // 只有 WebP 值得再往深处读一次。头没读满说明整份文件已经在手里了，再读一遍是白付
-    // 一次 open——那种情况下第一次定位失败就已经是最终答案。
-    if bytes.len() == EXIF_HEAD_CAP && is_webp(&bytes) {
-        if let Ok(deep) = read_head(path, EXIF_WEBP_CAP) {
+    // 头里没有：补读深档，**不看容器**——m290 起 JPEG / PNG / TIFF 与 WebP 一视同仁。
+    // `bytes.len() == EXIF_HEAD_CAP` 说明头读满了、文件后面还有内容；否则整个文件已经在
+    // 手里，再 open 一次是白付。
+    if bytes.len() == EXIF_HEAD_CAP {
+        if let Ok(deep) = read_head(path, EXIF_DEEP_CAP) {
             if let Some(tiff) = locate_tiff(&deep) {
                 return parse_tiff(&deep[tiff..]);
             }
@@ -95,17 +95,12 @@ pub fn read_exif(path: &Path) -> ExifInfo {
     ExifInfo::default()
 }
 
-/// 容器是不是 WebP。嗅探只要头 12 字节，长度不够一律判否。
-fn is_webp(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"RIFF") && bytes.len() >= 12 && &bytes[8..12] == b"WEBP"
-}
-
-/// 常规容器的文件头上限（JPEG APP1 / PNG `eXIf` / TIFF IFD 都在这一段里）。
+/// 常规容器的文件头上限（JPEG APP1 / PNG `eXIf` / TIFF IFD 通常都落在这一段里）。
 const EXIF_HEAD_CAP: usize = 256 * 1024;
 
-/// WebP 专用的深档：它的 `EXIF` chunk 常在尾部，256 KiB 头装不下。12 MiB 是"别冻住
-/// UI 线程"的兜底，不是实际需要量（读数见 [`read_exif`]）。
-const EXIF_WEBP_CAP: usize = 12 * 1024 * 1024;
+/// 深档：头里找不到 TIFF 起点时补读这一段（不看容器）。12 MiB 是"别冻住 UI 线程"的
+/// 兜底，不是实际需要量（读数见 [`read_exif`] 的文档）。
+const EXIF_DEEP_CAP: usize = 12 * 1024 * 1024;
 
 /// 读文件前 `cap` 字节。`File` + `take` 而不是 `fs::read` 后再截断——后者会把整个
 /// 大文件先吃进内存，那正是要避免的事。
@@ -1273,19 +1268,19 @@ mod tests {
         );
     }
 
-    /// ★ m104 判据的反半条：EXIF 落在默认头档**之外**（300 KiB）照实为空——不许猜、
-    /// 不许拿上一张的缓存顶着。这条用例存在的意义就是把"本轮新收的缺口"钉成一个断言，
-    /// 而不是只写在文档里等人发现。
+    /// ★ m290 判据（把 m104 立的那条反半条**翻正**）：EXIF 落在**头档之外**（300 KiB）
+    /// 也必须读得到。拍摄信息是看图要看的东西，不能为了省一次 4 ms 就整段留空；
+    /// 而这笔钱只在"头里确实没有"时才付。
+    /// ★ 这条本身就是**负向验证**：把 `read_exif` 里补读深档那几行去掉，它当场红。
     #[test]
-    fn exif_beyond_the_head_cap_reads_empty_not_guessed() {
+    fn exif_beyond_the_head_cap_reads_through_the_deep_pass() {
         let info = read_exif_of(
             &jpeg_with_app1_behind(300 * 1024),
-            "rupix_m104_past_head.jpg",
+            "rupix_m290_past_head.jpg",
         );
-        assert_eq!(
-            info,
-            ExifInfo::default(),
-            "APP1 在 300 KiB 处（超出默认档）⇒ 照实全空，这是 m104 登记的已知缺口"
+        assert!(
+            !info.camera.is_empty(),
+            "APP1 在 300 KiB 处（超出头档）⇒ 必须走深档读出来，实读 {info:?}"
         );
     }
 

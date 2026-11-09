@@ -110,6 +110,35 @@ fn viewer_with_image() -> Viewer {
     v
 }
 
+/// 造一个装上**指定尺寸**合成位图的 Viewer（离屏，不碰 WIC）。
+///
+/// m290 的几何用例要一张真的比视口大的图：4×4 那枚太小，`overscroll` 的退化分支
+/// 会把结论吃掉。400×600 = 960 KB 内存，测试里完全可接受。
+fn viewer_with_sized_image(w: u32, h: u32) -> Viewer {
+    use crate::core::decode::{Decoder, Done};
+    use crate::core::pixels::{Anim, Bitmap, Decoded};
+    let (tx, _rx) = std::sync::mpsc::channel::<Done>();
+    let mut v = Viewer::new(
+        Rc::new(Decoder::spawn_with(tx)),
+        Rc::new(RefCell::new(Config::default())),
+    );
+    assert!(v.apply(Done {
+        seq: 0,
+        path: std::path::PathBuf::from("a.png"),
+        out: Ok(Decoded {
+            natural: (w, h),
+            region: None,
+            anim: Anim::STATIC,
+            bitmap: Bitmap {
+                width: w,
+                height: h,
+                rgba: vec![0x40u8; (w * h * 4) as usize],
+            },
+        }),
+    }));
+    v
+}
+
 /// 造一份**只用于字节账**的解码结果。
 ///
 /// ★ `rgba` 故意不给满：[`Prefetched::bytes`] 的账只按声明尺寸 `w*h*4` 算，
@@ -505,6 +534,80 @@ fn overscroll_keeps_a_sliver_and_never_the_whole_window() {
     // 没有窗口或没有图 ⇒ 不动。
     assert_eq!(overscroll(0.0, 100.0), 0.0);
     assert_eq!(overscroll(400.0, 0.0), 0.0);
+}
+
+/// ★ m290：标题栏是**浮层**（画在画布顶部之上），而平移上限用的 `view` 含它那一块
+/// ⇒ 旧口径把「看图上缘」那一侧的 24dp 衣角推到画布顶 24dp 处，正好落在标题栏底下，
+/// 画面看起来整块全空（用户 2026-11-09 拍板要做的那条）。
+///
+/// 本条钉住修正后的几何：无边框 / 全屏（不画标题栏）时**一个像素都不许变**；
+/// 画标题栏时那一侧要多让出标题栏的高度，另一侧（看图下缘）**不许被牵连**。
+#[test]
+fn pan_limit_keeps_the_corner_below_the_title_bar() {
+    let mut v = viewer_with_sized_image(400, 600);
+    v.fit = false;
+    v.zoom = 1.0;
+    v.view = (0.0, 0.0, 200.0, 300.0); // 图 400×600，比视口大一倍
+
+    // ① 没有标题栏：旧口径。span = (300 + 600)/2 - 24 = 426。
+    let (_, ry0) = v.pan_limits();
+    assert_eq!(ry0.min, -426.0, "无标题栏时下限就是对称口径");
+    assert_eq!(ry0.max, 426.0, "无标题栏时上限就是对称口径");
+    let edge0 = 300.0 / 2.0 + ry0.min + 600.0 / 2.0;
+    assert_eq!(edge0, 24.0, "无标题栏：衣角落在画布顶 24dp（老口径）");
+
+    // ② 有标题栏（40dp）：下限抬高 40，图下缘落到 24 + 40 = 64。
+    v.set_chrome_top(40.0);
+    let (_, ry1) = v.pan_limits();
+    assert_eq!(ry1.min, -386.0, "标题栏 40dp：下限要多让出 40");
+    assert_eq!(ry1.max, 426.0, "另一侧（看图下缘）一个像素都不许动");
+    let edge1 = 300.0 / 2.0 + ry1.min + 600.0 / 2.0;
+    assert_eq!(edge1, 64.0, "衣角必须落在标题栏下沿之下 24dp 处");
+    let top1 = 300.0 / 2.0 + ry1.max - 600.0 / 2.0;
+    assert_eq!(top1, 276.0, "看图下缘那一侧不受影响");
+}
+
+/// ★ m290：夹取必须用**新的非对称区间**——上限改了而夹取还是老的，衣角照样被吃掉。
+#[test]
+fn clamp_pan_respects_the_title_bar_aware_range() {
+    let mut v = viewer_with_sized_image(400, 600);
+    v.fit = false;
+    v.zoom = 1.0;
+    v.view = (0.0, 0.0, 200.0, 300.0);
+    v.set_chrome_top(40.0);
+    v.pan.1 = -9999.0;
+    v.clamp_pan();
+    assert_eq!(v.pan.1, -386.0, "夹取必须落在标题栏感知过的下限上");
+
+    // 标题栏收掉（切无边框 / 退出全屏）：区间放宽，但图**不该自己跳**——
+    // 旧位置在新区间里仍然合法，跳一下反而是惊吓。
+    v.set_chrome_top(0.0);
+    assert_eq!(v.pan.1, -386.0, "区间放宽后不该把图拽走");
+
+    // 反过来：标题栏长出来时区间收紧，**必须立刻重夹**，不许停在越界位置上
+    // （否则那枚衣角还在标题栏底下，直到用户下一次拖动才"跳"一下）。
+    let mut w = viewer_with_sized_image(400, 600);
+    w.fit = false;
+    w.zoom = 1.0;
+    w.view = (0.0, 0.0, 200.0, 300.0);
+    w.pan.1 = -9999.0;
+    w.clamp_pan();
+    assert_eq!(w.pan.1, -426.0, "无标题栏时的下限");
+    w.set_chrome_top(40.0);
+    assert_eq!(w.pan.1, -386.0, "标题栏长出来时必须立刻重夹");
+}
+
+/// 纯函数边界：`head` 大到离谱时不能把区间收成「必须往一边挪」。
+#[test]
+fn pan_range_head_is_clamped_to_the_travel() {
+    use super::zoom::PanRange;
+    let r = PanRange::with_head(10.0, 1000.0);
+    assert_eq!(r.min, 10.0, "head 超过整段行程时按一半算");
+    assert_eq!(r.max, 10.0);
+    assert!(r.min <= r.max, "区间不许倒挂");
+    // head = 0 ⇒ 与对称口径逐值相同（无边框 / 全屏那两种形态不许有任何行为变化）。
+    let z = PanRange::with_head(10.0, 0.0);
+    assert_eq!(z, PanRange::symmetric(10.0), "head = 0 必须等于对称口径");
 }
 
 /// `can_pan` 必须与 `clamp_pan` 是**同一份几何**——它是左键手势分工的判据之一

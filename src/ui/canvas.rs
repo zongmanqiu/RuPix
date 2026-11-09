@@ -320,8 +320,10 @@ enum LeftDrag {
 /// - `drag_image`：用户自己要的开关；关掉就是 2026-10-08 那套拍板。
 /// - `can_pan`：这张图**此刻拖得动**。★ 2026-11-03 用户第三、第四条口径连着放宽到这里：
 ///   图比窗口小也拖得动，而且**图边允许越过窗口边**（拖到只剩一枚衣角），
-///   上限本体是 `Viewer::pan_limits` → `overscroll`。仍然拖不动的只剩"还没有图"（空窗）
-///   与"视口还没量出来"两种——那时那一按留着拖窗口，**不许把拖窗口这条路堵死**。
+///   上限本体是 `Viewer::pan_limits` → `overscroll`（横向对称；纵向自 m290 起**不对称**——
+///   顶上被标题栏遮住那一侧要多让出标题栏的高度，见 `Viewer::chrome_top`）。
+///   仍然拖不动的只剩"还没有图"（空窗）与"视口还没量出来"两种——那时那一按留着拖窗口，
+///   **不许把拖窗口这条路堵死**。
 /// - `!in_title`：指针不在顶部标题栏那一条里——**标题栏永远带走窗口**（判据单一来源
 ///   见 [`Chrome::in_title_strip`]）。
 ///
@@ -2118,9 +2120,18 @@ impl Widget for ImageCanvas {
         };
         let hint_ts = TextStyle::new(14.0);
         let mut nav: Option<(Rect, Rect)> = None;
+        // m290：平移上限要按**看得见的部分**算。标题栏是画在画布顶部的浮层，`view`
+        // 里含它那一块（摆图居中用的就是整块），所以这里单独告诉 core「顶上被挡了多少」。
+        // 判据与 `chrome::paint` 同源（`title_strip_h`），不另写一遍。
+        let chrome_top = chrome::title_strip_h(
+            window_state().fullscreen,
+            self.chrome.minimal_mode.get(),
+            &self.chrome,
+        );
         {
             let mut v = self.viewer.borrow_mut();
             v.on_viewport(vx, vy, vw, vh, canvas.dpi_scale());
+            v.set_chrome_top(chrome_top);
             // ★ 画的是**位图**的目标矩形（SVG 切片 ≠ 整图 dst），而鸟瞰几何仍用整图 dst。
             let base_dst = v.dst_rect(from_rect(work));
             let img_src = v.image();
@@ -4540,7 +4551,8 @@ fn system_body(h: &Handles) -> Element {
     /// 用户要的是"能只拖图片"，不是"把拖窗口这条路堵死"：标题栏那一条永远带走窗口，
     /// 拖不动东西（只有"还没有图"这一种）时也留着拖窗口。
     /// ★ "拖得动"到 2026-11-03 第四条口径时已经放宽到**几乎总是真**，判据本体见
-    /// `Viewer::pan_limits` → `overscroll`（并集的一半减一枚衣角）。
+    /// `Viewer::pan_limits` → `overscroll`（并集的一半减一枚衣角；纵向自 m290 起还要
+    /// 避开顶上那条自绘标题栏，见 `Viewer::chrome_top`）。
     #[test]
     fn left_drag_yields_the_window_unless_there_is_room_in_the_canvas() {
         use LeftDrag::{PanImage, Window};
