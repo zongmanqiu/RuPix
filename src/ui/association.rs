@@ -58,6 +58,11 @@ pub(crate) fn show(ctx: &mut EventCtx) {
         move |q| filtered_rows(&exts, q)
     });
 
+    // 底栏两个会变的文案（m288 返修）：`Window::content` 是 `FnOnce`，树只建一次，
+    // 所以它们**必须**是信号——`TextContent::Bound` 每帧取当前值。
+    let count: Signal<String> = signal(count_text(0, exts.len()));
+    let all_label: Signal<String> = signal("全选".to_string());
+
     // ★ 先关旧窗再开新窗、两个键必须不同——插件设置窗踩过的坑（同键 WM_CLOSE 收走新窗）。
     let (old_key, win_key) = singleton::recycle("file-assoc");
     ctx.close_window(old_key);
@@ -68,7 +73,7 @@ pub(crate) fn show(ctx: &mut EventCtx) {
             .centered(true)
             .owned(true)
             .single(win_key)
-            .content(move || build(&exts, &sigs, &search, view)),
+            .content(move || build(&exts, &sigs, &search, view, &count, &all_label)),
     );
 }
 
@@ -95,13 +100,41 @@ fn count_text(selected: usize, total: usize) -> String {
     }
 }
 
+/// 底栏读数与「全选 / 取消全选」的**唯一刷新点**。
+///
+/// 勾选变化有三条路：单个框（`on_toggle`）、全选框、应用后复位。三条都必须过这里——
+/// 少一处就回到"勾了、字不动"的老毛病（m288 用户实测）。
+/// 文案本身仍由 [`count_text`] 生成，判据不在本函数里另立一份。
+fn refresh_footer(
+    sigs: &[Signal<bool>],
+    total: usize,
+    count: &Signal<String>,
+    all_label: &Signal<String>,
+) {
+    let n = sigs.iter().filter(|s| s.get()).count();
+    count.set(count_text(n, total));
+    all_label.set(if total > 0 && n == total {
+        "取消全选".to_string()
+    } else {
+        "全选".to_string()
+    });
+}
+
 /// 窗体内容：滚动页（搜索 + 4 列网格，设置页同款骨架）+ 固定底栏。
-/// 每帧重建：双态按钮文案、勾选状态全部即时读信号；**网格的过滤走派生信号**。
+///
+/// ★ **这棵树只建一次**：`Window::content` 收的是 `FnOnce`（windui `app/mod.rs`），
+///   所以任何"跟着勾选变"的文案都不能在这里现算——现算的结果就是开窗那一刻的快照。
+///   要变的东西一律**绑信号**：底栏读数与「全选/取消全选」是 `Signal<String>`
+///   （`TextContent::Bound` 每帧取当前值），网格的过滤则是 `host_signal` 的派生视图。
+///   首版把计数在 `build()` 里现算成一个静态字符串，于是勾了框红字不动、双态按钮也不翻
+///   （m288 用户实测报的正是这个）。
 fn build(
     exts: &[String],
     sigs: &[Signal<bool>],
     search: &Signal<String>,
     view: Signal<Vec<Vec<usize>>>,
+    count: &Signal<String>,
+    all_label: &Signal<String>,
 ) -> Element {
     let mut inner = Element::col().fill().spacing(0);
     // 搜索行（在滚动页里，随页滚走——设置页的卡片也住同一个滚动区）。
@@ -116,15 +149,28 @@ fn build(
     inner = inner.child(Element::host_signal(view, {
         let exts = exts.to_vec();
         let sigs = sigs.to_vec();
+        let count = *count;
+        let all_label = *all_label;
+        let total = sigs.len();
         move |chunk: Vec<usize>| {
             let mut row = Element::row().height(GRID_ROW_H).spacing(0);
             for i in chunk {
+                // 受控勾选（m288）：挂 `on_toggle` 就接管了默认翻转 ⇒ 必须自己 `set` 回去，
+                // 再刷底栏。不挂的话读数只能等下一次重建，而重建根本不会发生。
+                let sig = sigs[i];
+                let all = sigs.clone();
+                let count = count;
+                let all_label = all_label;
+                let checkbox = Element::checkbox("", sigs[i]).on_toggle(move |_ctx| {
+                    sig.set(!sig.get());
+                    refresh_footer(&all, total, &count, &all_label);
+                });
                 let cell = Element::row()
                     .width(CELL_W)
                     .height(GRID_ROW_H)
                     .spacing(6)
                     .cross(Align::Center)
-                    .child(Element::checkbox("", sigs[i]))
+                    .child(checkbox)
                     .child(Element::label(exts[i].clone()));
                 row = row.child(cell);
             }
@@ -134,25 +180,24 @@ fn build(
     // 底部留白：滚到最底时最后一行不贴着窗底/底栏。
     inner = inner.child(Element::row().height(GAP));
 
-    // 双态按钮文案按当前全量勾选状态即时算（150 次布尔读，每帧可忽略）。
-    let all_selected = !sigs.is_empty() && sigs.iter().all(|s| s.get());
-    let select_all_label = if all_selected {
-        "取消全选"
-    } else {
-        "全选"
-    };
-
     let sigs_all = sigs.to_vec();
-    let select_all = dialog_footer::action(select_all_label, move |_ctx| {
+    let count_all = *count;
+    let label_all = *all_label;
+    let total = sigs.len();
+    let select_all = dialog_footer::action(*all_label, move |_ctx| {
         // 有一个没勾就算"没全选"⇒ 全选；否则全不勾。
         let target = sigs_all.iter().any(|s| !s.get());
         for s in &sigs_all {
             s.set(target);
         }
+        refresh_footer(&sigs_all, total, &count_all, &label_all);
     });
 
     let sigs_apply = sigs.to_vec();
     let exts_apply = exts.to_vec();
+    let count_apply = *count;
+    let label_apply = *all_label;
+    let total_apply = sigs.len();
     let apply = dialog_footer::action("应用", move |ctx| {
         let checked: Vec<String> = exts_apply
             .iter()
@@ -171,6 +216,8 @@ fn build(
         for s in &sigs_apply {
             s.set(false);
         }
+        // 复位也要刷底栏——它是"勾选变化的第三条路"（前两条：单个框、全选框）。
+        refresh_footer(&sigs_apply, total_apply, &count_apply, &label_apply);
     });
 
     // 底栏：三组按钮靠一颗弹性空白右对齐；**左右 16 挂在自己身上**（根列不给
@@ -188,15 +235,10 @@ fn build(
         }))
         .child(Element::flex_spacer())
         // 计数（m288，用户口径）：全选左侧、**红字**——没勾读「共 N 种后缀」，
-        // 勾了就报「已选中 x/N」。红字用浅色系的 `TEXT_ACCENT`（与解码器页「已安装 N」
-        // 的计数同色，色值只在 tokens 一处）；每帧现算，不存第二份状态。
-        .child(
-            Element::label(count_text(
-                sigs.iter().filter(|s| s.get()).count(),
-                sigs.len(),
-            ))
-            .fg(to_color(TEXT_ACCENT)),
-        )
+        // 勾了就报「已选中 x/N」。红字用浅色系的 `TEXT_ACCENT`（与解码器「已安装 N」
+        // 的计数同色，色值只在 tokens 一处）。
+        // ★ **必须绑信号**：树只建一次（`FnOnce`），现算就是开窗快照——首版正是这么错的。
+        .child(Element::label(*count).fg(to_color(TEXT_ACCENT)))
         .child(select_all)
         .child(apply);
 
@@ -260,6 +302,74 @@ mod tests {
         assert!(
             include_str!("association.rs").contains(".fg(to_color(TEXT_ACCENT))"),
             "计数没上红字（或改用字面色值了）"
+        );
+    }
+
+    /// m288 返修：底栏读数与双态按钮**必须是活的**。
+    ///
+    /// 背景：`Window::content` 收 `FnOnce`，树只建一次 ⇒ 任何现算文案都是开窗快照
+    /// （首版正是这么错的：勾了框红字不动、「全选 ↔ 取消全选」也永远不翻）。这条用例
+    /// 同时钉三件事：① 刷新函数把两条路都写对；② 计数元素绑的是信号不是字符串；
+    /// ③ 每个勾选框都挂了 `on_toggle`（不挂就永远收不到变化）。
+    #[test]
+    fn footer_readout_is_bound_and_refreshed() {
+        let sigs: Vec<Signal<bool>> = (0..5).map(|_| signal(false)).collect();
+        let count = signal(String::new());
+        let all = signal(String::new());
+
+        refresh_footer(&sigs, 5, &count, &all);
+        assert_eq!(count.get(), "共 5 种后缀");
+        assert_eq!(all.get(), "全选");
+
+        sigs[0].set(true);
+        sigs[3].set(true);
+        refresh_footer(&sigs, 5, &count, &all);
+        assert_eq!(count.get(), "已选中 2/5");
+        assert_eq!(all.get(), "全选", "只选了一部分，按钮不能翻成取消全选");
+
+        for s in &sigs {
+            s.set(true);
+        }
+        refresh_footer(&sigs, 5, &count, &all);
+        assert_eq!(count.get(), "已选中 5/5");
+        assert_eq!(all.get(), "取消全选");
+
+        for s in &sigs {
+            s.set(false);
+        }
+        refresh_footer(&sigs, 5, &count, &all);
+        assert_eq!(count.get(), "共 5 种后缀", "复位后回到总数态");
+        assert_eq!(all.get(), "全选");
+
+        // 空集（理论上不会出现，但别让 0/0 长出「取消全选」）
+        let none: Vec<Signal<bool>> = Vec::new();
+        refresh_footer(&none, 0, &count, &all);
+        assert_eq!(all.get(), "全选");
+    }
+
+    /// m288：接线层面的两条负向判据——写成静态文案就红，去掉 `on_toggle` 也红。
+    #[test]
+    fn footer_wiring_must_stay_reactive() {
+        let src = include_str!("association.rs");
+        // ★ 反向判据的针不能直接写在本文件里：`include_str!` 连**这条断言自己**一起读，
+        //   字面量写全就永远命中（与 K188「grep 命中登记它缺号那一句」同一个坑）。
+        //   `concat!` 在编译期拼，源码里不会出现连着的整串。
+        let bad = concat!("Element::label(", "count_text(");
+        assert!(
+            !src.contains(bad),
+            "计数又被现算成静态串了（树只建一次，它是开窗快照）"
+        );
+        assert!(
+            src.contains("Element::label(*count)"),
+            "计数元素没有绑到 `Signal<String>` 上"
+        );
+        assert!(
+            src.contains("dialog_footer::action(*all_label"),
+            "「全选」按钮的文字没绑信号 ⇒ 永远停在开窗那一刻"
+        );
+        assert!(
+            src.contains(".on_toggle(move |_ctx|"),
+            "勾选框没挂 on_toggle ⇒ 勾了不会刷新底栏"
         );
     }
 

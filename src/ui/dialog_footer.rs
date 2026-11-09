@@ -35,7 +35,12 @@ use super::tokens::{DIALOG_PAD, GAP, ROW_H};
 ///
 /// 调用点一律写 `action("确定", move |ctx| …)`，别再 `Element::button(...)`——
 /// 那条路绕开了本模块，hygiene 第 14 查会红。
-pub fn action<F>(label: &str, click: F) -> Element
+///
+/// ★ m288：`label` 收 `impl Into<TextContent>` 而不是 `&str`。原来的 `&str` 把"能写死的
+///   文案"这条隐含约束带进了每一扇对话框；而 `Window::content` 是 `FnOnce`（树只建一次），
+///   于是"按钮文字要随状态变"就只能靠绑 `Signal<String>`——`&str` 签名直接堵死了这条路
+///   （文件关联窗的「全选 ↔ 取消全选」就因此一直不翻）。`&str` 调用点零改动。
+pub fn action<F>(label: impl Into<TextContent>, click: F) -> Element
 where
     F: Fn(&mut EventCtx) + 'static,
 {
