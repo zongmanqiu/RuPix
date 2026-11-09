@@ -916,6 +916,22 @@ impl ImageCanvas {
 
         let mut items = Vec::new();
 
+        // ── 四块 · 三条线（m287 重排项序；线的条数一条没动）──
+        //
+        // 规矩：**每条分隔线都要能说出它切开的两种东西是什么**，说不出来就该删线或归并。
+        //
+        //   ① 磁盘层      打开… / 复制 ▸ / 排序 ▸ / 属性…      ← 四件都不改屏幕像素
+        //   ── 线①：磁盘 → 像素 ──
+        //   ② 对画面做事  操作 ▸ / 本图 ▸ / 插件 ▸             ← 点了立刻改画面或另开一扇窗
+        //   ── 线②：做事 → 状态 ──
+        //   ③ 状态开关    外观 ▸ / 幻灯片放映 / 左键拖图        ← 改的是持续态，勾选即是真相
+        //   ── 线③：功能与设置入口之间 ──
+        //   ④ 设置…                                            ← 唯一一个"离开看图"的入口
+        //
+        // ★ 别为"对齐设置页四卡"再加线：那四张卡是**配置**的分类，这里是**动作**的分类，
+        //   两套轴不同源。再切细就成了 5 段 11 项、每段一两个，反而更难扫。要加项时先答
+        //   "它属于①②③哪一块"；答不上来，才轮到讨论加线。
+
         // ── 打开 ──
         items.push({
             let mut it = MenuItem::run(
@@ -951,15 +967,75 @@ impl ImageCanvas {
 
         // ── 复制（二级菜单，向右弹出）──
         // m248：紧跟「打开…」——两者都针对文件。m276 把「RAW 参数…」收进「本图 ▸」
-        // 之后，第一块是文件类三项（打开 / 复制 / 属性）：它们只碰磁盘上的这个文件，
-        // 不依赖当前这张图有没有解出来。2026-11-03 用户口径「三个复制收纳到
-        // "复制"里面，向右弹出，这样比较节省空间」：同一次只选一种口径（画面 PNG /
-        // 文件本身 / 路径文本），平铺会摊成菜单最长的三段。快捷键仍挂在「复制当前」
-        // 与「复制文件路径」上，收进子菜单不影响按键——显示的是同一份 hotkeys。
+        // 之后，第一块原来是文件类三项（打开 / 复制 / 属性）；m287 把「排序 ▸」也
+        // 收进来，成了**四项**（打开 / 复制 / 排序 / 属性），判据见下面排序那段注释：
+        // 这一块是「**磁盘层**」，四件事都不改屏幕上的像素。
+        // 2026-11-03 用户口径「三个复制收纳到"复制"里面，向右弹出，这样比较节省空间」：
+        // 同一次只选一种口径（画面 PNG / 文件本身 / 路径文本），平铺会摊成菜单最长的三段。
+        // 快捷键仍挂在「复制当前」与「复制文件路径」上，收进子菜单不影响按键——显示的
+        // 是同一份 hotkeys。
         items.push(MenuItem::submenu(
             "复制",
             self.copy_items(has_image, has_file),
         ));
+
+        // ── 排序 ▸（m275 立，m287 从"看图区"上移到这里）──
+        //
+        // ini 键 `sort_by` + `sort_desc`。四项维度 + 一条分隔线 + 倒序：先选按什么排、
+        // 再定方向，与资源管理器「排序方式 ▸」同构（那边也是四个维度 + 一个升降序）。
+        //
+        // ★ **为什么在这一块**（m287，用户口径"这个是和文件本体有关的"）：这一块的
+        //   原则不是"操作这个文件"，而是「**磁盘层**」——打开（读文件）、复制（写文件 /
+        //   写路径）、排序（读目录次序并重排清单）、属性（读元数据与 EXIF），四条都
+        //   不碰屏幕上的像素。它原来排在「幻灯片放映」「左键拖图」之后，读起来像
+        //   "又一个看图开关"，可那两项改的是**看的方式**，排序改的是**下一个是谁**。
+        // ★ **为什么在「复制」与「属性」之间**：让「属性」留在这一块的最后一项。
+        //   资源管理器 / 桌面 / 驱动器右键里「属性」**永远是最后一项**，末端读
+        //   "看它是什么"最顺；把排序插在它前面，两头都不破坏。
+        //
+        // ★ 与「跳转到…帧/页」是一对，但**分居两处**：排序是**组间**导航（下一张是谁），
+        //   跳转是**组内**导航（这张的第几帧 / 页），后者只属于这张图 ⇒ 留在「本图 ▸」。
+        //   别为了"配对好看"把两者合并到一处。
+        //
+        // 勾选态直接读配置（唯一正本）；改完**当场**重排——`Viewer::sync_sort` 在
+        // 下一次 tick（16ms 内）对齐，重排拿当前这张当锚点，画面不闪、不重解码。
+        {
+            let cfg = self.config.clone();
+            let cur = self.config.borrow().sort_spec();
+            let mut sub = Vec::new();
+            for by in SortBy::ALL {
+                let cfg = cfg.clone();
+                let hub = self.hub.clone();
+                sub.push(
+                    MenuItem::run(
+                        by.label(),
+                        move |ctx| {
+                            persist_session(&cfg, &hub, |c| c.sort_by = by);
+                            ctx.mark_dirty();
+                        },
+                        cur.by == by,
+                    )
+                    // 四项都要留勾选列：只给勾着的那项 `.check` 会让整列随选项跳。
+                    .check(cur.by == by),
+                );
+            }
+            sub.push(MenuItem::separator());
+            let cfg = self.config.clone();
+            let hub = self.hub.clone();
+            sub.push(
+                MenuItem::run(
+                    "倒序",
+                    move |ctx| {
+                        let on = !cfg.borrow().sort_desc;
+                        persist_session(&cfg, &hub, |c| c.sort_desc = on);
+                        ctx.mark_dirty();
+                    },
+                    cur.desc,
+                )
+                .check(cur.desc),
+            );
+            items.push(MenuItem::submenu("排序", sub));
+        }
 
         // ── 新建窗口：**不做**（2026-11-05 用户裁定）──
         //
@@ -1072,56 +1148,13 @@ impl ImageCanvas {
             it
         });
 
-        // ── 排序 ▸（m275，ini 键 sort_by + sort_desc）──
-        //
-        // 归这一组而不是「外观 ▸」：排序改的是**下一张是谁**，与「幻灯片放映」
-        // 「左键拖图」同类（都是看图行为），画面长什么样一个字不动。
-        // 四项维度 + 一条分隔线 + 倒序：先选按什么排、再定方向，与资源管理器的
-        // 「排序方式 ▸」同构（那边也是四个维度 + 一个升降序）。
-        //
-        // 勾选态直接读配置（唯一正本）；改完**当场**重排——`Viewer::sync_sort` 在
-        // 下一次 tick（16ms 内）对齐，重排拿当前这张当锚点，画面不闪、不重解码。
-        {
-            let cfg = self.config.clone();
-            let cur = self.config.borrow().sort_spec();
-            let mut sub = Vec::new();
-            for by in SortBy::ALL {
-                let cfg = cfg.clone();
-                let hub = self.hub.clone();
-                sub.push(
-                    MenuItem::run(
-                        by.label(),
-                        move |ctx| {
-                            persist_session(&cfg, &hub, |c| c.sort_by = by);
-                            ctx.mark_dirty();
-                        },
-                        cur.by == by,
-                    )
-                    // 四项都要留勾选列：只给勾着的那项 `.check` 会让整列随选项跳。
-                    .check(cur.by == by),
-                );
-            }
-            sub.push(MenuItem::separator());
-            let cfg = self.config.clone();
-            let hub = self.hub.clone();
-            sub.push(
-                MenuItem::run(
-                    "倒序",
-                    move |ctx| {
-                        let on = !cfg.borrow().sort_desc;
-                        persist_session(&cfg, &hub, |c| c.sort_desc = on);
-                        ctx.mark_dirty();
-                    },
-                    cur.desc,
-                )
-                .check(cur.desc),
-            );
-            items.push(MenuItem::submenu("排序", sub));
-        }
-
         // m276：「跳转到…帧/页」与「RAW 参数…」一起收进「本图 ▸」——它换的是
         // **这一张图里的第几帧/页**，不是"清单里的第几张"，与「排序 ▸」（改下一张是谁）
         // 不是同一件事。状态格 `(12/340)` 的点击入口照旧留着，那是鼠标最短的一条路。
+        //
+        // m287：「排序 ▸」已上移到**文件块**（见上面「复制」之后那段注释）。这一块
+        // 从此只剩"改画面 / 改手感"三颗，正好一条轴：外观 ▸（画面长什么样）→
+        // 幻灯片放映（怎么自动翻）→ 左键拖图（鼠标怎么分工）。
 
         items.push(MenuItem::separator());
         items.push({
@@ -3716,11 +3749,17 @@ mod tests {
         assert_order(&old, &APPEARANCE_PAGE_KEYS, "m262 旧序模拟");
     }
 
-    /// m275 / m276：顶层浏览区的**相对位置**。m275 把「排序 ▸」放在
-    /// 「幻灯片放映」「左键拖图」之后；m276 把跳转收进「本图 ▸」之后顶层只剩它，
-    /// 所以期望序也跟着收成四项。排序改的是"这一组图的下一张是谁"，画面一个像素
-    /// 都不变，混进「外观 ▸」会让人以为它影响渲染——这条一并钉住。
-    const VIEW_ORDER_MENU_KEYS: [&str; 4] = ["\"外观\"", "\"幻灯片放映\"", "\"排序\"", "\"设置…\""];
+    /// m275 / m276 / m287：顶层**文件块**的项序。m287 把「排序 ▸」从看图区上移到
+    /// 「复制」与「属性」之间 —— 既让「属性」留在块尾（资源管理器里它永远是最后一项），
+    /// 也把"改磁盘上的清单"和"改屏幕上的像素"分成两块。这条钉子钉三件事：
+    /// 排序在文件块里、在「复制」之后、在「属性」之前。
+    const FILE_BLOCK_MENU_KEYS: [&str; 4] = ["\"打开…\"", "\"复制\"", "\"排序\"", "\"属性…\""];
+
+    /// m275 / m287：顶层**状态开关区**的相对位置。排序搬走后这一块剩三项
+    /// （外观 → 幻灯片放映 → 左键拖图），加上块尾的「设置…」共四项要按序出现。
+    /// 排序仍不许混进「外观 ▸」：它不改画面，只改下一张是谁。
+    const VIEW_ORDER_MENU_KEYS: [&str; 4] =
+        ["\"外观\"", "\"幻灯片放映\"", "\"左键拖图\"", "\"设置…\""];
 
     /// m276 / m280：「本图 ▸」组内四项的次序。三个"打开一个窗"的常驻项在前、
     /// 会话开关垫底；改名 / 挪位 / 少一项都会红。
@@ -3763,17 +3802,49 @@ mod tests {
     }
 
     #[test]
-    fn sort_and_current_image_group_sit_where_the_browse_block_wants_them() {
+    fn sort_sits_in_the_file_block_and_current_image_group_keeps_its_four() {
         let src = code_lines(production_src());
         let menu = src.split("fn context_menu").nth(1).expect("右键菜单");
         let top = menu.split("fn appearance_items").next().unwrap_or(menu);
-        assert_order(top, &VIEW_ORDER_MENU_KEYS, "右键菜单浏览区");
+        assert_order(top, &FILE_BLOCK_MENU_KEYS, "右键菜单文件块");
+        assert_order(top, &VIEW_ORDER_MENU_KEYS, "右键菜单状态开关区");
         let appearance = src.split("fn appearance_items").nth(1).unwrap_or("");
         assert!(
             !appearance.contains("MenuItem::submenu(\"排序\""),
             "「排序 ▸」被挪进「外观 ▸」里了：它不改画面，只改下一张是谁"
         );
         assert_current_image_menu(&src);
+    }
+
+    /// 负向臂③（m287）：把「排序 ▸」按 m275 的旧位置放回「左键拖图」之后，文件块那条
+    /// 钉子必须当场红 —— 否则这次上移就只是"代码挪了、钉子没跟上"。
+    #[test]
+    #[should_panic(expected = "右键菜单文件块 里找不到")]
+    fn file_block_rejects_the_old_sort_position() {
+        let old = [
+            "fn context_menu(&self) {",
+            "    MenuItem::run(\"打开…\", |_| {}, false);",
+            "    MenuItem::submenu(\"复制\", vec![]);",
+            "    MenuItem::run(\"属性…\", |_| {}, false);",
+            "    MenuItem::separator();",
+            "    MenuItem::submenu(\"操作\", vec![]);",
+            "    MenuItem::submenu(\"本图\", vec![]);",
+            "    MenuItem::submenu(\"插件\", vec![]);",
+            "    MenuItem::separator();",
+            "    MenuItem::submenu(\"外观\", vec![]);",
+            "    MenuItem::run(\"幻灯片放映\", |_| {}, false);",
+            "    MenuItem::run(\"左键拖图\", |_| {}, false);",
+            "    MenuItem::submenu(\"排序\", vec![]);",
+            "    MenuItem::separator();",
+            "    MenuItem::run(\"设置…\", |_| {}, false);",
+            "}",
+            "fn appearance_items(&self) {}",
+            "fn current_image_items(&self) {}",
+            "fn copy_items(&self) {}",
+        ]
+        .join("\n");
+        let top = old.split("fn appearance_items").next().unwrap_or(&old);
+        assert_order(top, &FILE_BLOCK_MENU_KEYS, "右键菜单文件块");
     }
 
     /// 负向臂①：模拟 m275 的旧布局——组已经叫「本图」了，但 RAW 参数仍摊在顶层。
