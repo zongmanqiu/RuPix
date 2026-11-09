@@ -6,9 +6,9 @@ There is deliberately NO sha256 and NO size: official-channel builds are
 identified by file name + version only (user decision 2026-11-07).
 
 Usage (from main/):
-    python build/gen_update_json.py --version 0.1.0 \
+    python build/gen_update_json.py --version 0.2.0 \
         --notes ../.temp/release-out/RELEASE_NOTES.md
-    python build/gen_update_json.py --version 0.1.0 --notes ... --out ../update.json
+    python build/gen_update_json.py --version 0.2.0 --notes ... --out ../update.json
 """
 import argparse
 import json
@@ -30,7 +30,7 @@ def fail(msg: str) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--version", required=True, help="release version, e.g. 0.1.0 (tag = version)")
+    ap.add_argument("--version", required=True, help="release version, e.g. 0.2.0 (tag = version)")
     ap.add_argument("--notes", required=True, help="UTF-8 file with the user-facing release notes")
     ap.add_argument("--published", default=date.today().isoformat())
     ap.add_argument("--out", default=str(ROOT / "update.json"))

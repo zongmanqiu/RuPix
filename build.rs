@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-/// `0.1.0` → `0,1,0,0`：VERSIONINFO 要四段数值，第四段留给"构建号"（我们没有，填 0）。
+/// `0.2.0` → `0,2,0,0`：VERSIONINFO 要四段数值，第四段留给"构建号"（我们没有，填 0）。
 fn version_quad(v: &str) -> String {
     let mut parts: Vec<String> = v
         .split('.')

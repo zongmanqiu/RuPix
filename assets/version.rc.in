@@ -6,7 +6,7 @@
 //   VS_VERSION_INFO = 1 · VOS_NT_WINDOWS32 = 0x00040004L · VFT_APP = 0x1L · VFF_MASK = 0x3fL
 //
 // 版本号的唯一来源是 Cargo.toml 的 `[package] version`（build.rs 注入），**别在这里手填**：
-// 第二份版本字符串必然漂移，漂移的后果是资源管理器显示 0.1.0、崩溃报告里写着另一套。
+// 第二份版本字符串必然漂移，漂移的后果是属性页显示一个版本、崩溃报告与更新清单里写着另一套。
 //
 // code_page 65001：本文件是 UTF-8，下面有中文显示串（FileDescription）。写进资源的是
 // 宽字符，中文在中文系统里显示正常；`Translation` 那对 (0x804, 0x4b0) = zh-CN + Unicode，

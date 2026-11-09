@@ -1,7 +1,7 @@
 # RuPix
 
-**[⬇️ 下载 0.1.0 (Gitee)](https://gitee.com/qiuzongman/RuPix/releases/download/0.1.0/RuPix_0.1.0.zip)**
- ｜ **[⬇️ 下载 0.1.0 (GitHub)](https://github.com/zongmanqiu/RuPix/releases/download/0.1.0/RuPix_0.1.0.zip)**
+**[⬇️ 下载 0.2.0 (Gitee)](https://gitee.com/qiuzongman/RuPix/releases/download/0.2.0/RuPix_0.2.0.zip)**
+ ｜ **[⬇️ 下载 0.2.0 (GitHub)](https://github.com/zongmanqiu/RuPix/releases/download/0.2.0/RuPix_0.2.0.zip)**
  ｜ [Gitee主仓](https://gitee.com/qiuzongman/RuPix)
  ｜ [GitHub镜像](https://github.com/zongmanqiu/RuPix)
 

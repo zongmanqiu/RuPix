@@ -10,7 +10,7 @@ No sha256, no size, no byte comparison (user decision 2026-11-07).
 
 Usage (from main/):
     python build/check_update_asset.py
-    python build/check_update_asset.py --local ../.temp/release-out/RuPix_0.1.0.zip
+    python build/check_update_asset.py --local ../.temp/release-out/RuPix_0.2.0.zip
 """
 import argparse
 import io
