@@ -5,8 +5,9 @@ REM ----------------------------------------------------------------------------
 REM Runs the whole pipeline in order, stopping at the first failure:
 REM
 REM   [1/6] 1_check_env.bat   verify the toolchain (read-only)
-REM   [2/6] 2_scan.bat        static gates: layering_scan + hygiene_scan + cargo fmt
-REM                           --check + cargo clippy -D warnings + structure_gen --check
+REM   [2/6] 2_scan.bat        static gates (7, all must pass): layering + hygiene + fmt
+REM                           + clippy -D warnings + structure_gen --check
+REM                           + dump_sym --selftest + cargo doc (broken intra-doc links)
 REM   [3/6] 3_build_ext.bat   build+test+publish decoder DLLs (.build\decoders)
 REM   [4/6] 4_build.bat       cargo build --release  -> .temp\target
 REM   [5/6] 5_test.bat        test gate - FAILING TESTS STOP THE PIPELINE

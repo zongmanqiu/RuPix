@@ -34,22 +34,27 @@ core(0) → platform(1) → {decoders(2), extensions(2)} → ui(3) → runtime(4
 ┌────────────────────────────────────────────────────────────┐
 │ runtime(4)   装配层：run() + 16ms 轮询 + 解码线程接线           │  main.rs → runtime::run()
 ├────────────────────────────────────────────────────────────┤
-│ ui(3)        windui 控件与窗口内容：brand/canvas/chrome/        │
-│              settings/tray/raw_dialog/svg/window              │  禁 windows
+│ ui(3)        windui 控件与窗口内容：画布 / 标题栏 / 缩略图条 /    │
+│              设置页 / 托盘 / 各类对话框 / 设计令牌               │  禁 windows
 ├────────────────────────────────────────────────────────────┤
 │ decoders(2)   解码器宿主：DLL 生命周期 + 目录 + FFI 编排           │  禁 windui / windows
-│              （mod.rs + catalog.rs，Win32 一律走 platform）     │
+│              + 按 DLL 串行锁（Win32 一律走 platform）           │
 ├────────────────────────────────────────────────────────────┤
 │ extensions(2) 非解码器扩展：manifest 发现 + 进程外编排 + 远程清单  │  禁 windui / windows
 │              （与 decoders 平级且双向禁互引；命令/编辑型已接）      │
 ├────────────────────────────────────────────────────────────┤
-│ platform(1)  Win32 薄封装：clipboard/dll/panic_guard/          │  禁 windui
-│              seh/window_frame                                  │
+│ platform(1)  Win32 薄封装：窗口 / 进程 / 管道 / HTTP /         │  禁 windui
+│              凭据与日志 / 崩溃取证                             │
 ├────────────────────────────────────────────────────────────┤
-│ core(0)      纯逻辑：abi/config/decode/error/formats/          │  禁 windui / windows
-│              gallery/geometry/hotkey/paths/pixels/thumbs/util/viewer              │  （单测必须能无头跑）
+│ core(0)      纯逻辑：配置 / 解码调度 / 几何 / 像素 / 画廊 /      │  禁 windui / windows
+│              热键 / 路径 / 格式探测                            │  （单测必须能无头跑）
 └────────────────────────────────────────────────────────────┘
 ```
+
+> ★ **这张图只写职责，不写文件清单**：层内文件会随版本增删，清单写在这里必然漂
+> （本图早先按文件名枚举，等它被读到的时候磁盘上已经多出一倍）。文件表 / 行数 / 符号索引的
+> 唯一正本是 [`目录结构说明.md`](目录结构说明.md)，由 `build/structure_gen.py --write` 生成，
+> **不许手改，也别在这里抄第二份**。
 
 | 层 | 禁引外部 crate | 违反后果 |
 |---|---|---|
@@ -100,7 +105,7 @@ python build\hygiene_scan.py      # 硬编路径 / 调试残留 / TODO 真标记
    - 调试 / 验证脚本（`.py` / `.ps1` / 临时探针）、构建日志、命令输出（**禁止重定向到 `main/` 或 `解码器仓库`**）。
    - 计划 / 进度 / 发现类文件由工作区计划区管理，不在宿主文档内展开；一次性草稿 / 实测转储 / 截图 / 样本图片 → `.temp`。
    - 退役源码备份、探针工具目录（`.temp/*probe*/`）等。
-2. **禁止向 `main/` / `解码器仓库` 内写入任何日志、临时脚本或草稿文件**。`main/` 只放：源码（`src/`）、离屏探针（`examples/`）、构建脚本（`build/`）、文档（`*.md` / `docs/`）、资源（`assets/`：品牌图标 svg + PE 图标资源 ico/rc/in）、ABI 契约快照（`vendor/rupix-abi/`）。
+2. **禁止向 `main/` / `解码器仓库` 内写入任何日志、临时脚本或草稿文件**。`main/` 只放：源码（`src/`）、单元/集成测试（`tests/`）、离屏探针（`examples/`）、构建脚本（`build/`）、文档（`*.md` / `docs/`）、资源（`assets/`：品牌图标 svg + PE 图标资源 ico/rc/in）、第三方补丁登记（`patches/`）、ABI 契约快照（`vendor/rupix-abi/`）。这张清单与 §三 的表必须一致，增删目录两处一起改。
    - `main/docs/` 的文档必须有长期价值（架构总览 / 解码器开发规范指针 / 图片格式与后缀名 / 待办 / 踩坑记录）。一次性草稿 / 实测转储放 `.temp`，不入库。「未受控文档进仓库」是明令禁止的。
 3. **target 重定向是写死的**：
    - `main/.cargo/config.toml`：`[build] target-dir = "../.temp/target"`（宿主：不得改回 `./target`）
@@ -116,7 +121,7 @@ python build\hygiene_scan.py      # 硬编路径 / 调试残留 / TODO 真标记
 
 | 允许 | 禁止 |
 |---|---|
-| `src/` `examples/` `tests/` `build/` `docs/` `assets/` `patches/` | 任何 `.log` / `.txt` 草稿 / `__pycache__` |
+| `src/` `examples/` `tests/` `build/` `docs/` `assets/` `patches/` `vendor/` | 任何 `.log` / `.txt` 草稿 / `__pycache__` |
 | `Cargo.toml` `Cargo.lock` `build.rs` `seh_shim.c` | 编译中间产物（`.rs.bk`、备份、`.target`） |
 | 随源码的文档（`*.md` / `docs/`） | 一次性诊断脚本（→ `.temp/`） |
 | 构建脚本（`build/full.bat` 及编号步骤脚本） | 未在文档体系登记的临时文档（→ `.temp/`） |
@@ -164,10 +169,12 @@ RuPix/
 │  ├─ src/{core,platform,decoders,ui,runtime}/   五层（见 §一）
 │  ├─ examples/       离屏探针 / 验证
 │  ├─ tests/          集成门禁（tests/*.rs）+ 真机探针（tests/probes/，默认不编译）
-│  ├─ build/          六步流水线 bat + layering_scan.py / hygiene_scan.py / gate.py
-│  │                  / structure_gen.py（结构文档数字与符号索引的唯一写入者） / deploy.py
-│  │                  / dump_sym.py（读自家报告/.dmp → 异常码 / 寄存器 / RVA / 线程名 / 逐帧 源码行）
-│  │                  / size_map.py（读 /MAP 链接图 → exe 体积逐 crate 账本 + 闭合检查）
+│  ├─ build/          六步流水线 bat + 主要脚本（完整清单 `ls build/`；这里只列会被反复点名的）：
+│  │                  layering_scan.py / hygiene_scan.py / gate.py / structure_gen.py（结构文档
+│  │                  数字与符号索引的唯一写入者）/ deploy.py / dump_sym.py（报告或 .dmp → 异常码、
+│  │                  寄存器、RVA、线程名、逐帧源码行）/ size_map.py（读 /MAP → exe 体积逐 crate
+│  │                  账本 + 闭合检查）/ gen_update_json.py + check_update_asset.py（自更新清单发布
+│  │                  序）；另有 `*_probe.ps1` 一整套真机探针（灌真输入 / PrintWindow 取证）
 │  ├─ docs/           长期文档
 │  ├─ assets/         品牌图标（svg，`include_bytes!` 进 exe）+ PE 图标资源（`rupix.ico` / `rupix.rc` / `version.rc.in`，构建期用）
 │  ├─ patches/        第三方补丁登记（windui 卷 `PATCHES.md` + usvg 卷 `usvg-0.48.1/PATCHES.md`，编号只增）
@@ -354,7 +361,7 @@ cost=…ms bitmap=…`、`[decode-req] kind=… tier=… verdict=…`、`[close]
 | ★ **PowerShell 没有 `&&`** | `a && b` 在 PowerShell 报错；顺序执行写两行，或用 `;`；bat 脚本里用 `if !ERRORLEVEL!` 串联 |
 | ★ 2026-11-02 之前本仓无 `.git`，`cargo clippy --fix` 要加 `--allow-no-vcs` 才肯改文件 | 接入 git 后已不需要；若见到别人加这个参数，那是旧习惯 |
 | 一条几十个文件的批处理命令会静默失败 | 复杂操作落成脚本再执行 |
-| 本工具的终端**实际执行 PowerShell 5.1**（不是 git bash） | 别按 bash 语法写：`$(...)` / `Export` 一律换 PowerShell；**多行或复杂逻辑落成 `.ps1`**（纯 ASCII，见 K27）再 `powershell -NoProfile -ExecutionPolicy Bypass -File <path>`；前台 stdout 取不到就写文件再读，`>` 出 UTF-16（要读就用 `-Encoding Unicode` 转码，或走 `build\*.py`）。备注：本机另有 `git.exe`（`D:\ruanjian\Git\Git\cmd`）；本仓 2026-11-02 起有 `.git`，但与终端选择无关 |
+| ★ **两个终端别混用**：Bash 工具跑的是 **git bash**（`ls` / `grep` / `rm -rf` / `&&` / `$VAR` 全正常，coreutils 齐），PowerShell 工具跑的是 **Windows PowerShell 5.1** | 在 Bash 工具里写 `Out-File` / `Write-Output` 会 `command not found`；在 PowerShell 里写 `&&` / `$(…)` 会解析失败。**多行或复杂逻辑落成 `.ps1`**（纯 ASCII，见 K27）再 `-ExecutionPolicy Bypass -File <path>` 跑；PS 前台 stdout 取不到就写文件再读，而 PS 5.1 的 `>` 默认出 **UTF-16**，要给别人读就显式 `-Encoding utf8`（或走 `build\*.py`）。备注：本机另有 `git.exe`（`D:\ruanjian\Git\Git\cmd`）；本仓 2026-11-02 起有 `.git`，与终端选择无关 |
 
 ---
 
@@ -493,16 +500,16 @@ cost=…ms bitmap=…`、`[decode-req] kind=… tier=… verdict=…`、`[close]
 | 1 | 分层体检 | `cd main` → `python build\layering_scan.py` | `violations: 0` |
 | 2 | 卫生体检 | `python build\hygiene_scan.py` | `violations: 0` |
 | 3 | 格式化 | `cargo fmt --check` | exit 0（**已被 `build\2_scan.bat` 第 [3/7] 道强制执行**；此前列而不行，2026-10-17 补。★ 那一步一共 **7 道**：[1/7] 分层、[2/7] 卫生、[3/7] fmt、[4/7] clippy、[5/7] 结构文档新鲜度、[6/7] `dump_sym.py --selftest`、[7/7] **注释断链**（`cargo doc -D rustdoc::broken_intra_doc_links`，m282 补——前六道都只读代码、不读 doc comment，54 处断链因此长期无人发现）） |
-| 4 | 静态检查 | `cargo clippy --all-targets --release -- -D warnings` | exit 0。★ **必须带 `-D warnings`**：不带的话 clippy 有 warning 也退 0，"exit 0" 就是假绿。此列曾长期"列而不行"（与第 3 行 fmt 同一个毛病），2026-10-19 起由 `build\2_scan.bat` 第 [4/6] 步强制执行 |
+| 4 | 静态检查 | `cargo clippy --all-targets --release -- -D warnings` | exit 0。★ **必须带 `-D warnings`**：不带的话 clippy 有 warning 也退 0，"exit 0" 就是假绿。此列曾长期"列而不行"（与第 3 行 fmt 同一个毛病），2026-10-19 起由 `build\2_scan.bat` 第 [4/7] 步强制执行 |
 | 5 | 宿主单测 | `cargo test --lib -- --test-threads=1` | 全部 passed |
 | 6 | 集成门禁 | `cargo test --release -- --test-threads=1` | 全部 passed（含 docs_consistency） |
 | 7 | 解码器构建 | 在解码器仓库根运行它自己的 `build.ps1` | 编译 + 测试 + 发布 DLL 全过 |
 | 8 | 端到端冒烟 | `cargo run --release --example decoder_smoke -- <dll>...` / `--probe-decode` | 各解码器解码 OK |
 | 9 | 发布 | `main\build\full.bat`（或 `6_deploy.bat`） | `rupix.exe` 落 `.build\`，解码器清单核对过；**许可全文与第三方署名清单也落 `.build\`**（`deploy.py` 的 `license_gate` 硬拦：缺文件、空壳、或全文不是 AGPL 都不给部署） |
 | 10 | 文档同步 | 核 `docs/` 与 `DOCS_MANIFEST.md` | 清单里的文件描述成立 |
-| 13 | 更新清单发布序 | 打包 → `gen_update_json.py` → 上传两侧资产 → `check_update_asset.py` → **最后**推 `update.json` | 两个镜像都 `[ok]` 且文件名 / 版本与清单一致；提前推清单会让更新按钮必然 404 |
 | 11 | 结构文档新鲜度 | `python build\structure_gen.py --check`（漂移则 `--write` 重生成） | exit 0；第一/三/四节数字与第五节符号索引 = `src/` 现状。**这些数字与索引不许手改**，改 `src/` 后跑 `--write` |
 | 12 | 发布包打包器 | 一律 7-Zip 命令行 `7za a -tzip -mx=9 -mtm=off -mta=off -mtc=off <包.zip> <顶层目录>`；**禁止** Python `zipfile` / `shutil.make_archive` / `.7z` 容器，找不到 `7za` 直接报错；细则见 `开发指南.md` §一「打包铁律」 | 产物是标准 ZIP/Deflate；`7za l -slt` 核对条目；主程序包为空壳（exe + 许可 + 说明，不含解码器 / 插件 / 清单 / 运行期数据） |
+| 13 | 更新清单发布序 | 打包 → `gen_update_json.py` → 上传两侧资产 → `check_update_asset.py` → **最后**推 `update.json` | 两个镜像都 `[ok]` 且文件名 / 版本与清单一致；提前推清单会让更新按钮必然 404 |
 
 > 红线：本清单只检查、不提交。本仓 2026-11-02 起是 git 仓（origin = `gitee.com/qiuzongman/RuPix`，分支 `master`）；`commit` / `push` 仍须先取得用户明确许可。`.bf/` 快照继续打——它存的是 `main/` + `.3rd/` + 解码器仓三处合集，git 只管 `main/` 这一层。
 > ★ 源码只推 Gitee、GitHub 是自动镜像（不手推），但 release 资产与说明两边都要传——规则见 `开发指南.md` §四（本节不复述）。

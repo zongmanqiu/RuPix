@@ -15,10 +15,13 @@ Windows 10/11 上的小巧极速看图器。**宿主只做「看图」，位图�
 `decoders\` 放一个 DLL，宿主一行代码不用改。唯一例外：SVG 走内置 resvg（矢量需按
 视口 1:1 重渲，位图解码器语义表达不了，见 [`docs/架构总览.md`](docs/架构总览.md)）。
 
-**便携**：整个程序就是可拷走的一个目录，全部持久化写在 **exe 同级目录**
-（配置 `rupix.ini` 与解码器 `decoders/` 在根，其余全部收在 exe 旁的 `temp\` 里：
-运行日志 `rupix-<日期>.log`、崩溃报告 `crash-<日期>.log` 与转储 `crash-<日期>-<时分秒>.dmp`、会话戳 `rupix.run`），
-不碰注册表、不碰用户配置目录——删掉目录就干净了。`rupix.ini` 里每项都有中文注释；
+**便携**：整个程序就是可拷走的一个目录，全部持久化写在 **exe 同级目录**。放在根上的是你会直接看的
+——配置 `rupix.ini`、解码器 `decoders/`、插件 `plugins/`、随包清单 `docs/`；诊断物收在 exe 旁的 `temp\`
+（运行日志 `rupix-<日期>.log`、崩溃报告 `crash-<日期>.log` 与转储 `crash-<日期>-<时分秒>.dmp`、
+会话戳 `rupix.run`）；只用来提速的（SVG 字体索引 `cache\svg-fonts.bin`）收在 `cache\`，删了只是慢一点。
+不碰用户配置目录（`%APPDATA%` 一律不写）——删掉目录就干净了。
+**唯一会写注册表的是设置页里你主动勾选的「文件关联」**：只写当前用户（HKCU）自己的那几个键，
+不锁系统默认程序、随时可以被别家改回去。`rupix.ini` 里每项都有中文注释；
 设置页没摆出来的少数高级项可以直接改它，例如图片预读深度 `prefetch_depth`
 （每个方向预读几张，默认 `3`，可填 `1`–`4`）。**手改 ini 后重启才生效**；
 设置页里的开关则是改完即时生效。诊断物**按天命名**，启动时清掉文件名日期
@@ -109,7 +112,7 @@ RuPix\                  ← 工作区根（宿主文档只画宿主这一侧）
 | --- | --- |
 | windui 0.23.0（本地 path 依赖 `.3rd/wind-ui-rust-0.23.0`，features：svg / svg-text / d2d） | UI 框架 + 内置 resvg SVG 渲染（唯一内置解码例外） |
 | usvg 0.48.1（`.3rd/usvg-0.48.1`，经 `[patch.crates-io]` 接入，不是直接依赖） | 把 windui 的 resvg 换成打了线程级排版缓存补丁的那一份（补丁登记见 `patches/usvg-0.48.1/PATCHES.md`） |
-| windows 0.62（Win32 绑定，`[target.'cfg(windows)'.dependencies]` 共 **27 条 feature**，下面已省掉各自的 `Win32_` 前缀：Foundation / Security / Security_Authorization / System_Pipes / Graphics_Gdi / System_DataExchange / System_Ole / System_Memory / System_ProcessStatus / System_Threading / System_RemoteDesktop / System_SystemInformation / UI_WindowsAndMessaging / UI_Input_KeyboardAndMouse / UI_HiDpi / System_LibraryLoader / UI_Shell / UI_Shell_Common / System_Com / System_Variant / System_Diagnostics_Debug / System_Kernel / Storage_FileSystem / System_IO / System_JobObjects / System_Time / Networking_WinHttp） | 剪贴板、崩溃错误框与转储、DPI 边框反算、DLL 搜索路径硬化、会话号（诊断头）、命名管道与共享内存（插件进程）、回收站、WinHTTP 取清单。逐条用途写在 `Cargo.toml` 的行内注释里 |
+| windows 0.62（Win32 绑定，`[target.'cfg(windows)'.dependencies]` 共 **28 条 feature**，下面已省掉各自的 `Win32_` 前缀：Foundation / Security / Security_Authorization / System_Pipes / Graphics_Gdi / System_DataExchange / System_Ole / System_Memory / System_ProcessStatus / System_Threading / System_RemoteDesktop / System_SystemInformation / UI_WindowsAndMessaging / UI_Input_KeyboardAndMouse / UI_HiDpi / System_LibraryLoader / UI_Shell / UI_Shell_Common / System_Com / System_Variant / System_Diagnostics_Debug / System_Kernel / System_Registry / Storage_FileSystem / System_IO / System_JobObjects / System_Time / Networking_WinHttp） | 剪贴板、崩溃错误框与转储、DPI 边框反算、DLL 搜索路径硬化、会话号（诊断头）、命名管道与共享内存（插件进程）、回收站、**注册表（唯一例外：文件关联，仅 HKCU 且只写不撤）**、WinHTTP 取清单。逐条用途写在 `Cargo.toml` 的行内注释里 |
 | libloading 0.8 | LoadLibrary 包装（解码器 DLL 装载） |
 | memmap2 0.9 | 解码器文件 mmap（免 12MB 级堆拷贝，失败回退 fs::read） |
 | png 0.18.1 | 「复制当前」= RGBA → PNG 编码后进剪贴板 |
