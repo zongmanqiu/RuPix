@@ -31,9 +31,8 @@
 | `docs/架构总览.md` | 五层分层、§三关键类型（`DecodeBackend` / `Fail` / `ImageCache` 等）、§五解码路由与清单规则（**只写动态并集，不登记具体 DLL**）、§七性能红线、§八改动影响面任一变化；「明确不做」清单（§九）变化 | `python build/layering_scan.py` + `hygiene_scan.py` 均 `violations: 0` |
 | `docs/解码器开发规范.md`（**宿主侧 ABI 对接说明**，自包含） | 宿主看到的 ABI 版本、导出、结构体、错误码、缓冲所有权、能力路由变化时更新；契约结构体以 `vendor/rupix-abi` 为准 | 宿主 `cargo test --release --lib core::abi -- --test-threads=1` 全绿 + `cargo test --release --test docs_consistency -- --test-threads=1` |
 | `docs/图片格式与后缀名.md` | 宿主内置路径（只有 resvg 一枚，管 svg/svgz）与「动态并集」规则变化；**具体解码器清单不写在这里**（清单真源在解码器侧，宿主随包只带 `docs/decoders.json` 这份数据） | `ext` 组测试（`python build/gate.py run ext`）+ 真实文件冒烟 |
-| `docs/待办.md` | 候选项增删、状态变更（✅ / 🚫 / 调研结论） | 自检（与 HISTORY 不重复：待办记未来，HISTORY 记已发生） |
+| `docs/待办.md` | **唯一清单**（2026-11-09 m291 合并两份）：只收「还开着、且真有可能做」的条目、等外力项与已知边界；已拥有 / 不值得做 / 永久不提供的一律不列。新增或关闭条目时更新 | 自检 + `cargo test --release --test docs_consistency -- --test-threads=1`（j12 不写体积数字） |
 | `docs/产品定位与边界.md` | 战略定位 / 职责边界 / "轻量"硬定义 / 明确不做清单任一变化；本文件是战略层，内容长期稳定，改动应稀少 | 自检 + `python build/layering_scan.py`（引用分层结论时） + `cargo test --release --test docs_consistency` 全绿 |
-| `docs/待开发内容.md` | **唯一待开发清单**（2026-11-09 m289 重写）：还剩哪些条目、每条的「值不值 / 卡在哪 / 什么条件下重开」。`待办.md` §18 ⑮、§5 O7/O8②③、§35、§37、§68.5 与编码线（格式转换 / 涂鸦 / 裁剪）、编辑套件、窗口外发光，全部收敛到这里 | 自检（**判定值只在 `docs/待办.md` / `docs/产品定位与边界.md` 写一份，本文件不复述**）；`cargo test --release --test docs_consistency -- --test-threads=1` 全绿 |
 | `docs/superpowers/plans/2026-10-12-titlebar-topmost-lock.md` | 已执行完毕的计划存档，不更新（同类新工作另开新文件） | 自检（与同名 spec 成对存在） |
 | `docs/superpowers/specs/2026-10-12-titlebar-topmost-lock-design.md` | 设计变更时（被 `src/ui/chrome.rs` 注释与 `HISTORY.md` 引用） | 自检（引用路径成立） |
 
