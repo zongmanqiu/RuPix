@@ -33,7 +33,7 @@
 | `docs/图片格式与后缀名.md` | 宿主内置路径（只有 resvg 一枚，管 svg/svgz）与「动态并集」规则变化；**具体解码器清单不写在这里**（清单真源在解码器侧，宿主随包只带 `docs/decoders.json` 这份数据） | `ext` 组测试（`python build/gate.py run ext`）+ 真实文件冒烟 |
 | `docs/待办.md` | 候选项增删、状态变更（✅ / 🚫 / 调研结论） | 自检（与 HISTORY 不重复：待办记未来，HISTORY 记已发生） |
 | `docs/产品定位与边界.md` | 战略定位 / 职责边界 / "轻量"硬定义 / 明确不做清单任一变化；本文件是战略层，内容长期稳定，改动应稀少 | 自检 + `python build/layering_scan.py`（引用分层结论时） + `cargo test --release --test docs_consistency` 全绿 |
-| `docs/待开发内容.md` | 编码相关三条（格式转换 / 涂鸦 / 裁剪）的**共同依赖、保存口径与重开条件**变化：新格式编码器、ABI 增编码面、`image.write` 同尺寸契约、`待办.md` §24 一律另存 PNG、§26④ 硬边界任一松动或出新裁决 | 自检（判定值只在 `docs/待办.md` / `docs/产品定位与边界.md` 写一份，本文件不复述）；`cargo test --release --test docs_consistency -- --test-threads=1` 全绿 |
+| `docs/待开发内容.md` | **唯一待开发清单**（2026-11-09 m289 重写）：还剩哪些条目、每条的「值不值 / 卡在哪 / 什么条件下重开」。`待办.md` §18 ⑮、§5 O7/O8②③、§35、§37、§68.5 与编码线（格式转换 / 涂鸦 / 裁剪）、编辑套件、窗口外发光，全部收敛到这里 | 自检（**判定值只在 `docs/待办.md` / `docs/产品定位与边界.md` 写一份，本文件不复述**）；`cargo test --release --test docs_consistency -- --test-threads=1` 全绿 |
 | `docs/superpowers/plans/2026-10-12-titlebar-topmost-lock.md` | 已执行完毕的计划存档，不更新（同类新工作另开新文件） | 自检（与同名 spec 成对存在） |
 | `docs/superpowers/specs/2026-10-12-titlebar-topmost-lock-design.md` | 设计变更时（被 `src/ui/chrome.rs` 注释与 `HISTORY.md` 引用） | 自检（引用路径成立） |
 
