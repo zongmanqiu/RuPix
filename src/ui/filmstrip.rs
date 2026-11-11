@@ -22,6 +22,7 @@ use windui::spec::Align;
 use windui::text::TextStyle;
 
 use super::tokens as tk;
+use super::{fill_panel_open, FlatEdges};
 
 use super::ImageCache;
 use crate::core::pixels::RgbaImage;
@@ -72,11 +73,25 @@ impl Side {
 pub struct Placement {
     pub side: Side,
     pub view: (f32, f32, f32, f32),
+    /// 左边有没有常驻文件树：有 ⇒ 条的左缘也是「相接边」，不许留圆角（m302）。
+    ///
+    /// 放在这里而不是 `paint` 多一个参数：`layout` / `panel` / `paint` / 命中本来
+    /// 就共用这一份 `Placement`，"条旁边挨着谁"也属于它的几何。
+    pub has_tree: bool,
 }
 
 impl Placement {
     pub fn new(side: Side, view: (f32, f32, f32, f32)) -> Self {
-        Self { side, view }
+        Self {
+            side,
+            view,
+            has_tree: false,
+        }
+    }
+
+    pub fn with_tree(mut self, has_tree: bool) -> Self {
+        self.has_tree = has_tree;
+        self
     }
 }
 
@@ -363,6 +378,17 @@ pub fn panel(at: Placement) -> Rect {
     }
 }
 
+/// 条贴哪一边、左边有没有文件树 ⇒ 哪几条边是「相接边」（不圆角，
+/// 见 [`super::fill_panel_open`]）。
+fn flat_edges(side: Side, has_tree: bool) -> FlatEdges {
+    match side {
+        // 贴底：上缘接看图区；左边有树时左缘接树。
+        Side::Bottom => FlatEdges::new(true, false, has_tree),
+        // 贴左：右缘接看图区；左边有树时左缘接树（四角就全平了，条被夹在中间）。
+        Side::Left => FlatEdges::new(false, true, has_tree),
+    }
+}
+
 /// 上屏纹理缓存上限。超过时按最后使用时间逐张淘汰到 3/4（LRU），
 /// 而非整批清空——后者会让大目录连翻几百张时突然全员重上传，一帧闪/顿。
 const MAX_KEPT: usize = 128;
@@ -409,8 +435,17 @@ impl Strip {
         //   m255 之前这里减过 `vx/vy`：底条时恒为 0 侥幸无害，贴左时整条左移 112。
         let local = |x: f32, y: f32, w: f32, h: f32| (x, y, w, h);
         let p = panel(at);
-        let (px, py, pw, ph) = local(p.x as f32, p.y as f32, p.w as f32, p.h as f32);
-        canvas.fill_round_rect(px, py, pw, ph, 10.0, &Paint::fill(tk::panel_bg()));
+        // ★ m302：凡是与别的地相接的边都平（贴底条＝上缘、贴左条＝右缘；左边有
+        //   文件树时再加左缘），只有真正贴窗口外角的那一角还留圆。四角全圆会在
+        //   接缝漏出底下那层底色，看着像空了一块。
+        fill_panel_open(
+            canvas,
+            p,
+            10.0,
+            flat_edges(at.side, at.has_tree),
+            &Paint::fill(tk::panel_bg()),
+            &Paint::fill(tk::panel_edge()),
+        );
 
         for (i, slot) in slots.iter().enumerate() {
             let (idx, r, path) = (slot.idx, slot.rect, slot.path);
@@ -1118,5 +1153,30 @@ mod tests {
             vec!["3", "4", "5", "6", "7"],
             "标签要按 idx+1 写；写成屏上位置号，滚动到远处时数字就全错了"
         );
+    }
+
+    /// m302：相接边一条都不能漏。贴底的条平上缘、贴左的条平右缘；左边有树时
+    /// 两条都要再平左缘——否则树与条之间那两个圆角会把底色漏成「空出一块」。
+    #[test]
+    fn strip_flat_edges_cover_every_joined_side() {
+        assert_eq!(
+            flat_edges(Side::Bottom, false),
+            FlatEdges::new(true, false, false)
+        );
+        assert_eq!(
+            flat_edges(Side::Left, false),
+            FlatEdges::new(false, true, false)
+        );
+        assert_eq!(
+            flat_edges(Side::Bottom, true),
+            FlatEdges::new(true, false, true)
+        );
+        assert_eq!(
+            flat_edges(Side::Left, true),
+            FlatEdges::new(false, true, true)
+        );
+        // 负向臂：贴底不许平右缘、贴左不许平上缘（那是贴窗口外角的一侧）。
+        assert!(!flat_edges(Side::Bottom, true).right);
+        assert!(!flat_edges(Side::Left, true).top);
     }
 }

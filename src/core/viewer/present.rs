@@ -13,6 +13,19 @@ impl Viewer {
     /// 把同一句话摆两遍（用户 2026-10-18："错误不要重复，太冗余了，只留中央"）。
     /// 中央那句因此是唯一的错误载体，宽度与让位都由 `ui::canvas` 负责。
     pub fn status(&self) -> String {
+        let base = self.status_base();
+        // ★ m304：压缩包层里有认得出但打不开的条目（加密 / 压缩方式不支持）时，
+        //   **不许静默少图**。状态格是数量/百分比之外唯一常驻的一行，只追加后缀、
+        //   不替换基础信息（用户 2026-11-06：「数量进度和缩放百分比永远不会被替换」）。
+        //   `skipped = 0` 时一个字都不多，普通目录的行为逐值不变。
+        if self.archive_skipped > 0 {
+            format!("{} · 另有 {} 项不支持", base, self.archive_skipped)
+        } else {
+            base
+        }
+    }
+
+    fn status_base(&self) -> String {
         let pos = match self.gallery.as_ref() {
             Some(g) if !g.is_empty() => format!("{}/{}", g.position(), g.len()),
             _ => return "没有打开图片".to_string(),

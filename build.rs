@@ -56,6 +56,13 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/version.rc.in");
     println!("cargo:rerun-if-changed=Cargo.toml");
 
+    // unrar_sys（RAR 解包，vendored C++）的 `GetRarDataPath` 调了 RegOpenKeyExW /
+    // RegQueryValueExW / RegCloseKey，但它的 build.rs 自己没声明 advapi32 ⇒ 链接期
+    // 报 LNK2019 三个未解析符号。补在这一处，别指望上游修（0.5.8 至今如此）。
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rustc-link-lib=advapi32");
+    }
+
     // cc/rc 都按**目标**平台走，不看 build.rs 自己的 cfg(windows)（那是 host 的）：
     // host≠target 的交叉编译会错位——shim 是链给目标机的，图标是烙进目标 exe 的。
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {

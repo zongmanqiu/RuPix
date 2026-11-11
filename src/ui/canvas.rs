@@ -75,7 +75,7 @@ use crate::core::pixels::MAX_TEXTURE_SIDE;
 use super::chrome::{self, Arrow, Btn, Press, TitleBtn};
 use super::plugin_settings::{LiveState, RunPrompt};
 use super::tokens as tk;
-use super::{filmstrip, settings};
+use super::{filmstrip, settings, tree};
 use super::{to_key_input, Chrome, Hub, Strip};
 use crate::core::hotkey::Action;
 use crate::core::pixels::RgbaImage;
@@ -161,6 +161,28 @@ pub struct ImageCanvas {
     /// 条是常驻的一块地（不是盖在画面上的浮层），所以摆图、缩放锚点、鸟瞰几何
     /// 都用这一份；悬浮工具栏那一层仍用完整的 `last`（它本来就是浮层）。
     last_work: Cell<Rect>,
+
+    // ── 文件树（m300）──
+    /// 整包层树（先序）。只在"这一层来自压缩包"时非空——普通目录不画树。
+    tree_nodes: RefCell<Vec<crate::core::archive::TreeNode>>,
+    /// 这批节点属于哪个层目录。换层 / 换文件时重读并把滚动归零：
+    /// 树的顺序跟着包走，旧首行在新树里指的是另一层。
+    tree_for: RefCell<Option<PathBuf>>,
+    /// 当前层在包里的路径段（`here()` 的结果）。与节点一起缓存——`here` 要读
+    /// `layer.tsv`，不能每帧读一次。
+    tree_segs: RefCell<Option<Vec<String>>>,
+    /// 上一帧画出的树几何（**视口绝对坐标**）。`None` = 这一帧没画树，
+    /// 事件回调据此决定拦不拦滚轮、点不点得中。
+    tree_at: Cell<Option<Rect>>,
+    /// 树的首行下标（滚动）。
+    tree_first: Cell<usize>,
+    /// 悬停的节点下标，只用于高亮。
+    tree_hover: Cell<Option<usize>>,
+    /// 这棵树有没有被层级预算截断（m306）。与节点同一批缓存：只在换层 / 换文件时
+    /// 跟着 `tree.tsv` 重读一次，不是每帧一次文件系统调用。
+    tree_truncated: Cell<bool>,
+    /// 正在拖树的滚动指示（m307）。`None` = 没在拖。
+    tree_scrub: Cell<Option<TreeScrub>>,
 }
 
 /// 滚轮翻页档每张图需要的增量（一格 WHEEL_DELTA）。
@@ -271,6 +293,36 @@ struct StripScrub {
     max_first: usize,
     /// 底条看横轴、左条看纵轴。
     horizontal: bool,
+}
+
+/// 正在拖树滚动指示的滑块（m307）。与 [`StripScrub`] 同构，只是树只有纵向。
+#[derive(Clone, Copy)]
+struct TreeScrub {
+    /// 按下那一刻指针的 y。
+    grab_at: f32,
+    /// 按下那一刻滑块顶的 y。
+    thumb0: f32,
+    /// 滑块能走的行程（轨道长 - 滑块长）；`0` = 滑块占满，拖不动。
+    span: f32,
+    max_first: usize,
+}
+
+/// 拖动 → 首行（纯函数）。`grab_at` 是按下时的偏移 ⇒ 跟手不跳。
+fn tree_scrub_first(s: &TreeScrub, y: f32) -> usize {
+    if s.span <= 0.0 {
+        return 0;
+    }
+    let t = (y - s.grab_at + s.thumb0).clamp(0.0, s.span);
+    (t / s.span * s.max_first as f32).round() as usize
+}
+
+/// 点轨道空白 → 首行：让**滑块中心**落到指针处，与拖动共用同一套行程映射。
+fn tree_scrub_jump(y: f32, track0: f32, thumb_len: f32, span: f32, max_first: usize) -> usize {
+    if span <= 0.0 {
+        return 0;
+    }
+    let t = (y - track0 - thumb_len / 2.0).clamp(0.0, span);
+    (t / span * max_first as f32).round() as usize
 }
 
 /// 滑块拖动 → 首格（纯函数）。`grab` 是按下那一刻指针距滑块起点的偏移 ⇒ 跟手不跳。
@@ -703,6 +755,14 @@ impl ImageCanvas {
             strip_dir: RefCell::new(None),
             strip_sort: Cell::new(0),
             last_work: Cell::new(Rect::new(0, 0, 1, 1)),
+            tree_nodes: RefCell::new(Vec::new()),
+            tree_for: RefCell::new(None),
+            tree_segs: RefCell::new(None),
+            tree_at: Cell::new(None),
+            tree_first: Cell::new(0),
+            tree_hover: Cell::new(None),
+            tree_truncated: Cell::new(false),
+            tree_scrub: Cell::new(None),
         }
     }
 
@@ -874,6 +934,7 @@ impl ImageCanvas {
     ///
     /// ```text
     /// 打开…
+    /// 系统菜单                  当前文件的资源管理器右键菜单（m313；内容全归外壳）
     /// 复制 ▸                    画面 PNG / 原文件 / 文件路径（m248 上移，与「打开」同为文件类）
     /// 属性…                     图片信息窗（m247 从浮条收编到顶层）
     /// ─────
@@ -922,7 +983,7 @@ impl ImageCanvas {
         //
         // 规矩：**每条分隔线都要能说出它切开的两种东西是什么**，说不出来就该删线或归并。
         //
-        //   ① 磁盘层      打开… / 复制 ▸ / 排序 ▸ / 属性…      ← 四件都不改屏幕像素
+        //   ① 磁盘层      打开… / 系统菜单 / 复制 ▸ / 排序 ▸ / 属性…   ← 五件都不改屏幕像素
         //   ── 线①：磁盘 → 像素 ──
         //   ② 对画面做事  操作 ▸ / 本图 ▸ / 插件 ▸             ← 点了立刻改画面或另开一扇窗
         //   ── 线②：做事 → 状态 ──
@@ -944,10 +1005,11 @@ impl ImageCanvas {
                     move |ctx| {
                         let v2 = v.clone();
                         let cfg2 = cfg.clone();
-                        // 过滤器用完整清单（内置 + 解码器自述 + 遗留）：装了新解码器，
-                        // 打开对话框里就多出那些后缀。`filter` 内部立即把切片转成自有
-                        // Vec，传这个局部量的引用是安全的。
-                        let exts = crate::core::gallery::known_exts();
+                        // 过滤器 = 完整图片清单 + 容器后缀（zip / cbz）：装了新解码器，
+                        // 打开对话框里就多出那些后缀。容器后缀只加在这一处过滤器上，
+                        // 不进 `gallery::known_exts()` —— 那份清单还喂文件关联。
+                        // `filter` 内部立即把切片转成自有 Vec，传局部量的引用是安全的。
+                        let exts = crate::core::archive::pick_exts();
                         ctx.request_pick_file(
                             windui::prelude::PickDialog::new()
                                 .title("打开图片")
@@ -966,6 +1028,63 @@ impl ImageCanvas {
             it.shortcut = self.config.borrow().hotkeys.display(Action::Open);
             it
         });
+
+        // m300：原先这里是「本包 ▸」二级菜单。它要求用户先记住自己在哪一层、上一层
+        // 叫什么，包里套包时来回跳很容易迷路；现在换成画面最左侧常驻的文件树
+        // （`ui::tree`），"看见就能点"。菜单整组撤掉，不留兜底——两套入口并存
+        // 只会让"现在到底在哪一层"有两份答案。
+
+        // ── 系统菜单（m313，紧跟「打开…」）──
+        //
+        // 这一项弹出的**不是我们的菜单**：宿主调 explorer 自己的 `IContextMenu`，
+        // 弹出来的是资源管理器里对着这个文件右键的那一份。理由是内容根本不在我们
+        // 手里——「打开方式」「发送到」「添加到压缩包」「用杀毒软件扫描」这些动词由
+        // 系统与第三方外壳扩展在注册表里登记，装了谁就多几项，换台机器就不一样。
+        // 复刻一份注定是"我这台机器上长这样"，所以这里只**转发**：宿主选位置、外壳
+        // 出内容、选中哪个由哪个动词自己执行（`platform::shell::FileMenu`）。
+        //
+        // ★ 与「打开…」的分界不是"都跟打开有关"，而是**谁在做主**：那个是宿主自己的
+        //   打开对话框（带我们的过滤器，换来一张图继续看）；这个是**对磁盘上这个
+        //   文件做事**（用别的程序打开 / 压缩 / 扫描 / 发到别处）。两者都在磁盘层，
+        //   所以紧挨着排；它排在「复制」前头，因为「复制」本身就是系统菜单里的一项。
+        //
+        // ★ 没有当前文件时置灰（空窗只可能从托盘开出来）：系统菜单是"针对这个文件"
+        //   的，没有文件就没有对象，这一项连弹都不该弹。
+        items.push(
+            MenuItem::run(
+                "系统菜单",
+                {
+                    let v = self.viewer.clone();
+                    move |ctx| {
+                        let Some(path) = v.borrow().current_path() else {
+                            return; // 入口已置灰，这里只是兜底
+                        };
+                        let Some(hwnd) = windui::platform::native_window_handle() else {
+                            ctx.toast_err("系统菜单：取不到窗口句柄");
+                            return;
+                        };
+                        // 一行 info：菜单的内容不归我们，落日志的只有"谁被交给系统了"
+                        // （菜单里选了什么由外壳自己执行，宿主看不到也不该看到）。
+                        log::info!("系统菜单：{}", path.display());
+                        // 两段走：**先装**（只读盘 + 查注册表，失败当场给一句人话），
+                        // **后弹**（模态，自己会跑一圈消息循环）。后者必须等这一轮事件
+                        // 分发完全返回——在回调里直接弹，菜单的消息循环会重入窗口过程，
+                        // 那里再取一次窗口状态就是 `&mut` 别名（windui 铁律，见
+                        // `EventCtx::defer_blocking` 的注释）。
+                        match crate::platform::shell::FileMenu::for_path(hwnd, &path) {
+                            Ok(menu) => ctx.defer_blocking(move || {
+                                if let Err(e) = menu.show(hwnd) {
+                                    log::warn!("系统菜单：{e}");
+                                }
+                            }),
+                            Err(e) => ctx.toast_err(e),
+                        }
+                    }
+                },
+                false,
+            )
+            .enabled(has_file),
+        );
 
         // ── 复制（二级菜单，向右弹出）──
         // m248：紧跟「打开…」——两者都针对文件。m276 把「RAW 参数…」收进「本图 ▸」
@@ -1957,21 +2076,33 @@ fn exec_title_btn(
 /// ★ 与 `filmstrip::layout` 的 `Placement.view` 是**同一份 `content` 的两种推导**：
 /// 这里减掉条、那里画条。贴左时两边都必须从 `content.x` 起算——若一边拿 `work`
 /// 再扣一次，条就会画进画面里、或者画面被扣掉两条宽。
-fn work_of(content: Rect, side: filmstrip::Side) -> Rect {
+///
+/// m300：左边又多了一条文件树。★ 树在**最外侧**（`content.x` 起），条在树右边，
+/// 所以两者共用 [`strip_area`] 作起点——谁再各自从 `content` 扣一遍，条就会压到树上。
+fn work_of(content: Rect, side: Option<filmstrip::Side>, tree_w: i32) -> Rect {
+    let area = strip_area(content, tree_w);
+    let (mut x, y, mut w, mut h) = (area.x, area.y, area.w, area.h);
     match side {
-        filmstrip::Side::Bottom => Rect::new(
-            content.x,
-            content.y,
-            content.w,
-            (content.h as f32 - filmstrip::STRIP_H).max(1.0) as i32,
-        ),
-        filmstrip::Side::Left => Rect::new(
-            content.x + filmstrip::STRIP_W as i32,
-            content.y,
-            (content.w as f32 - filmstrip::STRIP_W).max(1.0) as i32,
-            content.h,
-        ),
+        Some(filmstrip::Side::Bottom) => h = (h as f32 - filmstrip::STRIP_H).max(1.0) as i32,
+        Some(filmstrip::Side::Left) => {
+            x += filmstrip::STRIP_W as i32;
+            w = (w as f32 - filmstrip::STRIP_W).max(1.0) as i32;
+        }
+        None => {}
     }
+    Rect::new(x, y, w, h)
+}
+
+/// 扣掉文件树之后、留给"缩略图条 + 画面"的那块宽度。
+///
+/// 树不显示时 `tree_w = 0`，逐字节等于 m300 之前的行为。
+fn strip_area(content: Rect, tree_w: i32) -> Rect {
+    Rect::new(
+        content.x + tree_w,
+        content.y,
+        (content.w - tree_w).max(1),
+        content.h,
+    )
 }
 
 impl Widget for ImageCanvas {
@@ -1993,16 +2124,57 @@ impl Widget for ImageCanvas {
         // 缩略图条占掉一条边（它是常驻的地，不是浮层）：摆图、悬浮层、命中测试
         // 一律用扣掉之后的 `work`——**画在哪就要点在哪**，三者共用一份几何。
         // m253：贴底扣高、贴左扣宽（`filmstrip_left`），两根主轴共用一套格子。
+        // ── 文件树（m300）：只在压缩包层里出现，永远贴最外侧 ──
+        //
+        // 树是**整包一棵**（一次建全，见 `core::archive`），同一包的任意层共用 ⇒ 只有
+        // 换层 / 换文件才重读。★ 不能每帧调 `tree_of`：它要读 `layer.tsv` 才知道
+        // "这一层是不是包层"，那是每帧一次文件系统调用。
+        let gallery_dir = self.viewer.borrow().gallery_dir().map(Path::to_path_buf);
+        let reload = self.tree_for.borrow().as_deref() != gallery_dir.as_deref();
+        if reload {
+            // 一次拿到「这棵树」与「当前层在哪」，两处都只在换层 / 换文件时算。
+            let (nodes, cur) = match gallery_dir.as_deref() {
+                Some(d) => match crate::core::archive::here(d) {
+                    Some((_, segs)) => (crate::core::archive::tree_of(d), Some(segs)),
+                    // 普通目录：不是包层，没有树。
+                    None => (Vec::new(), None),
+                },
+                None => (Vec::new(), None),
+            };
+            *self.tree_nodes.borrow_mut() = nodes;
+            // ★ m306：截断标记与上面那批节点同源，同一趟 reload 一起读走。
+            //   `tree_truncated` 对普通目录返回 false（`session_of` 直接 None）。
+            self.tree_truncated.set(
+                gallery_dir
+                    .as_deref()
+                    .is_some_and(crate::core::archive::tree_truncated),
+            );
+            *self.tree_segs.borrow_mut() = cur;
+            *self.tree_for.borrow_mut() = gallery_dir;
+            self.tree_first.set(0);
+            self.tree_hover.set(None);
+        }
+        // 无边框形态下 chrome 全隐（含标题栏、缩略图条、信息条），树一起收：那时
+        // 整块画面就是标题栏，留一条常驻面板就不叫无边框了（判据同缩略图条）。
+        let tree_w = if chrome::borderless() || self.tree_nodes.borrow().is_empty() {
+            0
+        } else {
+            tree::width_for(content.w as f32) as i32
+        };
+        // ★ 条占的是**树的右边**，所以"放不放得下"要按扣掉树之后的宽算——拿整块
+        //   `content.w` 去判会得出"放得下"，然后条压到树上。
+        let body = strip_area(content, tree_w);
+
         let strip_side = filmstrip::Side::from_left(self.chrome.filmstrip_left.get());
         // m269：无边框形态下 chrome 全隐，条画出来就是一块多余的浮层 ⇒ 不显示
         // （不改配置，关掉形态后条照原样回来）。判据在 `fits` 之前，换边归零逻辑照旧走。
         let strip_on = self.strip_on()
             && !chrome::borderless()
-            && filmstrip::fits(strip_side, content.w as f32, content.h as f32);
-        // 条的主轴长度：底条按内容宽、左条按内容高——都用**完整** `content`，
-        // 因为条画的就是 `content` 的那一条（不是 `work`）。
+            && filmstrip::fits(strip_side, body.w as f32, content.h as f32);
+        // 条的主轴长度：底条按宽度、左条按高度——都用**扣掉树之后**那块，
+        // 因为条画的就是 [`strip_area`] 的那一条（不是 `work`，也不是整块 `content`）。
         let strip_axis = match strip_side {
-            filmstrip::Side::Bottom => content.w as f32,
+            filmstrip::Side::Bottom => body.w as f32,
             filmstrip::Side::Left => content.h as f32,
         };
         // 换边 / 关条 ⇒ 锚点归零（m258）：两个方向每屏格数不同，旧首格没有意义；
@@ -2044,11 +2216,7 @@ impl Widget for ImageCanvas {
             self.strip_drag.set(None);
             self.strip_dragged.set(false);
         }
-        let work = if strip_on {
-            work_of(content, strip_side)
-        } else {
-            content
-        };
+        let work = work_of(content, strip_on.then_some(strip_side), tree_w);
         // m254：用户**刚**打开条 / 换了边，但窗口放不下 ⇒ 先把窗口放大到刚好放得下，
         // 下一帧条自然出现（`apply_session_flags` 只置一次请求，这里消费即清）。
         // ★ 用户自己把窗口拉小（条自动隐藏）不会被反向顶大——那种"拉不动"的窗口很讨厌。
@@ -2059,8 +2227,10 @@ impl Widget for ImageCanvas {
             // （那时候画面里根本没有那条）。
             if self.chrome.filmstrip.get() && !strip_on && !chrome::borderless() {
                 let dpi = canvas.dpi_scale().max(0.5);
-                let (tw, th) =
-                    filmstrip::grow_to_fit(strip_side, content.w as f32, content.h as f32);
+                // 要放得下的是「树 + 条 + 一点画面」，所以按扣掉树之后那块去算，
+                // 再把树宽加回来——否则窗口刚好放得下条时树又把画面挤回去。
+                let (tw, th) = filmstrip::grow_to_fit(strip_side, body.w as f32, content.h as f32);
+                let tw = tw + tree_w as f32;
                 self.chrome
                     .strip_resize
                     .set(Some(((tw * dpi).round() as i32, (th * dpi).round() as i32)));
@@ -2340,7 +2510,38 @@ impl Widget for ImageCanvas {
             &title,
         );
 
-        // ⑤ 底部缩略图条（常驻的一块地，已在前面从摆图区里扣掉）。
+        // ⑤ 文件树（m300）：常驻在画面最外侧，已在前面从摆图区里扣掉。
+        //
+        // 画在 chrome **之后**：树不占 `work`，两者根本不重叠（chrome 的几何全在
+        // `work` 里推导），先后只影响"谁盖谁"这种不可能发生的情况。
+        self.tree_at.set(None);
+        if tree_w > 0 {
+            let nodes = self.tree_nodes.borrow();
+            let p = tree::panel(content, tree_w as f32);
+            let cur = self
+                .tree_segs
+                .borrow()
+                .as_ref()
+                .and_then(|s| nodes.iter().position(|n| &n.segs == s));
+            // 滚动夹一次：换层后节点数变少时，旧首行可能越界（那时整棵树都是空的，
+            // 夹到 0 比留一个越界值安全）。
+            let cap = tree::capacity(p.h, self.tree_truncated.get());
+            let max = tree::max_first(nodes.len(), cap);
+            let first = self.tree_first.get().min(max);
+            self.tree_first.set(first);
+            tree::paint(
+                canvas,
+                p,
+                &nodes,
+                cur,
+                first,
+                self.tree_hover.get(),
+                self.tree_truncated.get(),
+            );
+            self.tree_at.set(Some(p));
+        }
+
+        // ⑥ 底部缩略图条（常驻的一块地，已在前面从摆图区里扣掉）。
         *self.strip_items.borrow_mut() = if strip_on {
             // 先向状态机要"这一屏该显示哪几张"（顺带为缺图的发起后台解码），
             // 再把格子摆开。m100：路径全程按引用走，一帧一个 `PathBuf` 都不克隆。
@@ -2360,15 +2561,13 @@ impl Widget for ImageCanvas {
             // 条画在**完整 content** 的那一条上（扣掉的那条正是它占的地，用 work 就
             // 叠回画面上了）。★ 贴左时 `work.x` 已经右移了一条宽 ⇒ 这里必须重新取
             // `content.x` / `content.w`，不能拿上面那组 `vx`/`vw`（那是 work 的）。
+            // ★ m300：条画在 [`strip_area`] 那一块（= `content` 扣掉左边的文件树），
+            //   不是整块 `content`——否则条会压到树上、而画面又被扣掉两条宽。
             let at = filmstrip::Placement::new(
                 strip_side,
-                (
-                    content.x as f32,
-                    content.y as f32,
-                    content.w as f32,
-                    content.h as f32,
-                ),
-            );
+                (body.x as f32, body.y as f32, body.w as f32, body.h as f32),
+            )
+            .with_tree(tree_w > 0);
             let rects = filmstrip::layout(at, n);
             // 事件回调（命中 / 拖动 / 滚轮 / 滚动指示 / 光标）要判断"指针在不在条上"：
             // 把 `Placement` 整份存下来，`panel` / `layout` 都能从它推——与 `strip_items`
@@ -2554,6 +2753,18 @@ impl ImageCanvas {
         self.chrome.hit(pos, self.work_tuple())
     }
 
+    /// 收掉面板上的「可点」提示（m312，锁定时用）。
+    ///
+    /// 树那一行、条那一格还亮着，锁住的窗口看着像还能点——锁定只吞事件不清
+    /// 悬停的话，指针一停下就停在那块高亮上，直到解锁才消失。
+    fn clear_panel_hover(&self, ctx: &mut EventCtx) {
+        let tree = self.tree_hover.replace(None).is_some();
+        let strip = self.strip_hover.replace(None).is_some();
+        if tree || strip {
+            ctx.mark_dirty();
+        }
+    }
+
     /// 指针落在缩略图条背板里吗（用 `paint` 写下的那一帧几何，**视口绝对坐标**）。
     fn in_strip_panel(&self, pos: (f32, f32)) -> bool {
         let Some(at) = self.strip_at.get() else {
@@ -2717,15 +2928,36 @@ impl ImageCanvas {
 
     fn on_pointer(&mut self, ctx: &mut EventCtx, p: &PointerEvent) -> bool {
         let pos = (p.pos.x as f32, p.pos.y as f32);
+        // ★ m312：锁定 = **整窗**交互封锁，在这里收成一道闸。
+        //   以前这条判据散在各个分支里（滚轮一处、缩略图条一处、右键几处），
+        //   漏了**文件树**：锁着窗口点树上的某一行照样换层，条上照样换图
+        //   （用户实报「锁住窗口的时候，目录和缩略图好像没有一起锁住」）。
+        //   漏的根因不是忘了写，是「每加一块地就得记得再加一次判断」——
+        //   收成一道闸之后，新面板天然被锁住，不必逐个补。
+        //   只放行标题栏那颗锁钮（`Chrome::hit` 锁定时也只认它），别的全吞。
+        //   ★ 必须**吞掉**（return true），不能 return false：漏下去会落到
+        //   「拖窗口 / 双击关窗」那条兜底路——锁着的窗口被拖走、被关掉更不像话。
+        if self.chrome.locked.get() {
+            let unlock = matches!(p.kind, PointerKind::Down | PointerKind::Up)
+                && p.button == MouseButton::Left
+                && self.chrome_hit(pos) == Some(Press::TitleBtn(TitleBtn::Lock));
+            if !unlock {
+                // 滚轮沿用旧口径：即便锁着也算「用户插手了画面」，先把放映停掉再吞。
+                if matches!(p.kind, PointerKind::Wheel(_)) {
+                    self.chrome.slide_stop();
+                }
+                // 悬停一并收掉：树那一行还亮着，锁着的窗口看着像还能点。
+                self.clear_panel_hover(ctx);
+                return true;
+            }
+        }
         match p.kind {
             PointerKind::Wheel(delta) => {
                 // ★ 放映让位挂在**滚轮事件本身**上，不挂在翻页节奏闸上：默认档里滚轮是缩放
                 // （默认档 `wheel == Zoom`），那条路根本不进 `wheel_gate`——2026-10-31 用户实测
                 // "滚轮没用、方向键有用"就是这个错位。缩放同样是"用户插手了画面"。
                 self.chrome.slide_stop();
-                if self.chrome.locked.get() {
-                    return true; // 锁定：吞掉滚轮，不缩放不翻页
-                }
+                // 锁定已在 `on_pointer` 入口统一吞掉，这里不必再判一次。
                 // 缩略图条（m259）：条内滚轮 = 翻列表，**不换图**。
                 // 这里不看 `config.wheel`——列表上的滚轮就是滚动列表，条上也没有
                 // 可缩放的画布；Shift+滚轮 = 一屏。碎增量同样攒够一格才算（`wheel_detent`）。
@@ -2733,6 +2965,30 @@ impl ImageCanvas {
                 //   列表惯例是"向下滚 = 看后面" ⇒ 先经 [`wheel_nav_dir`] 翻号。
                 //   第一版写成 `+ dir`，于是"往下滚想看后面"反而在开头卡死，用户实报
                 //   "滚轮对滚动条不起作用"就是这一句。
+                // 文件树（m300）：树内滚轮 = 滚树，**不换图、不缩放**。树常常比一屏长
+                // （一个包几十层），没有这条就只能靠把窗口拉高。方向与缩略图条同轴
+                // （向下滚 = 往树的下方看），共用 [`wheel_nav_dir`] 翻号。
+                if let Some(tp) = self.tree_at.get() {
+                    if tp.contains(windui::geometry::Point {
+                        x: pos.0 as i32,
+                        y: pos.1 as i32,
+                    }) {
+                        let (acc, dir) = wheel_detent(self.wheel_acc.get(), delta);
+                        self.wheel_acc.set(acc);
+                        if dir != 0 {
+                            let cap = tree::capacity(tp.h, self.tree_truncated.get());
+                            let max = tree::max_first(self.tree_nodes.borrow().len(), cap);
+                            let from = self.tree_first.get();
+                            let next = (from as isize
+                                + wheel_nav_dir(dir) * (if p.mods.shift { 5 } else { 1 }))
+                            .clamp(0, max as isize) as usize;
+                            if self.tree_first.replace(next) != next {
+                                ctx.mark_dirty();
+                            }
+                        }
+                        return true;
+                    }
+                }
                 if self.in_strip_panel(pos) && self.strip_scrollable() {
                     let (acc, dir) = wheel_detent(self.wheel_acc.get(), delta);
                     self.wheel_acc.set(acc);
@@ -2822,6 +3078,37 @@ impl ImageCanvas {
                 // 显隐位一翻就当场标脏——"悬停立即浮现、移开立即收走"只有这一个触发点，
                 // 不接就等于让浮条等别的重绘源（当年的"不流畅"就是这么来的）。
                 if self.chrome_activity(pos) {
+                    ctx.mark_dirty();
+                }
+                // 拖树的滚动指示（m307）：按行程比例走，指针跑到面板外也不会断。
+                if let Some(s) = self.tree_scrub.get() {
+                    let first = tree_scrub_first(&s, pos.1);
+                    if self.tree_first.replace(first) != first {
+                        ctx.mark_dirty();
+                    }
+                    return true;
+                }
+                // 文件树悬停（m300）：只在这一行的归属变了才重绘——树是一屏几十行，
+                // 每次 Move 都标脏会把整窗画面拖进无谓重绘。
+                let th = match self.tree_at.get() {
+                    Some(tp) => {
+                        let inside = tp.contains(windui::geometry::Point {
+                            x: pos.0 as i32,
+                            y: pos.1 as i32,
+                        });
+                        if inside {
+                            let nodes = self.tree_nodes.borrow();
+                            let cap = tree::capacity(tp.h, self.tree_truncated.get());
+                            let first =
+                                self.tree_first.get().min(tree::max_first(nodes.len(), cap));
+                            tree::hit(tp, nodes.len(), first, pos, self.tree_truncated.get())
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
+                if self.tree_hover.replace(th) != th {
                     ctx.mark_dirty();
                 }
                 // 缩略图条悬停高亮：只在这一格的归属变了才重绘。
@@ -2924,6 +3211,7 @@ impl ImageCanvas {
                 let was_strip = self.strip_pressed.replace(None).is_some();
                 let was_dragging_strip = self.strip_drag.replace(None).is_some();
                 let was_scrub = self.strip_scrub.replace(None).is_some();
+                let was_tree_scrub = self.tree_scrub.replace(None).is_some();
                 self.strip_dragged.set(false);
                 let was_pending = self.lmb_pending.replace(None).is_some();
                 let was_drag = self.viewer.borrow().dragging();
@@ -2938,6 +3226,7 @@ impl ImageCanvas {
                     || was_strip
                     || was_dragging_strip
                     || was_scrub
+                    || was_tree_scrub
                     || was_pending
                     || was_drag
                 {
@@ -2978,6 +3267,96 @@ impl ImageCanvas {
                     }
                     ctx.mark_dirty();
                     return true;
+                }
+                // 文件树（m300）：点一行 = 进那一层。命中与绘制共用 `tree_at`
+                // （同一帧几何），所以点得到的一定看得见、看得见的一定点得到。
+                if let Some(tp) = self.tree_at.get() {
+                    let inside = tp.contains(windui::geometry::Point {
+                        x: pos.0 as i32,
+                        y: pos.1 as i32,
+                    });
+                    if inside {
+                        // ★ m307：先判滚动指示——点在条上不是「进那一层」。
+                        let notice = self.tree_truncated.get();
+                        let n = self.tree_nodes.borrow().len();
+                        let cap = tree::capacity(tp.h, notice);
+                        let cur_first = self.tree_first.get().min(tree::max_first(n, cap));
+                        if let Some((track, thumb)) =
+                            tree::scroll_at(tp, cur_first, cap, n, notice, pos)
+                        {
+                            let span = (track.h - thumb.h).max(0) as f32;
+                            let max_first = tree::max_first(n, cap);
+                            let first = if thumb.contains(windui::geometry::Point {
+                                x: pos.0 as i32,
+                                y: pos.1 as i32,
+                            }) {
+                                tree_scrub_first(
+                                    &TreeScrub {
+                                        grab_at: pos.1,
+                                        thumb0: thumb.y as f32,
+                                        span,
+                                        max_first,
+                                    },
+                                    pos.1,
+                                )
+                            } else {
+                                tree_scrub_jump(
+                                    pos.1,
+                                    track.y as f32,
+                                    thumb.h as f32,
+                                    span,
+                                    max_first,
+                                )
+                            };
+                            self.tree_first.set(first);
+                            // 跳转之后滑块换了位置 ⇒ `thumb0` 跟着换，否则再拖会先弹回。
+                            let thumb0 = track.y as f32
+                                + if max_first > 0 && span > 0.0 {
+                                    (first as f32 / max_first as f32) * span
+                                } else {
+                                    0.0
+                                };
+                            self.tree_scrub.set(Some(TreeScrub {
+                                grab_at: pos.1,
+                                thumb0,
+                                span,
+                                max_first,
+                            }));
+                            ctx.mark_dirty();
+                            return true;
+                        }
+                        let (segs, same) = {
+                            let nodes = self.tree_nodes.borrow();
+                            let cap = tree::capacity(tp.h, self.tree_truncated.get());
+                            let first =
+                                self.tree_first.get().min(tree::max_first(nodes.len(), cap));
+                            match tree::hit(tp, nodes.len(), first, pos, self.tree_truncated.get())
+                            {
+                                Some(i) => {
+                                    let s = nodes[i].segs.clone();
+                                    let same =
+                                        self.tree_segs.borrow().as_deref() == Some(s.as_slice());
+                                    (Some(s), same)
+                                }
+                                None => (None, false),
+                            }
+                        };
+                        // 点自己那一层不重开：那是"原地刷新"，只会让画面白闪一下。
+                        if let (Some(segs), false) = (segs, same) {
+                            let src = self
+                                .viewer
+                                .borrow()
+                                .gallery_dir()
+                                .and_then(crate::core::archive::here)
+                                .map(|(s, _)| s);
+                            if let Some(src) = src {
+                                let v = self.viewer.clone();
+                                open_layer_in(&v, &src, &segs);
+                                ctx.mark_dirty();
+                            }
+                        }
+                        return true;
+                    }
                 }
                 if self.chrome_activity(pos) {
                     ctx.mark_dirty();
@@ -3132,6 +3511,12 @@ impl ImageCanvas {
             PointerKind::Up if p.button == MouseButton::Left => {
                 // 没挪够阈值的一击（单击 / 双击序列）：清账，不当拖动看。
                 self.lmb_pending.set(None);
+                // 拖树的滚动指示（m307）：松手即收，绝不当成"点行进层"。
+                if self.tree_scrub.take().is_some() {
+                    self.sync_hand(pos);
+                    ctx.mark_dirty();
+                    return true;
+                }
                 // 拖滚动指示的滑块（m259）：松手即收，绝不当作"点格子"。
                 if self.strip_scrub.take().is_some() {
                     self.strip_pressed.set(None);
@@ -3629,7 +4014,7 @@ fn exec_action(
             let Some(c) = ctx else { return false };
             let v2 = viewer.clone();
             let cfg2 = cfg.clone();
-            let exts = crate::core::gallery::known_exts();
+            let exts = crate::core::archive::pick_exts();
             c.request_pick_file(
                 windui::prelude::PickDialog::new()
                     .title("打开图片")
@@ -3661,6 +4046,18 @@ fn exec_action(
             // 不提示：窗口当场变透，屏幕自己已经说了。
             true
         }
+    }
+}
+
+/// 进压缩包某一层的统一动作：展开 `source` 里 `segs` 指向的那一层再打开。
+///
+/// 入口是**左侧文件树**点一行（m300 撤掉右键「本包 ▸」之后只剩这一处）。
+/// 空层不在这里拦——[`Viewer::open_layer`] 认它（画面空 + 一句提示，树里还能继续往下）。
+/// 展开失败只报错、不清画面：这一步没成，用户还在原处。
+fn open_layer_in(viewer: &Rc<RefCell<Viewer>>, source: &Path, segs: &[String]) {
+    match crate::core::archive::enter(source, segs) {
+        Ok(layer) => viewer.borrow_mut().open_layer(&layer),
+        Err(e) => viewer.borrow_mut().report_error(e),
     }
 }
 
@@ -3760,11 +4157,19 @@ mod tests {
         assert_order(&old, &APPEARANCE_PAGE_KEYS, "m262 旧序模拟");
     }
 
-    /// m275 / m276 / m287：顶层**文件块**的项序。m287 把「排序 ▸」从看图区上移到
+    /// m275 / m276 / m287 / m313：顶层**文件块**的项序。m287 把「排序 ▸」从看图区上移到
     /// 「复制」与「属性」之间 —— 既让「属性」留在块尾（资源管理器里它永远是最后一项），
-    /// 也把"改磁盘上的清单"和"改屏幕上的像素"分成两块。这条钉子钉三件事：
-    /// 排序在文件块里、在「复制」之后、在「属性」之前。
-    const FILE_BLOCK_MENU_KEYS: [&str; 4] = ["\"打开…\"", "\"复制\"", "\"排序\"", "\"属性…\""];
+    /// 也把"改磁盘上的清单"和"改屏幕上的像素"分成两块；m313 把「系统菜单」插在
+    /// 「打开…」正后方（两条都是"拿这个文件当对象"，内容一个归我们、一个归外壳）。
+    /// 这条钉子钉三件事：系统菜单紧跟打开、排序在文件块里、排序在「复制」之后且在
+    /// 「属性」之前。
+    const FILE_BLOCK_MENU_KEYS: [&str; 5] = [
+        "\"打开…\"",
+        "\"系统菜单\"",
+        "\"复制\"",
+        "\"排序\"",
+        "\"属性…\"",
+    ];
 
     /// m275 / m287：顶层**状态开关区**的相对位置。排序搬走后这一块剩三项
     /// （外观 → 幻灯片放映 → 左键拖图），加上块尾的「设置…」共四项要按序出现。
@@ -3829,12 +4234,15 @@ mod tests {
 
     /// 负向臂③（m287）：把「排序 ▸」按 m275 的旧位置放回「左键拖图」之后，文件块那条
     /// 钉子必须当场红 —— 否则这次上移就只是"代码挪了、钉子没跟上"。
+    /// ★ m313 起这份旧布局也要带上「系统菜单」：不然它会先在前一项就红，看着绿、其实
+    ///   没验到"排序位置"这一条（负向臂最容易这么失效）。
     #[test]
     #[should_panic(expected = "右键菜单文件块 里找不到")]
     fn file_block_rejects_the_old_sort_position() {
         let old = [
             "fn context_menu(&self) {",
             "    MenuItem::run(\"打开…\", |_| {}, false);",
+            "    MenuItem::run(\"系统菜单\", |_| {}, false);",
             "    MenuItem::submenu(\"复制\", vec![]);",
             "    MenuItem::run(\"属性…\", |_| {}, false);",
             "    MenuItem::separator();",
@@ -5704,21 +6112,250 @@ fn system_body(h: &Handles) -> Element {
     fn strip_side_decides_which_dimension_is_taken() {
         let c = Rect::new(10, 20, 900, 700);
 
-        let b = work_of(c, filmstrip::Side::Bottom);
+        let b = work_of(c, Some(filmstrip::Side::Bottom), 0);
         assert_eq!((b.x, b.y, b.w), (10, 20, 900), "底条只扣高，宽度原样");
         assert_eq!(b.h, 700 - filmstrip::STRIP_H as i32);
         assert_eq!(b.x + b.w, c.x + c.w);
 
-        let l = work_of(c, filmstrip::Side::Left);
+        let l = work_of(c, Some(filmstrip::Side::Left), 0);
         assert_eq!((l.y, l.h), (20, 700), "左条只扣宽，高度原样");
         assert_eq!(l.x, 10 + filmstrip::STRIP_W as i32, "画面要让出左边一条");
         assert_eq!(l.w, 900 - filmstrip::STRIP_W as i32);
         assert_eq!(l.y + l.h, c.y + c.h);
 
+        // 没有条时原样还回去。
+        let none = work_of(c, None, 0);
+        assert_eq!((none.x, none.y, none.w, none.h), (10, 20, 900, 700));
+
         // 极端窄窗：扣到最后不许出现 0 宽/0 高（除零会造出 NaN 坐标）。
         let tiny = Rect::new(0, 0, 10, 10);
-        assert!(work_of(tiny, filmstrip::Side::Left).w >= 1);
-        assert!(work_of(tiny, filmstrip::Side::Bottom).h >= 1);
+        assert!(work_of(tiny, Some(filmstrip::Side::Left), 0).w >= 1);
+        assert!(work_of(tiny, Some(filmstrip::Side::Bottom), 0).h >= 1);
+        assert!(work_of(tiny, None, 0).w >= 1);
+    }
+
+    /// m300：文件树在**最外侧**，条在它右边。树和条同时开时必须各扣一条、互不重叠
+    /// ——早先两边各自从 `content` 扣一遍，条就会压在树上、而画面被扣掉两条宽。
+    #[test]
+    fn tree_sits_outside_the_strip_and_both_are_taken_out() {
+        let c = Rect::new(10, 20, 900, 700);
+        let tw = 180;
+        let body = strip_area(c, tw);
+        assert_eq!((body.x, body.w), (10 + 180, 900 - 180), "树占最外侧那一条");
+
+        // 条贴左：条在树右边，画面再往右让一条 —— 两条互不重叠。
+        let w = work_of(c, Some(filmstrip::Side::Left), tw);
+        assert_eq!(w.x, 10 + 180 + filmstrip::STRIP_W as i32);
+        assert_eq!(w.w, 900 - 180 - filmstrip::STRIP_W as i32);
+        assert_eq!(w.h, 700, "左条不扣高");
+        assert!(
+            w.x >= body.x + filmstrip::STRIP_W as i32,
+            "条的右缘必须已经越过树"
+        );
+
+        // 条贴底：两者正交，画面只扣宽（树）和高（条）。
+        let w = work_of(c, Some(filmstrip::Side::Bottom), tw);
+        assert_eq!(w.x, 10 + 180);
+        assert_eq!(w.w, 900 - 180);
+        assert_eq!(w.h, 700 - filmstrip::STRIP_H as i32);
+        assert_eq!(w.y, 20);
+
+        // 没有树时逐字节等于 m300 之前的行为。
+        assert_eq!(
+            work_of(c, Some(filmstrip::Side::Left), 0),
+            filmstrip_work_of_old(c, filmstrip::Side::Left)
+        );
+    }
+
+    /// 树必须整体待在画面左缘之外：它和画面、缩略图条三者不许有任何一个像素重叠。
+    /// 这条是 m300 布局的负向臂——早先两边各自从 `content` 扣一遍时，条会压到树上。
+    #[test]
+    fn the_tree_panel_never_overlaps_the_view_or_the_strip() {
+        let c = Rect::new(0, 0, 900, 700);
+        let tw = 180;
+        let p = tree::panel(c, tw as f32);
+        let area = strip_area(c, tw);
+        assert_eq!(p.right(), area.x, "树的右缘正好是「条 + 画面」那条的起点");
+        let w = work_of(c, Some(filmstrip::Side::Left), tw);
+        assert!(p.right() <= w.x, "树必须整体在画面左缘之外");
+        // 底条时画面起点紧贴树右缘（正交，不额外让宽）。
+        let wb = work_of(c, Some(filmstrip::Side::Bottom), tw);
+        assert_eq!(wb.x, p.right());
+    }
+
+    /// m300：树上的按下必须被树**吞掉**——不进拖窗口、不进拖图、也不碰缩略图条。
+    /// 几何由测试自己摆（与 `strip_items` 那套同款：`paint` 只负责写，命中读同一份）。
+    #[test]
+    fn a_click_on_the_tree_never_becomes_a_canvas_gesture() {
+        use windui::event::{MouseButton, PointerEvent, PointerKind};
+        use windui::geometry::Point;
+
+        let mut canvas = strip_canvas();
+        // 没有清单时 `gallery_dir()` 是 None ⇒ 点了也不会真去换层（`src` 取不到），
+        // 正好单测"吞事件"这一半。
+        *canvas.tree_nodes.borrow_mut() = (0..4)
+            .map(|i| crate::core::archive::TreeNode {
+                segs: if i == 0 {
+                    Vec::new()
+                } else {
+                    vec![format!("n{i}")]
+                },
+                label: format!("n{i}"),
+                dir: true,
+                depth: i,
+                images: i,
+            })
+            .collect();
+        let panel = tree::panel(Rect::new(0, 0, 800, 600), tree::TREE_W);
+        canvas.tree_at.set(Some(panel));
+
+        let r = tree::row_rect(panel, 2);
+        let at = Point::new(r.x + 30, r.y + 10);
+        let down = Event::Pointer(PointerEvent::single(
+            PointerKind::Down,
+            at,
+            MouseButton::Left,
+        ));
+        // ★ 判据是 `on_event` 的**返回值**（已消费），不是 `DispatchResult::repaint`：
+        // 点自己那一层刻意不重开（见 `same` 那句），所以这一下可以什么都不脏——
+        // 拿 repaint 当"吞掉了"会把这个正确的行为判成 bug（本条单测第一版就是这么红的）。
+        let eaten = std::cell::Cell::new(false);
+        let feed = |c: &mut ImageCanvas, e: &Event| -> bool {
+            windui::testing::run_with_ctx(|ctx| {
+                eaten.set(c.on_event(ctx, e));
+            });
+            eaten.get()
+        };
+        assert!(feed(&mut canvas, &down), "树上的按下必须被吞掉");
+        assert_eq!(canvas.strip_pressed.get(), None, "不许顺带按下某一格缩略图");
+        assert!(!canvas.nav_drag.get(), "不许把树上的按下当成鸟瞰拖动");
+
+        // 反向臂：同一点、树没开（`tree_at` 为 None）时必须落成**画面手势**。
+        // 少了这一臂，"被吞掉"可能只是被别处顺手吃了（比如那块地正好压在某个
+        // 热区上），本条就测不到树——它只会一直绿着。
+        let mut bare = strip_canvas();
+        *bare.tree_nodes.borrow_mut() = canvas.tree_nodes.borrow().clone();
+        bare.tree_at.set(None);
+        assert!(feed(&mut bare, &down), "没有树时这一击也该被画面接手");
+        let acted = bare.lmb_pending.get().is_some()
+            || bare.viewer.borrow().dragging()
+            || bare.strip_pressed.get().is_some()
+            || bare.nav_drag.get();
+        assert!(acted, "树没开时同一点必须落成画面手势（树外不许被白吞）");
+        assert_eq!(canvas.lmb_pending.get(), None, "树的点击不许留下待定拖窗位");
+    }
+
+    /// ★ m312：锁定 = **整窗**封锁，文件树与缩略图条必须一起停摆。
+    ///
+    /// 改前这条判据散在各分支里：滚轮一处、缩略图条一处、右键几处，**树漏了**——
+    /// 锁住窗口点树上的某一行照样换层；条那一格虽然拦住了点击，悬停高亮却还亮着，
+    /// 看着照样像能点（用户实报「锁住窗口的时候，目录和缩略图好像没有一起锁住」）。
+    #[test]
+    fn locked_window_swallows_the_tree_and_the_strip_too() {
+        use windui::event::{MouseButton, PointerEvent, PointerKind};
+        use windui::geometry::Point;
+
+        let mut canvas = strip_canvas();
+        *canvas.tree_nodes.borrow_mut() = (0..4)
+            .map(|i| crate::core::archive::TreeNode {
+                segs: if i == 0 {
+                    Vec::new()
+                } else {
+                    vec![format!("n{i}")]
+                },
+                label: format!("n{i}"),
+                dir: true,
+                depth: i,
+                images: i,
+            })
+            .collect();
+        let panel = tree::panel(Rect::new(0, 0, 800, 600), tree::TREE_W);
+        canvas.tree_at.set(Some(panel));
+        let r = tree::row_rect(panel, 2);
+        let at = Point::new(r.x + 30, r.y + 10);
+
+        let eaten = std::cell::Cell::new(false);
+        let feed = |c: &mut ImageCanvas, e: &Event| -> bool {
+            windui::testing::run_with_ctx(|ctx| {
+                eaten.set(c.on_event(ctx, e));
+            });
+            eaten.get()
+        };
+        let ev = |kind, at| Event::Pointer(PointerEvent::single(kind, at, MouseButton::Left));
+
+        // 负向臂（**先做**）：解锁时同一点要能亮起悬停——证明它真落在树行上，
+        // 否则下面那些"没亮"可能只是这个夹具压根没命中树，整条用例在空转。
+        assert!(feed(&mut canvas, &ev(PointerKind::Move, at)));
+        assert_eq!(canvas.tree_hover.get(), Some(2), "夹具没落在第 2 行上");
+
+        canvas.chrome.locked.set(true);
+
+        // ① 移动：吞掉，并且**不许**在树上留悬停（锁着的窗口看着像还能点）。
+        assert!(feed(&mut canvas, &ev(PointerKind::Move, at)));
+        assert_eq!(canvas.tree_hover.get(), None, "锁定后树上还留着悬停高亮");
+
+        // ② 条那一格同理：先把悬停点亮，锁着再划过来必须被清掉。
+        canvas.strip_hover.set(Some(1));
+        assert!(feed(&mut canvas, &ev(PointerKind::Move, at)));
+        assert_eq!(canvas.strip_hover.get(), None, "锁定后条上还留着悬停高亮");
+
+        // ③ 按下：吞掉，且不许起任何画面手势 / 拖树状态。
+        assert!(feed(&mut canvas, &ev(PointerKind::Down, at)));
+        assert_eq!(
+            canvas.lmb_pending.get(),
+            None,
+            "锁定后按下不许起拖动/双击那套"
+        );
+        assert_eq!(
+            canvas.strip_pressed.get(),
+            None,
+            "锁定后不许按下某一格缩略图"
+        );
+        assert!(!canvas.nav_drag.get(), "锁定后不许把按下当成鸟瞰拖动");
+        assert!(
+            canvas.tree_scrub.get().is_none(),
+            "锁定后不许进入拖树滚动条的状态"
+        );
+
+        // ④ 解锁钮必须照常放行——吞成铁板的话，锁了就永远出不来。
+        //   位置从 `chrome_hit` 自己扫出来，不手抄几何：锁定时它只认这一颗，
+        //   扫得到也顺带证明"别的钮都不可命中"这条前提还成立。
+        let lock_at = (0..800)
+            .find_map(|x| {
+                let q = (x as f32 + 0.5, 12.0);
+                (canvas.chrome_hit(q) == Some(Press::TitleBtn(TitleBtn::Lock))).then_some(q)
+            })
+            .expect("锁定时标题栏里该有且只有锁钮可命中");
+        assert!(feed(
+            &mut canvas,
+            &ev(
+                PointerKind::Down,
+                Point::new(lock_at.0 as i32, lock_at.1 as i32)
+            )
+        ));
+        assert_eq!(
+            canvas.chrome.pressed_title_btn.get(),
+            Some(TitleBtn::Lock),
+            "解锁钮被那道闸一起吞了：锁死出不来"
+        );
+    }
+
+    /// m300 之前的算式原样抄一份：树宽为 0 时新实现必须与它完全一致。
+    fn filmstrip_work_of_old(content: Rect, side: filmstrip::Side) -> Rect {
+        match side {
+            filmstrip::Side::Bottom => Rect::new(
+                content.x,
+                content.y,
+                content.w,
+                (content.h as f32 - filmstrip::STRIP_H).max(1.0) as i32,
+            ),
+            filmstrip::Side::Left => Rect::new(
+                content.x + filmstrip::STRIP_W as i32,
+                content.y,
+                (content.w as f32 - filmstrip::STRIP_W).max(1.0) as i32,
+                content.h,
+            ),
+        }
     }
 
     /// 缩略图格里的任何一点都不许被当成工具栏按钮——条开着时命中区下沉 96px

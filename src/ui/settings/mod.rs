@@ -1073,7 +1073,7 @@ pub(crate) fn settings_window(config: &Rc<RefCell<Config>>, hub: &Hub) -> Window
                 return Element::label("设置已关闭");
             };
             let pages = [
-                options_page(&h),
+                options_page(&h, config.clone()),
                 shortcuts_page(&h, config.clone(), capturing, texts),
                 decoders_page(&h, config.clone()),
                 extensions_page(&config, &h),
@@ -1399,7 +1399,7 @@ pub(crate) mod tests {
         let h = test_handles();
         let (capturing, texts) = shortcuts_ui();
         let pages: Vec<Element> = vec![
-            options_page(&h),
+            options_page(&h, config.clone()),
             shortcuts_page(&h, config.clone(), capturing, texts),
             decoders_page(&h, config.clone()),
             extensions_page(&config, &h),
@@ -1466,7 +1466,8 @@ pub(crate) mod tests {
         use windui::text::NullTextEngine;
 
         let h = test_handles();
-        let ui = options_page(&h).fill();
+        let cfg = Rc::new(RefCell::new(Config::default()));
+        let ui = options_page(&h, cfg).fill();
         let mut tree = Tree::new();
         let root = ui.build(&mut tree);
         tree.root = Some(root);

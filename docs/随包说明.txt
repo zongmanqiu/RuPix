@@ -1,0 +1,39 @@
+RuPix {{VERSION}} - Windows x64
+==============================
+
+免安装：把整个文件夹解压到任意位置，双击 rupix.exe 即可。
+仅 Windows x64；配置文件 rupix.ini 会在首次运行时生成在 exe 同级目录。
+
+目录说明
+  rupix.exe                        主程序
+  LICENSE                          AGPL-3.0 许可全文
+  THIRD-PARTY-NOTICES.md           第三方组件声明
+
+首次使用
+  本包只包含主程序：开箱可直接查看 SVG / SVGZ 矢量图。
+  其它格式需要解码器：打开「设置 > 解码器 > 可下载」，点「刷新」取得清单，
+  再按需安装。插件同理，在「设置 > 插件」页下载。
+  下载的内容都放在 exe 同级目录，拷走整个文件夹即可一起带走。
+  已有旧版本的用户也可以在「关于」页点「检查更新」直接升级。
+
+常用操作
+  打开图片    拖进窗口、右键「打开...」，或先在
+              「设置 > 选项 > 系统 > 文件关联」勾选后缀后双击
+  空格看图    托盘常驻时，在文件管理器选中图片按空格
+  翻页/缩放   方向键、滚轮、W/A/S/D 平移
+  右键菜单    打开 / 系统菜单 / 复制 / 排序 / 属性 / 本图 / 插件 / 外观 / 幻灯片放映 / 设置
+  系统菜单    右键「系统菜单」弹的是资源管理器对着这个文件右键的那一份，
+              打开方式 / 发送到 / 压缩 / 扫描这些由系统与其它程序提供
+  卸载        删除本文件夹即可；文件关联可在 Windows「默认应用」里改回
+
+源码与反馈
+  本程序按 AGPL-3.0 授权，许可全文见同目录 LICENSE。对应源码：
+    Gitee      https://gitee.com/qiuzongman/RuPix
+    GitHub     https://github.com/zongmanqiu/RuPix
+  本版源码
+    Gitee      https://gitee.com/qiuzongman/RuPix/releases/tag/{{VERSION}}
+    GitHub     https://github.com/zongmanqiu/RuPix/tree/{{VERSION}}
+  解码器源码   https://gitee.com/qiuzongman/RuPix-Decoders
+  插件源码     https://gitee.com/qiuzongman/RuPix-Plugins
+  问题反馈     上述任一仓库的 Issue
+  更新记录     源码仓的 HISTORY.md

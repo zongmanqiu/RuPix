@@ -94,6 +94,33 @@ flate2 = "1"
 # ZIP decoder package: download ZIP, verify/extract DLL + versioned license folder.
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 
+# ── 压缩包容器（m297）：一种容器一个库，全部**编进 exe**，不随包 DLL ──
+# ★ 为什么不是 DLL：容器解析要的是「列条目 + 按条取字节」，与解码器 ABI
+#   （「给字节 → 出像素」）不是一个东西。走 DLL 得另开一条清单/下载/自更新线。
+#   这四个库合计约 620 KB，离线可用，也省掉一层版本核对。
+# ★ 为什么不能"只留一种算法"：压缩方法是**逐条目**记录的。一个 zip 里可以混
+#   Stored + Deflated + BZip2；一个 7z 的每个 folder 有自己的 coder chain；tar
+#   自身零算法，压缩在外层 .gz/.xz/.bz2/.zst。少一种就是"打开十个包七个报错"。
+#   所以这里一律**全算法**，不做裁剪。
+# ★ 三个必须知道的行为差异（决定了 `walk` 要写成顺序遍历）：
+#   1. zip 有中央目录，可按索引随机读；
+#   2. 7z 常见 `Solid = +` 单块，读**任意一条**都要从块头解（实测 91 MB 包
+#      1.84 s/条）；所以只能顺序走一遍，收齐即停；
+#   3. **tar 没有中央目录**，要列目录必须从头扫到尾，1 GB 的 tar.gz 就是全解一遍。
+sevenz-rust2 = "0.25"
+# unrar 是 vendored C++（官方 UnRAR 源码）。许可允许**解压**免费无限制，只禁止
+# 拿它做 RAR 压缩器；分发时须在许可文档里带那段原文（见 THIRD-PARTY-NOTICES）。
+# ★ 它在 Windows 上自身没声明 advapi32（GetRarDataPath 用了注册表），由 build.rs 补。
+unrar = "0.5"
+tar = "0.4"
+# 与 sevenz-rust2 的 bzip2 feature 同版本 ⇒ Cargo 只编一份，不会两份并存的浪费。
+bzip2 = "0.6"
+ruzstd = "0.9"
+# ★ 不引 `lzma-rs`：它只给 `xz_decompress(&mut BufRead, &mut Write)`，得把整个
+#   .tar.xz 解进内存（1 GB 的包直接爆）。`lzma-rust2` 是 sevenz-rust2 的既有依赖，
+#   自带**流式** `XzReader`，复用它比另引一个库更小也更快——这正是"一起编译省体积"。
+lzma-rust2 = "0.25"
+
 # ── 解码器 ABI 契约（宿主侧快照）──
 # 真源在解码器仓的 abi crate（另一个仓、独立 workspace，本仓构建时看不见它）。
 # 这里是一份逐字节副本；同步唯一动作 = 把上游 abi/src/lib.rs 整份复制覆盖本目录的 src/lib.rs
@@ -174,6 +201,12 @@ windows = { version = "0.62", features = [
     # 一个"取一份 JSON"的 GET；WinHTTP 是服务型 API，无缓存副作用，且 HTTPS 开箱可用。
     "Win32_Networking_WinHttp",
 ] }
+
+# UserChoice 哈希（m247）：Windows 默认打开方式的防篡改哈希 = MD5(data) → 私有混合
+# sub1/sub2 → XOR → base64。纯计算、无平台调用，但只在 association.rs（Windows 注册
+# 表路径）使用；md-5 与 base64 都是纯 Rust 静态链接，不增加任何 DLL 依赖。
+md-5 = "0.10"
+base64 = "0.23"
 
 # ── 体积优先的发布配置（照抄 CurSeen 的实测结论）──
 # ★ `lto` 这里是 **false**，不是笔误：见下面"例外"那段——`lto = true` 会让

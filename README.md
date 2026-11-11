@@ -2,8 +2,8 @@
 
 **[⬇️ 下载 0.2.0 (Gitee)](https://gitee.com/qiuzongman/RuPix/releases/download/0.2.0/RuPix_0.2.0.zip)**
  ｜ **[⬇️ 下载 0.2.0 (GitHub)](https://github.com/zongmanqiu/RuPix/releases/download/0.2.0/RuPix_0.2.0.zip)**
- ｜ [Gitee主仓](https://gitee.com/qiuzongman/RuPix)
- ｜ [GitHub镜像](https://github.com/zongmanqiu/RuPix)
+
+> 宿主仓库（本仓）: [Gitee](https://gitee.com/qiuzongman/RuPix) | [GitHub](https://github.com/zongmanqiu/RuPix)
 
 > 解码器仓库: [Gitee](https://gitee.com/qiuzongman/RuPix-Decoders) | [GitHub](https://github.com/zongmanqiu/RuPix-Decoders)
 
@@ -37,6 +37,7 @@ Windows 10/11 上的小巧极速看图器。**宿主只做「看图」，位图�
 ## 功能速览
 
 - 窗口：无边框，四缘/四角都可拖动缩放（悬停时光标变成双箭头）/ Aero 吸附；顶部拖动区 + 文件名 + 置顶📌/锁住🔒/最小化/最大化/关闭；条上右键弹系统菜单
+- **压缩包直接看图**：`.zip` / `.cbz`、`.7z`、`.rar` / `.cbr`、`.tar` 与 `.tar.gz` / `.tgz` / `.tar.xz` / `.tar.bz2` / `.tar.zst`。打开哪个包就只看它**根下那一层**的图；包里有哪些层由画面最外侧的**文件树**一次列全（目录与子包都算），当前层高亮、每层标着直接几张图，点一行就进那一层。开着缩略图条时树在条的左边。建树只读条目名，不解图片；7z 的固实包首次扫一遍要一两秒（同一层再进是即时的），tar 因为**没有中央目录**，列目录就等于从头扫一遍
 - **窗口尺寸三档**（选项 → 窗口 → 启动窗口，ini 键 `init_window`）：**固定尺寸**（按 `window_w × window_h` 开窗）、**全屏**（铺满当前显示器）、**图片尺寸**（窗口客户区跟着当前这张图走——启动、翻页、目录跳转都跟，图多大窗多大；超出工作区时等比缩进，小于 100×100 时放大到最短边 100）。前两档里图片**总是适应窗口**（小图也放大铺满，与主流看图器一致），第三档则是 1:1 原始像素。设置里那格「窗口尺寸 (宽, 高)」**只在固定尺寸档可用**，另外两档下是灰的（全屏由显示器定、图片尺寸由图片定，填了也不生效）
 - **无边框形态**（选项 → 窗口 → 无边框，ini 键 `borderless`）：与上面那条**正交**——任意尺寸档都能开。开启后标题栏 / 操作按钮 / 信息条 / 缩略图条 / 底色**全部不画**，只留画面本身，**图片的透明区直接透出桌面**；四周**一条边框线都没有**（连 Win11 由 DWM 画在窗口最外一圈像素之内的那 1px 边框也按 `DWMWA_BORDER_COLOR` 关掉，补丁 029）。这个形态没有标题栏，所以**整块画面都可以拖着搬窗口**（图放大到溢出窗口时，画面那一拖改成平移图片，缩回适应即恢复）；右键菜单、快捷键、拖动、缩放、置顶、锁定全都照常——鼠标仍只与本窗交互，不穿透到背后
 - **空格看图**：资源管理器里选中文件按空格，直接盖出一张无边框预览（再按空格或 Esc 收起），**不接受任何操作**。预览尺寸与上面的「启动窗口」三档同源——**全屏**铺满整块显示器、**固定尺寸**用主窗那块客户区（`window_w × window_h` 扣掉系统边框，按 DPI 换算）、**图片尺寸**则是原图 1:1（超出屏幕才缩）。前两档里图片**适应这个框**（小图放大、大图缩小）并居中，第三档按原始像素
@@ -118,7 +119,10 @@ RuPix\                  ← 工作区根（宿主文档只画宿主这一侧）
 | memmap2 0.9 | 解码器文件 mmap（免 12MB 级堆拷贝，失败回退 fs::read） |
 | png 0.18.1 | 「复制当前」= RGBA → PNG 编码后进剪贴板 |
 | flate2 1 | svgz 的 gzip 解压（windui 的 resvg 没开 svgz feature，而清单与路由都登记了 svgz ⇒ 解压由宿主自己做） |
-| zip 8（`default-features = false`，只开 `deflate-flate2`） | 解码器 / 插件下载包的校验与解包（宿主只读得动 ZIP/deflate） |
+| zip 8（`default-features = false`，只开 `deflate-flate2`） | 解码器 / 插件下载包的校验与解包；以及看图时打开 `.zip` / `.cbz` |
+| sevenz-rust2 0.25 + lzma-rust2 0.25 | 打开 `.7z`（LZMA / LZMA2 / BCJ / PPMd / bzip2 / Deflate / AES **全算法，不裁剪**）；`lzma-rust2` 同时提供 `.tar.xz` 的**流式**解码 |
+| unrar 0.5（vendored UnRAR C++） | 打开 `.rar` / `.cbr`。**只解不压**——许可允许解压、只禁止做 RAR 压缩器，原文见 `THIRD-PARTY-NOTICES.md` §四.6 |
+| tar 0.4 + bzip2 0.6 + ruzstd 0.9 | 打开 `.tar` / `.tar.gz` / `.tar.bz2` / `.tar.zst`（tar 自身不含压缩，压缩层在外）；`bzip2` 与 7z 的 bzip2 coder 共用同一份 |
 | rupix-abi（path 依赖 `vendor/rupix-abi`） | 解码器 C-ABI 契约的宿主侧逐字节快照（契约正本在解码器仓库内部） |
 | log 0.4 + env_logger 0.11（`default-features = false`：regex / humantime / auto-color 全关） | 日志；时刻自己拼、着色器关掉（ANSI 码进日志文件是噪音） |
 | cc 1（build 依赖） | 编译 `seh_shim.c`（C SEH 隔离层，`static_crt`） |
@@ -173,6 +177,7 @@ RuPix\                  ← 工作区根（宿主文档只画宿主这一侧）
 | 写一个插件 | [`docs/扩展体系.md`](docs/扩展体系.md)（宿主侧契约）；插件源码与《插件开发规范》在插件侧仓库自己维护 |
 | 格式 ↔ 解码库 ↔ 后缀名对照 | 解码器侧仓库自己的档位 README 与发布清单（清单真源）；宿主只记录"动态并集"这条规则，见 [`docs/图片格式与后缀名.md`](docs/图片格式与后缀名.md) |
 | 当前还剩什么要做（唯一清单） | [`docs/待办.md`](docs/待办.md) |
+| 让 AI 客户端接入 RuPix、换一个 AI 来验收 | [`docs/MCP接入指南.md`](docs/MCP接入指南.md)（随包同名；适配器是仓外独立组件，不在发行包内） |
 | 产品定位、职责边界、轻量定义、明确不做（战略宪章） | [`docs/产品定位与边界.md`](docs/产品定位与边界.md) |
 | 每个目录放什么、为什么 | [`目录结构说明.md`](目录结构说明.md) |
 | 改代码的流程、改动 → 文档同步对照 | [`开发指南.md`](开发指南.md) |
@@ -195,7 +200,16 @@ RuPix\                  ← 工作区根（宿主文档只画宿主这一侧）
 | `--safe-mode` | 一键不加载任何解码器（解码器崩溃/卡死的最后止损） |
 | `--probe-decode <文件>` | 隐藏探针：不经 UI 直接解码并打印结果后退出；失败或缺文件以非 0 退出码结束 |
 | `--bench-thumb <文件> [次数]` | 隐藏基准：缩略图两条解码腿在生产链路上配对计时，逐次台账打到 stdout；`RUPIX_BENCH_REVERSE=1` 翻转臂序 |
+| `--list <目录>` | 无头命令面：一行 JSON 回「这个目录 RuPix 认哪些图」，与翻页清单同源；不建窗 |
+| `--metadata <文件>` | 无头命令面：一行 JSON 回大小 / 时间 / 后缀与 EXIF 六行；**不解码** |
+| `--thumbnail <文件>` | 无头命令面：一行 JSON 回 240×180 缩略图的 PNG（base64 内联） |
+| `--render <文件> [宽 高]` | 无头命令面：一行 JSON 回解码像素的 PNG（base64 内联）、原图尺寸与帧数；缺宽高按原尺寸 |
 | 其他 `--` 开头的参数 | 警告后忽略 |
+
+> 四个无头动词与 GUI 共用同一条解码链，stdout **恰好一行 JSON**（日志只落盘），
+> 退出码 `0` 成功 / `2` 参数错 / `3` 失败 / `4` 上限拒绝，与响应里的 `code` 字段同值。
+> 发布版是 GUI 子系统，调用方需重定向 stdout 才能取到那一行；它们不建窗、不进单实例闸门、
+> 不常驻也不监听端口，供进程外适配器（如 MCP server）转调。
 
 | 环境变量 | 说明 |
 | --- | --- |

@@ -3715,3 +3715,53 @@ fn moving_the_strip_replans_and_drops_stale_cached_pages() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// m304：压缩包层里有跳过项时状态格必须说出来；为 0 时不许多一个字，
+/// 基础信息也不许被这句替换掉。
+#[test]
+fn status_reports_skipped_archive_entries_without_replacing_basics() {
+    let mut v = viewer_with_image();
+    v.archive_skipped = 0;
+    let plain = v.status();
+    assert!(!plain.contains("不支持"), "没有跳过项时不许多一段文案");
+    v.archive_skipped = 3;
+    let s = v.status();
+    assert!(s.contains("另有 3 项不支持"), "{s}");
+    // 负向臂：基础串必须原样保留在前面（后缀只许追加，不许顶替）。
+    assert!(s.starts_with(&plain), "{s}");
+}
+
+#[test]
+fn empty_layer_hint_points_at_the_tree_not_the_removed_menu() {
+    // ★ m312：旧文案写「右键「本包」进入子层」，可那个二级菜单 m300 就撤了、换成
+    //   左侧文件树——用户看到的是一句**根本走不通的指令**（实报「居然还存在…这种
+    //   旧提示」）。这里既钉文案，也钉"只有真有子层时才指路"。
+    let dir = std::env::temp_dir().join(format!("rupix_m312_empty_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut v = viewer_with_image();
+
+    // 有子层的空层：指路。
+    std::fs::write(dir.join("subs.tsv"), "#images 0\n#skipped 0\nd\tsub\tch1\n").unwrap();
+    let layer = crate::core::archive::Layer {
+        dir: dir.clone(),
+        images: 0,
+        from_archive: true,
+        skipped: 0,
+    };
+    v.open_layer(&layer);
+    let msg = v.error.clone().unwrap_or_default();
+    assert!(msg.contains("左侧文件树"), "空层提示没指路：{msg}");
+    // 负向臂：撤掉的入口名一个字都不许回来。
+    assert!(
+        !msg.contains("本包"),
+        "又指回 m300 撤掉的「本包 ▸」了：{msg}"
+    );
+    assert!(!msg.contains("右键"), "空层还让人右键找入口：{msg}");
+
+    // 负向臂二：**没有**子层时只报事实。给一句走不通的指令比不给更糟。
+    std::fs::write(dir.join("subs.tsv"), "#images 0\n#skipped 0\n").unwrap();
+    v.open_layer(&layer);
+    assert_eq!(v.error.as_deref(), Some("这一层没有图片"));
+
+    std::fs::remove_dir_all(&dir).ok();
+}

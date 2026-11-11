@@ -11,7 +11,7 @@
 | 步 | 脚本 | 干什么 | 失败行为 |
 |---|---|---|---|
 | ① | `1_check_env.bat` | 只读工具链体检：cargo/rustc host 必须 msvc；python/powershell 必须在；`.3rd\wind-ui-rust-0.23.0` 缺失 = ERROR（本地 path 依赖，无下载步可修复）；解码器 workspace 缺失 = ERROR。`.3rd\usvg-0.48.1` 缺失 = ERROR（`Cargo.toml` 的 `[patch.crates-io]` 那一份，同样没有下载步可修复） | ERROR → exit 1 |
-| ② | `2_scan.bat` | **六道静态门禁**，按 `[1/6]`…`[6/6]` 逐道打点：`layering_scan.py`（五层方向 + 各层禁引 crate + decoders/extensions 禁互引）→ `hygiene_scan.py`（13 查，见下）→ `cargo fmt --check` → `cargo clippy --all-targets --release -- -D warnings` → `structure_gen.py --check`（结构文档的数字与符号索引必须等于 `src/` 现状）→ `dump_sym.py --selftest`（崩溃取证解析器自己的断言：发布名 → CodeView pdb 名、报告解析）。违规即红。★ 三条判据的牙齿各在何处：fmt 与 clippy 要的是 exit 0，而 **clippy 不带 `-D warnings` 时有 warning 照样退 0**（那就是假绿，见 K69）；结构文档这一步只读，漂移的正解是 `--write` 重生成、**不是手改数字**（手工计数漂过一截，所以这六道里它是唯一由生成器写文档的门）；`dump_sym.py --selftest` 不需要符号归档与崩溃夹具，一秒内跑完，为的是"最后一环的工具不能只靠信任" | exit 1 |
+| ② | `2_scan.bat` | **七道静态门禁**，按 `[1/7]`…`[7/7]` 逐道打点：`layering_scan.py`（五层方向 + 各层禁引 crate + decoders/extensions 禁互引）→ `hygiene_scan.py`（15 查，见下）→ `cargo fmt --check` → `cargo clippy --all-targets --release -- -D warnings` → `structure_gen.py --check`（结构文档的数字与符号索引必须等于 `src/` 现状）→ `dump_sym.py --selftest`（崩溃取证解析器自己的断言：发布名 → CodeView pdb 名、报告解析）→ **注释断链**（`cargo doc -D rustdoc::broken_intra_doc_links`，m282 补——前六道都只读代码、不读 doc comment，54 处断链因此长期无人发现）。违规即红。★ 三条判据的牙齿各在何处：fmt 与 clippy 要的是 exit 0，而 **clippy 不带 `-D warnings` 时有 warning 照样退 0**（那就是假绿，见 K69）；结构文档这一步只读，漂移的正解是 `--write` 重生成、**不是手改数字**（手工计数漂过一截，所以这七道里它是唯一由生成器写文档的门）；`dump_sym.py --selftest` 不需要符号归档与崩溃夹具，一秒内跑完，为的是"最后一环的工具不能只靠信任" | exit 1 |
 | ③ | `3_build_ext.bat` | 调解码器仓库自己的 `build.ps1`：**fmt 检查** + 编译 + 测试 + 发布 DLL 到 `<项目>\.temp\decoder-dist\`（并同步 `.build\decoders`）（格式或测试失败不发布） | exit 1 |
 | ④ | `4_build.bat` | `cd main` + `CARGO_INCREMENTAL=0` + `cargo build --release`；不拷贝任何东西 | exit 1 |
 | ⑤ | `5_test.bat` | **真门禁**两层：`cargo test --release`（集成，含 docs_consistency）→ `--lib`（单元）；均 `--test-threads=1`（杀软锁新链接二进制会假死） | 任一层失败 → exit 1 |
@@ -44,7 +44,7 @@ python build/hygiene_scan.py  [--json|--selftest]   # 十三查，逐类见下�
     解码器也不调用扩展。
   - 禁引检查覆盖 `use X::` 与**裸路径** `X::`（注释行豁免）——裸路径那一路是对 CurSeen 的补强：
     正文里直接写 `windui::…::svg_warm_fonts` 而不带 use 语句的形态，use-only 扫描抓不到。
-- **卫生十三查**（`hygiene_scan.py` 的 `CATEGORIES`，按它的固定顺序；打印与 `--json` 都按这十三档分别报数）：
+- **卫生十四查**（`hygiene_scan.py` 的 `CATEGORIES`，按它的固定顺序；打印与 `--json` 都按这十四档分别报数）：
 
 | # | 分类名 | 判据 | 扫描域 |
 |---|---|---|---|
@@ -61,6 +61,8 @@ python build/hygiene_scan.py  [--json|--selftest]   # 十三查，逐类见下�
 | 11 | `ui_super_path` | ui 层内跨模块引用一律经 `super::`，禁 `crate::ui::`（中枢在 `ui/mod.rs`） | `src/ui/**` |
 | 12 | `secret` | 无密钥 / 无隐私：私钥块、访问令牌、URL 内嵌凭据、口令字面量、私人邮箱、含真名的本机路径 | `main/**` |
 | 13 | `single_window_key` | 单例窗不许同一个键既 `close_window` 又 `single`（关窗是投递、开窗是即时，K196） | `src/ui/**` |
+| 14 | `footer_buttons` | 自绘对话框的按钮只许走 `settings::rows::btn` / `dialog_footer::action`，`Element::button(` 不许散落（版式正本 `docs/界面版式规范.md`，2026-11-06） | `src/ui/**` |
+| 15 | `settings_include` | `config.rs` 的 M4 用例（`ui_touchpoints_cover_all_keys`）里 `include_str!` 的 `../ui/settings/` 条目集 = 磁盘 `src/ui/settings/*.rs` 全集，双向判等（`include_str!` 不支持通配，漏列的那一页若恰好没有 ini 键写点注释，M4 用例永远查不到——`decoders.rs` 曾静默漏过；E3 下沉，2026-11-10） | `src/core/config.rs` + `src/ui/settings/` |
 
   豁免（第十三查以外的通用形状）：`#[cfg(test)]` 之后按测试桩处理（整篇是测试模块的 `tests.rs` 文件
   也算），**生产代码在前、`mod tests` 在文件末尾**是硬性惯例；`src/main.rs` 对 stdout 打印有唯一豁免
@@ -123,6 +125,7 @@ python build/gate.py run all
 | `pill_probe.ps1` | 底部浮条"在闪"到底是**整条显隐**还是**宽度随状态文本抖**：逐帧取那一行五个点的 ARGB |
 | `key_dispatch_probe.ps1` | 一次按下的字符键触发几个动作：黑白交替、帧延迟 300 s 的 GIF 当夹具，配合 `RUST_LOG=trace` 分辨 WM_KEYDOWN 与 WM_CHAR 双派发 |
 | `probe_tray_clear.ps1` | "关进托盘再唤醒 → 旧图必须已经清空"：唤醒不带文件应当是空窗（截图小）、带文件应当有图（截图大），且工作集与线程数不随轮次上涨 |
+| `shell_menu_probe.ps1` | 右键「系统菜单」是不是**真转到 explorer 了**：按 `#32768` 找到原生菜单窗、按它自己的矩形抓屏看项名，再用真鼠标点「复制文件地址」，**剪贴板等于原路径**才算 `InvokeCommand` 的 id→verb 映射没歪（`-RowY` / `-SubY` / `-VerbY` 三段） |
 | `multi_window_probe.ps1` | 多开是"每次启动一扇新窗"还是"就地换图"：私有根连开 N 次，数本进程顶层窗 + 读日志里上屏的文件 |
 | `dll_serial_probe.ps1` | 两（三）扇窗迎面翻同一批图，`[dll-serial]` 记每笔的 `wait`/`run`；`-CloseMidway` 在解码在飞时关掉一扇，`-HoldSec` 让进程在驱动之后再活 N 秒（跨过看门狗 10 s 首报阈值，才验得了"没有假告警"）。`-Arm idle` = 第二扇窗只开不驱动（**用户真实场景**：一窗翻页、另一窗只是开着并在后台预取）；`-Prefetch 0/1` 开关邻图预读（默认 0 保持 m229/m230 的臂可复跑，要测真实体验必须给 1）；`-Bin` 指定被测二进制做 A/B（旧名 `-Exe` 会被脚本里的 `$exe` 顶掉，PS 变量名不分大小写） |
 | `dll_serial_analyze.py` | 上一条的判据：持锁区间零重叠、等待上界随窗口数缩放、跨解码器重叠是**并行**的正面证据；退出码 0/1/2（2 = 没测到争用 ⇒ 结论不成立） |

@@ -28,6 +28,8 @@
 //! | `sort_by`         | 清单排序维度：0 文件名 / 1 大小 / 2 创建日期 / 3 修改日期 | `0`  |
 //! | `sort_desc`       | 排序方向：0 升序 / 1 倒序                    | `0`  |
 //! | `show_toolbar_buttons` | 底部浮条显示操作按钮：关掉只留信息并水平居中 | `1`  |
+//! | `assoc_exts`      | 勾选的默认打开方式后缀（分号分隔；空 = 没有订阅） | 空   |
+//! | `assoc_heal`      | 关联自愈总开关：定时核对并抢回被改掉的关联（m315） | `0`  |
 //! | `decoders_disabled`| 被停用的解码器 id（分号分隔）             | 空   |
 //! | `decoders_preferred`| 各扩展名的首选解码器 `扩展名=解码器id`（分号分隔）| 空  |
 //! | `raw_last`        | 裸数据参数窗的上次使用值 `宽x高:布局`       | 空   |
@@ -629,6 +631,33 @@ pub struct Config {
     pub opacity: u8,
     /// 被用户关闭的解码器 id 列表（分号分隔存盘）。空 = 全部启用。
     pub decoders_disabled: Vec<String>,
+    /// 用户**勾选**的默认打开方式后缀（分号分隔存盘）。空 = 没勾任何后缀。
+    ///
+    /// # 这是「意图」，不是「事实」
+    ///
+    /// 这里记的是"我希望这些后缀由 RuPix 打开"；系统当前实际认谁，住注册表
+    /// （`crate::platform::association`）。m244 那条「关联态住注册表、ini 没有它的键」
+    /// 的修宪例外因此只覆盖**事实层**——意图层落在这里，两者不同层，不冲突。
+    ///
+    /// # 三条推论
+    ///
+    /// 1. **取消勾选 = 退订，不撤销**。撤销要知道"还原成什么程序"，我们无从知道，
+    ///    删掉只会把用户推到「双击弹选择器」的更差状态。注册表原样保留。
+    /// 2. **点「应用」写一次事实**：本表 ≠ 定时维护。要不要持续盯着由
+    ///    [`Config::assoc_heal`] 单独决定（默认关）——勾了后缀不等于允许我们反复动注册表。
+    /// 3. **执行时对「本表 ∩ 当前可用后缀」求交**（`formats::declared_exts` 已经过滤掉
+    ///    被关闭与已卸载的解码器）。解码器临时关掉**不删这里**——一开一关不能丢勾选。
+    pub assoc_exts: Vec<String>,
+    /// 关联自愈总开关（ini `assoc_heal`，默认 **关**）。开 = 允许 `runtime::assoc`
+    /// 按时间门（启动满 60 秒首查、之后每 60 分钟）核对 [`Config::assoc_exts`] 的每一个
+    /// 后缀，破损就重写；关 = 只在点「应用」时写一次，之后一概不碰注册表。
+    ///
+    /// # 为什么必须 opt-in（用户 2026-11-11 拍板）
+    ///
+    /// 自愈无法区分"别的程序抢走了默认"和"用户自己在系统设置里改成了别的程序"——
+    /// 两种都是系统 API 写的合法哈希。所以开启它等于授权"抢回"，这必须由用户主动选择，
+    /// 不能因为勾了一个后缀就默认获得。默认关，且在文件关联窗底栏显式勾选。
+    pub assoc_heal: bool,
     /// 被用户关闭的扩展 id 列表（分号分隔存盘）。空 = 全部启用。
     pub extensions_disabled: Vec<String>,
     /// 连续失败被隔离的插件 id（三振自动写入；设置页可解除）。分号分隔。
@@ -813,6 +842,8 @@ impl Default for Config {
             window_h: 600,
             opacity: OPACITY_DEFAULT,
             decoders_disabled: Vec::new(),
+            assoc_exts: Vec::new(),
+            assoc_heal: false,
             extensions_disabled: Vec::new(),
             extensions_isolated: Vec::new(),
             decoders_preferred: BTreeMap::new(),
@@ -1003,6 +1034,17 @@ impl Config {
                 "window_w" => cfg.window_w = v.parse().unwrap_or(800).clamp(WINDOW_MIN, WINDOW_MAX),
                 "window_h" => cfg.window_h = v.parse().unwrap_or(600).clamp(WINDOW_MIN, WINDOW_MAX),
                 "opacity" => cfg.opacity = quantize_opacity(v.parse().unwrap_or(OPACITY_DEFAULT)),
+                // 默认打开方式的订阅表：只做最朴素的切分 / 去点 / 小写。
+                // 「什么算合法后缀」不在这里判——那是 `platform::association::normalize`
+                // 的事，配置层复制一份判据就等于给它埋第二个漂移点。
+                "assoc_exts" => {
+                    cfg.assoc_exts = v
+                        .split(';')
+                        .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                }
+                "assoc_heal" => set_bool(&mut cfg.assoc_heal, v, "assoc_heal"),
                 "decoders_disabled" => {
                     cfg.decoders_disabled = v
                         .split(';')
@@ -1136,6 +1178,7 @@ impl Config {
     /// 内存会话"，不该在这里大费周章地补mkdir。
     fn save_to(&self, p: &Path) {
         let opacity = quantize_opacity(self.opacity);
+        let assoc_exts = self.assoc_exts.join(";");
         let decoders_disabled = self.decoders_disabled.join(";");
         let extensions_disabled = self.extensions_disabled.join(";");
         let extensions_isolated = self.extensions_isolated.join(";");
@@ -1155,7 +1198,7 @@ impl Config {
              checker={}\nfilmstrip={}\nfilmstrip_left={}\nlocked={}\n\
              long_image_fit={}\nwheel_behavior={}\nctrl_wheel={}\nalt_wheel={}\nshift_wheel={}\ninit_window={}\nborderless={}\nwindow_w={}\n\
              window_h={}\nopacity={}\nsort_by={}\nsort_desc={}\n\
-             decoders_disabled={}\nextensions_disabled={}\nextensions_isolated={}\ndecoders_preferred={}\nprefetch={}\nprefetch_depth={}\nclose_to_tray={}\nspace_preview={}\ndrag_image={}\nshow_toolbar_buttons={}\nraw_last={}\ndownload_source={}\nui_theme={}\ndecoder_index_gitee={}\ndecoder_index_github={}\nplugin_index_gitee={}\nplugin_index_github={}\nupdate_index_gitee={}\nupdate_index_github={}\nhotkeys={}\nallow_multiple={}\ndecode_timeout_s={}\nui_cards={}\n",
+             assoc_exts={}\nassoc_heal={}\ndecoders_disabled={}\nextensions_disabled={}\nextensions_isolated={}\ndecoders_preferred={}\nprefetch={}\nprefetch_depth={}\nclose_to_tray={}\nspace_preview={}\ndrag_image={}\nshow_toolbar_buttons={}\nraw_last={}\ndownload_source={}\nui_theme={}\ndecoder_index_gitee={}\ndecoder_index_github={}\nplugin_index_gitee={}\nplugin_index_github={}\nupdate_index_gitee={}\nupdate_index_github={}\nhotkeys={}\nallow_multiple={}\ndecode_timeout_s={}\nui_cards={}\n",
             self.stay_on_top as i32,
             self.dbl_click.index(),
             self.slide_interval,
@@ -1176,6 +1219,8 @@ impl Config {
             opacity,
             self.sort_by.index(),
             self.sort_desc as i32,
+            assoc_exts,
+            self.assoc_heal as i32,
             decoders_disabled,
             extensions_disabled,
             extensions_isolated,
@@ -1377,6 +1422,15 @@ window_h=600
 # 窗口整体不透明度（百分制，10% 一档，最低 10）
 opacity=90
 
+# 勾选的默认打开方式：点「应用」时按这张表写一次（分号分隔，留空 = 没勾）。
+# 取消勾选只是退订，不会撤销已有的关联——改回别的程序请在系统设置里做。
+assoc_exts=
+
+# 关联自愈（默认关）：开 = 运行满一分钟查一次、之后每 60 分钟查一次，
+# 发现上面这些后缀的默认打开方式被改掉就自动写回 RuPix。
+# 关 = 只在点「应用」时写一次，之后一概不碰注册表。
+assoc_heal=0
+
 # 停用的解码器 id，分号分隔（留空 = 全部启用）
 decoders_disabled=
 
@@ -1490,7 +1544,7 @@ hotkeys={hotkeys}
 ///   ★ 写在 UI 写点处的 `ini 键：<名>` 注释是**给人导航的约定，没有测试读它**（2026-10-24 实测：
 ///   20 个键里 13 个标了，没标的是 `double_click`、`filmstrip`、`locked`、`long_image_fit`、
 ///   `decoders_disabled`、`window_w`、`window_h`）——别把它当成门禁。
-pub const ALL_KEYS: [&str; 43] = [
+pub const ALL_KEYS: [&str; 45] = [
     "stay_on_top",
     "double_click",
     "slide_interval",
@@ -1510,6 +1564,8 @@ pub const ALL_KEYS: [&str; 43] = [
     "window_h",
     "opacity",
     "decoders_disabled",
+    "assoc_exts",
+    "assoc_heal",
     "extensions_disabled",
     "extensions_isolated",
     "decoders_preferred",
@@ -2233,8 +2289,10 @@ plugin_source=github
     ///
     /// ★ 2026-10-17 `ui/settings.rs` 拆成 `ui/settings/` 各页后，这里逐文件列出：
     ///   `include_str!` 不支持通配，编译期取源码是这个测试的立身之本（不靠运行时
-    ///   去找目录）。漏列一页的后果不是静默通过，而是"那一页上的键报找不到写点"——
-    ///   报错是响的。
+    ///   去找目录）。漏列一页的后果分两半：那一页上**有**键写点才会响；**没有写点的
+    ///   页是静默的**（decoders.rs 就这么静默漏过一次）——全集对账由
+    ///   `hygiene_scan.py` 第十五查 `settings_include` 守着，本用例只管
+    ///   "列进来的文件里有写点"这一半。
     #[test]
     fn ui_touchpoints_cover_all_keys() {
         let ui = concat!(
@@ -2243,12 +2301,16 @@ plugin_source=github
             include_str!("../ui/settings/exts.rs"),
             include_str!("../ui/settings/metadata.rs"),
             include_str!("../ui/settings/options.rs"),
+            include_str!("../ui/settings/decoders.rs"),
             include_str!("../ui/settings/decoders_tab.rs"),
             include_str!("../ui/settings/extensions_tab.rs"),
             include_str!("../ui/settings/rows.rs"),
             include_str!("../ui/settings/shortcuts.rs"),
             include_str!("../ui/canvas.rs"),
             include_str!("../ui/raw_dialog.rs"),
+            // m315：文件关联窗是 `assoc_exts` / `assoc_heal` 的**唯一**写点，必须列进来
+            // （漏了它的后果不是红，而是这两个键被"忘了"——本测试只认列进来的文件）。
+            include_str!("../ui/association.rs"),
         );
         for k in CONFIG_ONLY_KEYS {
             assert!(

@@ -11,6 +11,8 @@
 
 /// 解码器 ABI 的宿主侧镜像（`#[repr(C)]` 结构 + 错误码 + 编译期断言）。
 pub mod abi;
+/// 压缩包来源：容器递归展平成一层真实文件，供 `Gallery` 按目录清单消费（离屏可测）。
+pub mod archive;
 pub mod b64;
 pub mod config;
 pub mod decode;

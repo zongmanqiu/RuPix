@@ -87,6 +87,9 @@ python build\hygiene_scan.py      # 硬编路径 / 调试残留 / TODO 真标记
                                   # ui 层色值只认 `ui/tokens.rs`（禁字面色值 `Color::rgb(`/`rgba(`）/
                                   # ui 层内跨模块引用一律经 `super::`（禁 `crate::ui::`，中枢在 `ui/mod.rs`）/
                                   # 单例窗不许同键既关又开（close_window 是投递、open_window 是即时，K196）/
+                                  # 自绘对话框按钮只走 btn / dialog_footer::action（第十四查 footer_buttons，2026-11-06）/
+                                  # M4 的 include_str! 清单 = 磁盘 settings/*.rs 全集（第十五查 settings_include，
+                                  #   E3 下沉——漏列方向 M4 用例自己永远查不到，decoders.rs 曾静默漏过）/
                                   # 无密钥/无隐私（私钥块 / 访问令牌 / URL 内嵌凭据 / 口令字面量 / 私人邮箱 / 含真名的本机路径）；
                                   # violations: 0 才算过。★ 写 `.ps1` 注释一律英文；解码器仓同款判据在
                                   # 解码器仓库的 `check_docs.py`
@@ -106,7 +109,7 @@ python build\hygiene_scan.py      # 硬编路径 / 调试残留 / TODO 真标记
    - 计划 / 进度 / 发现类文件由工作区计划区管理，不在宿主文档内展开；一次性草稿 / 实测转储 / 截图 / 样本图片 → `.temp`。
    - 退役源码备份、探针工具目录（`.temp/*probe*/`）等。
 2. **禁止向 `main/` / `解码器仓库` 内写入任何日志、临时脚本或草稿文件**。`main/` 只放：源码（`src/`）、单元/集成测试（`tests/`）、离屏探针（`examples/`）、构建脚本（`build/`）、文档（`*.md` / `docs/`）、资源（`assets/`：品牌图标 svg + PE 图标资源 ico/rc/in）、第三方补丁登记（`patches/`）、ABI 契约快照（`vendor/rupix-abi/`）。这张清单与 §三 的表必须一致，增删目录两处一起改。
-   - `main/docs/` 的文档必须有长期价值（架构总览 / 解码器开发规范指针 / 图片格式与后缀名 / 待办 / 踩坑记录）。一次性草稿 / 实测转储放 `.temp`，不入库。「未受控文档进仓库」是明令禁止的。
+   - `main/docs/` 的文档必须有长期价值（架构总览 / 解码器开发规范·宿主侧对接说明 / 图片格式与后缀名 / 待办 / 踩坑记录）。一次性草稿 / 实测转储放 `.temp`，不入库。「未受控文档进仓库」是明令禁止的。
 3. **target 重定向是写死的**：
    - `main/.cargo/config.toml`：`[build] target-dir = "../.temp/target"`（宿主：不得改回 `./target`）
    - 解码器仓库的 `workspace/.cargo/config.toml`：`[build] target-dir = "../../.temp/decoder-target"`（相对**当前工作目录**解析，
@@ -136,7 +139,7 @@ python build\hygiene_scan.py      # 硬编路径 / 调试残留 / TODO 真标记
 > 不归本文件的 `patches/` 管——宿主仓只记"它在、谁在用"；上游核对日期由解码器仓
 > `tools/check_patches.py` 每 90 天逼一次（只核补丁结构与路径，不记哈希）。
 
-### 无密钥 / 无隐私（两仓通用，2026-10-26，硬性）
+### 无密钥 / 无隐私（三仓通用，2026-10-26，硬性）
 
 `main/`、`解码器仓库`、`插件仓库` 都要能**原样公开**（三仓都已在 gitee 公开）。下列东西一条都不许进：
 
@@ -154,7 +157,7 @@ python build\hygiene_scan.py      # 硬编路径 / 调试残留 / TODO 真标记
 - 机器把关：`python build\hygiene_scan.py` 的**第十二查 `secret`**（`2_scan` 自带，`violations: 0` 才算过）。
   判据刻意窄——只认高置信写法（`password: self.config.password` 这种赋值不算），
   因为一条天天误报的门禁，最后一定被人加白名单加到失效。加了新判据必须配**负向验证**。
-- 解码器仓的对应判据是它自己的 `python tools/check_secrets.py`（两仓各自自包含，判据同源）。
+- 解码器仓的对应判据是它自己的 `python tools/check_secrets.py`（三仓各自自包含，判据同源）。
 - **万一已经泄了**：第一动作是**把那把凭据作废/换新**——删文件不管用，它已经在 git 历史里；
   再清历史、再补门禁。
 
@@ -181,10 +184,12 @@ RuPix/
 │  ├─ seh_shim.c      C SEH 隔离层（build.rs 编译）
 │  └─ build.rs        编译 seh_shim.c（cc，static_crt）
 ├─ 解码器仓库      解码器独立仓库（规则、契约与文档都在它内部，不在本文件展开）
-├─ .build/             发布目录：rupix.exe + decoders/*.dll + plugins/<id>/ + docs/（两份随包清单
-│                      与插件包）+ **`LICENSE` + `THIRD-PARTY-NOTICES.md`**（m182：许可全文与第三方
+├─ 插件仓库         插件独立仓库（独立进程，宿主只消费发布产物 `<exe>/plugins/<id>/`；
+│                   规则与文档都在它内部，不在本文件展开）
+├─ .build/             发布目录：rupix.exe + decoders/*.dll + plugins/<id>/ + docs/（随包清单
+│                      与 MCP 接入指南）+ **`LICENSE` + `THIRD-PARTY-NOTICES.md`**（m182：许可全文与第三方
 │                      署名随作品到达，`deploy.py` 硬拦——缺料或放错内容就不给部署）
-├─ .3rd/               第三方本地副本：windui + usvg 0.48.1（宿主）+ emfsdk 0.2.0（解码器 doc 的 Rust 补丁副本）+ stb/libde265/libheif/jxrlib（解码器仓库的 C 源）
+├─ .3rd/               第三方本地副本：windui + usvg 0.48.1（宿主）+ emfsdk 0.2.0（解码器 doc 的 Rust 补丁副本）+ 解码器侧 C/C++ 源与构建工具链（doc-legacy 静态库 libcdr/libwpg/libzmf/librevenge、vcpkg；stb 已退役、libde265/libheif/jxrlib 为未接入候选）——逐目录台账见 `.3rd/README.md`
 └─ .temp/              ★ **构建期**临时与编译中间产物（宿主 `target/`、解码器 `decoder-target/`、日志 / 探针 / 样本）；运行时缓存不落这里（见下便携铁律）
 ```
 
@@ -228,8 +233,9 @@ cost=…ms bitmap=…`、`[decode-req] kind=… tier=… verdict=…`、`[close]
   下载列由清单的 `gitee` / `github` 两列提供（`make_index.py` 推导时主机名与 owner **一起换**）。
   GitHub release 资产要单独上传；上传前 GitHub 下载列会 404，`check_urls.py` 会如实报错；
 - 选哪个来源**同时决定两件事**（用户 2026-10-26 方案）：去哪拉清单，以及每枚 DLL 用清单里哪一列
-下载地址（`gitee` / `github`）。清单顶层就是数组，一项一枚 DLL，十一个字段
-`id/name/version/abi/size/released/desc/formats/gitee/github`——**没有哈希**（2026-11-02 用户口径：
+下载地址（`gitee` / `github`）。清单顶层就是数组，一项一枚 DLL，十二个字段
+`id/name/version/abi/size/released/desc/formats/author/license/gitee/github`（`author` / `license`
+来自 DLL 的 `iv_metadata()`）——**没有哈希**（2026-11-02 用户口径：
 官方产物不需要指纹，识别一枚只认 `id` + `version`；`size` 只作列表显示，不参与判定）。
 `gitee` 是主源（作者手填）、
   `github` 默认由 `gitee` 推导（**主机名 + owner 一起换**，见 `make_index.py::derive_github_url`），
@@ -306,7 +312,6 @@ cost=…ms bitmap=…`、`[decode-req] kind=… tier=… verdict=…`、`[close]
   改名必须两仓同步发版，**不随术语调整**。另有 ABI 字段 `extensions`、std `with_extension()`、
   Rust 字段 `extensions: Vec<String>`、构建变量 `EXT_DIR`。
   ★ 所以看到 `iv_decoder_info` 别当成漏改——那是**契约**，不是命名遗留。
-- **扩展名（ext / suffix）**——指文件后缀（`.jpg` 等）。**凡后缀义一律用「扩展名」。**
 - **解码器仓库目录名**：由解码器仓库自己的规则维护；宿主文档统一称“解码器仓库”，不复制其目录名与改名史。
 - **文档名已定**：《解码器开发规范.md》（曾名《扩展解码器规范.md》），所有引用改之。
 
@@ -337,7 +342,7 @@ cost=…ms bitmap=…`、`[decode-req] kind=… tier=… verdict=…`、`[close]
   解码器仓库自己的 README/历史里，两边各自留档。
 - **产物命名**：`<id>_<ver>.dll`；**目录里只有 DLL，没有任何清单/指针文件**（自述全在 DLL 内的 `iv_decoder_info()`）；**同 id 只留一份 DLL**。
 - **线程模型（契约）**：宿主单解码线程串行调用；解码器需**可重入**但不必 MT-safe；`iv_last_error` 线程局部；禁止解码器自建线程池。
-- **对输入字节"推进且线性"（防挂死，正本 `docs/解码器开发规范.md` §六 第 10 条）**：由文件长度字段驱动的循环读到 0 长度必须推进或报错；递归 / 交叉引用用 **visited 去重**（只设深度上限不够，菱形重入是 `N^层数`）；轮数上界取自文件长度而非文件内的计数。**挂死风险源是「输入字节」，不是「解码器谁写的」**——自研解码器、第三方 DLL、宿主自己的元数据解析（`platform::exif` 走 UI 线程）适用同一条。隔离栈（`catch_unwind` / SEH / 三振 / `--safe-mode`）**只拦崩、不拦卡**。
+- **对输入字节"推进且线性"（防挂死，条文正本 = 解码器仓库《解码器开发规范.md》§六 第 10 条；宿主侧说明见 `docs/解码器开发规范.md` §6）**：由文件长度字段驱动的循环读到 0 长度必须推进或报错；递归 / 交叉引用用 **visited 去重**（只设深度上限不够，菱形重入是 `N^层数`）；轮数上界取自文件长度而非文件内的计数。**挂死风险源是「输入字节」，不是「解码器谁写的」**——自研解码器、第三方 DLL、宿主自己的元数据解析（`platform::exif` 走 UI 线程）适用同一条。隔离栈（`catch_unwind` / SEH / 三振 / `--safe-mode`）**只拦崩、不拦卡**。
 - 新增 / 修改解码库：在解码器仓库内部完成；宿主 `main/` 不接收任何解码实现或解码库源码。
 
 ---

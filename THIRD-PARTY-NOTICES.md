@@ -26,7 +26,7 @@
 | **许可证** | **`MIT OR Apache-2.0`**（[实读字段] `.3rd/wind-ui-rust-0.23.0/Cargo.toml` 的 `license` 行） |
 | 许可文件 | **`LICENSE-MIT` 与 `LICENSE-APACHE` 两份原文均在** `.3rd/wind-ui-rust-0.23.0/` 目录内（实读目录清单）——无需标注「许可证文件未见」 |
 | 上游 | `repository = "https://github.com/huanfeng/wind-ui-rust"`（[实读字段]），作者 `huanfeng <huanfengf@gmail.com>` |
-| 本地修改 | **已落补丁 01–10**（01/03/04/05/06 于 2026-10-13 在 0.23.0 上重放，02/07 已被 0.23.0 上游收编；`★ RuPix 补丁 01`–`10`：托盘显隐 · 失焦回调 · 逐像素透明度 · 窗口 op 扩展 · 命中优先级 · SVG 性能 · 滚动条内缩 · list_signal 滚动修复 · 输入框前置图标镜像 · EventCtx 按单例键关窗）：修改后完整文件归档于 `main/patches/wind-ui-rust-0.23.0/`，登记与迁移记录见 `PATCHES.md`；今后任何修改仍须按 `patches/README.md` 生命周期登记 |
+| 本地修改 | **已落补丁多枚，份数与逐枚说明以 [`patches/PATCHES.md`](patches/PATCHES.md) 的章节为准**（登记正本在那里，本行不抄第二份；01/03/04/05/06 于 2026-10-13 在 0.23.0 上重放，02/07 已被 0.23.0 上游收编）：修改后完整文件归档于 `main/patches/wind-ui-rust-0.23.0/`，机制与生命周期见 `patches/README.md`；今后任何修改仍须按该生命周期登记 |
 
 > **「OR」的含义**：`MIT OR Apache-2.0` 是 SPDX 许可表达式，作者同时按两个许可证授权，使用者任选其一满足即可；
 > 不得自行删改成单一许可证。windui 由 path 依赖编进 `rupix.exe`，其许可义务随二进制分发。
@@ -68,9 +68,20 @@
 | `env_logger` | `0.11`，`default-features=false`，仅 `auto-color` | 0.11.11 | MIT OR Apache-2.0 [实测] | 日志输出 |
 | `libloading` | `0.8` | 0.8.9 | **ISC** [实测]（★ 旧推定「惯例 MIT OR Apache-2.0」**不成立**） | `LoadLibraryExW` 包装（解码器加载） |
 | `memmap2` | `0.9` | 0.9.11 | MIT OR Apache-2.0 [实测]（★ 不是单 MIT） | 解码器文件 mmap（免 12MB 级堆拷贝，失败回退 `fs::read`） |
-| `windows`（仅 `cfg(windows)`） | `0.62`，9 个 feature | 0.62.2 | MIT OR Apache-2.0 [实测] | Win32 绑定：剪贴板 / DPI / 崩溃框 / DLL 搜索路径硬化 |
+| `windows`（仅 `cfg(windows)`） | `0.62`（feature 全集见 `README.md` 技术栈表，2026-11-10 实读 28 条） | 0.62.2 | MIT OR Apache-2.0 [实测] | Win32 绑定（剪贴板 / DPI / 管道与共享内存 / 注册表·仅文件关联 / WinHTTP 等；逐条用途写在 `Cargo.toml` 的行内注释里） |
 | `cc`（build-dependencies） | `1` | 1.6.0（解码器仓依赖图里是 1.7.0） | MIT OR Apache-2.0 [实测] | 编译 `seh_shim.c`（C SEH 隔离层） |
 | `embed-resource`（build-dependencies） | `3` | 3.0.12 | **MIT** [实测]（★ 单许可，不是双许可） | 编译 `assets/rupix.rc` → exe `.rsrc` 的 PE 图标（资源管理器/任务管理器显示它） |
+| `zip` | `8`，`default-features=false`，仅 `deflate-flate2` | 8.6.0 | **MIT** [实读字段]（★ 单许可，不是双许可） | ZIP / CBZ 容器 |
+| `sevenz-rust2` | `0.25`（默认特性 = 全算法，**刻意不裁剪**） | 0.25.0 | Apache-2.0 [实读字段] | 7z 容器 |
+| `lzma-rust2` | `0.25` | 0.25.0 | Apache-2.0 [实读字段] | 7z 的 LZMA/LZMA2；`.tar.xz` 的**流式** `XzReader`（不引 `lzma-rs`，那一个只能整条解进内存） |
+| `unrar` | `0.5` | 0.5.8 | MIT OR Apache-2.0 [实读字段]（★ 指 wrapper 本身；内含的 UnRAR C++ 源码另有许可，见 §四.6） | RAR / CBR 容器 |
+| `unrar_sys` | 传递（`unrar` 依赖） | 0.5.8 | MIT OR Apache-2.0 [实读字段]（同上，见 §四.6） | vendored UnRAR C++ 与 FFI 绑定 |
+| `tar` | `0.4` | 0.4.46 | MIT OR Apache-2.0 [实读字段] | tar 归档（**自身不含压缩**，压缩层在其外） |
+| `bzip2` | `0.6` | 0.6.1 | MIT OR Apache-2.0 [实读字段] | `.tar.bz2`，以及 7z 里的 bzip2 coder |
+| `libbz2-rs-sys` | 传递（`bzip2` 的默认后端） | 0.2.6 | **bzip2-1.0.6** [实读字段]（★ 不是 MIT/Apache，是 bzip2 自己的历史许可） | 纯 Rust bzip2 实现 |
+| `ruzstd` | `0.9` | 0.9.1 | **MIT** [实读字段]（★ 单许可） | `.tar.zst` 解码 |
+| `ppmd-rust` | 传递（`sevenz-rust2` 的 `ppmd` 特性） | 1.5.2 | CC0-1.0 OR MIT-0 [实读字段] | 7z 的 PPMd coder |
+| `aes` / `cbc` / `sha2` | 传递（`sevenz-rust2` 的 `aes256` 特性） | 0.9.4 / 0.2.1 / 0.11.1 | MIT OR Apache-2.0 [实读字段] | 7z 的 AES-256 加密条目 |
 
 > **实读勘误（2026-10-11，2026-10-12 修订）**：`main/Cargo.toml` 中**没有 `winres`、没有 `image`**，
 > `main/Cargo.lock` 中也没有 `winres` / `image` / `zune-jpeg` / `gif` / `tiff`。
@@ -101,6 +112,23 @@
    ★ 复跑：`python .temp/m76/license_audit.py`（一次性区，不在仓里；改依赖后照 §四 第 5 条重跑并更新本文件）。
 5. **触发本文件更新的时机**（见 `DOCS_MANIFEST.md` 第一节末行）：新增 / 移除 / 更换依赖、
    依赖版本变化、windui 补丁落地、分发方式变化。
+6. **★ UnRAR 许可（RAR / CBR 支持，m297）**：`unrar` crate 把 RARLAB 的 UnRAR C++ 源码
+   vendored 编进二进制。源码自身 `license` 字段写的是 `MIT OR Apache-2.0`（那是 Rust 外壳），
+   **真正约束来自 UnRAR 源码的许可**，其原文要求**随副本保留下面这段**（"or in documentation
+   if license is not available"——本文件就是那个 documentation，所以这段必须原样留在这里）：
+
+   > UnRAR source code may be used in any software to handle RAR archives without limitations
+   > free of charge, but cannot be used to develop RAR (WinRAR) compatible archiver and to
+   > re-create RAR compression algorithm, which is proprietary. Distribution of modified UnRAR
+   > source code in separate form or as a part of other software is permitted, provided that
+   > full text of this paragraph, starting from "UnRAR source code" words, is included in
+   > license, or in documentation if license is not available, and in source code comments of
+   > resulting package.
+   >
+   > —— Copyright (c) Alexander Roshal
+
+   **本项目只解包、不打包**：RAR 解压被明确允许（免费、无限制，含商业软件）；被禁止的是
+   拿它做 RAR 兼容的压缩器或重造压缩算法。若哪天有人想加 RAR **压缩**功能，先读这一条。
 
 > 版本读取日期：**2026-10-12**（新增 `embed-resource` 行时重读 `Cargo.lock`：3.0.12）。下次改动依赖后重读两份 `Cargo.lock` 再更新本文件，禁止沿用旧数字。
 > **2026-10-21 m76 只重读了许可证列**（§四 第 4 条那 32 个 crate）——顺带证明这些行的版本号自 2026-10-12 起未漂移；版本号本身没有重新全量实读，别把这句当成"全表版本都是 10-21 的"。

@@ -30,6 +30,8 @@
 //! 各窗口自己的 16ms 轮询收（实拍 ≈31 ms 一拍）。翻页上屏因此比单窗时代慢半拍，
 //! 换来的是"一个进程、一个托盘"这条用户口径。
 
+/// 默认打开方式的自愈调度（m314：启动满 60 秒首查，之后每 60 分钟）。
+pub mod assoc;
 /// 宿主本体自更新的后台编排（检查 / 下载 / 进程外覆盖）。
 pub mod update;
 
@@ -305,6 +307,9 @@ struct Shared {
     trim_stage: Cell<u8>,
     idle_trimmed: Cell<bool>,
     last_install_poll: Cell<Instant>,
+    /// 关联自愈的上次触发时刻。`None` = 本次会话还没查过（首查按 `started_at`
+    /// 满 [`assoc::FIRST_DELAY`] 才放行，避开启动期）。
+    last_assoc_check: Cell<Option<Instant>>,
 }
 
 impl Shared {
@@ -563,6 +568,24 @@ impl WinRt {
         if shared.last_install_poll.get().elapsed() >= Duration::from_millis(250) {
             shared.last_install_poll.set(Instant::now());
             crate::ui::settings::poll_installs(ctx, &config, &hub);
+        }
+        // 关联自愈（m314 建、m315 改为 opt-in）：**只有 `assoc_heal` 打开才跑**。
+        // 勾后缀 ≠ 授权我们反复动注册表——自愈分不清"别的程序抢走了默认"和"用户自己
+        // 在系统设置里改成了别的程序"，所以这一步必须是用户显式选择（默认关）。
+        // 时间门在这（每帧一次 `elapsed()`），真正干活在后台线程：`heal` 判破时会走
+        // `apply`，末尾 `SHChangeNotify` 会让资源管理器重读关联与图标缓存，落在 16 ms
+        // 的帧里就是一次可感知的卡顿。启动不立刻查的理由见 `runtime::assoc` 模块文档。
+        // ★ 关着时**不**更新时间戳：勾上开关后下一帧就放行，而不是再等满一小时。
+        let assoc_due = match shared.last_assoc_check.get() {
+            None => shared.started_at.elapsed() >= crate::runtime::assoc::FIRST_DELAY,
+            Some(t) => t.elapsed() >= crate::runtime::assoc::INTERVAL,
+        };
+        if assoc_due {
+            let heal_on = config.borrow().assoc_heal;
+            if heal_on {
+                shared.last_assoc_check.set(Some(Instant::now()));
+                crate::runtime::assoc::kick(config.borrow().assoc_exts.clone());
+            }
         }
         // 工作集裁剪（对齐 CurSeen）：把字体扫描 / DLL 加载 / 启动后才开的窗口（如
         // 设置）残留的可归还页还回系统，任务管理器数字落回个位数。仅裁可归还页，按需自动
@@ -1198,6 +1221,7 @@ pub fn run(initial: Option<PathBuf>) {
         trim_stage: Cell::new(0),
         idle_trimmed: Cell::new(false),
         last_install_poll: Cell::new(Instant::now()),
+        last_assoc_check: Cell::new(None),
     });
 
     // ★ 常驻模式（`run_resident`）：不建主窗。界面全部由 `Window` 建出，
@@ -1319,6 +1343,8 @@ pub fn run(initial: Option<PathBuf>) {
     // 空格预览的低级钩子挂在系统钩子链上。显式停用把收权从「赌进程消亡时系统替我摘」
     // 变成一句明写的动作；投递走控制线程（摘钩必须在装配它的那条线程上）。
     crate::platform::spacehook::set_enabled(false);
+    // 压缩包 v0：退出时收走全部展开目录（含上次被杀进程留下的残留）；运行期不删。
+    crate::core::archive::cleanup_all();
 }
 
 /// 托盘 / 二次启动要的那批窗口请求。

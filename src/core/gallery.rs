@@ -135,16 +135,7 @@ impl Gallery {
         // 拖进来的是**文件夹** = 打开这个文件夹。旧写法把它当"某张图"取 `parent()`，
         // 于是打开的是它旁边那个目录的第一张图。
         if file.is_dir() {
-            let files = listing(file, sort)?;
-            if files.is_empty() {
-                return Err(ViewError::NoImages(file.to_path_buf()));
-            }
-            return Ok(Self {
-                dir: file.to_path_buf(),
-                files,
-                index: 0,
-                sort,
-            });
+            return Self::from_dir(file, sort, false);
         }
         let dir = file
             .parent()
@@ -161,6 +152,24 @@ impl Gallery {
             dir,
             files,
             index,
+            sort,
+        })
+    }
+
+    /// 建一个「目录清单」。`allow_empty` 为真时，空目录也返回一个「有清单、零项」的对象。
+    ///
+    /// 只有压缩包的**层**用得上：那一层的子目录 / 子包才是可进入项，画面空着是正常态
+    /// （用户停在 `1M.zip/ch1` 这种只有子目录的地方，右键还能继续往下），不是"打开失败"。
+    /// 普通目录仍走 [`Self::from_file`]，空目录照旧报 `NoImages`——那是缺陷不是常态。
+    pub fn from_dir(dir: &Path, sort: SortSpec, allow_empty: bool) -> ViewResult<Self> {
+        let files = listing(dir, sort)?;
+        if files.is_empty() && !allow_empty {
+            return Err(ViewError::NoImages(dir.to_path_buf()));
+        }
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            files,
+            index: 0,
             sort,
         })
     }
@@ -393,7 +402,7 @@ type FoundList = Vec<Found>;
 /// ★ 这里**不做**逐文件魔数嗅探：那是 O(目录项数 × 解码器数)，每次开图都要付一遍。
 ///   代价是"目录里其他无后缀但魔数认得的文件"不进网格（翻不到）——罕见形态不值这笔钱。
 ///   用户**显式点开**的那一个例外，由 [`ensure_listed`] 兜住。
-fn listing(dir: &Path, sort: SortSpec) -> ViewResult<Vec<PathBuf>> {
+pub(crate) fn listing(dir: &Path, sort: SortSpec) -> ViewResult<Vec<PathBuf>> {
     // 清单只取一次（见 `is_image_ext_in` 的注释）。
     let declared = formats::declared_exts();
     let mut found: FoundList = Vec::new();

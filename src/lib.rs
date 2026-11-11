@@ -20,6 +20,7 @@ pub mod cli;
 pub mod core;
 pub mod decoders;
 pub mod extensions;
+pub mod headless;
 pub mod platform;
 pub mod runtime;
 pub mod ui;

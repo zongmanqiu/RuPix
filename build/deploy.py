@@ -61,6 +61,11 @@ CATALOG_DST = DOCS_DIR / "decoders.json"
 CATALOG_SRC = ROOT / "RuPix-Decoder" / "decoders.json"
 # 插件的随包清单与它的下载物（`docs/<id>_<ver>.zip`）：清单只认一版，旧版 zip 要跟着清。
 PLUGIN_CATALOG = DOCS_DIR / "plugins.json"
+# 随包 MCP 材料**只有一份接入文档**：真源在 `main/docs/`，发布目录里那份由部署生成。
+# ★ 适配器是仓外独立组件，**不进发行包** —— 本包不附带任何脚本或脚本运行时依赖。
+MCP_SHIP_FILES = (
+    ("MCP接入指南.md", "MCP接入指南.md"),
+)
 
 # 产物命名约定（RuPix-Decoder\build.ps1 负责生成）：<id>_<ver>.dll
 # m139 起文件名不再带 abi：宿主加载不解析文件名（扫 *.dll -> LoadLibrary ->
@@ -79,9 +84,17 @@ EXPECTED_ICON_SIZES = [16, 24, 32, 48, 64, 256]
 # `.build\` 这一整目录，所以同等材料落在 exe 同级：用户打开文件夹第一眼就能看见，
 # 而不是"许可只存在于源码仓里"。真源仍是 `main\LICENSE` 与 `main\THIRD-PARTY-NOTICES.md`，
 # 这里只复制、不生成第二份。
-# ★ **随包不放"源码位置"链接**：宿主仓在 Gitee/GitHub 上还是空的（无提交、无 tag），
-#   写上去就是假话——那一格等源码真推上去再补，账在 `docs/待办.md`。
+# ★ 随包 README 也有真源：`main\README.txt`，由 `ship_readme_gate` 把 `{{VERSION}}`
+#   渲染成 `Cargo.toml` 的版本后落到 `.build\README.txt`。m308 之前它是发布目录里的
+#   **孤本**——不进版本控制、部署既不生成也不校验，改一次漂一次，重建 .build 就没了。
+#   源码位置那一格当时因为宿主仓还是空的（无提交、无 tag）而留白；2026-11-10 实测两侧
+#   仓与 0.2.0 tag 都已就位（GitHub / Gitee API 各有 0.1.0、0.2.0），故补齐。
 LICENSE_SRC = MAIN / "LICENSE"
+# 随包说明：真源在 `main\docs\`（与 `MCP接入指南.md` 同一条路：随包物的真源都放 docs，
+# 仓根只留 README.md 一份，别让 .md 与 .txt 并排显得是同一份的两份拷贝）。
+# 落地名仍是 README.txt —— 发行包里那份就该叫这个名字，用户解压第一眼认得出。
+SHIP_README_SRC = ("docs", "随包说明.txt")
+SHIP_README = "README.txt"
 NOTICES_SRC = MAIN / "THIRD-PARTY-NOTICES.md"
 AGPL_MARK = "GNU AFFERO GENERAL PUBLIC LICENSE"
 
@@ -379,6 +392,112 @@ def license_gate(main_dir: Path, out_dir: Path, *, ship: bool = True) -> list[st
     return bad
 
 
+def ship_readme_gate(
+    main_dir: Path, out_dir: Path, *, ship: bool = True, version: str | None = None
+) -> list[str]:
+    """随包 README.txt：真源 `main\\README.txt` → 渲染版本号 → 落到发布目录。
+
+    为什么非要真源：这份文件从前只活在 `.build\\` 里，不进版本控制、部署既不生成也不校验，
+    是一枚孤本——换机器重建发布目录就没了，此后谁手改谁就成了唯一正本。m308 起真源进仓。
+
+    为什么查两条镜像域、而不是只查"文件在"：AGPL-3.0 要求向接收者提供对应源码的获取方式，
+    一句「见仓库」却不给地址，等于没给。判据只认域名（gitee.com / github.com 各至少一处），
+    不认具体路径——换组织名、改仓库名不该让门禁假红，那属于维护者的事。
+
+    版本号唯一正本是 `Cargo.toml`，所以真源写 `{{VERSION}}` 由这里代入：手抄版本号就是
+    第二正本，下一版必忘（README 上说错版本比不说更糟）。
+    `ship=False` 只判不写，供 `--selftest` 造红证。
+    """
+    bad: list[str] = []
+    src = main_dir.joinpath(*SHIP_README_SRC)
+    if not src.is_file():
+        return [f"缺源文件 {src}"]
+    raw = src.read_bytes()
+    if len(raw) < 800:
+        return [f"{SHIP_README} 只有 {len(raw)} B（空壳不算送达）"]
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        return [f"{SHIP_README} 不是可读 UTF-8：{e}"]
+    ver = version or cargo_version()
+    lines = text.replace("\r\n", "\n").split("\n")
+    lines = [ln.replace("{{VERSION}}", ver) for ln in lines]
+    # 标题下那行 `=` 按渲染后的标题重算：版本号一变它就长短不齐，一眼看得出是凑的。
+    if len(lines) >= 2 and lines[1] and set(lines[1]) == {"="}:
+        lines[1] = "=" * len(lines[0])
+    body = "\n".join(lines)
+    if "{{" in body:
+        at = body.index("{{")
+        bad.append(f"{SHIP_README} 渲染后还留着占位符 {body[at:at + 24]!r}")
+    if ver not in body:
+        bad.append(
+            f"{SHIP_README} 里没有版本号 {ver}（版本号唯一正本 = Cargo.toml 的 [package] version）"
+        )
+    for host in ("https://gitee.com/", "https://github.com/"):
+        if host not in body:
+            bad.append(
+                f"{SHIP_README} 缺 {host} 下的源码地址"
+                "（AGPL-3.0 要给接收者源码获取方式，只写「见仓库」不算）"
+            )
+    if bad:
+        return bad
+    if ship:
+        # 与随包清单同一套：先 .tmp 再换名，发布目录可能正被打开着看。
+        data = body.replace("\n", "\r\n").encode("utf-8")
+        dst = out_dir / SHIP_README
+        tmp = dst.with_name(dst.name + ".tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, dst)
+        if dst.read_bytes() != data:
+            bad.append(f"{SHIP_README} 落地后字节与渲染结果不一致")
+    return bad
+
+
+def mcp_docs_gate(main_dir: Path, out_dir: Path, ship: bool = True) -> list[str]:
+    """随包 MCP 接入文档：真源在不在、是不是完整 UTF-8、落地后是不是同一份字节。
+
+    为什么不满足于「文件在」：随包文档若停在旧版、或复制时被截断，收件人按文档配置
+    AI 客户端会直接连不上，而且很难想到是发布目录里的那份过期。`ship=False` 只判不写，
+    供 `--selftest` 造红证用。返回红名单，空 = 过。
+
+    ★ 本包只交文档：MCP 适配器是仓外独立组件，`docs/` 下出现任何脚本都判红，
+    免得发行版悄悄带上 Python / 批处理等运行时依赖（m294 撤回）。
+    """
+    bad: list[str] = []
+    for rel, target in MCP_SHIP_FILES:
+        src = main_dir / "docs" / rel
+        if not src.is_file():
+            bad.append(f"缺源文件 {src}")
+            continue
+        try:
+            raw = src.read_bytes()
+            raw.decode("utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            bad.append(f"{rel} 不是可读 UTF-8：{e}")
+            continue
+        if len(raw) < 200:
+            bad.append(f"{rel} 只有 {len(raw)} B（空壳不算送达）")
+            continue
+        if ship:
+            dst = out_dir / "docs" / target
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dst.with_name(dst.name + ".tmp")
+            tmp.write_bytes(raw)
+            os.replace(tmp, dst)
+            if dst.read_bytes() != raw:
+                bad.append(f"{target} 落地后字节与真源不一致")
+    if ship and (out_dir / "docs").is_dir():
+        docs = out_dir / "docs"
+        stray = sorted(
+            str(f.relative_to(docs))
+            for ext in ("*.py", "*.pyc", "*.ps1", "*.bat", "*.cmd", "*.exe")
+            for f in docs.rglob(ext)
+        )
+        if stray:
+            bad.append("随包 docs 混入脚本（本包不附带任何脚本）：" + ", ".join(stray))
+    return bad
+
+
 def selftest() -> int:
     """把上面三个判据的"会红的形状"钉在夹具里（跑法同 layering/hygiene 的 --selftest）。
 
@@ -531,6 +650,87 @@ def selftest() -> int:
             and n2 == 2,
         )
     )
+    # 16) 随包 MCP 只交一份文档：缺真源 / 空壳会红，落地字节同源；
+    #     并且 docs/ 下混入脚本要红（本包不附带适配器 / 自检脚本）。
+    # 命名不取「随包…」前缀，免得被上面第 12~15 条的计数判据误收。
+    mroot = root / "mcp-fixture"
+    shutil.rmtree(mroot, ignore_errors=True)
+    (mroot / "main" / "docs").mkdir(parents=True)
+    (mroot / "out" / "docs").mkdir(parents=True)
+    rel, target = MCP_SHIP_FILES[0]
+    checks.append(
+        ("MCP 文档缺真源会红",
+         len(mcp_docs_gate(mroot / "main", mroot / "out", ship=False)) == 1)
+    )
+    (mroot / "main" / "docs" / rel).write_text("x", encoding="utf-8")
+    checks.append(
+        ("MCP 文档空壳会红",
+         len(mcp_docs_gate(mroot / "main", mroot / "out", ship=False)) == 1)
+    )
+    (mroot / "main" / "docs" / rel).write_text("# fixture\n" + "x" * 300, encoding="utf-8")
+    bad_mcp = mcp_docs_gate(mroot / "main", mroot / "out", ship=True)
+    checks.append(
+        ("MCP 文档落地且逐字节同源",
+         not bad_mcp and (mroot / "out" / "docs" / target).read_bytes()
+         == (mroot / "main" / "docs" / rel).read_bytes())
+    )
+    (mroot / "out" / "docs" / "stray.py").write_text("print(1)\n", encoding="utf-8")
+    bad_stray = mcp_docs_gate(mroot / "main", mroot / "out", ship=True)
+    checks.append(
+        ("MCP 材料禁止夹带脚本（docs 下 .py 会红）",
+         any("混入脚本" in b for b in bad_stray))
+    )
+
+    # 16)~20) 随包 README：真源 → 渲染 → 落地（判据与五条红证见 ship_readme_gate）
+    rdir = root / "readme"
+    rout = rdir / "out"
+    rout.mkdir(parents=True, exist_ok=True)
+
+    def readme_src(name: str, body: str) -> Path:
+        d = rdir / name
+        p = d.joinpath(*SHIP_README_SRC)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body, encoding="utf-8")
+        return d
+
+    ok_readme = (
+        "RuPix {{VERSION}} - Windows x64\n"
+        + "=" * 30
+        + "\n\n源码与反馈\n"
+        "  Gitee   https://gitee.com/someone/RuPix\n"
+        "  GitHub  https://github.com/someone/RuPix\n" + "y" * 900 + "\n"
+    )
+    bad_readme = ship_readme_gate(readme_src("good", ok_readme), rout, version="9.9.9")
+    landed = rout / SHIP_README
+    checks.append(
+        (
+            "README 渲染落地（版本号已代入、两条镜像地址都在）",
+            bad_readme == []
+            and landed.is_file()
+            and b"9.9.9" in landed.read_bytes()
+            and b"{{" not in landed.read_bytes()
+            and b"gitee.com" in landed.read_bytes()
+            and b"github.com" in landed.read_bytes(),
+        )
+    )
+    # 缺一条镜像地址 ⇒ 红并点名缺的是哪个域（只写「见仓库」等于没给）
+    no_gh = ok_readme.replace("  GitHub  https://github.com/someone/RuPix\n", "")
+    r = ship_readme_gate(readme_src("no_gh", no_gh), rout, ship=False, version="9.9.9")
+    checks.append(("README 缺镜像地址会红", any("github.com" in b for b in r)))
+    # 真源里写了个没登记的占位符 ⇒ 红（渲染只认 {{VERSION}}，别的一个都不会被换掉）
+    stray = ok_readme.replace("Windows x64", "Windows x64 {{BUILD_ID}}")
+    r = ship_readme_gate(readme_src("stray", stray), rout, ship=False, version="9.9.9")
+    checks.append(("README 残留占位符会红", any("占位符" in b for b in r)))
+    # 版本号手抄死 ⇒ 红：这就是"第二正本"，下一版必忘（README 说错版本比不说更糟）
+    pinned = ok_readme.replace("{{VERSION}}", "0.0.1")
+    r = ship_readme_gate(readme_src("pinned", pinned), rout, ship=False, version="9.9.9")
+    checks.append(("README 版本号写死旧版会红", any("版本号" in b for b in r)))
+    # 空壳（文件在、几十个字）⇒ 红：放了等于没放那一形
+    r = ship_readme_gate(readme_src("tiny", "RuPix {{VERSION}}\n"), rout, ship=False, version="9.9.9")
+    checks.append(("README 空壳会红", any("空壳" in b for b in r)))
+    readme_names = [n for n, _ in checks if n.startswith("README ") and "装上" not in n]
+    checks.append(("README 门禁装上 5 条（少一条＝新判据没接进夹具）", len(readme_names) == 5))
+
     path_names = [name for name, _ in checks if name.startswith("随包")]
     checks.append(("随包产物门禁装上 3 条（少一条＝新判据没接进夹具）", len(path_names) == 3))
     bad = [n for n, ok in checks if not ok]
@@ -742,6 +942,28 @@ def main() -> int:
               "补缺的那一份即可，**不要**手抄进 .build\\（那会变成第二真源）"
         )
     print("  license   : LICENSE + THIRD-PARTY-NOTICES.md 已随包（与两个子仓的包形同构）")
+
+    # ── 随包 MCP 接入文档（真源 main\docs\，副本 .build\docs\；本包不含脚本）────
+    bad_mcp = mcp_docs_gate(MAIN, OUT_DIR)
+    if bad_mcp:
+        return fail(
+            "随包 MCP 文档有问题，部署中止：\n         "
+            + "\n         ".join(bad_mcp)
+            + "\n         真源 = main\\docs\\MCP接入指南.md；**不要**手抄进 .build\\docs\\；"
+              "docs\\ 下若混入了脚本，删掉后重跑（适配器是仓外组件，不进发行包）"
+        )
+    print(f"  mcp docs  : {len(MCP_SHIP_FILES)} 份已随包（仅接入指南，与真源逐字节一致；不含脚本）")
+
+    # ── 随包 README（真源 main\README.txt，渲染版本号后落地；AGPL 源码位置在这里）──
+    bad_readme = ship_readme_gate(MAIN, OUT_DIR)
+    if bad_readme:
+        return fail(
+            "随包 README 有问题，部署中止：\n         "
+            + "\n         ".join(bad_readme)
+            + "\n         真源 = main\\README.txt（版本号写 {{VERSION}}，由本脚本代入 Cargo.toml）；"
+              "**不要**手改 .build\\README.txt，那份是渲染出来的"
+        )
+    print(f"  readme    : {SHIP_README} 已渲染落地（版本号取自 Cargo.toml；含两侧源码地址）")
 
     print("  deploy OK")
     return 0

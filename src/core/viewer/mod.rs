@@ -443,6 +443,10 @@ pub struct Viewer {
     ///   时刻，与其在每一处挂清除点，不如让过期的一句自然作废；换图 / 翻页仍显式
     ///   清掉（见 [`Self::open`] 与 [`Self::navigate`]）。取走即清空，窗口段每 16 ms
     ///   跑一次也不会重复弹。
+    /// 当前打开的压缩包层里「认得出但打不开」的条数（m304）。
+    /// 0 = 普通目录 / 这一层全能打开。状态格据此**追加**「另有 N 项不支持」，
+    /// 不替换数量进度与缩放百分比（用户 2026-11-06 口径）。换层由 `open_at` 重设。
+    pub(super) archive_skipped: usize,
     pub(super) note: Option<(&'static str, Instant)>,
 
     pub(super) drag: Option<Drag>,

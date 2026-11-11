@@ -8,10 +8,10 @@
 
 | 文件 | 何时更新 | 谁验证 |
 |---|---|---|
-| `README.md` | 功能清单 / 快速开始命令表 / 技术栈版本 / 架构简图 / **文档地图** / 命令行参数表 / License 行 / 致谢变化时 | 自检 + `python build/layering_scan.py`（引用了分层结论时） |
+| `README.md` | 功能清单 / 快速开始命令表 / 技术栈版本 / 架构简图 / **文档地图** / 命令行参数表 / License 行 / 致谢变化时 | 自检 + `python build/layering_scan.py`（引用了分层结论时）+ `docs_consistency.rs::j18`（技术栈表 windows feature 集 = Cargo.toml 实际声明，双向判等；E2 下沉 2026-11-10） |
 | `AGENTS.md` | 规则本身变化时：§一 五层架构与禁引、§四 布局与术语铁律（含保留项）、§五 解码器 ABI 契约、§六 执行环境坑、§七 源码陷阱、§八 编码纪律、§九 交付清单——增删任一条即更 | `python build/gate.py run config` 等门禁全绿 + 自检 |
 | `目录结构说明.md` | 新建 / 删除 / 移动 `src/` 文件或子目录；§二根目录约定变化。**第一、三、四节的数字与第五节符号索引不许手改**——跑 `python build/structure_gen.py --write`；第三节「说明」列与 §二是人写的职责描述，生成器只动数值格 | `python build/structure_gen.py --check`（j10）+ j9 Rust 独立走盘对账 + j11 生成器自检，全在 `cargo test --release -- --test-threads=1`（docs 组）里 |
-| `开发指南.md` | §一六步流程、§二改动→文档对照表、§三写文档决策树、§四源码提交与发布资产分工、**§五发布前同步点清单（E1–E12 + 三方对齐）**任一处变化；「明确不做」清单变化。★ §五 的判据是"**这两件事之间没有机器读过**"才许进：做成门禁后该行要删或改成"已下沉"，本节应越用越短 | 自检；与本登记簿交叉核对；每条命令必须能在 `main/` 下照抄跑出数（本轮 12 条逐条跑过） |
+| `开发指南.md` | §一六步流程、§二改动→文档对照表、§三写文档决策树、§四源码提交与发布资产分工、**§五发布前同步点清单（E1–E12 + 三方对齐）**、**§六编译档位（体积/速度/依赖合编）**任一处变化；「明确不做」清单变化。★ §五 的判据是"**这两件事之间没有机器读过**"才许进：做成门禁后该行要删或改成"已下沉"，本节应越用越短 | 自检；与本登记簿交叉核对；每条命令必须能在 `main/` 下照抄跑出数（本轮 12 条逐条跑过） |
 | `update.json` | 每次发版：版本号、日期、面向使用者的说明、两条 release 下载地址；**先上传资产再推本文件** | `python build/check_update_asset.py`（两镜像 `[ok]`）+ 自检：无 `sha256` / `size` 字段 |
 | `build/gen_update_json.py` / `build/check_update_asset.py` | 清单字段或两条判据变化 | 前者照 `main/` 下用法跑一遍；后者 `--local <zip>` 与两镜像核对都过 |
 | `DOCS_MANIFEST.md`（本文件） | 任何文档新建 / 改名 / 删除 / 废弃时（包括本表任何一行的触发条件变化） | 自检（每行指向的文件必须真实存在，【待建】除外） |
@@ -33,8 +33,11 @@
 | `docs/图片格式与后缀名.md` | 宿主内置路径（只有 resvg 一枚，管 svg/svgz）与「动态并集」规则变化；**具体解码器清单不写在这里**（清单真源在解码器侧，宿主随包只带 `docs/decoders.json` 这份数据） | `ext` 组测试（`python build/gate.py run ext`）+ 真实文件冒烟 |
 | `docs/待办.md` | **唯一清单**（2026-11-09 m291 合并两份）：只收「还开着、且真有可能做」的条目、等外力项与已知边界；已拥有 / 不值得做 / 永久不提供的一律不列。新增或关闭条目时更新 | 自检 + `cargo test --release --test docs_consistency -- --test-threads=1`（j12 不写体积数字） |
 | `docs/产品定位与边界.md` | 战略定位 / 职责边界 / "轻量"硬定义 / 明确不做清单任一变化；本文件是战略层，内容长期稳定，改动应稀少 | 自检 + `python build/layering_scan.py`（引用分层结论时） + `cargo test --release --test docs_consistency` 全绿 |
+| `docs/建议筛选-值得开发清单.md` | 外部建议（`.ex/其它/建议/`）再进新一轮筛选、或某条候选开工并按 `待办.md` 卷首收录判据定档后更新 | 自检 + `cargo test --release --test docs_consistency`（j1 登记 / j3·j4 无考古串 / j5 行数） |
 | `docs/superpowers/plans/2026-10-12-titlebar-topmost-lock.md` | 已执行完毕的计划存档，不更新（同类新工作另开新文件） | 自检（与同名 spec 成对存在） |
 | `docs/superpowers/specs/2026-10-12-titlebar-topmost-lock-design.md` | 设计变更时（被 `src/ui/chrome.rs` 注释与 `HISTORY.md` 引用） | 自检（引用路径成立） |
+| `docs/随包说明.txt` | 随包分发的纯文本快速上手说明（面向拿到发行包的人，不是仓库访客）。★ 真源放 `docs/` 而不是仓根：仓根已有 `README.md`，再摆一份 `.txt` 会让人当成同一份的两份拷贝。版本号**必须写 `{{VERSION}}`**，由 `build/deploy.py` 代入 `Cargo.toml` 的值后落地 `.build\README.txt`（落地名保持 README.txt，解压第一眼认得出）；标题目录、常用操作、源码与反馈地址变化时 | `python build/deploy.py --selftest`（含缺镜像地址 / 残留占位符 / 版本号写死 / 空壳四条红证）+ `6_deploy.bat` 落地字节同源 |
+| `docs/MCP接入指南.md` | 宿主四个无头动词的对外契约、任意 AI 客户端的接入与验收方式、外置解码器边界任一项变化；用户要换 AI 客户端来验时先读这一份 | `python build/deploy.py --selftest`（含「随包 docs 混入脚本会红」负向臂）+ `6_deploy.bat` 随包字节同源 |
 
 ## 三、补充登记
 

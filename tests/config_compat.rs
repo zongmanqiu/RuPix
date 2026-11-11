@@ -59,6 +59,11 @@ fn legacy_ini_loads_without_loss() {
         //   里那行 `legacy_disabled=av;raw` 现在是**未知键** → 静默回空。
         //   代价要说清楚：老用户的"停用 / 首选解码器"这两项在升级后需重设一次。
         decoders_disabled: Vec::new(),
+        // 旧 fixture 不含 assoc_exts 键（m314 新增）→ 回空表 = 没勾任何后缀。
+        assoc_exts: Vec::new(),
+        // 旧 fixture 不含 assoc_heal 键（m315 新增）→ 回 false = 不自愈。
+        // ★ 这条尤其要紧：缺键绝不能"猜"成 true，否则老用户升级后就被默许动注册表。
+        assoc_heal: false,
         // 旧 fixture 不含 extensions_disabled 键 → 回空表。
         extensions_disabled: Vec::new(),
         // 旧 fixture 不含 extensions_isolated 键 → 回空表。

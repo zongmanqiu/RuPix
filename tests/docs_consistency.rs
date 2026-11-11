@@ -958,3 +958,346 @@ fn j17_rejects_a_label_that_drifted_back() {
     )];
     assert_no_retired_label(&fake, "旧实现");
 }
+
+/// 判据⑲（E5 重定义后下沉）：工作区根 `AGENTS.md` 是**本地工作区地图**（给本机 AI
+/// 助手看，不随三仓上传），它与 `main/AGENTS.md` 是「地图 ↔ 正本」的分工，
+/// **不做逐节等同**——旧 E5 的"两份逐节对读"判据随这个口径作废。地图的本职是
+/// "不骗人"：它点名的每个仓内路径都必须真实存在。本查扫描根地图文本，提取带仓
+/// 前缀（`main/`、`RuPix-Decoder/`、`RuPix-Plugin/`、`.build/`、`.plan/`、`.temp/`、
+/// `.3rd/`、`.ex/`、`.bf/`、`.workbuddy/`）的路径（正反斜杠都认），逐一断言存在。
+/// 边界：叙述性**状态**的漂移（如某天地图里写"本仓无 .git"这类时效句）不在此查
+/// ——那靠文档对读轮次兜底，本查只管"指得到 / 指不到"。段内非 ASCII 只认常用
+/// 汉字区（U+4E00–9FFF），全角标点（，：（）等）一律断段——否则
+/// "`association.rs`，仅 HKCU" 会把逗号吃进路径造成误报。
+/// 失明兜底：一张路径都提取不到 = 地图格式大改，报红不静默。
+///
+/// 从地图文本提取带仓前缀的仓内路径：去重保序、统一 `/`、去尾分隔符。
+/// 裸前缀（"不在 `main` 管辖内"）与无仓前缀的路径（`patches/`、`target/`）不算。
+fn workspace_map_paths(text: &str) -> Vec<String> {
+    const PREFIXES: &[&str] = &[
+        "RuPix-Decoder",
+        "RuPix-Plugin",
+        "main",
+        ".build",
+        ".plan",
+        ".temp",
+        ".3rd",
+        ".ex",
+        ".bf",
+        ".workbuddy",
+    ];
+    let bytes = text.as_bytes();
+    // 前缀的词边界：前一个字符不许是字母 / 数字 / 下划线 / 点（`domain/`、`x.3rd` 不算）。
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'.';
+    // 路径段字符：ASCII 词字符 + `-`，以及常用汉字区（U+4E00–U+9FFF，UTF-8 为
+    // E4–E9 开头的三字节）。全角标点与符号区不在其列——它们必须断段。
+    let seg_len = |bytes: &[u8]| -> usize {
+        let c = bytes[0];
+        if c.is_ascii() {
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'-' {
+                1
+            } else {
+                0
+            }
+        } else if (0xE4..=0xE9).contains(&c)
+            && bytes.len() >= 3
+            && (bytes[1] & 0xC0) == 0x80
+            && (bytes[2] & 0xC0) == 0x80
+        {
+            3
+        } else {
+            0
+        }
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        // 非 ASCII 字符整体跳过：前缀全是 ASCII，不可能从多字节内部开始；
+        // 按 UTF-8 首字节跳整字符，保证 i 永远落在字符边界上（text[i..] 切片不炸）。
+        if bytes[i] >= 0x80 {
+            i += match bytes[i] {
+                0xC0..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                0xF0..=0xF7 => 4,
+                _ => 1, // 孤立续字节（不应出现），防御性跳过
+            };
+            continue;
+        }
+        // 尝试在 i 处匹配某个仓前缀；词中（`domain/`）与裸前缀（"不在 `main` 管辖"）不算路径。
+        // 前缀集合内互不为真前缀，同一位置命中即停。
+        let mut matched: Option<&str> = None;
+        for p in PREFIXES {
+            if !text[i..].starts_with(p) {
+                continue;
+            }
+            let word_inside = i > 0 && is_word(bytes[i - 1]);
+            let after = &text[i + p.len()..];
+            if !word_inside && (after.starts_with('/') || after.starts_with('\\')) {
+                matched = Some(p);
+            }
+            break;
+        }
+        let Some(p) = matched else {
+            i += 1;
+            continue;
+        };
+        // 收集 前缀 + (分隔符 + 段)*；分隔符后没有段就停在分隔符前（尾斜杠形式）。
+        let mut end = i + p.len();
+        while end < bytes.len() && (bytes[end] == b'/' || bytes[end] == b'\\') {
+            let mut j = end + 1;
+            while j < bytes.len() {
+                let n = seg_len(&bytes[j..]);
+                if n == 0 {
+                    break;
+                }
+                j += n;
+            }
+            if j == end + 1 {
+                break;
+            }
+            end = j;
+        }
+        let path = text[i..end].replace('\\', "/");
+        let path = path.trim_end_matches('/').to_string();
+        if !out.contains(&path) {
+            out.push(path);
+        }
+        i = end.max(i + 1);
+    }
+    out
+}
+
+fn broken_map_paths(root: &std::path::Path, paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|p| !root.join(p).exists())
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn j19_workspace_root_agents_map_is_truthful() {
+    let root = main_dir()
+        .parent()
+        .expect("main 没有上级目录")
+        .to_path_buf();
+    let map = read(&root.join("AGENTS.md"));
+    let paths = workspace_map_paths(&map);
+    assert!(
+        paths.len() >= 10,
+        "j19：根地图里一处仓内路径都没提取到（格式大改？本查失明）——{paths:?}"
+    );
+    let broken = broken_map_paths(&root, &paths);
+    assert!(
+        broken.is_empty(),
+        "工作区根 AGENTS.md（本地地图）点名的路径在磁盘上不存在：{broken:?}\
+         ——地图不骗人是它的本职：修地图，或把目录建回来"
+    );
+}
+
+/// 负向臂：幽灵路径必须被抓，裸前缀（无斜杠）不算路径，相等集合不误报。
+#[test]
+fn j19_rejects_a_map_pointing_at_ghosts() {
+    let root = main_dir()
+        .parent()
+        .expect("main 没有上级目录")
+        .to_path_buf();
+    let fake =
+        "正本在 `main/AGENTS.md`，快照进 `.bf/`；不在 `main` 管辖内；另有 `main/不存在/幽灵.md`。";
+    let paths = workspace_map_paths(fake);
+    assert_eq!(
+        paths,
+        vec!["main/AGENTS.md", ".bf", "main/不存在/幽灵.md"],
+        "提取顺序与内容不对：{paths:?}"
+    );
+    let broken = broken_map_paths(&root, &paths);
+    assert_eq!(
+        broken,
+        vec!["main/不存在/幽灵.md"],
+        "幽灵路径必须被抓：{broken:?}"
+    );
+}
+
+/// 判据⑱（`开发指南.md` §五 E2 下沉）：README 技术栈表的 windows feature 集
+/// = `Cargo.toml` 里 `windows` 依赖实际声明的 features 数组，**双向集合判等**。
+///
+/// 为什么值得一条硬门禁：feature 少列一条，换台机器照 README 对账就编不过；
+/// 截断写法（实测抓到 `Win32_System_Pipes` 被写成 `Pipes`）数个数也数不出来
+/// ——所以判据是**逐条集合判等**，不是计数。README 那一行的固定表述
+/// （「共 **N 条 feature**」「下面已省掉各自的 `Win32_` 前缀：」）是本判据的解析
+/// 契约：锚不到、列表空、数组空，一律按"本查失明"报红——静默通过比报错更危险。
+/// 行内那个 `N` 也在对账之列：它是第二个正本，漂了照样红。
+///
+/// 两侧集合判差。纯函数，负向臂直接喂合成样本。
+/// 返回违规消息：cargo 有 readme 无 = 缺列；readme 有 cargo 无 = 多列/截断。
+fn feature_set_diff(
+    cargo: &std::collections::BTreeSet<String>,
+    readme: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let mut bad = Vec::new();
+    for f in cargo.difference(readme) {
+        bad.push(format!(
+            "README 技术栈表缺 feature {f}（换台机器照 README 对账就编不过；名单真源是 Cargo.toml）"
+        ));
+    }
+    for f in readme.difference(cargo) {
+        bad.push(format!(
+            "README 技术栈表多了 feature {f} —— Cargo.toml 里没有（截断写法如 Pipes？写全名，或从 Cargo.toml 确认真名）"
+        ));
+    }
+    bad
+}
+
+/// 从 `Cargo.toml` 文本里取 `windows` 依赖的 features 数组全集。
+/// 数组条目是逐行 `"Win32_xxx",`（行尾带 `#` 注释），先剥注释再收引号串。
+fn cargo_windows_features(cargo_toml: &str) -> std::collections::BTreeSet<String> {
+    let start = cargo_toml
+        .find("windows = {")
+        .unwrap_or_else(|| panic!("j18：Cargo.toml 里找不到 windows 依赖（本查失明）"));
+    let seg = &cargo_toml[start..];
+    let fkey = seg
+        .find("features")
+        .unwrap_or_else(|| panic!("j18：windows 依赖里没有 features 键（本查失明）"));
+    let open_rel = seg[fkey..]
+        .find('[')
+        .unwrap_or_else(|| panic!("j18：features 数组的 [ 找不到（本查失明）"));
+    let after = &seg[fkey + open_rel + 1..];
+    let body = &after[..after
+        .find(']')
+        .unwrap_or_else(|| panic!("j18：features 数组的 ] 找不到（本查失明）"))];
+    let mut out = std::collections::BTreeSet::new();
+    for raw in body.lines() {
+        let line = match raw.find('#') {
+            Some(i) => &raw[..i], // 数组里的行尾注释不参与
+            None => raw,
+        };
+        let mut parts = line.split('"');
+        parts.next(); // 首个引号之前的残段
+        while let Some(item) = parts.next() {
+            let item = item.trim();
+            if !item.is_empty() {
+                out.insert(item.to_string());
+            }
+            parts.next(); // 跳过配对引号之后的段
+        }
+    }
+    out
+}
+
+/// 从 README 技术栈表的 windows 行取 feature 全集（条目省略 `Win32_` 前缀，按
+/// 行内声明补回），并顺带核对行内「共 **N 条 feature**」的计数。
+fn readme_windows_features(readme: &str) -> std::collections::BTreeSet<String> {
+    let line = readme
+        .lines()
+        .find(|l| l.contains("windows 0.62") && l.contains("已省掉各自的"))
+        .unwrap_or_else(|| {
+            panic!(
+                "j18：README 技术栈表里找不到 windows 行（锚点句「windows 0.62 / 已省掉各自的」漂了？本查失明）"
+            )
+        });
+    let declared = line
+        .split("共 **")
+        .nth(1)
+        .and_then(|s| s.split(" 条 feature").next())
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "j18：README windows 行的「共 **N 条 feature**」读不出来（计数表述漂了？本查失明）"
+            )
+        });
+    let list = line
+        .split("前缀：")
+        .nth(1)
+        .unwrap_or_else(|| {
+            panic!("j18：README windows 行找不到「前缀：」锚（列表表述漂了？本查失明）")
+        })
+        .split('）')
+        .next()
+        .unwrap_or_else(|| panic!("j18：README windows 行的列表段没有收尾「）」（本查失明）"));
+    let mut out = std::collections::BTreeSet::new();
+    for tok in list.split('/') {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let full = if t.starts_with("Win32_") {
+            t.to_string()
+        } else {
+            format!("Win32_{t}")
+        };
+        out.insert(full);
+    }
+    assert_eq!(
+        out.len(),
+        declared,
+        "README windows 行自报「共 {declared} 条 feature」，实际列了 {} 条——计数本身漂了（它是第二个正本）",
+        out.len()
+    );
+    out
+}
+
+#[test]
+fn j18_readme_windows_features_match_cargo_toml() {
+    let main = main_dir();
+    let cargo = cargo_windows_features(&read(&main.join("Cargo.toml")));
+    assert!(
+        !cargo.is_empty(),
+        "j18：Cargo.toml 的 windows features 数组没解析出任何条目（写法变了，本查失明）"
+    );
+    let readme = readme_windows_features(&read(&main.join("README.md")));
+    assert!(
+        !readme.is_empty(),
+        "j18：README windows 行没解析出任何条目（列表写法变了，本查失明）"
+    );
+    let drift = feature_set_diff(&cargo, &readme);
+    assert!(
+        drift.is_empty(),
+        "README 技术栈表与 Cargo.toml 的 feature 集不一致：\n{}",
+        drift.join("\n")
+    );
+}
+
+/// 负向臂（E2 的两个真实事故形状）：少列一条、截断写法，同一判据必须当场红。
+#[test]
+fn j18_rejects_missing_and_truncated_features() {
+    let cargo: std::collections::BTreeSet<String> = ["Win32_System_Pipes", "Win32_Foundation"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    // 形状一：README 漏列一条（换台机器照 README 对账就编不过）。
+    let readme: std::collections::BTreeSet<String> =
+        ["Win32_Foundation"].into_iter().map(String::from).collect();
+    let drift = feature_set_diff(&cargo, &readme);
+    assert!(
+        drift.len() == 1 && drift[0].contains("缺 feature Win32_System_Pipes"),
+        "漏列必须报缺：{drift:?}"
+    );
+    // 形状二：截断写法 `Pipes`（历史实测事故）——补前缀后与真名对不上，
+    // 两侧各报一条：多一个 Win32_Pipes、缺一个 Win32_System_Pipes。
+    let truncated: std::collections::BTreeSet<String> = ["Win32_Foundation", "Pipes"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let truncated = truncated
+        .into_iter()
+        .map(|t| {
+            if t.starts_with("Win32_") {
+                t
+            } else {
+                format!("Win32_{t}")
+            }
+        })
+        .collect::<std::collections::BTreeSet<String>>();
+    let drift = feature_set_diff(&cargo, &truncated);
+    assert!(
+        drift.len() == 2
+            && drift.iter().any(|m| m.contains("多了 feature Win32_Pipes"))
+            && drift
+                .iter()
+                .any(|m| m.contains("缺 feature Win32_System_Pipes")),
+        "截断写法必须两侧都报：{drift:?}"
+    );
+    // 相等集合不许报（防误伤）。
+    let same: std::collections::BTreeSet<String> = cargo.clone();
+    assert!(feature_set_diff(&cargo, &same).is_empty(), "相等集合不该报");
+}

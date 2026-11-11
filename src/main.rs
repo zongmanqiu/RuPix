@@ -13,7 +13,7 @@ fn main() {
 
     // 命令行解析：整段搬到 `rupix_lib::cli`（`tests/` 链接不到 `bin`，留在这里的每一行
     // 都等于没测——这里出过一次「`--probe-decode` 把自己判成未知项」的回归，
-    // 2026-10-17 审计 §三b）。未知选项仍然只在这条真入口 warn：探针命令面的输出
+    // 2026-10-17 审计 §三b）。未知选项仍然只在这条真入口 warn：命令面的输出
     // 要可信，脚本按「有 warn 就算异常」判读。
     let argv: Vec<String> = std::env::args().collect();
     let args = rupix_lib::cli::parse(&argv);
@@ -30,20 +30,28 @@ fn main() {
         eprintln!("用法：rupix.exe --bench-thumb <文件> [次数]");
         std::process::exit(2);
     }
-    let (probe, bench, safe_mode) = (args.probe, args.bench, args.safe_mode);
+    // 无头命令面缺路径也回一行 JSON（cmd:null / code:2），不打破「stdout 恰好一行」。
+    // 打印只发生在 bin 真入口：lib 里的 `headless` 是纯函数，卫生门禁不许它带打印宏。
+    if args.headless_flag && args.headless.is_none() {
+        let (code, line) = rupix_lib::headless::arg_error(
+            "用法：rupix.exe --list|--metadata|--thumbnail|--render <路径>",
+        );
+        println!("{line}");
+        std::process::exit(code);
+    }
 
     // 单实例闸门：放在一切重活（装解码栈、起线程、建窗）之前。
     // 二次实例（已经有一个进程在跑）会把 argv 转发给首实例、自己直接退出，
     // 绝不新建第二个进程或第二个托盘——这正是「一个进程、一个托盘」的根基。
-    // 探针（`probe`/`bench`）例外：它是诊断工具，进闸门就会被转发给 GUI、自己反而没跑。
+    // 探针与无头命令例外：它们不建窗，进闸门就会被转发给 GUI、自己反而没跑。
+    // 判据在 `cli::needs_instance_gate`（lib 里，有单测盯着），不是这里的裸条件。
     // `app_id` 必须与 `runtime::run` 里 `App::single_instance` 完全一致，否则会把自己
     // 误判成二次实例、转发给自己、窗口永不出现。
     //
     // ★ 多开（2026-11-04 用户裁定）：多开的意思是**窗口可以有多个，进程与托盘都只有一个**，
     //   所以闸门恒生效——多开与否的分岔在首实例收到 argv 之后（`runtime` 的 `second_tx`：
     //   开新窗口 / 在当前窗口换图），不在"要不要起第二个进程"。
-    if probe.is_none()
-        && bench.is_none()
+    if rupix_lib::cli::needs_instance_gate(&args)
         && windui::claim_instance(rupix_lib::APP_ID) == windui::InstanceRole::Handoff
     {
         return;
@@ -52,19 +60,28 @@ fn main() {
     let initial = rupix_lib::initial_path(&argv);
 
     // 必须在解码线程起来之前置位（Host 每次调用都会读它）。
-    rupix_lib::decoders::set_safe_mode(safe_mode);
+    rupix_lib::decoders::set_safe_mode(args.safe_mode);
     // 格式清单装入 core::formats（幂等）：目录清单/裸数据路由在任何 GUI 之前就绪。
     rupix_lib::decoders::install_format_source();
-    // 解码后端 + SVG 渲染器（--probe-decode 与 GUI 共用同一条链路）。
+    // 解码后端 + SVG 渲染器：GUI、老探针与无头命令面**共用同一条链路**，
+    // 全进程只在这里装一次；无头模块不许另起后端。
     rupix_lib::install_decode_stack();
 
+    // 无头命令面（m293）：四个纯读动词，各回一行 JSON 后退出，不建窗、不进托盘。
+    // 排在老探针之前是因为它自带退出码；老两条通道一个字没改。
+    if let Some(h) = args.headless.as_ref() {
+        let (code, line) = rupix_lib::headless::run(h);
+        println!("{line}");
+        std::process::exit(code);
+    }
+
     // 探针：离屏解码走与打开图片相同的解码链路，打印结果后退出，不建窗口。
-    if let Some(p) = probe {
-        probe_decode(&p);
+    if let Some(p) = args.probe.as_ref() {
+        probe_decode(p);
         return;
     }
-    if let Some((p, reps)) = bench {
-        bench_thumb(&p, reps);
+    if let Some((p, reps)) = args.bench.as_ref() {
+        bench_thumb(p, *reps);
         return;
     }
 

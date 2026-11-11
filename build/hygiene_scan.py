@@ -5,9 +5,9 @@ r"""
   python build/hygiene_scan.py --json     # 机器可读
   python build/hygiene_scan.py --selftest # 规则自检（合成样例命中验证，门禁的牙齿）
 
-十四查（1–6 只扫第一方 Rust 源码 `main/src/**/*.rs`；第 7 查按登记要求跨到 `main/patches/` 与 `.3rd/`，**不碰归档**；
+十五查（1–6 只扫第一方 Rust 源码 `main/src/**/*.rs`；第 7 查按登记要求跨到 `main/patches/` 与 `.3rd/`，**不碰归档**；
 第 8 查扫 `main/**` 的全部第一方文本文件；第 9 查只扫 `main/**/*.ps1`；第 10、11、13、14 查只扫 `main/src/ui/**`；
-第 12 查扫 `main/**` 找凭据形状）：
+第 12 查扫 `main/**` 找凭据形状；第 15 查读 `src/core/config.rs` 的 M4 用例与 `src/ui/settings/` 磁盘目录做集合判等）：
 
   1. 硬编码绝对路径  `[A-Z]:\`  —— 换台电脑就失效
   2. 调试残留        `println!` / `eprintln!` / `print!` / `eprint!` / `dbg!`
@@ -97,17 +97,27 @@ r"""
   「窗闪一下就没了」。正确写法是 `singleton::recycle` 给出的两个不同键。
 
 十四查 `footer_buttons`（2026-11-06，用户点名）：`main/src/ui/**` 的非测试代码里，
-  `Element::button(` 只许出现在 `settings/rows.rs`（`btn` 的实现本身）。其余一律走
-  `btn(...)` 或 `dialog_footer::action(...)`，整扇对话框走 `dialog_footer::shell`。
-  起因是三扇对话框各写一套四边留白 / 行间距 / 按钮位：插件设置窗 `spacing(0)` 再在按钮行
-  加一层 16、裸数据参数窗 `spacing(10)` 且按钮不贴底、恢复提示窗 `spacing(10)` 自己顶一颗
-  spacer——用户看到的是「通道调色的快捷键窗按钮和其它插件不一样」。版式正本见
-  `docs/界面版式规范.md` §2：四边 16（`DIALOG_PAD`）、行间距与按钮间距 8（`GAP`）、
-  行高 40（`ROW_H`）、按钮右对齐且贴底。
+   `Element::button(` 只许出现在 `settings/rows.rs`（`btn` 的实现本身）。其余一律走
+   `btn(...)` 或 `dialog_footer::action(...)`，整扇对话框走 `dialog_footer::shell`。
+   起因是三扇对话框各写一套四边留白 / 行间距 / 按钮位：插件设置窗 `spacing(0)` 再在按钮行
+   加一层 16、裸数据参数窗 `spacing(10)` 且按钮不贴底、恢复提示窗 `spacing(10)` 自己顶一颗
+   spacer——用户看到的是「通道调色的快捷键窗按钮和其它插件不一样」。版式正本见
+   `docs/界面版式规范.md` §2：四边 16（`DIALOG_PAD`）、行间距与按钮间距 8（`GAP`）、
+   行高 40（`ROW_H`）、按钮右对齐且贴底。
+
+十五查 `settings_include`（2026-11-10，`开发指南.md` §五 E3 下沉）：`src/core/config.rs` 的
+   M4 用例（`ui_touchpoints_cover_all_keys`）把设置页各页源码 `include_str!` 进来，
+   编译期核对「每个 ini 键都有 `ini 键：<名>` 写点注释」。`include_str!` 不支持通配 ⇒
+   那张清单靠人手维护，而 M4 用例自己只查「**列进来的**文件里有没有写点」——**漏列一页
+   永远不会红**（实测现场：`decoders.rs` 曾在名单外，那一页恰好没有写点注释，
+   测试绿着、漏列静默）。本查锚定 M4 用例，把清单里 `../ui/settings/` 的条目集与磁盘
+   `src/ui/settings/*.rs` 全集做**双向判等**：磁盘有清单无 = 漏列（必须报）；清单有磁盘无
+   = 幽灵条目（cargo 编译也会红，静态提前报，与 patch_parity 同风格）。解析不出 M4 用例、
+   条目集为空、磁盘目录为空一律报「本查失明」——静默通过比报错更危险。
 
 分类计数：违规按 `abs_path` / `debug_macro` / `marker` / `boundary_doc` / `panic_source` /
 `config_last_mile` / `patch_parity` / `control_char` / `ps1_ascii` / `literal_color` /
-`ui_super_path` / `secret` / `single_window_key` / `footer_buttons` 十四档分别报数（见 [`CATEGORIES`]）。**判定门限仍是「总数 = 0」**——分类只为趋势可见（哪一类在动），
+`ui_super_path` / `secret` / `single_window_key` / `footer_buttons` / `settings_include` 十五档分别报数（见 [`CATEGORIES`]）。**判定门限仍是「总数 = 0」**——分类只为趋势可见（哪一类在动），
 不引入基线冻结；RuPix 违规历史 = 0，加基线等于给满分项目开小抄通道。
 退出码：0 = 「违规 0 处」；1 = 有违规。
 
@@ -226,7 +236,7 @@ CFG_FIELD = re.compile(r"\bcfg\.([a-z_][a-z0-9_]*)")
 # 与上面"九查"顺序一一对应；新增分类请**尾追**（头插会打乱旧日志三段布局）。
 CATEGORIES = ("abs_path", "debug_macro", "marker", "boundary_doc", "panic_source", "config_last_mile",
               "patch_parity", "control_char", "ps1_ascii", "literal_color",
-              "ui_super_path", "secret", "single_window_key", "footer_buttons")
+              "ui_super_path", "secret", "single_window_key", "footer_buttons", "settings_include")
 
 
 def is_comment(line: str) -> bool:
@@ -712,6 +722,76 @@ def detect_secrets(root_dir: pathlib.Path) -> list[str]:
     return bad
 
 
+# ── 十五查（2026-11-10）：M4 清单 = 磁盘 settings/*.rs 全集（E3 下沉） ───────────
+# 为什么锚定 M4 用例函数：它的语义就是「设置页各页源码全集」（注释明说「拆成各页后
+# 逐文件列出」），函数名是 Rust 测试契约、稳定可锚；锚点丢了就报失明，绝不静默空跑。
+M4_TEST_NAME = "fn ui_touchpoints_cover_all_keys"
+INCLUDE_STR_ARG = re.compile(r'include_str!\(\s*"([^"]+)"\s*\)')
+SETTINGS_PREFIX = "../ui/settings/"
+
+
+def settings_include_gaps(disk, listed):
+    """双向集合判等（元素 = 不带 .rs 的文件名）。纯函数，selftest 直接喂合成样本。"""
+    bad = []
+    for name in sorted(disk - listed):
+        bad.append(
+            f"settings_include: settings/{name}.rs 在磁盘上、M4 清单里却没有 —— "
+            "include_str! 不支持通配，漏列的那一页若恰好没有 ini 键写点注释，"
+            "M4 用例永远查不到它（decoders.rs 就这么静默漏过一次）；"
+            f'在 ui_touchpoints_cover_all_keys 的 concat! 里补 include_str!("../ui/settings/{name}.rs")'
+        )
+    for name in sorted(listed - disk):
+        bad.append(
+            f"settings_include: M4 清单列了 settings/{name}.rs，磁盘上却没有 —— "
+            "幽灵条目（cargo 编译也会红；先修清单，或把文件找回）"
+        )
+    return bad
+
+
+def detect_settings_include(src_dir: pathlib.Path) -> list[str]:
+    """M4 用例的 include_str! 清单必须恰好覆盖 `src/ui/settings/*.rs` 磁盘全集。
+
+    为什么值得一条硬门禁：M4 用例自己只查「列进来的文件里有没有写点」，漏列方向
+    完全失明——而 `include_str!` 不支持通配，清单永远靠人手维护，设置页每拆/加一页
+    就多一次漏列机会。与 config_last_mile 同款兜底：解析不出任何东西也报，
+    本查不许空跑成"全部通过"。
+    """
+    cfg = src_dir / "core" / "config.rs"
+    settings_dir = src_dir / "ui" / "settings"
+    if not cfg.is_file():
+        return ["settings_include: 找不到 src/core/config.rs（本查失明）"]
+    if not settings_dir.is_dir():
+        return ["settings_include: 找不到 src/ui/settings/（目录形状变了，本查失明）"]
+    disk = {
+        p.name[: -len(".rs")]
+        for p in settings_dir.iterdir()
+        if p.is_file() and p.name.endswith(".rs")
+    }
+    if not disk:
+        return ["settings_include: settings/ 下一个 .rs 都没有（目录形状变了，本查失明）"]
+    text = cfg.read_text(encoding="utf-8", errors="replace")
+    start = text.find(M4_TEST_NAME)
+    if start < 0:
+        return [
+            f"settings_include: config.rs 里找不到 `{M4_TEST_NAME}`（用例改名了？锚点丢了，本查失明）"
+        ]
+    # M4 用例体 = 函数名起、到下一个测试属性或顶层项为止（体内只有 assert，无嵌套 fn）。
+    tail = text[start + len(M4_TEST_NAME):]
+    nxt = re.search(r"(?m)^(?:\s*#\[test\]|\s*(?:pub\s+)?(?:fn|struct|enum|impl|mod|const|static)\s)", tail)
+    body = text[start : start + len(M4_TEST_NAME) + (nxt.start() if nxt else len(tail))]
+    listed = set()
+    for m in INCLUDE_STR_ARG.finditer(body):
+        rel = m.group(1).replace("\\", "/")
+        if rel.startswith(SETTINGS_PREFIX) and rel.endswith(".rs"):
+            listed.add(rel[len(SETTINGS_PREFIX):-len(".rs")])
+    if not listed:
+        return [
+            "settings_include: M4 用例里一处 `../ui/settings/` 的 include_str! 都没解析出"
+            "（写法变了，本查失明）"
+        ]
+    return settings_include_gaps(disk, listed)
+
+
 def selftest() -> int:
     """自检：合成样例必须被十查规则正确命中（tests/docs_consistency.rs 判据⑧）。
 
@@ -797,6 +877,25 @@ def selftest() -> int:
             ".single(win_key)",
         ]) == [],
         "测试区不算生产代码",
+    )
+
+    # settings_include（十五查：M4 清单 = 磁盘 settings 全集，E3 下沉）——
+    # 漏列 / 幽灵 / 相等三臂各证一次，再对本仓现状验一次（有差集就是漏列或幽灵）。
+    expect(
+        settings_include_gaps({"mod", "options", "rows"}, {"mod", "options"}) != [],
+        "磁盘有、清单没有 ⇒ 漏列必须报（E3 的原始痛点）",
+    )
+    expect(
+        settings_include_gaps({"mod"}, {"mod", "ghost"}) != [],
+        "清单有、磁盘没有 ⇒ 幽灵条目必须报",
+    )
+    expect(
+        settings_include_gaps({"mod", "rows"}, {"rows", "mod"}) == [],
+        "两集合相等 ⇒ 不该报",
+    )
+    expect(
+        detect_settings_include(SRC) == [],
+        "本仓 M4 清单必须与 settings/ 磁盘全集一致（差一件就是漏列或幽灵）",
     )
 
     # TEST_ONLY —— 文件级测试模块（`#[cfg(test)] mod tests;`）整篇算测试区；
@@ -1108,6 +1207,10 @@ def main():
     # footer_buttons：按钮创建点只留两处（见模块头十四查与 detect_footer_buttons）。
     for msg in detect_footer_buttons(SRC):
         violations.append(("footer_buttons", msg))
+
+    # settings_include：M4 清单 = 磁盘 settings/*.rs 全集（见模块头十五查与 detect_settings_include）。
+    for msg in detect_settings_include(SRC):
+        violations.append(("settings_include", msg))
 
     by_cat = {c: 0 for c in CATEGORIES}
     for cat, _ in violations:

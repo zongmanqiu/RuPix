@@ -195,6 +195,20 @@ pub const TEXT_ACCENT: [u8; 3] = [192, 57, 43];
 struct Overlay {
     /// 空窗底 / 画布底（棋盘格关掉时铺满整个画面）。
     empty_bg: [u8; 3],
+    /// 左侧文件树面板底（m302）。
+    ///
+    /// ★ 它是**第三块地**，既不能等于 [`Overlay::empty_bg`]（看图区），也不能等于
+    ///   [`Overlay::panel_bg`]（缩略图条）：相等的那两块在屏上会连成一片，圆角处
+    ///   漏出的底色又跟面板同色，面板等于没画（2026-11-10 用户截图实测）。
+    ///   两套主题都取「离看图区最远」的一档：深色最亮、浅色最暗。
+    tree_bg: [u8; 3],
+    /// 文件树里**当前层**那一行的底（m309）。
+    ///
+    /// ★ 不复用 [`Overlay::slot_cur`]：那是给缩略图格用的半透明叠加（6% 黑），
+    ///   压在**实心**的 `tree_bg` 上只差 14 级灰，真机上等于没标（用户原话
+    ///   「标出当前层倒是有必要」——那时候其实已经有标记，只是看不出来）。
+    ///   这里取不透明值：深浅两套都精确可控，不受底层色影响。
+    tree_cur: [u8; 3],
     /// 棋盘格两格（透明背景）：必须一深一浅交替，任何图都能看出哪块是透明的。
     checker_a: [u8; 3],
     checker_b: [u8; 3],
@@ -223,6 +237,13 @@ struct Overlay {
     arrow_press: [u8; 4],
     /// 底部缩略图条的背板（比胶囊更重一档，整条压在画面下缘）。
     panel_bg: [u8; 4],
+    /// 面板朝内容区那侧的 **1dp 分隔线**（m311，见 `ui::fill_panel_open` 的 `edge`）。
+    ///
+    /// ★ 浅色主题**必须**有线：看图区已经 L\* 99，再亮就到 100，三块地最多挤出
+    ///   ΔE≈4 的差；不补这条线就只能靠「把树压暗」来分开——那正是用户说的「太重」。
+    /// ★ 深色主题是 α=0（**不画**）：那两档 ΔE 已经 11，再加一道线纯属多余。
+    ///   两套给不同的 α 不是偷懒，是这两套主题的可用明度空间根本不一样。
+    panel_edge: [u8; 4],
     /// 缩略图格底。
     slot_bg: [u8; 4],
     /// 缩略图格悬停。
@@ -246,7 +267,14 @@ struct Overlay {
 
 /// 深色（默认）：2026-10-26 以来压在图片上的那一套，一个字节都没改。
 const DARK_OVERLAY: Overlay = Overlay {
-    empty_bg: [15, 15, 15],
+    // ★ m310：三档按 **CIELAB 的 L\*** 等距（每步 ΔL*≈11），不是按 sRGB 数值等距。
+    //   暗部要**更大**的数值差才有同样的感知落差（用户 2026-11-10 口径），
+    //   所以这儿的 sRGB 跨度 48 明显大于浅色那套的 24——两套用同一组步长的话，
+    //   深色在观感上永远比浅色弱一档。看图区永远在**最暗**那端。
+    //   L*: 4.0 / 15.3 / 26.4。
+    empty_bg: [14, 14, 16],
+    tree_bg: [62, 62, 68],
+    tree_cur: [106, 106, 114],
     checker_a: [34, 34, 34],
     // 浅格不能太暗（2026-11-01 用户实测）：以前 [48,48,48] 与深格只差 14 级，
     // 暗色调的图压在浅格上跟透明区糊成一片；提到 120 后深色内容与透明区一眼可分。
@@ -262,7 +290,9 @@ const DARK_OVERLAY: Overlay = Overlay {
     btn_press: [255, 255, 255, 44],
     arrow_hover: [52, 52, 56, 230],
     arrow_press: [70, 70, 74, 235],
-    panel_bg: [24, 24, 26, 232],
+    panel_bg: [38, 38, 42, 232],
+    // α=0：深色两档之间差了 11 个 ΔE，分得开靠的是填充色本身，不需要线。
+    panel_edge: [0, 0, 0, 0],
     slot_bg: [255, 255, 255, 12],
     slot_hover: [255, 255, 255, 34],
     slot_cur: [255, 255, 255, 22],
@@ -276,15 +306,24 @@ const DARK_OVERLAY: Overlay = Overlay {
 /// 浅色：同一批浮层换白底深字。
 ///
 /// 数值不是"把深色反过来"算出来的，是按各自职责重配的：
-/// - 背板走**近白微灰**（`246,246,248` / 白胶囊）而不是纯白：纯白压在浅色照片上
-///   边界会糊掉，差 8–10 级刚好把浮层"托"起来，又不至于像一块灰板。
+/// - 三块地走**等距阶梯**（m309：看图区 251 → 缩略图条 239 → 文件树 227，每级 12）：
+///   看图区取近白微灰而不是纯白——纯白压在浅色照片上边界会糊掉；阶梯把浮层一级一级
+///   "托"起来，又不至于像一块灰板。
 /// - 所有"亮一档表示悬停/按下"的叠加一律改成**压暗**（`0,0,0,a`）：白底上越叠越亮
 ///   会直接看不见，这是把深色做法反过来之后最容易踩的一脚。
 /// - 棋盘格浅格是白、深格是 `221,223,228`（差 34 级），与深色主题的 86 级同一量级，
 ///   透明区在浅底上照样一眼可辨。
-/// - 红系整体加深：`224,86,78` 这类亮红压在 246 的底上对比只有 2.6:1，读不清。
+/// - 红系整体加深：`224,86,78` 这类亮红压在浅底上对比只有 2.6:1，读不清。
 const LIGHT_OVERLAY: Overlay = Overlay {
-    empty_bg: [246, 246, 248],
+    // ★ m311：三块地整体**抬亮**（看区 249→252、条 232→239、树 215→228）。
+    //   m310 只按 L* 等距排，数被压到灰那一端：树 #D7D9DD 压在近白的画面上就是一整块
+    //   灰，而它与条只差 5.7 L*，五五开地糊成一片（用户 2026-11-10：「太重，而且难以
+    //   区分」）。现在每步 ΔE≈4.2，树再带一点冷调（b* −3.7）——但这点差**不够**，
+    //   剩下的分离交给 `panel_edge` 那条 1dp 线（浅色端没有明度余量，见该字段注释）。
+    //   L*: 99.0 / 94.8 / 91.6，sRGB 跨度 24（深色那套是 48，见其注释）。
+    empty_bg: [252, 252, 253],
+    tree_bg: [228, 231, 238],
+    tree_cur: [189, 194, 204],
     checker_a: [255, 255, 255],
     checker_b: [221, 223, 228],
     hint_text: [128, 132, 138],
@@ -296,7 +335,9 @@ const LIGHT_OVERLAY: Overlay = Overlay {
     btn_press: [0, 0, 0, 34],
     arrow_hover: [232, 234, 238, 238],
     arrow_press: [214, 217, 222, 242],
-    panel_bg: [252, 252, 254, 240],
+    panel_bg: [239, 240, 242, 240],
+    // 8% 黑：压在条上比底色深 6.7 个 L*，一条锐利的细缝（VS Code 的边框就是这个量级）。
+    panel_edge: [0, 0, 0, 20],
     slot_bg: [0, 0, 0, 10],
     slot_hover: [0, 0, 0, 28],
     slot_cur: [0, 0, 0, 16],
@@ -321,6 +362,14 @@ fn overlay() -> &'static Overlay {
 /// 空窗底 / 画布底。
 pub fn empty_bg() -> Color {
     to_color(overlay().empty_bg)
+}
+/// 左侧文件树面板底（第三块地，别与 `empty_bg` / `panel_bg` 混用）。
+pub fn tree_bg() -> Color {
+    to_color(overlay().tree_bg)
+}
+/// 文件树里当前层那一行的底（m309）。不透明，别拿 `slot_cur` 顶替。
+pub fn tree_cur() -> Color {
+    to_color(overlay().tree_cur)
 }
 /// 棋盘格深格。
 pub fn checker_a() -> Color {
@@ -369,6 +418,10 @@ pub fn arrow_press() -> Color {
 /// 缩略图条背板。
 pub fn panel_bg() -> Color {
     to_color4(overlay().panel_bg)
+}
+/// 面板朝内容区那侧的 1dp 分隔线（见 `ui::fill_panel_open`）。
+pub fn panel_edge() -> Color {
+    to_color4(overlay().panel_edge)
 }
 /// 缩略图格底。
 pub fn slot_bg() -> Color {
@@ -507,5 +560,218 @@ mod tests {
             DARK_OVERLAY.text_active, LIGHT_OVERLAY.text_active,
             "激活绿必须换（浅底上用深绿，否则看不出来）"
         );
+    }
+
+    /// ★ m302：树、条、看图区是三块地，必须两两可分。截图实测过一次「树 = 看图区」
+    ///   （浅色主题下都是 #F6F6F8）的后果：整块面板融进背景，圆角漏出来的也是同色，
+    ///   看上去就是没画面板。
+    #[test]
+    fn tree_strip_and_view_are_three_distinct_surfaces() {
+        // 两套表一个是 RGB、一个是 RGBA：都按切片前三个通道比，别为长度写两份。
+        let dist = |a: &[u8], b: &[u8]| {
+            a[0].abs_diff(b[0]) as u32 + a[1].abs_diff(b[1]) as u32 + a[2].abs_diff(b[2]) as u32
+        };
+        for (name, view, panel, tree) in [
+            (
+                "dark",
+                DARK_OVERLAY.empty_bg,
+                DARK_OVERLAY.panel_bg,
+                DARK_OVERLAY.tree_bg,
+            ),
+            (
+                "light",
+                LIGHT_OVERLAY.empty_bg,
+                LIGHT_OVERLAY.panel_bg,
+                LIGHT_OVERLAY.tree_bg,
+            ),
+        ] {
+            assert!(dist(&view, &tree) >= 18, "{name}: 树与看图区糊成一片");
+            assert!(dist(&tree, &panel) >= 18, "{name}: 树与缩略图条糊成一片");
+            // 负向臂：树不许落在「看图区与条之间」——那样必定有一套主题下它贴近
+            // 半透明条压出来的观感色，条贴左时又分不出两块。
+            assert!(
+                dist(&view, &tree) > dist(&view, &panel),
+                "{name}: 树该比条离看图区更远"
+            );
+        }
+    }
+
+    /// sRGB 三通道 → CIELAB 的 L*（D65，只取明度轴）。
+    ///
+    /// ★ 判据为什么必须用它，而不是 `R+G+B`：sRGB 的数值差**不是**感知差。用户
+    ///   2026-11-10 的原话是「浅色部分的一点点数值就会有很大区别，深色部分却需要
+    ///   比较大的数值」。m309 拿算术和当尺子，把两套都判成"等距"（12/12 与 14/14），
+    ///   看着仍然是"没层次"——因为同一套 sRGB 步长，在暗部换来的观感落差和亮部不等。
+    /// sRGB → CIELAB（D65）。
+    ///
+    /// ★ 只比 L\* 不够：m311 起树底带一点冷调（b\* ≈ −3.7），明度差相同时色相也在
+    ///   帮忙分开。判「看起来差多少」必须走 ΔE，否则那点冷调被算成零。
+    fn lab(rgb: &[u8]) -> (f32, f32, f32) {
+        let lin = |v: u8| {
+            let c = v as f32 / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let (r, g, b) = (lin(rgb[0]), lin(rgb[1]), lin(rgb[2]));
+        let x = 0.4124564 * r + 0.3575761 * g + 0.1804375 * b;
+        let y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b;
+        let z = 0.0193339 * r + 0.119_192 * g + 0.9503041 * b;
+        let f = |t: f32| {
+            if t > 0.008856 {
+                t.powf(1.0 / 3.0)
+            } else {
+                7.787 * t + 16.0 / 116.0
+            }
+        };
+        let (fx, fy, fz) = (f(x / 0.95047), f(y), f(z / 1.08883));
+        (116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
+    }
+
+    /// 两色的 CIE76 色差（ΔE\*ab）。经验刻度：≈2.3 是「刚好能看出」的门槛。
+    fn delta_e(a: &[u8], b: &[u8]) -> f32 {
+        let (p, q) = (lab(a), lab(b));
+        ((p.0 - q.0).powi(2) + (p.1 - q.1).powi(2) + (p.2 - q.2).powi(2)).sqrt()
+    }
+
+    /// 把一枚（可能带 α 的）ink 压到 bg 上，得到「看见的那个颜色」。
+    fn blend(ink: &[u8], bg: &[u8]) -> [u8; 3] {
+        let k = ink[3] as f32 / 255.0;
+        [0, 1, 2].map(|i| (ink[i] as f32 * k + bg[i] as f32 * (1.0 - k)).round() as u8)
+    }
+
+    fn lstar(rgb: &[u8]) -> f32 {
+        lab(rgb).0
+    }
+
+    /// `lstar` 自己的标定：黑 0、白 100，中点大致在 sRGB 119。
+    /// 这条先站稳，后面两条判据才有意义。
+    #[test]
+    fn lstar_hits_its_two_anchors() {
+        assert!(lstar(&[0, 0, 0]).abs() < 0.5, "纯黑该是 L*≈0");
+        assert!(
+            (lstar(&[255, 255, 255]) - 100.0).abs() < 0.5,
+            "纯白该是 L*≈100"
+        );
+        // 负向臂：算术和会把 119 和 255 判成差 136 级，L* 上它们差 50。
+        assert!((lstar(&[119, 119, 119]) - 50.0).abs() < 1.0);
+    }
+
+    /// ★ m311：三块地要**亮**、还得**分得开**——浅色端这两件事会打架。
+    ///
+    /// 四件事一起判：
+    ///   ① 顺序一致——看图区永远在最极端那端（它是内容区，最不该被背景抢）；
+    ///   ② 浅色不许沉——树底 L\* ≥90。这条是用户「太重」那句的机器版：m310 把树
+    ///      压到 86.6（#D7D9DD），压在近白的画面上就是一整块灰；
+    ///   ③ 每步 ΔE ≥3.5，且**分不够就必须有线**——浅色看图区已经 L\* 99，再往上没
+    ///      空间，三块地最多挤出 ΔE≈4；这时光靠填充色必然「难以区分」，得由 1dp 线
+    ///      补刀。深色反过来：ΔE 已经 11，画线纯属多一道；
+    ///   ④ **深色的 sRGB 跨度必须大于浅色**——「暗部需要更大的数值差」的机器判据，
+    ///      挡住「两套共用一组步长」这种偷懒写法。
+    #[test]
+    fn three_surfaces_stay_light_and_apart() {
+        let l = [
+            &LIGHT_OVERLAY.empty_bg[..],
+            &LIGHT_OVERLAY.panel_bg[..3],
+            &LIGHT_OVERLAY.tree_bg[..],
+        ];
+        let d = [
+            &DARK_OVERLAY.empty_bg[..],
+            &DARK_OVERLAY.panel_bg[..3],
+            &DARK_OVERLAY.tree_bg[..],
+        ];
+
+        // ① 先后位置。
+        assert!(
+            lstar(l[0]) > lstar(l[1]) && lstar(l[1]) > lstar(l[2]),
+            "light: 三块地的先后位置不对（看图区必须最亮）"
+        );
+        assert!(
+            lstar(d[0]) < lstar(d[1]) && lstar(d[1]) < lstar(d[2]),
+            "dark: 三块地的先后位置不对（看图区必须最暗）"
+        );
+
+        // ② 浅色不许沉。
+        assert!(
+            lstar(l[2]) >= 90.0,
+            "light: 树底 L* 只有 {:.1}（该 ≥90）——压在近白的画面上就是一整块灰",
+            lstar(l[2])
+        );
+
+        // ③ 每步跟得上；分不够时，空缺必须由那条线补上。
+        let (l1, l2) = (delta_e(l[0], l[1]), delta_e(l[1], l[2]));
+        assert!(
+            l1 >= 3.5 && l2 >= 3.5,
+            "light: 有一步 ΔE 只 {l1:.1} / {l2:.1}（每步至少 3.5）"
+        );
+        if l1.min(l2) < 5.5 {
+            let a = LIGHT_OVERLAY.panel_edge[3];
+            let on = blend(&LIGHT_OVERLAY.panel_edge, l[1]);
+            assert!(
+                a >= 12 && delta_e(&on, l[1]) >= 3.0,
+                "light: 每步 ΔE 只有 {:.1}，分隔线却看不见（α={a}，压在条上差 {:.1} ΔE）——两块地会糊在一起",
+                l1.min(l2),
+                delta_e(&on, l[1])
+            );
+        }
+        assert_eq!(
+            DARK_OVERLAY.panel_edge[3],
+            0,
+            "dark: 两档 ΔE 已经 {:.1}，不该再画线（多一道反而脏）",
+            delta_e(d[0], d[1])
+        );
+
+        // ④ 暗部靠更大的数值差。
+        let (ls, ds) = (
+            l[0][0] as i32 - l[2][0] as i32,
+            d[2][0] as i32 - d[0][0] as i32,
+        );
+        assert!(
+            ds > ls,
+            "深色的 sRGB 跨度 {ds} 不大于浅色的 {ls}——暗部要靠更大的数值差才看得出层次"
+        );
+    }
+
+    /// 当前层那一行必须**看得出来**。m309 之前它用 `slot_cur`（6% 黑）压在实心的
+    /// 树底上，只差 14 级灰——标记在，效果等于没有。
+    #[test]
+    fn tree_current_row_stands_out_from_the_panel() {
+        // hover 是半透明的：先合成到树底上，再一起折算成 L*，否则比的是两个世界的东西。
+        let hover_over = |hover: &[u8], bg: &[u8]| -> [u8; 3] {
+            let k = hover[3] as f32 / 255.0;
+            let f = |i: usize| (hover[i] as f32 * k + bg[i] as f32 * (1.0 - k)).round() as u8;
+            [f(0), f(1), f(2)]
+        };
+        for (name, bg, cur, hover) in [
+            (
+                "dark",
+                DARK_OVERLAY.tree_bg,
+                DARK_OVERLAY.tree_cur,
+                DARK_OVERLAY.slot_hover,
+            ),
+            (
+                "light",
+                LIGHT_OVERLAY.tree_bg,
+                LIGHT_OVERLAY.tree_cur,
+                LIGHT_OVERLAY.slot_hover,
+            ),
+        ] {
+            assert_ne!(bg, cur, "{name}: 当前层与树底同值");
+            let lb = lstar(&bg);
+            let cur_off = (lstar(&cur) - lb).abs();
+            let hov_off = (lstar(&hover_over(&hover, &bg)) - lb).abs();
+            assert!(
+                cur_off >= 8.0,
+                "{name}: 当前层与树底的 L* 只差 {cur_off:.1}（至少 8）——标记等于没标"
+            );
+            // ★ 当前层要比 hover **更重**：鼠标划过是瞬时提示，"你在这儿"是持久状态。
+            //   反过来就成了「划一下比停在那儿还显眼」——m309 第一版正是这个毛病。
+            assert!(
+                cur_off >= hov_off + 3.0,
+                "{name}: 当前层 L* 偏移 {cur_off:.1} 没比 hover 的 {hov_off:.1} 高出 3"
+            );
+        }
     }
 }

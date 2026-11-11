@@ -31,5 +31,6 @@ pub mod shared_mem;
 pub mod shell;
 pub mod shell_selection;
 pub mod spacehook;
+pub mod userchoice_hash;
 pub mod window_frame;
 pub mod working_set;

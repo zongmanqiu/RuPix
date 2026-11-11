@@ -30,7 +30,7 @@
 | §11 VERSIONINFO（"无翻转"） | `build.rs` + `assets/version.rc.in`（版本源 = `Cargo.toml`） | `deploy.py` **RT_VERSION 门禁**（K70） | ✅ 2026-10-19 |
 | §10 日志头必含版本/OS/DPI/会话/参数 | `platform::env_report` 会话头，崩溃报告读启动时冻结的那份 | `env_report` 单测 + `.build/temp/rupix-<日期>.log` 真机读数 | ✅ 2026-10-19 |
 | §7.2 原子写 temp + fsync + replace | `core::config::save_to` | 落盘往返测试只覆盖"内容完整"；**fsync 本身没有判据**（断电不可测），靠代码审查 + 注释里那条 NTFS 理由 | ✅ 2026-10-19 |
-| §16 clippy `-D warnings` 进 CI | `2_scan.bat` 第 [4/6] 步 | 门禁自身（K69：不带 `-D warnings` 就是假绿） | ✅ 2026-10-19 |
+| §16 clippy `-D warnings` 进 CI | `2_scan.bat` 第 [4/7] 步 | 门禁自身（K69：不带 `-D warnings` 就是假绿） | ✅ 2026-10-19 |
 | §2.4 组合根要薄（bin 对测试不可见） | argv 解析搬进 `rupix_lib::cli` | `cli` 5 条单测 | ✅ 2026-10-19 |
 | §2.2 时钟端口化（试金石 D′） | **只做防抖那一处**：`poll_at(c,&p,now)` | 防抖到期判据单测 | ✅ 局部；`Clock` trait 判废（core 30 处时间读，收益不成比例） |
 | §0.2 三条失效边界的守卫工具 | 边界 parse 单测 + 快照对拍 + 迁移契约类测试 | `cargo test`（含元数据盲点单测） | ✅ 部分。`loom` / `cargo-fuzz` **没引入，也没做过成本收益测算**——那是"没评估"，不是"已裁决"，别当结论引用 |

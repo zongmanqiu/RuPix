@@ -29,7 +29,10 @@ use super::*;
 ///
 /// 本页所有项都即时生效（m54）：窗口置顶 / 窗口大小 / 固定尺寸由 runtime 差分
 /// 推给当前窗口，不再需要「下次启动生效」的尾巴。
-pub fn options_page(h: &Handles) -> Element {
+///
+/// `config` 只给「文件关联」的入口用（m314）：那个窗要读写 `assoc_exts` 勾选表，
+/// 打开时按它预勾选、应用时写回。其余各项都走 `Handles` 里的信号。
+pub fn options_page(h: &Handles, config: Rc<RefCell<Config>>) -> Element {
     Element::scroll()
         .fill()
         .padding_xy(16, PAGE_TOP_MARGIN)
@@ -40,7 +43,7 @@ pub fn options_page(h: &Handles) -> Element {
                 .child(section_card("外观", h.card_appearance, appearance_body(h)))
                 .child(section_card("窗口", h.card_window, window_body(h)))
                 .child(section_card("看图", h.card_browse, browse_body(h)))
-                .child(section_card("系统", h.card_system, system_body(h))),
+                .child(section_card("系统", h.card_system, system_body(h, config))),
         )
 }
 
@@ -231,7 +234,7 @@ fn browse_body(h: &Handles) -> Element {
 /// ★ m266：图片预读已挪进「看图」卡（它改的是切图怎么被看到，不是后台层次）；
 ///   这一卡只剩两项，m244 加的文件关联是独立窗（ini 没有它的键——关联态住注册表，
 ///   修宪唯一例外）。
-fn system_body(h: &Handles) -> Element {
+fn system_body(h: &Handles, config: Rc<RefCell<Config>>) -> Element {
     Element::col()
         .fill()
         .spacing(0)
@@ -249,12 +252,13 @@ fn system_body(h: &Handles) -> Element {
             )
             .width(CONTROL_GROUP_W),
         ))
-        // 文件关联（m244）：独立窗，150+ 后缀勾选网格 + 一次性写入。
-        // 不放 ini 键、不做每帧计数——打开窗才知道细节，这里只给入口。
+        // 文件关联（m244 建窗；m314 起勾选持久、m315 起自愈 opt-in）：独立窗。
+        // 勾选落 ini（ini 键：assoc_exts），点「应用」写一次；「自动维护」是窗内
+        // 另一颗开关（ini 键：assoc_heal，**默认关**），开了才有定时核对。这里只给入口。
         .child(option_row(
             "文件关联",
-            super::rows::btn("管理…").on_click(|ctx| {
-                super::super::association::show(ctx);
+            super::rows::btn("管理…").on_click(move |ctx| {
+                super::super::association::show(ctx, config.clone());
             }),
         ))
 }

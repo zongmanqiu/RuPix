@@ -13,6 +13,52 @@ use std::path::PathBuf;
 /// `--bench-thumb` 缺省重复次数：够中位数稳（本项目配对基准的口径是 n≥200）。
 pub const BENCH_DEFAULT_REPS: usize = 200;
 
+/// 无头命令面的四个纯读动词（m293）。
+///
+/// 全部以 `--<动词>` 选项形式出现，**不做位置参数**：`initial_path` 取首个非 `--`
+/// 参数当要打开的文件，位置动词会被它抢走。四个动词都不建窗、不进单实例闸门，
+/// 输出由 `headless` 模块统一回一行 JSON。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadlessCmd {
+    List,
+    Metadata,
+    Thumbnail,
+    Render,
+}
+
+impl HeadlessCmd {
+    /// 出现在 JSON `cmd` 字段里的稳定名字；契约的一部分，不许随 UI 文案改名。
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::List => "list",
+            Self::Metadata => "metadata",
+            Self::Thumbnail => "thumbnail",
+            Self::Render => "render",
+        }
+    }
+
+    /// 认选项名；返回 `None` 时交给 `parse` 的未知选项分支。
+    pub fn from_option(s: &str) -> Option<Self> {
+        match s {
+            "--list" => Some(Self::List),
+            "--metadata" => Some(Self::Metadata),
+            "--thumbnail" => Some(Self::Thumbnail),
+            "--render" => Some(Self::Render),
+            _ => None,
+        }
+    }
+}
+
+/// 一条无头请求：动词 + 路径 + `render` 的可选目标框。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Headless {
+    pub cmd: HeadlessCmd,
+    pub path: PathBuf,
+    /// `Some((w,h))` 只由 `--render <文件> <宽> <高>` 两数同时给出时产生；
+    /// 缺省 `(0,0)` = 按原图尺寸解。其余三个动词恒 `None`。
+    pub target: Option<(u32, u32)>,
+}
+
 /// 解析结果。字段彼此独立，调用方按用途各取所需。
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Args {
@@ -28,20 +74,40 @@ pub struct Args {
     pub bench_flag: bool,
     /// `--safe-mode`：停用全部第三方解码器（`crate::decoders::set_safe_mode`）。
     pub safe_mode: bool,
+    /// 无头命令面（m293）：`--list` / `--metadata` / `--thumbnail` / `--render`。
+    pub headless: Option<Headless>,
+    /// 无头动词出现过、但没拿到路径。与 `probe_flag` 同理：少了这一位会静默起 GUI。
+    pub headless_flag: bool,
     /// 认不出来的 `--*` 选项。解析器**不**自己打日志：warn 属于表现层，
     /// 留在这里，`main` 与测试都能看见同一份事实。
     pub unknown: Vec<String>,
 }
 
-/// 一次遍历分辨「离屏探针」「safe-mode」「未知选项」。
+/// 是不是一条无头命令。单实例闸门、GUI 装配都由它分流。
+pub fn is_headless(args: &Args) -> bool {
+    args.headless.is_some()
+}
+
+/// 单实例闸门要不要生效：**只有 GUI 才要**。
+///
+/// 探针与基准绕过闸门是老规矩（进闸门会被转发给首实例、自己反而没跑）；无头命令
+/// 同理，而且它连窗口都没有，更不该被「一个进程、一个托盘」的模型收编。把这个判据
+/// 放在 lib 里而不是 `main.rs`，是因为 `tests/` 链接不到 bin target——闸门例外必须
+/// 有单测盯着，否则哪天少一个分支就是「命令被转发给 GUI、自己没跑」。
+pub fn needs_instance_gate(args: &Args) -> bool {
+    !is_headless(args) && args.probe.is_none() && args.bench.is_none()
+}
+
+/// 一次遍历分辨「离屏探针」「safe-mode」「无头命令」「未知选项」。
 ///
 /// 分段的旧写法会让第二段从头再看一遍 argv，于是探针标志自己被当成未知项——
-/// 模块头说的那次事故。三个带参标志会把**紧跟其后的路径参数**一起吃掉，避免它
+/// 模块头说的那次事故。带参标志会把**紧跟其后的路径参数**一起吃掉，避免它
 /// 落到未知项判定里；而"看起来像次数却不是数字"的那一颗**不吞**，留给调用方
 /// 判断（吞掉一个真选项会让脚本误判"参数被接受了"）。
 ///
 /// 要打开的文件路径不在这里取：它由 [`crate::initial_path`] 单独负责——
-/// 单实例转发给首实例的也是那份 argv，两处必须共用同一判据。
+/// 单实例转发给首实例的也是那份 argv，两处必须共用同一判据。这也是无头动词
+/// 一律做成 `--选项` 而不是位置参数的原因。
 pub fn parse(argv: &[String]) -> Args {
     let mut out = Args::default();
     let mut it = argv.iter().skip(1).peekable();
@@ -61,6 +127,37 @@ pub fn parse(argv: &[String]) -> Args {
             }
         } else if a == "--safe-mode" {
             out.safe_mode = true;
+        } else if let Some(cmd) = HeadlessCmd::from_option(a) {
+            out.headless_flag = true;
+            let path = it.next().map(PathBuf::from);
+            // 只有 `--render` 吃可选目标框；两数必须同时给且都 > 0，缺一按原尺寸。
+            let target = if cmd == HeadlessCmd::Render {
+                let w = it.peek().and_then(|s| s.parse::<u32>().ok());
+                if w.is_some() {
+                    it.next();
+                }
+                let h = if w.is_some() {
+                    it.peek().and_then(|s| s.parse::<u32>().ok())
+                } else {
+                    None
+                };
+                if h.is_some() {
+                    it.next();
+                }
+                match (w, h) {
+                    (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(p) = path {
+                out.headless = Some(Headless {
+                    cmd,
+                    path: p,
+                    target,
+                });
+            }
         } else if a.starts_with("--") {
             out.unknown.push(a.clone());
         }
@@ -165,5 +262,96 @@ mod tests {
             Some(std::path::Path::new("D:\\c.jpg"))
         );
         assert!(parse(&v).safe_mode, "两处判据必须同时成立");
+    }
+
+    /// 四个无头动词都认得、都不进 `unknown`；`--render` 的可选目标框要两数齐备。
+    #[test]
+    fn headless_verbs_parse_with_optional_box() {
+        let check = |opt: &str, cmd: HeadlessCmd| {
+            let a = parse(&argv(&["rupix.exe", opt, "D:\\dir"]));
+            assert_eq!(a.unknown, Vec::<String>::new(), "{opt} 不许自报未知项");
+            assert_eq!(a.headless.as_ref().map(|h| h.cmd), Some(cmd));
+            assert_eq!(a.headless.as_ref().unwrap().target, None);
+            assert!(a.headless_flag);
+        };
+        check("--list", HeadlessCmd::List);
+        check("--metadata", HeadlessCmd::Metadata);
+        check("--thumbnail", HeadlessCmd::Thumbnail);
+        check("--render", HeadlessCmd::Render);
+
+        let r = parse(&argv(&["rupix.exe", "--render", "D:\\a.png", "800", "600"]));
+        assert_eq!(r.headless.as_ref().unwrap().target, Some((800, 600)));
+        // 只给一个数 / 给了 0：不吃成目标框，按原尺寸解；真选项仍留在循环里。
+        let one = parse(&argv(&[
+            "rupix.exe",
+            "--render",
+            "D:\\a.png",
+            "800",
+            "--safe-mode",
+        ]));
+        assert_eq!(one.headless.as_ref().unwrap().target, None);
+        assert!(one.safe_mode, "--safe-mode 不该被当成高度吃掉");
+        let zero = parse(&argv(&["rupix.exe", "--render", "D:\\a.png", "0", "0"]));
+        assert_eq!(zero.headless.as_ref().unwrap().target, None);
+    }
+
+    /// 无头动词缺路径：标志留下了、请求为 None，`main` 据此回退出码 2。
+    #[test]
+    fn headless_flag_without_path_degrades_to_none() {
+        let a = parse(&argv(&["rupix.exe", "--list"]));
+        assert!(a.headless_flag);
+        assert_eq!(a.headless, None);
+        assert!(a.unknown.is_empty());
+    }
+
+    /// 闸门例外：四个动词一律绕开，GUI 一律进，老探针 / 基准照旧绕开。
+    /// ★ 负向臂：把 `is_headless` 这一项从判据里拿掉（即旧公式），四个动词就会
+    /// 被判成"要进闸门"——那正是「命令被转发给 GUI、自己没跑」的老故障。
+    #[test]
+    fn headless_bypasses_instance_gate_with_negative_arm() {
+        for cmd in [
+            HeadlessCmd::List,
+            HeadlessCmd::Metadata,
+            HeadlessCmd::Thumbnail,
+            HeadlessCmd::Render,
+        ] {
+            let a = Args {
+                headless: Some(Headless {
+                    cmd,
+                    path: PathBuf::from("a.png"),
+                    target: None,
+                }),
+                ..Default::default()
+            };
+            assert!(!needs_instance_gate(&a), "{cmd:?} 不该进闸门");
+            let old_formula = a.probe.is_none() && a.bench.is_none();
+            assert!(
+                old_formula,
+                "负向臂：漏掉 is_headless 时 {cmd:?} 会被误判进闸门"
+            );
+        }
+        let gui = Args::default();
+        assert!(needs_instance_gate(&gui), "普通 GUI 仍要进闸门");
+        let probe = Args {
+            probe: Some(PathBuf::from("a.png")),
+            ..Default::default()
+        };
+        assert!(!needs_instance_gate(&probe), "老探针通道不许被改坏");
+        let bench = Args {
+            bench: Some((PathBuf::from("a.png"), 3)),
+            ..Default::default()
+        };
+        assert!(!needs_instance_gate(&bench), "老基准通道不许被改坏");
+    }
+
+    /// 新增四个动词后，老的 `--probe-decode` / `--bench-thumb` 解析逐值不变。
+    #[test]
+    fn legacy_probe_channels_unchanged() {
+        let a = parse(&argv(&["rupix.exe", "--probe-decode", "D:\\a.tif"]));
+        assert_eq!(a.probe.as_deref(), Some(std::path::Path::new("D:\\a.tif")));
+        assert!(!a.headless_flag && a.headless.is_none());
+        let b = parse(&argv(&["rupix.exe", "--bench-thumb", "D:\\b.png", "50"]));
+        assert_eq!(b.bench, Some((PathBuf::from("D:\\b.png"), 50)));
+        assert!(!b.headless_flag);
     }
 }

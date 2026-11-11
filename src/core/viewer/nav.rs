@@ -47,6 +47,7 @@ impl Viewer {
             anim_due_at: None,
             anim_paused: false,
             step_target: None,
+            archive_skipped: 0,
             note: None,
             thumbs: Thumbs::new(),
             drag: None,
@@ -57,8 +58,40 @@ impl Viewer {
     // ── 打开 / 导航 ──────────────────────────────────────────────
 
     /// 打开一张图（同时把它所在目录建成清单）。
-    pub fn open(&mut self, path: &Path) {
+    ///
+    /// ★ 压缩包在这里分流：`archive::resolve` 把 `.zip` / `.cbz` 换成**这一层**展开后的
+    ///   目录，后面所有逻辑仍只看见一个目录路径。命令行 / 拖放 / 文件对话框 / 二次实例
+    ///   转发最终都汇到本函数，所以入口不必各写一遍。进包内更深的一层走
+    ///   [`Self::open_layer`]——那条路已经拿着 `Layer`，不必再解析一遍。
+    pub fn open(&mut self, file: &Path) {
+        let layer = match crate::core::archive::resolve(file) {
+            Ok(l) => l,
+            Err(e) => {
+                self.fail(e);
+                return;
+            }
+        };
+        self.open_at(
+            &layer.dir,
+            layer.from_archive && layer.images == 0,
+            layer.skipped,
+        );
+    }
+
+    /// 打开压缩包里**已经展开好**的某一层（左侧文件树点那一行就走这里）。
+    ///
+    /// 空层合法：`1M.zip/ch1` 这种只有子目录的地方照样能停下，画面空着、树里继续往下，
+    /// 不当成"打开失败"——`fail` 会把清单清掉，用户连菜单都没有了。
+    pub fn open_layer(&mut self, layer: &crate::core::archive::Layer) {
+        self.open_at(&layer.dir, layer.from_archive, layer.skipped);
+    }
+
+    fn open_at(&mut self, path: &Path, allow_empty: bool, skipped: usize) {
         let t0 = Instant::now();
+        // ★ m304：压缩包层里「认得出但打不开」的条数。每次打开新层都重设
+        //   （普通目录传 0），状态格据此追加后缀；不放进 Gallery，因为它描述的是
+        //   **容器**而不是清单本身。
+        self.archive_skipped = skipped;
         // 新开一张 = 换目录或换图，翻页方向无从推测。
         self.last_dir = 0;
         // ★ m101：**同一目录里再开一张不是换目录**。清单里认得它，就只换当前项。
@@ -85,7 +118,12 @@ impl Viewer {
             self.navigate();
             return;
         }
-        match Gallery::from_file(path, self.sort()) {
+        let built = if allow_empty && path.is_dir() {
+            Gallery::from_dir(path, self.sort(), true)
+        } else {
+            Gallery::from_file(path, self.sort())
+        };
+        match built {
             Ok(g) => {
                 log::debug!(
                     "[open] 清单就绪（{} 项，{} ms）→ 请求解码",
@@ -106,6 +144,22 @@ impl Viewer {
                 // m75：时间线随闸一起作废，下一帧重新起表（不续旧账）。
                 self.anim_due_at = None;
                 self.reset_view();
+                // 空层（压缩包里只有子目录 / 子包的那一层）：画面就该是空的，但必须
+                // 说清楚为什么、下一步在哪——否则用户以为文件坏了。
+                if self.gallery.as_ref().is_some_and(|g| g.is_empty()) {
+                    // ★ m312：m300 起「本包 ▸」二级菜单已经撤掉，子层在**左侧文件树**
+                    //   里。旧文案还在指一个不存在的入口（用户实报「居然还存在…这种
+                    //   旧提示」），而且是**给了一条走不通的指令**——比不给更糟。
+                    //   按「还有没有子层」分两句：有子层才指路，没有就只说没有。
+                    let subs = crate::core::archive::subs_of(path).len();
+                    self.error = Some(if allow_empty && subs > 0 {
+                        "这一层没有图片：从左侧文件树进入它的子层".to_string()
+                    } else {
+                        "这一层没有图片".to_string()
+                    });
+                    self.bump_image_gen();
+                    return;
+                }
                 // 命中元数据缓存：之前看过这张图，立即填回预览尺寸。
                 if let Some(g) = self.gallery.as_ref() {
                     if let Some(p) = g.current() {
@@ -390,6 +444,12 @@ impl Viewer {
     /// 把这些在途回包全部判成过期。
     pub(super) fn fail(&mut self, msg: String) {
         self.drop_current();
+        self.error = Some(msg);
+    }
+
+    /// UI 侧把一条错误文本送到画面上（进入包内下一层失败时用）。**不动当前画面**：
+    /// 进不去只是这一步没成，用户还在原处，清空清单等于把他赶出这个包。
+    pub fn report_error(&mut self, msg: String) {
         self.error = Some(msg);
     }
 

@@ -100,7 +100,9 @@ impl Drop for OwnedSecurityAttributes {
 }
 
 /// 当前用户的 SID 字符串（形如 `S-1-5-21-…-1001`）。
-fn current_user_sid_string() -> Option<String> {
+///
+/// 文件关联算 UserChoice 哈希时也要用（`platform::association` 唯一复用点，m247）。
+pub fn current_user_sid_string() -> Option<String> {
     invoke(|| unsafe { query_current_user_sid() }).ok()?
 }
 
