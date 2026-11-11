@@ -1193,7 +1193,7 @@ QtSvg 没这一步是因为它把 shaping 推迟到 paint 期、且 RuPix 用 re
     无文字 None/收尾丢失 None/gzip None；
   - `no_text_pass_matches_full_when_text_free_and_differs_with_text`——无文字两趟
     **逐字节相同**（调用方无需预判的契约），带文字两趟像素分离且剥字趟无字形残留。
-- 宿主端到端读数见 `.plan/m184`（原型量具 `examples/svg_progressive_probe` 已随 m197 删除，此处不写后缀，免得被 j3 当成现存文件）。
+- 宿主端到端读数见当轮实测记录（原型量具 `examples/svg_progressive_probe` 已随 m197 删除，此处不写后缀，免得被 j3 当成现存文件）。
 
 ### 门禁
 升级 windui 版本时：先看上游有没有把 text 的 shaping 挪出解析期（挪了则本补丁
@@ -1247,7 +1247,7 @@ usvg 架构上必须吃一份 `fontdb::Database`，所以**索引必须自己保
   `font_index_cache_roundtrip_matches_scan_and_rejects_mismatch`——回放库与现扫库
   面数/家族名集合/PostScript 名逐一相等；回放库 query 命中；改写字体副本（mtime 变）
   → 拒绝且零面进库；损坏字节 → 拒绝。
-- 宿主真机读数见 `.plan/m186`（跟进档 294.6 ms → 预期 <50 ms）。
+- 宿主真机读数：跟进档 294.6 ms → 预期 <50 ms。
 
 ### 门禁
 升级 windui 版本时：若上游 fontdb 自带索引持久化则整段撤掉；否则按第 1–4 步重放。
@@ -1411,7 +1411,7 @@ W1（m238 收起全屏顶条）之后用户看到的仍是「假全屏」：**�
 系统圆角，行为不变。
 
 ### 门禁行
-本轮读数见 `.plan/优化阶段-执行计划.md` §六与停机交付说明。
+本轮读数见停机交付说明。
 
 ---
 

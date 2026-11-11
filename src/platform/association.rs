@@ -28,7 +28,7 @@
 //! legacy 三件套只是兜底候选，不参与 UserChoice 判定——Hash 校验的是
 //! UserChoice ProgId + 写入时刻，与 `.ext` 默认值、OpenWithProgids 无关。
 //!
-//! # 加固（2026-11-11 二轮重审：`.plan/win11-default-app-gimp-case.md` + `默认打开方式-二次重审.md`）
+//! # 加固（2026-11-11 二轮重审；判据见 `docs/默认打开方式策略-UserChoice哈希.md`）
 //!
 //! 五条经验证的修正，专治「设了但没生效 / 生效了打不开」：
 //! 1. **壳必须先完整落地**：`shell\open\command` + `DefaultIcon`。不写图标 → 白纸。
