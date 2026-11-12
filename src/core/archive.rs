@@ -44,7 +44,7 @@ use crate::core::paths;
 /// "第 3 张图"这种东西。只有 `xxx.tar.gz` / `xxx.tgz` 才认。所以真正的判据是
 /// `kind()`，这个清单只负责"对话框里看得见"。
 pub const ARCHIVE_EXTS: &[&str] = &[
-    "7z", "bz2", "cbr", "cbz", "gz", "rar", "tar", "tgz", "xz", "zip", "zst",
+    "7z", "bz2", "cbr", "cb7", "cbz", "gz", "rar", "tar", "tgz", "xz", "zip", "zst",
 ];
 
 /// 容器种类。`Tar` 带一层外压缩，因为 **tar 自己不压**。
@@ -71,7 +71,7 @@ fn kind(path: &Path) -> Option<Kind> {
     let (stem, ext) = name.rsplit_once('.')?;
     match ext {
         "zip" | "cbz" => Some(Kind::Zip),
-        "7z" => Some(Kind::SevenZ),
+        "7z" | "cb7" => Some(Kind::SevenZ),
         "rar" | "cbr" => Some(Kind::Rar),
         "tar" => Some(Kind::Tar(None)),
         "tgz" => Some(Kind::Tar(Some(Comp::Gz))),
@@ -1451,11 +1451,13 @@ mod tests {
     #[test]
     fn archive_exts_are_case_insensitive_and_pick_list_has_no_duplicates() {
         assert!(is_archive(Path::new("a.CBZ")));
+        assert!(is_archive(Path::new("a.CB7")));
         assert!(is_archive(Path::new("a.zip")));
         assert!(!is_archive(Path::new("a.png")));
         let exts = pick_exts();
         assert_eq!(exts.iter().filter(|e| e.as_str() == "zip").count(), 1);
         assert_eq!(exts.iter().filter(|e| e.as_str() == "cbz").count(), 1);
+        assert_eq!(exts.iter().filter(|e| e.as_str() == "cb7").count(), 1);
     }
 
     /// ★ 复合后缀是这里唯一有坑的地方：`.gz` 单独不是包（那是压一个文件，没有

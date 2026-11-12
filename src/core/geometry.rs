@@ -46,6 +46,30 @@ pub fn oriented(rgba: Vec<u8>, w: u32, h: u32, o: i32) -> (Vec<u8>, u32, u32) {
 
 /// 把解码器返回的位图缩到「上屏需要的框」内（等比、不放大）。面积平均，质量够用。
 pub fn fit_to(rgba: Vec<u8>, w: u32, h: u32, max_w: u32, max_h: u32) -> Bitmap {
+    fit_to_impl(rgba, w, h, max_w, max_h, false)
+}
+
+/// 带 alpha 提示的 [`fit_to`]：解码器声明源格式有 alpha 通道时，先扫一遍 alpha；
+/// 只有真的不是全 255 才走预乘面积平均。全不透明图仍走原来的快路。
+pub fn fit_to_with_alpha(
+    rgba: Vec<u8>,
+    w: u32,
+    h: u32,
+    max_w: u32,
+    max_h: u32,
+    alpha_format: bool,
+) -> Bitmap {
+    fit_to_impl(rgba, w, h, max_w, max_h, alpha_format)
+}
+
+fn fit_to_impl(
+    rgba: Vec<u8>,
+    w: u32,
+    h: u32,
+    max_w: u32,
+    max_h: u32,
+    alpha_format: bool,
+) -> Bitmap {
     let (tw, th) = fit_dims(w, h, max_w, max_h);
     if (tw, th) == (w, h) {
         return Bitmap {
@@ -54,7 +78,7 @@ pub fn fit_to(rgba: Vec<u8>, w: u32, h: u32, max_w: u32, max_h: u32) -> Bitmap {
             rgba,
         };
     }
-    let out = downscale(&rgba, w, h, tw, th);
+    let out = downscale_with_alpha_hint(&rgba, w, h, tw, th, alpha_format);
     Bitmap {
         width: tw,
         height: th,
@@ -75,8 +99,33 @@ pub fn fit_to(rgba: Vec<u8>, w: u32, h: u32, max_w: u32, max_h: u32) -> Bitmap {
 /// 这里把反向轴的格划分改成远端锚定，转正只作用在几 MB 的小图上：48 MB 的跨步搬运没了，
 /// 像素一个不变。
 pub fn fit_oriented(rgba: Vec<u8>, w: u32, h: u32, o: i32, max_w: u32, max_h: u32) -> Bitmap {
+    fit_oriented_impl(rgba, w, h, o, max_w, max_h, false)
+}
+
+/// 带 alpha 提示的 [`fit_oriented`]；提示只在源格式确实有 alpha 通道时传 true。
+pub fn fit_oriented_with_alpha(
+    rgba: Vec<u8>,
+    w: u32,
+    h: u32,
+    o: i32,
+    max_w: u32,
+    max_h: u32,
+    alpha_format: bool,
+) -> Bitmap {
+    fit_oriented_impl(rgba, w, h, o, max_w, max_h, alpha_format)
+}
+
+fn fit_oriented_impl(
+    rgba: Vec<u8>,
+    w: u32,
+    h: u32,
+    o: i32,
+    max_w: u32,
+    max_h: u32,
+    alpha_format: bool,
+) -> Bitmap {
     if !matches!(o, 2..=8) {
-        return fit_to(rgba, w, h, max_w, max_h);
+        return fit_to_impl(rgba, w, h, max_w, max_h, alpha_format);
     }
     // 转正后的尺寸：与 `oriented` 同一套换轴规则，保证档位尺寸与参照路径一致。
     let (ow, oh) = if matches!(o, 5..=8) { (h, w) } else { (w, h) };
@@ -92,7 +141,7 @@ pub fn fit_oriented(rgba: Vec<u8>, w: u32, h: u32, o: i32, max_w: u32, max_h: u3
     } else {
         // 源轴是否被方向反着取样：`sx = w-1-…` ⇒ x 反向，`sy = h-1-…` ⇒ y 反向。
         // 分支表逐条对照 [`oriented`] 的映射手算，并由参照等值用例整体锁死。
-        downscale_anchored(
+        downscale_anchored_with_alpha_hint(
             &rgba,
             w,
             h,
@@ -100,6 +149,7 @@ pub fn fit_oriented(rgba: Vec<u8>, w: u32, h: u32, o: i32, max_w: u32, max_h: u3
             bh,
             matches!(o, 2 | 3 | 7 | 8),
             matches!(o, 3 | 4 | 6 | 7),
+            alpha_format,
         )
     };
     let (rgba, sw, sh) = oriented(small, bw, bh, o);
@@ -132,6 +182,14 @@ pub fn fit_dims(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
 /// 差别是"源怎么被走一遍"——朴素版按输出像素取块，块与块之间在源里跳行跳列。求和顺序
 /// 变了但整数加法可交换，**逐字节结果相同**（`downscale_matches_naive_reference` 锁住）。
 ///
+/// **线程是"有则用、没有则退"的**：按逻辑核数分档（≥8→8，4–7→4，3→3，2→2，1→1），
+/// 小图/目标行太少一律单线程；线程创建失败也回退单线程。
+/// 需要排障或做基准时可用环境变量 `RUPIX_DOWNSCALE_THREADS=1..8` 临时覆盖上限。
+///
+/// 2026-11-11 本机 5 轮中位数（6055²→1440²，`bench_downscale`）：
+/// **1 线程 48.1 ms / 2 线程 26.2 ms / 4 线程 19.3 ms / 8 线程 12.4 ms**。
+/// 8 线程仍有约 1.55× 收益，所以 ≥8 核的机器默认用 8；4–7 核用 4；1–3 核按核数。
+///
 /// ★ 试过更狠的 SWAR（一个 u32 装两条 16 位通道，竖向累加从 4 次加宽变 2 次掩码加）：
 ///   实测**反而慢 20%**（`bench_downscale` 同进程配对：6055²→1440² 朴素 148.7 / 两遍
 ///   119.3 / SWAR 179.9 ms）。原因是 `chunks_exact(4).enumerate()` 往两个数组做**跨步
@@ -142,6 +200,61 @@ pub fn fit_dims(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
 /// （一档实测 118–131 ms）、鸟瞰。解码器给不给档位都改变不了它。
 pub fn downscale(rgba: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
     downscale_anchored(rgba, w, h, tw, th, false, false)
+}
+
+/// 带 alpha 提示的 [`downscale`]：只有 `alpha_format` 为真才扫 alpha；
+/// 扫描发现全 255 仍走原快路，只有真透明才走预乘面积平均。
+fn downscale_with_alpha_hint(
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+    tw: u32,
+    th: u32,
+    alpha_format: bool,
+) -> Vec<u8> {
+    downscale_anchored_with_alpha_hint(rgba, w, h, tw, th, false, false, alpha_format)
+}
+
+/// 降采样总线程硬上限（含调用线程）。默认按核数分档，不写死 8：
+/// ≥8 逻辑核用 8，4–7 核用 4，3 核用 3，2 核用 2，1 核用 1。
+const DOWNSCALE_MAX_THREADS: usize = 8;
+
+/// 4–7 逻辑核的默认总线程数；避免把 4 核机器也塞到 8。
+const DOWNSCALE_MID_THREADS: usize = 4;
+
+/// 小图不值得付线程唤醒成本；低于这个源像素数一律单线程。
+const DOWNSCALE_MIN_PARALLEL_SOURCE_PIXELS: u64 = 4_000_000;
+
+/// 本次降采样实际用几个线程（含调用线程）。
+///
+/// 规则：`available_parallelism()` 返回 1 就是 1；目标行少于 4 也单线程；
+/// 源图小于 4 MP 单线程；默认按核数分档（≥8→8，4–7→4，3→3，2→2，1→1）；
+/// 环境变量只作为诊断/基准口子，范围 1..=8。
+fn downscale_threads(w: u32, h: u32, th: u32) -> usize {
+    if th < 4 {
+        return 1;
+    }
+    let source_pixels = u64::from(w).saturating_mul(u64::from(h));
+    if source_pixels < DOWNSCALE_MIN_PARALLEL_SOURCE_PIXELS {
+        return 1;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let cap = std::env::var("RUPIX_DOWNSCALE_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.clamp(1, DOWNSCALE_MAX_THREADS))
+        .unwrap_or_else(|| {
+            if cores >= DOWNSCALE_MAX_THREADS {
+                DOWNSCALE_MAX_THREADS
+            } else if cores >= DOWNSCALE_MID_THREADS {
+                DOWNSCALE_MID_THREADS
+            } else {
+                cores
+            }
+        });
+    cores.min(cap).min(th as usize)
 }
 
 /// 第 `i` 格（共 `t` 格，覆盖 `0..n` 这根轴）罩住的源区间。
@@ -172,6 +285,21 @@ pub fn downscale_anchored(
     ceil_x: bool,
     ceil_y: bool,
 ) -> Vec<u8> {
+    downscale_anchored_with_alpha_hint(rgba, w, h, tw, th, ceil_x, ceil_y, false)
+}
+
+/// [`downscale_anchored`] 的 alpha 提示版；`alpha_format=false` 时与公开版完全同路。
+#[allow(clippy::too_many_arguments)]
+fn downscale_anchored_with_alpha_hint(
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+    tw: u32,
+    th: u32,
+    ceil_x: bool,
+    ceil_y: bool,
+    alpha_format: bool,
+) -> Vec<u8> {
     // 竖向累加走不走 AVX2，**每张图判一次**（`is_x86_feature_detected!` 内部有缓存，
     // 但每行再判一次仍是白付）。判不到就是原来那条标量路，一字未变。
     // 实测（`examples/bench_downscale.rs` 候选臂 v3，五臂逐字节断言 + 正反两序）：
@@ -180,13 +308,17 @@ pub fn downscale_anchored(
     let simd = std::arch::is_x86_feature_detected!("avx2");
     #[cfg(not(target_arch = "x86_64"))]
     let simd = false;
-    downscale_anchored_impl(rgba, w, h, tw, th, ceil_x, ceil_y, simd)
+    // 只有解码器声明源格式带 alpha 才扫；全 255 的图仍走原来的 opaque 快路。
+    let alpha = alpha_format && has_transparency(rgba, simd);
+    let threads = downscale_threads(w, h, th);
+    downscale_anchored_impl_threads(rgba, w, h, tw, th, ceil_x, ceil_y, simd, threads, alpha)
 }
 
-/// 上面那个的实现体，`simd` 由调用方决定（单测要**同一份输入跑两遍**：向量的与标量的，
+/// 单线程实现体，`simd` 由调用方决定（单测要**同一份输入跑两遍**：向量的与标量的，
 /// 逐字节比。这是"换写法不许改像素"唯一的证法，见 `downscale_avx2_matches_scalar`）。
 // `simd` 平铺成一个 bool 是刻意的：它是测试的强制开关（真机上探测到 AVX2 就永远不会
 // 跑标量臂，没有这个口子就证不了等价），为它包一层参数结构只会让生产调用点多一次解包。
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn downscale_anchored_impl(
     rgba: &[u8],
@@ -198,10 +330,134 @@ fn downscale_anchored_impl(
     ceil_y: bool,
     simd: bool,
 ) -> Vec<u8> {
+    downscale_anchored_impl_threads(rgba, w, h, tw, th, ceil_x, ceil_y, simd, 1, false)
+}
+
+/// 按目标行切块的多线程实现；每块写 `out` 的不相交区间，求和顺序与单线程逐字节一致。
+///
+/// `threads` 只由 [`downscale_threads`] 或单测传入：生产不会在调用点写死线程数。
+/// 任何 `spawn` 失败都会在 scope 结束后整幅重算一次单线程，保证结果正确；
+/// 失败只发生在极端资源紧张时，代价是这一次多算一遍，不会崩。
+#[allow(clippy::too_many_arguments)]
+fn downscale_anchored_impl_threads(
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+    tw: u32,
+    th: u32,
+    ceil_x: bool,
+    ceil_y: bool,
+    simd: bool,
+    threads: usize,
+    alpha: bool,
+) -> Vec<u8> {
     let (w, h, tw, th) = (w as usize, h as usize, tw as usize, th as usize);
     let mut out = vec![0u8; tw * th * 4];
+    let threads = threads.clamp(1, DOWNSCALE_MAX_THREADS).min(th);
+    if threads <= 1 {
+        downscale_rows(
+            rgba, w, h, tw, th, ceil_x, ceil_y, simd, alpha, 0, th, &mut out,
+        );
+        return out;
+    }
+
+    let rows_per_chunk = th.div_ceil(threads);
+    let chunk_count = th.div_ceil(rows_per_chunk);
+    let mut failed = false;
+    let mut start = 0usize;
+    std::thread::scope(|scope| {
+        let mut rest = out.as_mut_slice();
+        for i in 0..chunk_count {
+            let end = (start + rows_per_chunk).min(th);
+            let len = (end - start) * tw * 4;
+            let (chunk, tail) = rest.split_at_mut(len);
+            rest = tail;
+            if i + 1 == chunk_count {
+                // 最后一块留在调用线程，避免只为一块再起线程。
+                downscale_rows(
+                    rgba, w, h, tw, th, ceil_x, ceil_y, simd, alpha, start, end, chunk,
+                );
+            } else {
+                let chunk_start = start;
+                match std::thread::Builder::new()
+                    .name("rupix-downscale".to_string())
+                    .spawn_scoped(scope, move || {
+                        downscale_rows(
+                            rgba,
+                            w,
+                            h,
+                            tw,
+                            th,
+                            ceil_x,
+                            ceil_y,
+                            simd,
+                            alpha,
+                            chunk_start,
+                            end,
+                            chunk,
+                        );
+                    }) {
+                    Ok(_) => {}
+                    Err(_) => failed = true,
+                }
+            }
+            start = end;
+        }
+    });
+
+    if failed {
+        // 线程创建失败：已经写过的块不算数，整幅按单线程重算，结果与正常路径逐字节相同。
+        out.fill(0);
+        downscale_rows(
+            rgba, w, h, tw, th, ceil_x, ceil_y, simd, alpha, 0, th, &mut out,
+        );
+    }
+    out
+}
+
+/// 计算目标行 `dy0..dy1`，写入 `out`（长度恰好是这些行的像素字节数）。
+///
+/// 每个线程各持一份 `w × 4` 列累加器；源行只读共享，输出行区间互不相交。
+#[allow(clippy::too_many_arguments)]
+fn downscale_rows(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    tw: usize,
+    th: usize,
+    ceil_x: bool,
+    ceil_y: bool,
+    simd: bool,
+    alpha: bool,
+    dy0: usize,
+    dy1: usize,
+    out: &mut [u8],
+) {
+    if alpha {
+        downscale_rows_alpha(rgba, w, h, tw, th, ceil_x, ceil_y, dy0, dy1, out);
+    } else {
+        downscale_rows_opaque(rgba, w, h, tw, th, ceil_x, ceil_y, simd, dy0, dy1, out);
+    }
+}
+
+/// 不透明快路：保留原来的 u32 列累加与 AVX2 竖向累加。
+#[allow(clippy::too_many_arguments)]
+fn downscale_rows_opaque(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    tw: usize,
+    th: usize,
+    ceil_x: bool,
+    ceil_y: bool,
+    simd: bool,
+    dy0: usize,
+    dy1: usize,
+    out: &mut [u8],
+) {
+    debug_assert_eq!(out.len(), (dy1 - dy0) * tw * 4);
     let mut col = vec![0u32; w * 4];
-    for dy in 0..th {
+    for dy in dy0..dy1 {
         let (sy0, sy1) = band(dy, h, th, ceil_y);
         col.fill(0);
         for sy in sy0..sy1 {
@@ -209,7 +465,7 @@ fn downscale_anchored_impl(
             accumulate_row(&mut col, row, simd);
         }
         let rows = (sy1 - sy0) as u32;
-        let o = dy * tw * 4;
+        let o = (dy - dy0) * tw * 4;
         for dx in 0..tw {
             let (sx0, sx1) = band(dx, w, tw, ceil_x);
             let mut acc = [0u32; 4];
@@ -226,7 +482,104 @@ fn downscale_anchored_impl(
             }
         }
     }
-    out
+}
+
+/// 透明慢路：按 alpha 加权求和，输出仍是**非预乘** RGBA。
+///
+/// 每个源像素：`acc_rgb += rgb * a`、`acc_a += a`；输出
+/// `rgb = acc_rgb / acc_a`、`a = acc_a / count`。全透明像素不把 RGB 拖进平均，
+/// 不会在不透明边缘拉出黑边。只有扫描确认存在非 255 alpha 才进来。
+#[allow(clippy::too_many_arguments)]
+fn downscale_rows_alpha(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    tw: usize,
+    th: usize,
+    ceil_x: bool,
+    ceil_y: bool,
+    dy0: usize,
+    dy1: usize,
+    out: &mut [u8],
+) {
+    debug_assert_eq!(out.len(), (dy1 - dy0) * tw * 4);
+    let mut col = vec![[0u32; 4]; w];
+    for dy in dy0..dy1 {
+        let (sy0, sy1) = band(dy, h, th, ceil_y);
+        col.fill([0; 4]);
+        for sy in sy0..sy1 {
+            let row = &rgba[sy * w * 4..(sy + 1) * w * 4];
+            for (px, acc) in row.chunks_exact(4).zip(col.iter_mut()) {
+                let a = u32::from(px[3]);
+                acc[0] += u32::from(px[0]) * a;
+                acc[1] += u32::from(px[1]) * a;
+                acc[2] += u32::from(px[2]) * a;
+                acc[3] += a;
+            }
+        }
+        let rows = (sy1 - sy0) as u32;
+        let o = (dy - dy0) * tw * 4;
+        for dx in 0..tw {
+            let (sx0, sx1) = band(dx, w, tw, ceil_x);
+            let mut acc = [0u32; 4];
+            for p in &col[sx0..sx1] {
+                acc[0] += p[0];
+                acc[1] += p[1];
+                acc[2] += p[2];
+                acc[3] += p[3];
+            }
+            let cnt = rows * (sx1 - sx0) as u32;
+            let alpha = acc[3];
+            let d = &mut out[o + dx * 4..o + dx * 4 + 4];
+            d[3] = (alpha / cnt) as u8;
+            for c in 0..3 {
+                d[c] = acc[c].checked_div(alpha).unwrap_or(0) as u8;
+            }
+        }
+    }
+}
+
+/// 扫 alpha 通道：只有解码器声明格式带 alpha 时才调用；全 255 时返回 false。
+///
+/// AVX2 路径一次看 8 个像素的 alpha 位（`0x88888888` 掩码），标量路径逐像素兜底。
+/// 这一步只读 alpha 字节，不分配、不建表；对 RGBA8 大图通常远低于一次缩放的耗时。
+fn has_transparency(rgba: &[u8], simd: bool) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if simd {
+        // SAFETY：simd 由 `is_x86_feature_detected!("avx2")` 的结果传入；
+        // `rgba` 长度由解码层保证是 4 的倍数，AVX2 尾部走标量。
+        unsafe { return has_transparency_avx2(rgba) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = simd;
+    rgba.chunks_exact(4).any(|px| px[3] != 255)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn has_transparency_avx2(rgba: &[u8]) -> bool {
+    use std::arch::x86_64::{
+        __m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
+    };
+    const ALPHA_MASK: u32 = 0x8888_8888;
+    let all_ones = _mm256_set1_epi8(-1i8);
+    let mut i = 0usize;
+    while i + 32 <= rgba.len() {
+        let v = _mm256_loadu_si256(rgba.as_ptr().add(i).cast::<__m256i>());
+        let eq = _mm256_cmpeq_epi8(v, all_ones);
+        let bits = _mm256_movemask_epi8(eq) as u32;
+        if bits & ALPHA_MASK != ALPHA_MASK {
+            return true;
+        }
+        i += 32;
+    }
+    while i + 4 <= rgba.len() {
+        if rgba[i + 3] != 255 {
+            return true;
+        }
+        i += 4;
+    }
+    false
 }
 
 /// 一趟竖向累加：`col[i] += row[i] as u32`（`row.len() == col.len()`，即一行 RGBA）。
@@ -734,6 +1087,93 @@ mod tests {
         }
     }
 
+    /// 多线程按目标行切块，每块写不相交区间；整数加法可交换，结果必须与单线程**逐字节相同**。
+    /// 覆盖 1 行、2 行、奇数行、除不尽比例，以及线程数大于目标行数的退化情况。
+    #[test]
+    fn downscale_multithread_matches_single() {
+        let mut s = 0xA54F_F53A_5E4F_2D17u64;
+        let cases: [(u32, u32, u32, u32); 6] = [
+            (13, 7, 5, 5),
+            (257, 257, 13, 13),
+            (300, 300, 7, 2),
+            (800, 600, 300, 200),
+            (300, 300, 7, 1),
+            (1024, 768, 301, 199),
+        ];
+        for (w, h, tw, th) in cases {
+            let mut src = vec![0u8; (w * h * 4) as usize];
+            for px in src.chunks_exact_mut(4) {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let r = (s >> 32) as u32;
+                for (c, b) in px.iter_mut().enumerate() {
+                    *b = ((r >> (8 * c as u32)) & 0xFF) as u8;
+                }
+            }
+            let single = downscale_anchored_impl(&src, w, h, tw, th, false, false, false);
+            for threads in [2usize, 3, 4, 8] {
+                let multi = downscale_anchored_impl_threads(
+                    &src, w, h, tw, th, false, false, false, threads, false,
+                );
+                assert_eq!(
+                    single, multi,
+                    "{w}×{h}→{tw}×{th} threads={threads}：多线程与单线程不一致"
+                );
+            }
+        }
+    }
+
+    /// 透明图：透明像素的 RGB 不得把不透明边缘拉暗。2×1 红 + 全透明黑缩成 1×1，
+    /// 颜色必须是红、alpha 才是 50%；旧的逐通道平均会得到 (127,0,0,127)。
+    #[test]
+    fn downscale_alpha_does_not_darken_transparent_border() {
+        let src = [
+            255, 0, 0, 255, // 不透明红
+            0, 0, 0, 0, // 全透明黑
+        ];
+        let out = downscale_with_alpha_hint(&src, 2, 1, 1, 1, true);
+        assert_eq!(out, [255, 0, 0, 127], "透明像素不该把红拉黑");
+    }
+
+    /// 格式带 alpha 但实际全 255 时，扫完必须回退 opaque 快路，结果与普通 downscale 相同。
+    #[test]
+    fn downscale_alpha_hint_opaque_matches_fast_path() {
+        let (w, h, tw, th) = (37u32, 29u32, 13u32, 9u32);
+        let mut src = vec![0u8; (w * h * 4) as usize];
+        for (i, px) in src.chunks_exact_mut(4).enumerate() {
+            px[0] = (i % 251) as u8;
+            px[1] = (i / 3 % 241) as u8;
+            px[2] = (i / 7 % 239) as u8;
+            px[3] = 255;
+        }
+        let fast = downscale(&src, w, h, tw, th);
+        let hinted = downscale_with_alpha_hint(&src, w, h, tw, th, true);
+        assert_eq!(fast, hinted, "全 255 的 alpha 图不该走慢路");
+    }
+
+    /// alpha 慢路也要支持多线程，且与单线程逐字节一致。
+    #[test]
+    fn downscale_alpha_multithread_matches_single() {
+        let (w, h, tw, th) = (64u32, 48u32, 13u32, 11u32);
+        let mut src = vec![0u8; (w * h * 4) as usize];
+        for (i, px) in src.chunks_exact_mut(4).enumerate() {
+            let a = ((i * 37) % 256) as u8;
+            px[0] = (i * 11 % 256) as u8;
+            px[1] = (i * 17 % 256) as u8;
+            px[2] = (i * 23 % 256) as u8;
+            px[3] = a;
+        }
+        let single =
+            downscale_anchored_impl_threads(&src, w, h, tw, th, false, false, false, 1, true);
+        for threads in [2usize, 4] {
+            let multi = downscale_anchored_impl_threads(
+                &src, w, h, tw, th, false, false, false, threads, true,
+            );
+            assert_eq!(single, multi, "alpha 慢路 threads={threads} 与单线程不一致");
+        }
+    }
+
     /// ★ m67 的承重判据：**AVX2 竖向累加与标量累加必须逐字节相同**。
     ///
     /// 为什么这条能"证明"而不只是"看起来一样"：lane 分组没变——第 `i` 个 u32 累加的仍然
@@ -836,6 +1276,31 @@ mod tests {
                     "{w}×{h} 框 {mw}×{mh} 方向 {o}：像素与「先转再缩」不同 ⇒ 会改画面"
                 );
             }
+        }
+    }
+
+    /// alpha 提示 + 方向：`fit_oriented_with_alpha` 必须与
+    /// 「整图转正 → `fit_to_with_alpha`」逐字节相同。
+    #[test]
+    fn fit_oriented_with_alpha_matches_orient_then_fit_alpha() {
+        let (w, h, mw, mh) = (37u32, 29u32, 13u32, 11u32);
+        let mut src = vec![0u8; (w * h * 4) as usize];
+        for (i, px) in src.chunks_exact_mut(4).enumerate() {
+            px[0] = (i * 7 % 251) as u8;
+            px[1] = (i * 13 % 241) as u8;
+            px[2] = (i * 19 % 239) as u8;
+            px[3] = ((i * 31) % 256) as u8;
+        }
+        for o in 1..=8i32 {
+            let (r, rw, rh) = oriented(src.clone(), w, h, o);
+            let reference = fit_to_with_alpha(r, rw, rh, mw, mh, true);
+            let got = fit_oriented_with_alpha(src.clone(), w, h, o, mw, mh, true);
+            assert_eq!(
+                (got.width, got.height),
+                (reference.width, reference.height),
+                "方向 {o}：尺寸不一致"
+            );
+            assert_eq!(got.rgba, reference.rgba, "方向 {o}：alpha 路径改像素");
         }
     }
 

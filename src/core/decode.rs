@@ -1510,6 +1510,27 @@ pub fn probe_decode_frame(
     decode_one(&req)
 }
 
+/// 同 [`probe_decode_frame`]，但点亮原生降采样；辅图首屏用。
+pub fn probe_scaled_frame(
+    path: &Path,
+    max_w: u32,
+    max_h: u32,
+    frame_index: u32,
+) -> Result<Decoded, String> {
+    let req = Req {
+        seq: 0,
+        path: path.to_path_buf(),
+        max_w,
+        max_h,
+        region: None,
+        frame_index,
+        raw: None,
+        kind: ReqKind::Main,
+        allow_scaled: true,
+    };
+    decode_one(&req)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::sync::mpsc::channel;

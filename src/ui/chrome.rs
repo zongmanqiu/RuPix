@@ -45,6 +45,7 @@ use crate::core::hotkey::Hotkeys;
 // 配色一律取自全 ui 共用的令牌（[`crate::ui::tokens`]）：本文件不自带色值。
 // 用模块别名而不是逐个 import：跟随主题那一组是**函数**（运行期切主题），
 // 名字又短又常见（`text` / `empty_bg`），逐个引入容易和局部变量撞名。
+use super::companion::{CompanionSource, LinkMode, Pane};
 use super::tokens as tk;
 
 /// 顶部拖动条高度（逻辑 dp）：画布据此判定"指针落在顶条里"以发起窗口拖动，
@@ -346,6 +347,20 @@ pub struct Chrome {
     pub minimal_mode: Cell<bool>,
     /// 棋盘格透明背景开关（右键菜单与工具栏共用；m53 起落盘，ini 键 `checker`）。
     pub checker: Cell<bool>,
+    /// 主辅视图开关（m322）：主图 + 右栏辅图；默认关，会话临时态。
+    pub companion: Cell<bool>,
+    /// 辅图来源（m322 Phase 2）：主序列下一项 / 用户选定的独立序列。
+    pub companion_source: Cell<CompanionSource>,
+    /// 用户选定的辅图文件（独立序列的锚点）。
+    pub companion_picked: RefCell<Option<PathBuf>>,
+    /// 联动方式（m322 Phase 2）：联动偏移跟随 / 固定辅图。
+    pub companion_link: Cell<LinkMode>,
+    /// 当前活动窗（m322）：只决定右栏徽标高亮；滚轮/拖动仍按指针所在的 pane。
+    pub active_pane: Cell<Pane>,
+    /// 交换主辅请求（菜单置位，paint 消费）。
+    pub companion_swap: Cell<bool>,
+    /// 双页对照时让辅图跟随主图的缩放/平移（同一实际比例 + 同一像素偏移）。
+    pub companion_sync_view: Cell<bool>,
     /// 取色器开关（m217，右键「本图 ▸ 取色器」）。会话临时态，同极简模式，不落盘。
     /// 只进菜单不进浮条——用户口径「一排按钮已经很多了」。
     /// 旋转角度（整数度数，m280）。会话临时态、按看图窗分格、**不落盘**。
@@ -388,6 +403,9 @@ pub struct Chrome {
     /// ★ 静态位图 / 单张 SVG 恒为假：没有第二张就不给 `(1/1)`，也不给逐帧按钮；
     ///   只有真动图与多页文档为真（判据在 `core::pixels::Anim::has_index`）。
     pub anim: Cell<bool>,
+    /// 浮条只挂「上一页/下一页」两颗（m323）：活动窗是辅图且它有页/帧号时置位。
+    /// 辅图不需要播放钮（不能替主图播），所以不能复用完整播放组。
+    pub index_pair: Cell<bool>,
     /// 动画当前是否暂停。只影响 [`Btn::PlayPause`] 的字形（双状态按钮要能读出当前态）。
     pub paused: Cell<bool>,
     /// 最近一次指针活动时刻。
@@ -559,6 +577,14 @@ pub enum CopyWait {
 }
 
 impl Chrome {
+    /// 主题切换后清掉**按主题色预渲染**的位图（目前只有标题栏图钉）。
+    ///
+    /// 图钉是 `render_pins(overlay_text(), overlay_text_active())` 的成品；
+    /// 不清就会把浅色主题的深色图钉带到深色主题上，直接看不见。
+    pub fn invalidate_theme_caches(&self) {
+        *self.pins.borrow_mut() = None;
+    }
+
     pub fn new(minimal_mode: bool) -> Rc<Self> {
         std::rc::Rc::new(Self {
             minimal_mode: Cell::new(minimal_mode),
@@ -568,12 +594,20 @@ impl Chrome {
             picker: Cell::new(false),
             picker_at: Cell::new(None),
             checker: Cell::new(false),
+            companion: Cell::new(false),
+            companion_source: Cell::new(CompanionSource::default()),
+            companion_picked: RefCell::new(None),
+            companion_link: Cell::new(LinkMode::default()),
+            active_pane: Cell::new(Pane::default()),
+            companion_swap: Cell::new(false),
+            companion_sync_view: Cell::new(false),
             filmstrip: Cell::new(false),
             filmstrip_left: Cell::new(false),
             strip_fit_request: Cell::new(false),
             strip_resize: Cell::new(None),
             locked: Cell::new(false),
             anim: Cell::new(false),
+            index_pair: Cell::new(false),
             paused: Cell::new(false),
             last_move: Cell::new(Instant::now()),
             last_pos: Cell::new((f32::MAX, f32::MAX)),
@@ -1137,7 +1171,12 @@ impl Chrome {
         let title = Self::in_title_strip(pos, view);
         // 工具栏/信息条/箭头边带：仍需相对 view 定位（随窗口大小变化）
         let (x, y) = (abs_x - vx, abs_y - vy);
-        let (px, py, pw, ph) = Chrome::pill(view, self.anim.get(), self.info_cell.get());
+        let (px, py, pw, ph) = Chrome::pill_ex(
+            view,
+            self.anim.get(),
+            self.info_cell.get(),
+            self.index_pair.get(),
+        );
         let toolbar = x >= px && x < px + pw && y >= py && y < py + ph;
         // 信息条：跟着 draw 每帧回写的**真实**矩形走（窄窗整行档的宽是现量的，
         // 而且这帧可能根本没画——零矩形）。固定估宽（旧 MAX_W=200）与画出来的那块错位：
@@ -1231,7 +1270,12 @@ impl Chrome {
         let x = abs_x - vx;
         let y = abs_y - vy;
         let in_frame = x <= FRAME || x >= vw - FRAME || y <= FRAME || y >= vh - FRAME;
-        let (px, py, pw, ph) = Chrome::pill(viewport, self.anim.get(), self.info_cell.get());
+        let (px, py, pw, ph) = Chrome::pill_ex(
+            viewport,
+            self.anim.get(),
+            self.info_cell.get(),
+            self.index_pair.get(),
+        );
         let in_toolbar = x >= px && x < px + pw && y >= py && y < py + ph;
         // 信息条：与 hover 同源，读 draw 回写的真实矩形（零矩形 = 这帧没画，不算命中）
         let in_info = self.in_info_cell(self.last_pos.get());
@@ -1259,12 +1303,25 @@ impl Chrome {
     ///   见 [`crate::core::pixels::Anim`]）。所以返回"前段 + 尾段"两个切片就够——
     ///   动画组是 [`Btn::ALL`] 末尾连续三颗，静态图只取 `..ANIM_START`。
     pub fn row(anim: bool, vw: f32) -> (&'static [Btn], Option<&'static [Btn]>) {
+        Self::row_ex(anim, vw, false)
+    }
+
+    /// [`Self::row`] 的完整版：`index_pair` = 只要「上一页 / 下一页」两颗。
+    /// 辅图有页/帧号时走这条，不把播放钮挂到主图的播放状态上。
+    pub fn row_ex(
+        anim: bool,
+        vw: f32,
+        index_pair: bool,
+    ) -> (&'static [Btn], Option<&'static [Btn]>) {
         // m245：隐藏按钮 = 这一行没有按钮。`pill` / `btn_rect` / `hit` / 鸟瞰避让
         // 全部经由本函数推导，所以一处收口就够，别在调用点各判一次。
         // m247：动画组是 `ALL` 末尾连续三颗，静态图直接截掉尾段；`Info` 撤走后
         // 不再有尾段按钮，第二个返回值恒为 `None`（保留接口给调用点链拼接）。
         if !toolbar_buttons() {
             return (&[], None);
+        }
+        if index_pair && vw >= FULL_ROW_MIN_W {
+            return (&Btn::ALL[..ANIM_START], Some(&FRAME_PAIR));
         }
         if anim && vw >= FULL_ROW_MIN_W {
             (Btn::ALL.as_slice(), None)
@@ -1273,9 +1330,9 @@ impl Chrome {
         }
     }
 
-    /// 当前这一行的颗数。
-    fn row_len(anim: bool, vw: f32) -> usize {
-        let (head, tail) = Self::row(anim, vw);
+    /// [`Self::row`] 的完整版：`index_pair` 时尾段只有两颗。
+    fn row_len_ex(anim: bool, vw: f32, index_pair: bool) -> usize {
+        let (head, tail) = Self::row_ex(anim, vw, index_pair);
         head.len() + tail.map_or(0, <[Btn]>::len)
     }
 
@@ -1300,8 +1357,18 @@ impl Chrome {
     /// `cell` 由**上一帧画出来的那份**提供（[`Chrome::info_cell`]）：格宽跟着文本伸缩，
     /// 命中与绘制必须同一份几何，不能在这里重新量一次。
     pub(crate) fn pill(view: (f32, f32, f32, f32), anim: bool, cell: f32) -> (f32, f32, f32, f32) {
+        Self::pill_ex(view, anim, cell, false)
+    }
+
+    /// [`Self::pill`] 的完整版；`index_pair` 与 [`Self::row_ex`] 必须同一份。
+    pub(crate) fn pill_ex(
+        view: (f32, f32, f32, f32),
+        anim: bool,
+        cell: f32,
+        index_pair: bool,
+    ) -> (f32, f32, f32, f32) {
         let (_, _, vw, vh) = view;
-        let n = Self::row_len(anim, vw) as f32;
+        let n = Self::row_len_ex(anim, vw, index_pair) as f32;
         // n=0（m245 隐藏按钮）时没有「按钮之间的间隙」，负 gap 会把胶囊算窄一格。
         let gap = if n > 0.0 { (n - 1.0) * BTN_GAP } else { 0.0 };
         let w = cell + 8.0 * 2.0 + n * BTN_W + gap;
@@ -1316,9 +1383,20 @@ impl Chrome {
         anim: bool,
         cell: f32,
     ) -> Option<(f32, f32, f32, f32)> {
-        let (px, py, _, ph) = Self::pill(view, anim, cell);
+        Self::btn_rect_ex(b, view, anim, cell, false)
+    }
+
+    /// [`Self::btn_rect`] 的完整版；`index_pair` 与绘制同一份。
+    pub fn btn_rect_ex(
+        b: Btn,
+        view: (f32, f32, f32, f32),
+        anim: bool,
+        cell: f32,
+        index_pair: bool,
+    ) -> Option<(f32, f32, f32, f32)> {
+        let (px, py, _, ph) = Self::pill_ex(view, anim, cell, index_pair);
         let (_, vw, _) = (px, view.2, view.3);
-        let (head, tail) = Self::row(anim, vw);
+        let (head, tail) = Self::row_ex(anim, vw, index_pair);
         let i =
             head.iter().position(|&x| x == b).or_else(|| {
                 tail.and_then(|s| s.iter().position(|&x| x == b).map(|p| p + head.len()))
@@ -1388,10 +1466,11 @@ impl Chrome {
         // 正常尺寸三者不重叠；窗口压到 100–119 高时箭头圆会压到标题按钮上，
         // 旧顺序（标题优先）会让“点箭头却关窗”。
         let anim = self.anim.get();
+        let index_pair = self.index_pair.get();
         let cell = self.info_cell.get();
-        let (head, tail) = Chrome::row(anim, view.2);
+        let (head, tail) = Chrome::row_ex(anim, view.2, index_pair);
         for b in head.iter().chain(tail.unwrap_or(&[])).copied() {
-            let Some((x, y, w, h)) = Chrome::btn_rect(b, view, anim, cell) else {
+            let Some((x, y, w, h)) = Chrome::btn_rect_ex(b, view, anim, cell, index_pair) else {
                 continue;
             };
             if pos.0 >= x && pos.0 < x + w && pos.1 >= y && pos.1 < y + h {
@@ -1426,6 +1505,9 @@ const FULL_ROW_W: f32 = 8.0 * 2.0 + 12.0 * 34.0 + 11.0 * 3.0;
 const NARROW_ROW_W: f32 = 8.0 * 2.0 + 7.0 * 34.0 + 6.0 * 3.0;
 /// 动画组在 `Btn::ALL` 里的起点（末尾连续三颗）。
 const ANIM_START: usize = 7;
+
+/// 辅图只有页/帧可切时的尾段：不挂播放钮（它不能替主图播放）。
+static FRAME_PAIR: [Btn; 2] = [Btn::FrameBack, Btn::FrameFwd];
 const BTN_W: f32 = 34.0;
 const BTN_H: f32 = 28.0;
 const BTN_GAP: f32 = 3.0;
@@ -1665,7 +1747,7 @@ pub fn paint(
         0.0
     };
     chrome.info_cell.set(cell);
-    let (px, py, pw, ph) = Chrome::pill(view, chrome.anim.get(), cell);
+    let (px, py, pw, ph) = Chrome::pill_ex(view, chrome.anim.get(), cell, chrome.index_pair.get());
     // 整行档（窄窗）的矩形就地定下：浮条上的悬停提示要照它让位，否则两条叠在一起。
     const INFO_H: f32 = 40.0;
     let above = if place == InfoPlace::Above && show_info {
@@ -1887,10 +1969,12 @@ pub fn paint(
         }
 
         let anim = chrome.anim.get();
+        let index_pair = chrome.index_pair.get();
         let paused = chrome.paused.get();
-        let (head, tail) = Chrome::row(anim, vw);
+        let (head, tail) = Chrome::row_ex(anim, vw, index_pair);
         for b in head.iter().chain(tail.unwrap_or(&[])).copied() {
-            let Some((bx, by, bw, bh)) = Chrome::btn_rect(b, view, anim, cell) else {
+            let Some((bx, by, bw, bh)) = Chrome::btn_rect_ex(b, view, anim, cell, index_pair)
+            else {
                 continue;
             };
             let hovered = chrome.hover_btn.get() == Some(b);
@@ -1923,12 +2007,16 @@ pub fn paint(
 
         // ── 悬停提示小条：图标按钮的"tooltip"，浮在工具栏上方 ──
         // 悬停中的那颗若正好被隐藏（切图后动画组收掉），拿不到矩形就不画提示条。
-        let tip = chrome
-            .hover_btn
-            .get()
-            .and_then(|b| Chrome::btn_rect(b, view, chrome.anim.get(), cell).map(|r| (b, r)));
+        let tip = chrome.hover_btn.get().and_then(|b| {
+            Chrome::btn_rect_ex(b, view, chrome.anim.get(), cell, chrome.index_pair.get())
+                .map(|r| (b, r))
+        });
         if let Some((b, (bx, _by, bw, _))) = tip {
-            let text = b.name();
+            let text = match (chrome.index_pair.get(), b) {
+                (true, Btn::FrameBack) => "上一页",
+                (true, Btn::FrameFwd) => "下一页",
+                _ => b.name(),
+            };
             let w = chrome.measure_w(canvas, text, &small) + 16.0;
             let h = 24.0;
             // 以按钮为中心，横向夹在视口内；顶上放不下就并入按钮内（不画）。
@@ -2322,7 +2410,7 @@ mod tests {
     /// （[`crate::core::pixels::Anim`]），多页文档拿到的是**同一组**按钮。
     #[test]
     fn row_follows_playability_and_width() {
-        let count = |anim: bool, vw: f32| Chrome::row_len(anim, vw);
+        let count = |anim: bool, vw: f32| Chrome::row_len_ex(anim, vw, false);
         assert_eq!(count(false, 1920.0), 7);
         assert_eq!(count(true, 1920.0), 10);
         assert_eq!(
@@ -2340,6 +2428,26 @@ mod tests {
         );
         let w10 = 8.0 * 2.0 + 10.0 * 34.0 + 9.0 * 3.0;
         assert_eq!(w, w10 + INFO_CELL_MAX, "10 颗 + 满格");
+    }
+
+    /// 辅图底栏：有页/帧号时只挂「上一页 / 下一页」两颗，不挂播放钮。
+    #[test]
+    fn index_pair_keeps_prev_next_and_hides_play() {
+        let wide = FULL_ROW_MIN_W + 200.0;
+        let (head, tail) = Chrome::row_ex(true, wide, true);
+        let shown: Vec<Btn> = head.iter().chain(tail.unwrap_or(&[])).copied().collect();
+        assert!(shown.contains(&Btn::FrameBack));
+        assert!(shown.contains(&Btn::FrameFwd));
+        assert!(!shown.contains(&Btn::PlayPause), "辅图不该挂主图播放钮");
+        assert_eq!(shown.len(), 9, "7 颗常用 + 2 颗页/帧");
+        assert_eq!(Chrome::row_len_ex(true, wide, true), 9);
+        let (_, _, w, _) = Chrome::pill_ex(
+            (0.0, 0.0, 1920.0, 1080.0),
+            true,
+            Chrome::cell_reserve(1920.0),
+            true,
+        );
+        assert_eq!(w, 8.0 * 2.0 + 9.0 * 34.0 + 8.0 * 3.0 + INFO_CELL_MAX);
     }
 
     /// 浮条总宽必须在**最小窗口**（360，见 `ui::window` 的 `min_size`）内放得下。

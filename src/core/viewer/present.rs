@@ -156,6 +156,19 @@ impl Viewer {
         self.gallery.as_ref().and_then(|g| g.current()).cloned()
     }
 
+    /// 取相对当前位置 `delta` 的清单路径（循环，0 起算内部下标）。
+    /// 单张返回 `None`——主辅视图没有"下一张"可配。
+    pub fn peek_path(&self, delta: isize) -> Option<PathBuf> {
+        let g = self.gallery.as_ref()?;
+        let n = g.len();
+        if n <= 1 {
+            return None;
+        }
+        let cur = g.position() as isize - 1;
+        let idx = (cur + delta).rem_euclid(n as isize) as usize;
+        g.peek(idx).cloned()
+    }
+
     /// 当前正在看的目录（供 runtime 挂目录监控：看图目录变了就重臂 watcher）。
     ///
     /// **借出来，不抄一份**（m106）：这个口子以前每 16 ms 被泵一次，只为和"上一次监控

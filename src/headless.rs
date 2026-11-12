@@ -3,9 +3,9 @@
 //! # 它是什么
 //!
 //! `--probe-decode` 是诊断探针，输出是人读的一行文本；本模块是给它旁边的**正式命令面**：
-//! `list` / `metadata` / `thumbnail` / `render` 四个纯读动词，各回**一行 JSON**，
-//! 供进程外的适配器（MCP 等）转调。适配器自己持有会话与生命周期，RuPix 侧不常驻、
-//! 不监听端口、不建窗、不进单实例闸门。
+//! `list` / `metadata` / `thumbnail` / `render` / `list-formats` 五个纯读动词，
+//! 各回**一行 JSON**，供进程外的适配器（MCP 等）转调。适配器自己持有会话与生命周期，
+//! RuPix 侧不常驻、不监听端口、不建窗、不进单实例闸门。
 //!
 //! # 三条不许破的规矩
 //!
@@ -27,9 +27,11 @@
 //! `--list` 吃压缩包时会经 `core::archive::resolve` 落一层到 `<exe>/temp/`，归属见
 //! [`cmd_list`] 的注释——这是唯一写盘的一条路，其余三动词仍然零临时文件。
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::cli::{Headless, HeadlessCmd};
+use crate::decoders::Health;
 
 /// 退出码：成功。
 pub const EXIT_OK: i32 = 0;
@@ -141,13 +143,101 @@ fn execute(req: &Headless) -> Result<String, (i32, String)> {
         HeadlessCmd::Metadata => cmd_metadata(&req.path),
         HeadlessCmd::Thumbnail => cmd_pixels(&req.path, None, true),
         HeadlessCmd::Render => cmd_pixels(&req.path, req.target, false),
+        HeadlessCmd::ListFormats => cmd_list_formats(),
+    }
+}
+
+/// `list-formats`：这台机器现在认哪些后缀。
+///
+/// 数据来源与设置页「解码器」三张卡**同源**：
+/// - 内置：`core::formats::builtin_exts()`（今天只有 resvg 的 svg/svgz）；
+/// - 解码器：`decoders::list_decoders()` 逐个 DLL 读 `iv_decoder_info()`。
+///
+/// 三条口径：
+/// 1. `decoders` **不隐藏坏条目**——`health` / `enabled` 一并回，坏 DLL 是排查线索，
+///    不是「这个格式不存在」。
+/// 2. `formats` 只并**启用且加载成功**的自述后缀，与 `declared_exts()` 的「实际能开」
+///    同一条判据；`count` 是它的长度。
+/// 3. 没有解码器目录 / safe-mode 时**仍然成功**，只回内置两条——这不是错误，是新装状态。
+///
+/// 只读：不写盘、不建窗、不碰单实例闸门。代价与设置页扫一次解码器目录相同（逐个
+/// `LoadLibrary` 读自述），只在用户显式调用时发生，不进启动路径。
+fn cmd_list_formats() -> Result<String, (i32, String)> {
+    let builtin = crate::core::formats::builtin_exts();
+    let mut decoders = crate::decoders::list_decoders();
+    decoders.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.file.cmp(&b.file)));
+
+    let mut formats: BTreeSet<String> = builtin.iter().cloned().collect();
+    for d in &decoders {
+        if d.enabled && matches!(d.health, Health::Ok) {
+            formats.extend(d.extensions.iter().cloned());
+        }
+    }
+    let formats: Vec<String> = formats.into_iter().collect();
+    let active = decoders
+        .iter()
+        .filter(|d| d.enabled && matches!(d.health, Health::Ok))
+        .count();
+
+    let mut fields = String::from(",\"builtin\":[");
+    push_json_list(&mut fields, &builtin);
+    fields.push_str("],\"decoders\":[");
+    for (i, d) in decoders.iter().enumerate() {
+        if i > 0 {
+            fields.push(',');
+        }
+        let mut exts = d.extensions.clone();
+        exts.sort();
+        exts.dedup();
+        fields.push_str(&format!(
+            "{{\"id\":{},\"name\":{},\"file\":{},\"abi\":{},\"enabled\":{},\"health\":{},\"health_detail\":{},\"extensions\":[",
+            quote(&d.id),
+            quote(&d.display_name),
+            quote(&d.file),
+            d.abi
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            d.enabled,
+            quote(health_code(&d.health)),
+            quote(&d.health.label()),
+        ));
+        push_json_list(&mut fields, &exts);
+        fields.push_str("]}");
+    }
+    fields.push_str("],\"formats\":[");
+    push_json_list(&mut fields, &formats);
+    fields.push_str(&format!(
+        "],\"count\":{},\"decoder_count\":{},\"active_decoder_count\":{}",
+        formats.len(),
+        decoders.len(),
+        active
+    ));
+    Ok(fields)
+}
+
+/// 稳定的机器可读健康码（UI 文案会随语言变，JSON 契约不变）。
+fn health_code(h: &Health) -> &'static str {
+    match h {
+        Health::Ok => "ok",
+        Health::AbiMismatch { .. } => "abi-mismatch",
+        Health::LoadFailed(_) => "load-failed",
+    }
+}
+
+/// 逗号分隔的 JSON 字符串数组内容（调用方负责写 `[` / `]`）。
+fn push_json_list(out: &mut String, items: &[String]) {
+    for (i, s) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&quote(s));
     }
 }
 
 /// `list`：走与 UI 翻页**同一份** `core::gallery::listing`，所以「RuPix 认哪些图」
 /// 在命令面与主窗里逐项一致；非图片不进清单，不另写一套后缀判定。
 ///
-/// ★ m305：四个动词里**只有 `--list` 认压缩包**——它本来就以「目录」为输入，包经
+/// ★ m305：五个动词里**只有 `--list` 认压缩包**——它本来就以「目录」为输入，包经
 /// [`crate::core::archive::resolve`] 落成真实目录后，这条腿一个字都不用改。像素类动词
 /// 仍只吃本机真实路径，不给契约加「包内定位」第二套坐标系；适配器先 `list` 再把
 /// `entries[].path` 交给 `--render`。
@@ -304,6 +394,52 @@ mod tests {
         let line = format_response(Some(HeadlessCmd::Render), EXIT_OK, "");
         assert!(line.starts_with("{\"ok\":"), "日志不许排在 JSON 前面");
         assert!(line.ends_with('}'), "JSON 后面不许再挂东西");
+    }
+
+    /// `list-formats` 不带路径也必须成功；没有解码器时只回内置 svg/svgz。
+    /// 这条同时钉住三件事：JSON 可解析、`count` 与 `formats` 同长、内置恒在。
+    #[test]
+    fn list_formats_reports_builtin_even_without_decoders() {
+        let req = Headless {
+            cmd: HeadlessCmd::ListFormats,
+            path: std::path::PathBuf::new(),
+            target: None,
+        };
+        let (code, line) = run(&req);
+        assert_eq!(code, EXIT_OK, "没有解码器目录不是错误：{line}");
+        assert_eq!(line.lines().count(), 1, "stdout 只许一行");
+        let v = crate::core::json::parse(&line).expect("自家 JSON 必须能解析");
+        assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(true));
+        assert_eq!(
+            v.get("cmd").and_then(|x| x.as_str()),
+            Some("list-formats"),
+            "cmd 是稳定契约，不许随 UI 文案改名"
+        );
+        let builtin: Vec<&str> = v
+            .get("builtin")
+            .and_then(|x| x.as_array())
+            .expect("builtin 必须是数组")
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        assert_eq!(builtin, vec!["svg", "svgz"], "内置只有 resvg 两条");
+        let formats = v
+            .get("formats")
+            .and_then(|x| x.as_array())
+            .expect("formats 必须是数组");
+        assert!(
+            formats.iter().any(|x| x.as_str() == Some("svg")),
+            "内置格式必须进并集"
+        );
+        assert_eq!(
+            v.get("count").and_then(|x| x.as_u64()),
+            Some(formats.len() as u64),
+            "count 与 formats 必须同长"
+        );
+        assert!(
+            v.get("decoders").and_then(|x| x.as_array()).is_some(),
+            "decoders 字段必须在（空目录也要有空数组）"
+        );
     }
 
     /// `quote` 要能扛中文路径、反斜杠、引号和控制字符，且转义后仍可解析。

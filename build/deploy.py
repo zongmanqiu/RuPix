@@ -1,6 +1,6 @@
 """6_deploy.bat 的执行体：把 exe 原子地部署到 .build\\，并核对解码器就位。
 
-职责八件（对齐 CurSeen deploy.py 的口径）：
+职责九件（对齐 CurSeen deploy.py 的口径）：
   1. 定位 .temp\\target\\release\\rupix.exe（第一候选）；缺失 = 硬错误。
   2. **PE 图标门禁**：解析 exe 的 .rsrc，RT_GROUP_ICON 必须存在且档位
      = [16,24,32,48,64,256]；缺了 = 硬错误。资源管理器/任务管理器/
@@ -29,7 +29,10 @@
         硬错误拦住；
      b) `.build\\docs\\<id>_<ver>.zip` 里被清单取代的旧插件包删掉（插件仓的打包器只写不清），
         清单不认识的名字与非 zip 文件一个都不碰。
-  7. **本机路径门禁两处**（判据同一条 `host_path_hits`，红证在 `--selftest`）：
+  7. **本包格式覆盖**（m317）：部署后跑 `rupix.exe --list-formats`，把 `.build\docs\formats.md`
+     与 `formats.json` 生成出来，并用 `formats_gate` 校验版本 / 计数 / 至少一枚可用解码器。
+     不手写格式表：内容完全来自 exe 对 `.build\decoders` 的实扫。
+  8. **本机路径门禁两处**（判据同一条 `host_path_hits`，红证在 `--selftest`）：
      a) 即将部署的 rupix.exe —— 拦住"绕过 build\\4_build.bat 直接 cargo build"；
      b) 发布目录里**每一枚会到达用户手里的 PE**：随包 DLL、已装插件、以及插件 ZIP 的
         **内层**（ZIP 要解开扫，压缩流里看不见路径明文）。只查 exe 漏的就是子仓那两份：
@@ -43,6 +46,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 import zipfile
@@ -66,6 +70,12 @@ PLUGIN_CATALOG = DOCS_DIR / "plugins.json"
 MCP_SHIP_FILES = (
     ("MCP接入指南.md", "MCP接入指南.md"),
 )
+# 本包实际格式覆盖（m317）：由部署后的 exe 自己回答，不在这里手写第二份表。
+# `--list-formats` 与设置页「解码器」三张卡同源：内置 svg/svgz + 各 DLL 的
+# `iv_decoder_info().extensions`。部署时快照成 md（给人看）/ json（给机器对账）。
+FORMATS_MD = "formats.md"
+FORMATS_JSON = "formats.json"
+FORMATS_CMD_TIMEOUT_S = 120
 
 # 产物命名约定（RuPix-Decoder\build.ps1 负责生成）：<id>_<ver>.dll
 # m139 起文件名不再带 abi：宿主加载不解析文件名（扫 *.dll -> LoadLibrary ->
@@ -498,6 +508,176 @@ def mcp_docs_gate(main_dir: Path, out_dir: Path, ship: bool = True) -> list[str]
     return bad
 
 
+def format_markdown(payload: dict, version: str) -> str:
+    """把 `--list-formats` 的 JSON 渲染成发布包内的 `formats.md`。
+
+    纯函数（不跑 exe、不写盘）：`--selftest` 可以直接喂夹具，不必拉起一个进程。
+    口径与 JSON 一致：`formats` 只含内置 + 已启用且 health=ok 的解码器；
+    坏 / 停用条目放到「未计入」，让人看得见「为什么少」。
+    """
+    builtin = [str(x) for x in (payload.get("builtin") or [])]
+    decoders = list(payload.get("decoders") or [])
+    formats = [str(x) for x in (payload.get("formats") or [])]
+    active = int(payload.get("active_decoder_count") or 0)
+    total = len(decoders)
+
+    def cell(s: object) -> str:
+        return str(s).replace("|", "\\|").replace("\n", " ")
+
+    lines = [
+        "# RuPix 格式覆盖（本包实际）",
+        "",
+        "> **生成物，勿手改。** 由 `main/build/deploy.py` 调用 `rupix.exe --list-formats` 生成。",
+        f"> 版本：{version}",
+        "> 口径：内置（宿主 resvg）∪ 已启用且加载成功的解码器自述扩展名；",
+        "> `health != ok` 或用户停用的条目列在「未计入」区，不计入总数。",
+        "",
+        "## 汇总",
+        "",
+        f"- 内置（不依赖 DLL）：`{'` `'.join(builtin)}`",
+        f"- 解码器：**{total}** 枚（可用 **{active}** 枚）",
+        f"- 唯一扩展名：**{len(formats)}** 个",
+        "",
+        "## 解码器",
+        "",
+        "| id | 名称 | 文件 | ABI | 状态 | 后缀数 |",
+        "|---|---|---|---:|---|---:|",
+    ]
+    if not decoders:
+        lines.append("| — | （没有解码器目录） | — | — | — | 0 |")
+    for d in decoders:
+        exts = d.get("extensions") or []
+        if d.get("enabled") and d.get("health") == "ok":
+            status = "可用"
+        elif not d.get("enabled"):
+            status = "已停用"
+        else:
+            status = str(d.get("health_detail") or d.get("health") or "不可用")
+        abi = d.get("abi")
+        lines.append(
+            f"| `{cell(d.get('id'))}` | {cell(d.get('name'))} | `{cell(d.get('file'))}` | "
+            f"{'—' if abi is None else abi} | {cell(status)} | {len(exts)} |"
+        )
+    lines += ["", "## 后缀", ""]
+    lines.append("`" + "` `".join(formats) + "`" if formats else "（无）")
+    lines += ["", "## 未计入", ""]
+    excluded = [
+        d for d in decoders if not d.get("enabled") or d.get("health") != "ok"
+    ]
+    if not excluded:
+        lines.append("无。")
+    else:
+        for d in excluded:
+            why = (
+                "已停用"
+                if not d.get("enabled")
+                else str(d.get("health_detail") or d.get("health") or "不可用")
+            )
+            lines.append(f"- `{d.get('id')}`：{why}")
+    lines += ["", "---", "", "机器可读的同源数据见同目录 `formats.json`。", ""]
+    return "\n".join(lines)
+
+
+def generate_formats(out_exe: Path, docs_dir: Path, version: str) -> tuple[list[str], dict | None]:
+    """部署后跑一次 `out_exe --list-formats`，把本包实际覆盖写成 md + json。
+
+    **不手写表**：内容完全来自 exe 对 `decoders/` 的实扫；`RUPIX_DECODERS_DIR` 从环境里
+    摘掉，避免开发机上指向别处的变量污染发布包。返回 `(红名单, payload)`。
+    """
+    env = dict(os.environ)
+    env.pop("RUPIX_DECODERS_DIR", None)
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        proc = subprocess.run(
+            [str(out_exe), "--list-formats"],
+            capture_output=True,
+            timeout=FORMATS_CMD_TIMEOUT_S,
+            env=env,
+            creationflags=flags,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return [f"跑 {out_exe.name} --list-formats 失败：{e}"], None
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", errors="replace").strip()
+        return [
+            f"{out_exe.name} --list-formats 退出码 {proc.returncode}"
+            + (f"：{err[:300]}" if err else "")
+        ], None
+    raw = proc.stdout.decode("utf-8", errors="replace").strip()
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return [f"`--list-formats` 不是一行合法 JSON：{raw[:300]!r}（{e}）"], None
+    if payload.get("ok") is not True or payload.get("cmd") != "list-formats":
+        return [f"`--list-formats` 响应形状不对：{raw[:300]!r}"], None
+    if not isinstance(payload.get("formats"), list) or not payload["formats"]:
+        return ["`--list-formats` 的 formats 为空"], None
+    if "svg" not in payload["formats"]:
+        return ["`--list-formats` 的 formats 里没有内置 svg"], None
+
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    doc = {"version": version, **payload}
+    data = json.dumps(doc, ensure_ascii=False, indent=2) + "\n"
+    md = format_markdown(payload, version)
+    for name, body in ((FORMATS_JSON, data), (FORMATS_MD, md)):
+        dst = docs_dir / name
+        tmp = dst.with_name(dst.name + ".tmp")
+        tmp.write_text(body, encoding="utf-8")
+        os.replace(tmp, dst)
+    return [], payload
+
+
+def formats_gate(docs_dir: Path, version: str) -> list[str]:
+    """发布包格式清单的落地判据：文件在、版本对、至少一枚可用解码器、计数自洽。"""
+    bad: list[str] = []
+    md = docs_dir / FORMATS_MD
+    js = docs_dir / FORMATS_JSON
+    if not md.is_file():
+        bad.append(f"缺 {FORMATS_MD}")
+    else:
+        try:
+            text = md.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            bad.append(f"{FORMATS_MD} 不是可读 UTF-8：{e}")
+            text = ""
+        if len(text.encode("utf-8")) < 300:
+            bad.append(f"{FORMATS_MD} 不足 300 B（空壳不算送达）")
+        for needle in ("# RuPix 格式覆盖", "生成物，勿手改", f"版本：{version}", "`svg`"):
+            if needle not in text:
+                bad.append(f"{FORMATS_MD} 缺 {needle!r}")
+    if not js.is_file():
+        bad.append(f"缺 {FORMATS_JSON}")
+        return bad
+    try:
+        payload = json.loads(js.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        bad.append(f"{FORMATS_JSON} 不是可读 UTF-8 JSON：{e}")
+        return bad
+    if payload.get("version") != version:
+        bad.append(f"{FORMATS_JSON} 版本是 {payload.get('version')!r}，不是 {version!r}")
+    if payload.get("ok") is not True or payload.get("cmd") != "list-formats":
+        bad.append(f"{FORMATS_JSON} 的 ok/cmd 形状不对")
+    formats = payload.get("formats")
+    if not isinstance(formats, list) or not formats:
+        bad.append(f"{FORMATS_JSON} 的 formats 为空")
+    else:
+        if payload.get("count") != len(formats):
+            bad.append(f"{FORMATS_JSON} 的 count 与 formats 长度不等")
+        if "svg" not in formats:
+            bad.append(f"{FORMATS_JSON} 的 formats 里没有内置 svg")
+    builtin = payload.get("builtin")
+    if not isinstance(builtin, list) or "svg" not in builtin:
+        bad.append(f"{FORMATS_JSON} 的 builtin 里没有 svg")
+    decoders = payload.get("decoders")
+    if not isinstance(decoders, list):
+        bad.append(f"{FORMATS_JSON} 的 decoders 不是数组")
+    elif not decoders:
+        bad.append(f"{FORMATS_JSON} 没有任何解码器（发布包不应只有内置 SVG）")
+    elif int(payload.get("active_decoder_count") or 0) == 0:
+        bad.append(f"{FORMATS_JSON} 所有解码器都未加载成功")
+    return bad
+
+
 def selftest() -> int:
     """把上面三个判据的"会红的形状"钉在夹具里（跑法同 layering/hygiene 的 --selftest）。
 
@@ -731,6 +911,77 @@ def selftest() -> int:
     readme_names = [n for n, _ in checks if n.startswith("README ") and "装上" not in n]
     checks.append(("README 门禁装上 5 条（少一条＝新判据没接进夹具）", len(readme_names) == 5))
 
+    # 21)~25) 格式清单：好夹具不红；缺 md / 旧版本 / 没有可用解码器 / count 漂移各红一条
+    froot = root / "formats-fixture"
+    shutil.rmtree(froot, ignore_errors=True)
+    froot.mkdir(parents=True)
+    good_formats = {
+        "ok": True,
+        "cmd": "list-formats",
+        "code": 0,
+        "builtin": ["svg", "svgz"],
+        "decoders": [
+            {
+                "id": "common",
+                "name": "Common",
+                "file": "common_0.2.6.dll",
+                "abi": 6,
+                "enabled": True,
+                "health": "ok",
+                "health_detail": "可用",
+                "extensions": ["jpg", "png"],
+            }
+        ],
+        "formats": ["jpg", "png", "svg", "svgz"],
+        "count": 4,
+        "decoder_count": 1,
+        "active_decoder_count": 1,
+    }
+
+    def write_formats(payload: dict) -> None:
+        (froot / FORMATS_JSON).write_text(
+            json.dumps({"version": "9.9.9", **payload}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    write_formats(good_formats)
+    good_md = format_markdown(good_formats, "9.9.9")
+    (froot / FORMATS_MD).write_text(good_md, encoding="utf-8")
+    checks.append(("格式清单齐套不红", formats_gate(froot, "9.9.9") == []))
+    (froot / FORMATS_MD).unlink()
+    checks.append(
+        ("格式清单缺 md 会红", any(FORMATS_MD in b for b in formats_gate(froot, "9.9.9")))
+    )
+    (froot / FORMATS_MD).write_text(good_md, encoding="utf-8")
+    checks.append(
+        ("格式清单旧版本会红", any("版本" in b for b in formats_gate(froot, "0.0.1")))
+    )
+    empty_formats = {
+        **good_formats,
+        "formats": ["svg", "svgz"],
+        "count": 2,
+        "active_decoder_count": 0,
+    }
+    write_formats(empty_formats)
+    checks.append(
+        (
+            "格式清单没有可用解码器会红",
+            any("解码器" in b for b in formats_gate(froot, "9.9.9")),
+        )
+    )
+    bad_count = {**good_formats, "count": 3}
+    write_formats(bad_count)
+    checks.append(
+        (
+            "格式清单 count 漂移会红",
+            any("count" in b for b in formats_gate(froot, "9.9.9")),
+        )
+    )
+    fmt_names = [
+        n for n, _ in checks if n.startswith("格式清单") and "装上" not in n
+    ]
+    checks.append(("格式清单门禁装上 5 条", len(fmt_names) == 5))
+
     path_names = [name for name, _ in checks if name.startswith("随包")]
     checks.append(("随包产物门禁装上 3 条（少一条＝新判据没接进夹具）", len(path_names) == 3))
     bad = [n for n, ok in checks if not ok]
@@ -907,6 +1158,30 @@ def main() -> int:
             print(f"            只在清单里（可下载、未随包）: {', '.join(only_catalog)}")
         if only_dir:
             print(f"            [WARNING] 只在目录里（清单没这一条）: {', '.join(only_dir)}")
+
+    # ── 本包实际格式覆盖（m317）：由部署后的 exe 自己回答，md/json 同源 ────────
+    # 这一步排在解码器核对之后：`--list-formats` 读的就是 .build\decoders 里这一批 DLL。
+    # 生成物不是手写表；换一台机器 / 换一批 DLL，重跑部署就会得到不同的清单。
+    fmt_err, fmt_payload = generate_formats(OUT_EXE, DOCS_DIR, cargo_version())
+    if fmt_err:
+        return fail(
+            "格式清单生成失败，部署中止：\n         "
+            + "\n         ".join(fmt_err)
+            + "\n         用法：确认 .build\\rupix.exe 能跑 `--list-formats`；"
+              "不要手写 docs\\formats.md"
+        )
+    assert fmt_payload is not None
+    fmt_bad = formats_gate(DOCS_DIR, cargo_version())
+    if fmt_bad:
+        return fail(
+            "格式清单落地自洽失败，部署中止：\n         "
+            + "\n         ".join(fmt_bad)
+            + "\n         本文件由 deploy.py 生成，**不要手改** .build\\docs\\formats.md"
+        )
+    print(
+        f"  formats : {DOCS_DIR / FORMATS_MD} "
+        f"({fmt_payload.get('count')} 后缀 / {fmt_payload.get('decoder_count')} 解码器)"
+    )
 
     # ── 发布目录里的插件包：同 id 只留清单上那一版（判据见 prune_stale_plugin_zips）──
     if PLUGIN_CATALOG.is_file():

@@ -37,7 +37,9 @@
 //! 预览尺寸与主窗「启动窗口」两档同源：全屏档铺 `rcMonitor`、固定档按主窗客户区
 //! （`preview_box`，纯函数 + 单测）。
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
@@ -49,7 +51,11 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, VK_SPACE,
+    GetAsyncKeyState, VK_ADD, VK_APPS, VK_BACK, VK_CONTROL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END,
+    VK_ESCAPE, VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_MULTIPLY, VK_NEXT, VK_OEM_1,
+    VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_MINUS,
+    VK_OEM_PERIOD, VK_OEM_PLUS, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SPACE,
+    VK_SUBTRACT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
@@ -58,8 +64,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetCursor, SetForegroundWindow, SetWindowLongPtrW, SetWindowsHookExW, TranslateMessage,
     UnhookWindowsHookEx, UpdateLayeredWindow, GWLP_USERDATA, HC_ACTION, HHOOK, IDC_ARROW,
     KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLKHF_UP, MSG, ULW_ALPHA, WH_KEYBOARD_LL, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_SETCURSOR, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_SETCURSOR, WM_SYSKEYDOWN,
+    WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 /// 自定义消息（`WM_APP` 起是应用私有段，与框架自身的 +1/+2 分配距离足够）。
@@ -183,6 +189,11 @@ static PREVIEW_HWND: AtomicUsize = AtomicUsize::new(0);
 static SPACE_DOWN: AtomicBool = AtomicBool::new(false);
 /// 解码世代：连按空格时旧线程的成品作废（一轮就有的设计，原样保留）。
 static GEN: AtomicU64 = AtomicU64::new(0);
+/// 当前预览的文件路径：预览态翻页以它为基准。只在控制线程写，导航 worker 读。
+static PREVIEW_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// 打开预览时缓存的翻页快捷键。避免在预览窗的每条按键消息里重读 INI；
+/// 用户改键后下一次开预览生效。
+static NAV_HOTKEYS: Mutex<Option<crate::core::hotkey::Hotkeys>> = Mutex::new(None);
 // 本线程持有的钩子句柄（`MSG_ENABLE` 差分会装上/摘掉；仅本线程读写）。
 thread_local! {
     static HOOK: std::cell::Cell<Option<HHOOK>> = const { std::cell::Cell::new(None) };
@@ -217,6 +228,103 @@ struct Ready {
     x: i32,
     y: i32,
     gen: u64,
+    /// 这一帧对应的文件；预览态翻页以它为基准。
+    path: PathBuf,
+}
+
+fn set_preview_path(path: Option<PathBuf>) {
+    if let Ok(mut g) = PREVIEW_PATH.lock() {
+        *g = path;
+    }
+}
+
+fn current_preview_path() -> Option<PathBuf> {
+    PREVIEW_PATH.lock().ok().and_then(|g| g.clone())
+}
+
+/// 把 `WM_KEYDOWN` 的 VK 映射到 core 的按键模型。只覆盖可绑定主键；
+/// 纯修饰键 / Tab / 未知键返回 `None`（与 ui 层 `to_key_input` 同口径）。
+fn vk_to_vkey(vk: u32) -> Option<crate::core::hotkey::VKey> {
+    use crate::core::hotkey::VKey;
+    let vk = vk as u16;
+    Some(match vk {
+        x if x == VK_LEFT.0 => VKey::Left,
+        x if x == VK_RIGHT.0 => VKey::Right,
+        x if x == VK_UP.0 => VKey::Up,
+        x if x == VK_DOWN.0 => VKey::Down,
+        x if x == VK_HOME.0 => VKey::Home,
+        x if x == VK_END.0 => VKey::End,
+        x if x == VK_PRIOR.0 => VKey::PageUp,
+        x if x == VK_NEXT.0 => VKey::PageDown,
+        x if x == VK_SPACE.0 => VKey::Space,
+        x if x == VK_RETURN.0 => VKey::Enter,
+        x if x == VK_BACK.0 => VKey::Backspace,
+        x if x == VK_DELETE.0 => VKey::Delete,
+        x if x == VK_INSERT.0 => VKey::Insert,
+        x if x == VK_APPS.0 => VKey::ContextMenu,
+        x if x == VK_ESCAPE.0 => VKey::Escape,
+        x if x == VK_ADD.0 => VKey::NumpadAdd,
+        x if x == VK_SUBTRACT.0 => VKey::NumpadSubtract,
+        x if x == VK_MULTIPLY.0 => VKey::NumpadMultiply,
+        x if x == VK_DIVIDE.0 => VKey::NumpadDivide,
+        x if x == VK_OEM_1.0 => VKey::Char(';'),
+        x if x == VK_OEM_PLUS.0 => VKey::Char('='),
+        x if x == VK_OEM_COMMA.0 => VKey::Char(','),
+        x if x == VK_OEM_MINUS.0 => VKey::Char('-'),
+        x if x == VK_OEM_PERIOD.0 => VKey::Char('.'),
+        x if x == VK_OEM_2.0 => VKey::Char('/'),
+        x if x == VK_OEM_3.0 => VKey::Char('`'),
+        x if x == VK_OEM_4.0 => VKey::Char('['),
+        x if x == VK_OEM_5.0 => VKey::Char('\\'),
+        x if x == VK_OEM_6.0 => VKey::Char(']'),
+        x if x == VK_OEM_7.0 => VKey::Char('\''),
+        0x41..=0x5A => VKey::Char((b'A' + (vk - 0x41) as u8) as char),
+        0x30..=0x39 => VKey::Char((b'0' + (vk - 0x30) as u8) as char),
+        0x60..=0x69 => VKey::Char((b'0' + (vk - 0x60) as u8) as char),
+        0x70..=0x87 => VKey::F((vk - 0x70 + 1) as u8),
+        _ => return None,
+    })
+}
+
+/// 从 `WM_KEYDOWN` 构造 `KeyInput`。修饰键取消息处理时的同步键态，
+/// 与 ui 层 `to_key_input` 的语义一致。
+fn key_input(vk: u32) -> Option<crate::core::hotkey::KeyInput> {
+    let key = vk_to_vkey(vk)?;
+    let held = |vk: i32| unsafe { GetAsyncKeyState(vk) & (-32768) != 0 };
+    Some(crate::core::hotkey::KeyInput {
+        key,
+        ctrl: held(VK_CONTROL.0 as i32),
+        alt: held(VK_MENU.0 as i32),
+        shift: held(VK_SHIFT.0 as i32),
+        win: held(VK_LWIN.0 as i32) || held(VK_RWIN.0 as i32),
+    })
+}
+
+/// 预览窗里的翻页键：命中 `Action::Prev/Next` 就派发一次导航。
+/// 长按自重复（lParam bit 30）忽略：一张一张按，避免把解码队列打满。
+fn preview_nav_key(vk: u32, lparam: usize) -> bool {
+    use crate::core::hotkey::Action;
+    if lparam & (1 << 30) != 0 {
+        return false;
+    }
+    let Some(ev) = key_input(vk) else {
+        return false;
+    };
+    let action = NAV_HOTKEYS
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|h| h.match_action(&ev)));
+    match action {
+        Some(Action::Next) => {
+            dispatch_navigate(1);
+            true
+        }
+        Some(Action::Prev) => {
+            dispatch_navigate(-1);
+            true
+        }
+        _ => false,
+    }
 }
 
 // ───────────────────────── 对外 API ─────────────────────────
@@ -639,7 +747,7 @@ unsafe fn on_space() {
 fn dispatch_pick_and_decode() {
     let gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let ctrl = CTRL_HWND.load(Ordering::SeqCst);
-    let spawned = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         // 清单口径与主窗一致：内置（SVG/SVGZ）∪ 解码器自述扩展名。判据在 `formats`
         // 一处，本处只引用。★ 裸像素（`rgb`/`uyvy`/`yuv`…）也在这份清单里：它们能不能
         // 出图取决于"参数推不推得出"，那是**文件级**事实，下一段按文件长度现场判——
@@ -653,111 +761,145 @@ fn dispatch_pick_and_decode() {
             log::debug!("spacehook：没取到可预览的选中项（前台非资源管理器，或后缀不在清单内）");
             return;
         };
-        // 裸像素没有文件头，也没有参数窗可弹（预览不该打断用户）：只能自动推断——
-        // 后缀定布局、文件长度反推宽高，与双击 `raw_dialog::open_path` 的"推得出就直接开"
-        // 是同一条推断。推不出就静默不出窗，绝不拿猜的参数去解。
-        if crate::core::decode::is_headerless_path(&path)
-            && crate::core::decode::get_raw_params(&path).is_none()
-        {
-            let Some(params) = crate::core::decode::infer_raw_params(&path) else {
-                log::debug!(
-                    "spacehook：裸像素推不出宽高，预览跳过（右键「本图 ▸ RAW 参数…」可手工指定）"
-                );
-                return;
-            };
-            crate::core::decode::set_raw_params(&path, params);
-        }
-        // 尺寸口径跟主窗「启动窗口」两档走（`preview_box`）；ini 现场读一遍——
-        // 用户在设置页刚改的档位，下一颗空格就生效，不必重启。
+        decode_and_post(path, gen, ctrl);
+    });
+}
+
+/// 预览态翻页：从当前预览文件出发，按主窗同一套排序取上一张/下一张，
+/// 再走与空格打开相同的解码/回投链。目录扫描与解码都在 worker 里，
+/// 不占控制线程（控制线程同时是低级键盘钩子的宿主）。
+fn dispatch_navigate(delta: isize) {
+    if !ENABLED.load(Ordering::SeqCst) || PREVIEW_HWND.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let Some(from) = current_preview_path() else {
+        return;
+    };
+    let gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let ctrl = CTRL_HWND.load(Ordering::SeqCst);
+    std::thread::spawn(move || {
         let cfg = crate::core::config::Config::load();
-        let metrics = crate::platform::shell_selection::monitor_metrics_of_foreground();
-        let (bx, by, bw, bh) = preview_box(
-            cfg.init_window,
-            cfg.window_w,
-            cfg.window_h,
-            &metrics,
-            crate::platform::window_frame::frameless_frame(),
-        );
-        let fit = preview_fit(cfg.init_window);
-        // 尺寸口径写进日志：用户问"预览怎么这么大/这么小"时，先看这一行对不对，
-        // 不必再去猜 ini 是哪个档、当时那块屏多少 DPI。
-        log::info!(
-            "空格预览：{} / {}（目标框 {}x{}@({}, {})｜屏幕 {}x{} 工作区 {}x{} DPI {}，ini {}x{}）",
-            cfg.init_window.label(),
-            match fit {
-                PreviewFit::Adapt => "适应目标框（含放大小图）",
-                PreviewFit::Native => "原始像素 1:1",
-            },
-            bw,
-            bh,
-            bx,
-            by,
-            metrics.mon.2,
-            metrics.mon.3,
-            metrics.work.2,
-            metrics.work.3,
-            metrics.dpi,
-            cfg.window_w,
-            cfg.window_h
-        );
-        let Ok(decoded) = crate::core::decode::probe_decode(&path, bw as u32, bh as u32) else {
-            // 解码失败静默：清单认领了却解不出属解码器层错误路径（主窗打开同样会
-            // 报错），预览不出窗即可——一轮口径原样保留。
+        let Ok(mut gallery) = crate::core::gallery::Gallery::from_file(&from, cfg.sort_spec())
+        else {
+            log::debug!("spacehook：预览翻页建清单失败: {}", from.display());
             return;
         };
-        if GEN.load(Ordering::SeqCst) != gen {
-            return; // 连按空格：这份已过期。
+        // 与主窗翻页同口径：永远循环（3/3 再下一张回 1/3）。
+        if !gallery.step_looped(delta) {
+            return;
         }
-        let natural = decoded.natural;
-        let bmp = decoded.bitmap;
-        let (mut w, mut h) = (bmp.width.max(1), bmp.height.max(1));
-        let mut premul = rgba_to_premul_bgra(&bmp.rgba);
-        // ★ m271：固定 / 全屏档要**适应**目标框——小图放大铺满、大图缩小装下，与主窗
-        //   里同一档的观感一致（`probe_decode` 只负责缩，放大的这一半在这里补）。
-        //   图片尺寸档保持 1:1：小图就是小图，窗口贴着它。
-        if fit == PreviewFit::Adapt {
-            let (nw, nh) = (natural.0.max(1) as f32, natural.1.max(1) as f32);
-            let s = (bw as f32 / nw).min(bh as f32 / nh);
-            let tw = ((nw * s).round() as u32).clamp(1, bw.max(1) as u32);
-            let th = ((nh * s).round() as u32).clamp(1, bh.max(1) as u32);
-            if tw > w + 1 || th > h + 1 {
-                premul = scale_premul(&premul, w, h, tw, th);
-                (w, h) = (tw, th);
-            }
-        }
-        let (w, h) = (w as i32, h as i32);
-        // 窗口贴图尺寸（预览窗是逐像素分层窗，没有可画的留白），在目标框里居中。
-        let x = bx + (bw - w) / 2;
-        let y = by + (bh - h) / 2;
-        let ready = Box::new(Ready {
-            premul,
-            w,
-            h,
-            x,
-            y,
-            gen,
-        });
-        // 成品交给控制线程上屏；`Box::into_raw` 的所有权**要么**转移给消息处理方，
-        // **要么**在投递失败时由我们收回。以前写的是 `let _ = PostMessageW(..)`：
-        // 控制线程已退出 / 队列满时投递失败，这张整图的堆块就没人负责（审计第三批）——
-        // 预览一次几 MB 到几十 MB，正是要省内存的那条路径。
-        let raw = Box::into_raw(ready);
-        let posted = unsafe {
-            PostMessageW(
-                Some(HWND(ctrl as *mut core::ffi::c_void)),
-                MSG_READY,
-                WPARAM(0),
-                LPARAM(raw as isize),
-            )
+        let Some(path) = gallery.current().cloned() else {
+            return;
         };
-        if posted.is_err() {
-            drop(unsafe { Box::from_raw(raw) });
-            log::debug!("spacehook：成品回投失败（控制线程已没？），位图就地释放");
-        }
+        decode_and_post(path, gen, ctrl);
     });
-    // 一次性解码线程：成品回投后即弃。`std::thread::spawn` 无失败返回（OS 线程
-    // 资源耗尽是进程级末日，与一轮 preview.rs 裸 spawn 同口径，不为其加防御）。
-    let _handle = spawned;
+}
+
+/// 单张解码 + 成品回投。调用方保证 `path` 是预览清单认领的图片；
+/// 裸像素的参数推断仍在这里做（与双击打开同一条推断）。
+fn decode_and_post(path: PathBuf, gen: u64, ctrl: usize) {
+    // 裸像素没有文件头，也没有参数窗可弹（预览不该打断用户）：只能自动推断——
+    // 后缀定布局、文件长度反推宽高，与双击 `raw_dialog::open_path` 的"推得出就直接开"
+    // 是同一条推断。推不出就静默不出窗，绝不拿猜的参数去解。
+    if crate::core::decode::is_headerless_path(&path)
+        && crate::core::decode::get_raw_params(&path).is_none()
+    {
+        let Some(params) = crate::core::decode::infer_raw_params(&path) else {
+            log::debug!(
+                "spacehook：裸像素推不出宽高，预览跳过（右键「本图 ▸ RAW 参数…」可手工指定）"
+            );
+            return;
+        };
+        crate::core::decode::set_raw_params(&path, params);
+    }
+    // 尺寸口径跟主窗「启动窗口」两档走（`preview_box`）；ini 现场读一遍——
+    // 用户在设置页刚改的档位，下一颗空格就生效，不必重启。
+    let cfg = crate::core::config::Config::load();
+    let metrics = crate::platform::shell_selection::monitor_metrics_of_foreground();
+    let (bx, by, bw, bh) = preview_box(
+        cfg.init_window,
+        cfg.window_w,
+        cfg.window_h,
+        &metrics,
+        crate::platform::window_frame::frameless_frame(),
+    );
+    let fit = preview_fit(cfg.init_window);
+    // 尺寸口径写进日志：用户问"预览怎么这么大/这么小"时，先看这一行对不对，
+    // 不必再去猜 ini 是哪个档、当时那块屏多少 DPI。
+    log::info!(
+        "空格预览：{} / {}（目标框 {}x{}@({}, {})｜屏幕 {}x{} 工作区 {}x{} DPI {}，ini {}x{}）",
+        cfg.init_window.label(),
+        match fit {
+            PreviewFit::Adapt => "适应目标框（含放大小图）",
+            PreviewFit::Native => "原始像素 1:1",
+        },
+        bw,
+        bh,
+        bx,
+        by,
+        metrics.mon.2,
+        metrics.mon.3,
+        metrics.work.2,
+        metrics.work.3,
+        metrics.dpi,
+        cfg.window_w,
+        cfg.window_h
+    );
+    let Ok(decoded) = crate::core::decode::probe_decode(&path, bw as u32, bh as u32) else {
+        // 解码失败静默：清单认领了却解不出属解码器层错误路径（主窗打开同样会
+        // 报错），预览不出窗即可——一轮口径原样保留。
+        return;
+    };
+    if GEN.load(Ordering::SeqCst) != gen {
+        return; // 连按空格/翻页：这份已过期。
+    }
+    let natural = decoded.natural;
+    let bmp = decoded.bitmap;
+    let (mut w, mut h) = (bmp.width.max(1), bmp.height.max(1));
+    let mut premul = rgba_to_premul_bgra(&bmp.rgba);
+    // ★ m271：固定 / 全屏档要**适应**目标框——小图放大铺满、大图缩小装下，与主窗
+    //   里同一档的观感一致（`probe_decode` 只负责缩，放大的这一半在这里补）。
+    //   图片尺寸档保持 1:1：小图就是小图，窗口贴着它。
+    if fit == PreviewFit::Adapt {
+        let (nw, nh) = (natural.0.max(1) as f32, natural.1.max(1) as f32);
+        let s = (bw as f32 / nw).min(bh as f32 / nh);
+        let tw = ((nw * s).round() as u32).clamp(1, bw.max(1) as u32);
+        let th = ((nh * s).round() as u32).clamp(1, bh.max(1) as u32);
+        if tw > w + 1 || th > h + 1 {
+            premul = scale_premul(&premul, w, h, tw, th);
+            (w, h) = (tw, th);
+        }
+    }
+    let (w, h) = (w as i32, h as i32);
+    // 窗口贴图尺寸（预览窗是逐像素分层窗，没有可画的留白），在目标框里居中。
+    let x = bx + (bw - w) / 2;
+    let y = by + (bh - h) / 2;
+    let ready = Box::new(Ready {
+        premul,
+        w,
+        h,
+        x,
+        y,
+        gen,
+        path,
+    });
+    // 成品交给控制线程上屏；`Box::into_raw` 的所有权**要么**转移给消息处理方，
+    // **要么**在投递失败时由我们收回。以前写的是 `let _ = PostMessageW(..)`：
+    // 控制线程已退出 / 队列满时投递失败，这张整图的堆块就没人负责（审计第三批）——
+    // 预览一次几 MB 到几十 MB，正是要省内存的那条路径。
+    let raw = Box::into_raw(ready);
+    let posted = unsafe {
+        PostMessageW(
+            Some(HWND(ctrl as *mut core::ffi::c_void)),
+            MSG_READY,
+            WPARAM(0),
+            LPARAM(raw as isize),
+        )
+    };
+    if posted.is_err() {
+        drop(unsafe { Box::from_raw(raw) });
+        log::debug!("spacehook：成品回投失败（控制线程已没？），位图就地释放");
+    }
 }
 
 /// RGBA（直通）→ **预乘 BGRA**（ULW_ALPHA 要求的合成格式）。每像素整数运算；
@@ -791,20 +933,18 @@ unsafe fn on_ready_raw(lparam: LPARAM) {
         return; // 开关已关 / 已有更新按键在途：作废。
     }
     if PREVIEW_HWND.load(Ordering::Acquire) != 0 {
-        return; // 已有窗口（收窗与成品赛跑的极端次序）：不叠加第二扇。
+        // 预览已经开着：原地换图，不重建窗口（翻页不闪、不丢焦点）。
+        update_preview(ready);
+    } else {
+        open_preview(ready);
     }
-    open_preview(ready);
 }
 
 // ───────────────────────── 预览窗（本线程原生分层弹窗） ─────────────────────────
 
-/// 开预览：先建分层 DIB 并填充（失败免建窗，少一次抖动），再开窗、ULW 提交、尝试
-/// 送进前台。任何一步失败静默放弃（下颗按键自愈），**不弹任何错误**。
-unsafe fn open_preview(ready: Ready) {
-    let hmod = match GetModuleHandleW(None) {
-        Ok(h) => h,
-        Err(_) => return,
-    };
+/// 建一张与 `ready` 同尺寸的 32bpp 预乘 BGRA DIB + 兼容 DC。
+/// 失败时已分配的资源就地归还，返回 `None`。
+unsafe fn make_surface(ready: &Ready) -> Option<PreviewPayload> {
     let bmi = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -822,12 +962,12 @@ unsafe fn open_preview(ready: Ready) {
         Ok(b) => b,
         Err(e) => {
             log::warn!("spacehook：预览位图创建失败: {e}");
-            return;
+            return None;
         }
     };
     if bits.is_null() {
         let _ = DeleteObject(HGDIOBJ(bmp.0));
-        return;
+        return None;
     }
     // DIB 内存不保证零初始化（windui 同款实测定论）：先全清再拷贝——解码尾数
     // 万一不满整窗时，留白呈全透明而不是杂色。
@@ -840,13 +980,37 @@ unsafe fn open_preview(ready: Ready) {
     let dc = CreateCompatibleDC(None);
     if dc.is_invalid() {
         let _ = DeleteObject(HGDIOBJ(bmp.0));
-        return;
+        return None;
     }
     let _ = SelectObject(dc, HGDIOBJ(bmp.0));
+    Some(PreviewPayload { dc, bmp: bmp.0 })
+}
 
+/// 释放 `make_surface` / `open_preview` 建立的 GDI 资源。
+/// 调用方保证 `p.dc` / `p.bmp` 是本模块创建且尚未释放的句柄；调用后不得再用 `p`。
+unsafe fn free_payload(p: PreviewPayload) {
+    let _ = DeleteDC(p.dc);
+    let _ = DeleteObject(HGDIOBJ(p.bmp));
+}
+
+/// 开预览：先建分层 DIB 并填充（失败免建窗，少一次抖动），再开窗、ULW 提交、尝试
+/// 送进前台。任何一步失败静默放弃（下颗按键自愈），**不弹任何错误**。
+unsafe fn open_preview(ready: Ready) {
+    let hmod = match GetModuleHandleW(None) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let path = ready.path.clone();
+    // 预览态翻页用打开这一刻的键位；用户改键后下一次开预览生效。
+    if let Ok(mut g) = NAV_HOTKEYS.lock() {
+        *g = Some(crate::core::config::Config::load().hotkeys);
+    }
+    let Some(payload) = make_surface(&ready) else {
+        return;
+    };
     // 随窗资源堆块的所有权：lpCreateParams → WM_CREATE → GWLP_USERDATA →
     // WM_DESTROY 一条线交还；建窗失败就地回收。
-    let payload = Box::into_raw(Box::new(PreviewPayload { dc, bmp: bmp.0 }));
+    let payload_raw = Box::into_raw(Box::new(payload));
     let hwnd = match CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TOPMOST,
         w!("RuPixSpacePreview"),
@@ -859,15 +1023,14 @@ unsafe fn open_preview(ready: Ready) {
         None,
         None,
         Some(hmod.into()),
-        Some(payload as *const core::ffi::c_void),
+        Some(payload_raw as *const core::ffi::c_void),
     ) {
         Ok(h) => h,
         Err(e) => {
             log::warn!("spacehook：预览窗创建失败: {e}");
             // 资源还没进 WM_CREATE 线：手动逐样归还，堆块也不例外。
-            let _ = DeleteDC(dc);
-            let _ = DeleteObject(HGDIOBJ(bmp.0));
-            drop(unsafe { Box::from_raw(payload) });
+            let p = unsafe { Box::from_raw(payload_raw) };
+            free_payload(*p);
             return;
         }
     };
@@ -894,7 +1057,7 @@ unsafe fn open_preview(ready: Ready) {
         None,
         Some(&dst),
         Some(&size),
-        Some(dc),
+        Some(unsafe { (*payload_raw).dc }),
         Some(&src),
         COLORREF(0),
         Some(&blend),
@@ -907,7 +1070,62 @@ unsafe fn open_preview(ready: Ready) {
         return;
     }
     PREVIEW_HWND.store(hwnd.0 as usize, Ordering::Release);
+    set_preview_path(Some(path));
     activate_soft(hwnd);
+}
+
+/// 预览已开时原地换图：新 DIB 先建好，ULW 提交成功后再替换旧 DIB，
+/// 失败则保留旧图。窗口句柄/焦点不变，翻页不闪。
+unsafe fn update_preview(ready: Ready) {
+    let raw = PREVIEW_HWND.load(Ordering::Acquire);
+    if raw == 0 {
+        open_preview(ready);
+        return;
+    }
+    let hwnd = HWND(raw as *mut core::ffi::c_void);
+    let Some(payload) = make_surface(&ready) else {
+        return;
+    };
+    let new_raw = Box::into_raw(Box::new(payload));
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+    };
+    let dst = POINT {
+        x: ready.x,
+        y: ready.y,
+    };
+    let src = POINT { x: 0, y: 0 };
+    let size = SIZE {
+        cx: ready.w,
+        cy: ready.h,
+    };
+    if UpdateLayeredWindow(
+        hwnd,
+        None,
+        Some(&dst),
+        Some(&size),
+        Some(unsafe { (*new_raw).dc }),
+        Some(&src),
+        COLORREF(0),
+        Some(&blend),
+        ULW_ALPHA,
+    )
+    .is_err()
+    {
+        let p = unsafe { Box::from_raw(new_raw) };
+        free_payload(*p);
+        return;
+    }
+    let old = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
+    unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, new_raw as isize) };
+    if old != 0 {
+        let p = unsafe { Box::from_raw(old as *mut PreviewPayload) };
+        free_payload(*p);
+    }
+    set_preview_path(Some(ready.path));
 }
 
 /// 尽力把预览窗送成前台键盘焦点（Esc 收窗依赖这一步；送不进去也无碍——收窗还有
@@ -929,6 +1147,9 @@ unsafe fn activate_soft(hwnd: HWND) {
 /// 收起预览（幂等）。Alt+F4 那条路不走这里、走窗体自己的销毁链，句柄统一在
 /// `WM_DESTROY` 里复位（见 `preview_wnd_proc`，不会给全局留下悬柄）。
 unsafe fn close_preview() {
+    // 作废在途解码：关窗后迟到的成品不能再把预览弹回来。
+    GEN.fetch_add(1, Ordering::SeqCst);
+    set_preview_path(None);
     let raw = PREVIEW_HWND.swap(0, Ordering::AcqRel);
     if raw != 0 {
         let _ = DestroyWindow(HWND(raw as *mut core::ffi::c_void));
@@ -968,18 +1189,19 @@ unsafe extern "system" fn preview_wnd_proc(
                 unsafe {
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                     let payload = Box::from_raw(raw as *mut PreviewPayload);
-                    let _ = DeleteDC(payload.dc);
-                    let _ = DeleteObject(HGDIOBJ(payload.bmp));
+                    free_payload(*payload);
                 }
             }
             // 全局句柄只在本窗就是"当前预览"时清：迟到的旧窗销毁不许抹掉
             // 新开预览的句柄（compare-exchange 恰好区分这两种世界）。
-            let _ = PREVIEW_HWND.compare_exchange(
-                hwnd.0 as usize,
-                0,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            );
+            if PREVIEW_HWND
+                .compare_exchange(hwnd.0 as usize, 0, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                // Alt+F4 / 系统关闭：作废在途解码，清掉导航基准。
+                GEN.fetch_add(1, Ordering::SeqCst);
+                set_preview_path(None);
+            }
             LRESULT(0)
         }
         WM_KEYDOWN => {
@@ -987,8 +1209,20 @@ unsafe extern "system" fn preview_wnd_proc(
                 unsafe {
                     let _ = DestroyWindow(hwnd);
                 }
+                return LRESULT(0);
+            }
+            // 预览态翻页：只认用户绑定的 Prev/Next；其余键保持旧行为（吞掉）。
+            if preview_nav_key(wparam.0 as u32, lparam.0 as usize) {
+                return LRESULT(0);
             }
             LRESULT(0)
+        }
+        WM_SYSKEYDOWN => {
+            // Alt+方向键也可作为翻页键；其余系统键（Alt+F4 等）交给默认过程。
+            if preview_nav_key(wparam.0 as u32, lparam.0 as usize) {
+                return LRESULT(0);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_SETCURSOR => {
             // 钉死箭头：类光标已是 IDC_ARROW，这里再显式应答一次——DefWindowProc 的
@@ -1160,5 +1394,59 @@ mod tests {
             assert!(src.contains(cls), "外壳类名表缺少 {cls}");
         }
         assert!(src.contains("SHELLDLL_DefView"), "桌面 defView 守卫不能丢");
+    }
+
+    /// 预览态翻页的 VK 映射要覆盖出厂 Prev/Next（←/→），以及常用的翻页别名。
+    #[test]
+    fn page_key_vk_map_matches_defaults() {
+        assert_eq!(
+            vk_to_vkey(VK_LEFT.0 as u32),
+            Some(crate::core::hotkey::VKey::Left)
+        );
+        assert_eq!(
+            vk_to_vkey(VK_RIGHT.0 as u32),
+            Some(crate::core::hotkey::VKey::Right)
+        );
+        assert_eq!(
+            vk_to_vkey(VK_PRIOR.0 as u32),
+            Some(crate::core::hotkey::VKey::PageUp)
+        );
+        assert_eq!(
+            vk_to_vkey(VK_NEXT.0 as u32),
+            Some(crate::core::hotkey::VKey::PageDown)
+        );
+    }
+
+    /// 出厂快捷键与预览窗的按键模型必须对得上：← = Prev，→ = Next。
+    #[test]
+    fn default_hotkeys_match_page_keys() {
+        use crate::core::hotkey::{Action, Hotkeys, KeyInput, VKey};
+        let hk = Hotkeys::default();
+        let left = KeyInput {
+            key: VKey::Left,
+            ctrl: false,
+            alt: false,
+            shift: false,
+            win: false,
+        };
+        let right = KeyInput {
+            key: VKey::Right,
+            ctrl: false,
+            alt: false,
+            shift: false,
+            win: false,
+        };
+        assert_eq!(hk.match_action(&left), Some(Action::Prev));
+        assert_eq!(hk.match_action(&right), Some(Action::Next));
+    }
+
+    /// 字母/标点/F 键/未知键的映射边界。
+    #[test]
+    fn vk_map_handles_letters_punctuation_and_unknown() {
+        use crate::core::hotkey::VKey;
+        assert_eq!(vk_to_vkey(0x41), Some(VKey::Char('A')));
+        assert_eq!(vk_to_vkey(VK_OEM_COMMA.0 as u32), Some(VKey::Char(',')));
+        assert_eq!(vk_to_vkey(0x74), Some(VKey::F(5)));
+        assert_eq!(vk_to_vkey(0xFFFF), None);
     }
 }

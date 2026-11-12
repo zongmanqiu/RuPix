@@ -140,11 +140,13 @@ pub enum Action {
     PanRight,
     /// 取色器开关（m217）。只进右键「本图 ▸ 取色器」，不进浮条按钮排。
     Picker,
+    /// 主辅视图开关（m322）：主图 + 右栏辅图，联动步长 2；不做 PiP/小窗。
+    Companion,
 }
 
 impl Action {
     /// 动作总数（也是 `bindings` 数组长度）。
-    pub const COUNT: usize = 35;
+    pub const COUNT: usize = 36;
 
     /// 全部动作，下标顺序与枚举定义严格一致（见类型注释）。
     pub const ALL: [Action; Action::COUNT] = [
@@ -183,6 +185,7 @@ impl Action {
         Action::PanDown,
         Action::PanRight,
         Action::Picker,
+        Action::Companion,
     ];
 
     /// 下标（0..COUNT），用于索引 `Hotkeys::bindings`。
@@ -233,6 +236,7 @@ impl Action {
             Action::PanDown => "pan_down",
             Action::PanRight => "pan_right",
             Action::Picker => "picker",
+            Action::Companion => "companion",
         }
     }
 
@@ -274,6 +278,7 @@ impl Action {
             "pan_down" => Some(Action::PanDown),
             "pan_right" => Some(Action::PanRight),
             "picker" => Some(Action::Picker),
+            "companion" => Some(Action::Companion),
             _ => None,
         }
     }
@@ -316,6 +321,7 @@ impl Action {
             Action::PanDown => "向下平移",
             Action::PanRight => "向右平移",
             Action::Picker => "取色器",
+            Action::Companion => "主辅视图",
         }
     }
 }
@@ -1137,7 +1143,7 @@ mod tests {
     /// 2026-10-19 起不透明度 `Ctrl+↑/↓` 也出厂就绑（m53-K，消除两个孤儿动作）。
     #[test]
     fn expanded_action_set_ids_round_trip_and_new_unbound() {
-        assert_eq!(Action::COUNT, 35);
+        assert_eq!(Action::COUNT, 36);
         for a in Action::ALL {
             assert_eq!(
                 Action::from_id(a.id()),
@@ -1163,6 +1169,7 @@ mod tests {
             // 入口是右键「操作」子菜单那一项，想要键的人在快捷键页自绑——那一页
             // 遍历 `Action::ALL`，这一行是自动多出来的。
             Action::Slideshow,
+            Action::Companion,
         ] {
             assert!(
                 hk.bindings[a.index()].is_empty(),

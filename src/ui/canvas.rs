@@ -73,6 +73,9 @@ use crate::core::pixels::MAX_TEXTURE_SIDE;
 // 鸟瞰 / 浮层的配色取自全 ui 共用的令牌（[`crate::ui::tokens`]），本文件不自带色值。
 // 别名引入：跟随主题那组是函数，名字短（`empty_bg` / `hint_text`），逐个 import 易撞名。
 use super::chrome::{self, Arrow, Btn, Press, TitleBtn};
+use super::companion::{
+    companion_path_label, pair_step, CompanionPane, CompanionSource, LinkMode, Pane,
+};
 use super::plugin_settings::{LiveState, RunPrompt};
 use super::tokens as tk;
 use super::{filmstrip, settings, tree};
@@ -95,6 +98,42 @@ const NAV_W: f32 = 220.0;
 const NAV_H: f32 = 160.0;
 const NAV_MARGIN: f32 = 12.0;
 
+/// 辅图解码上限（单边物理像素 / 总像素）。
+///
+/// 辅图是右栏的对照视图，不是主画面：放大到 4× 时仍按“铺满整张图”的纹理拉伸，
+/// 真按 zoom × DPI 去解一张上亿像素的图，UI 线程要拷贝、显卡要上传，反而卡。
+/// 9 MP 足以覆盖 4K 屏半栏 1.25× 余量，再大就交给纹理放大。
+const COMPANION_MAX_SIDE: f32 = 4096.0;
+const COMPANION_MAX_PIXELS: f32 = 9_000_000.0;
+
+type CompanionDrag = ((f32, f32), (f32, f32));
+
+/// 主/辅 pane 的**最近一次绘制几何**，与拖放回调共享。
+///
+/// `windui` 的文件拖放回调只给路径、不给落点；但落点决定“开在主图还是辅图”。
+/// 回调拿系统光标（拖放结束时光标就在落点）换算客户区坐标，再用这份几何判 pane。
+#[derive(Clone)]
+pub(crate) struct PaneGeom {
+    pub primary: Rc<Cell<Rect>>,
+    pub companion: Rc<Cell<Rect>>,
+}
+
+impl PaneGeom {
+    pub(crate) fn new() -> Self {
+        Self {
+            primary: Rc::new(Cell::new(Rect::new(0, 0, 0, 0))),
+            companion: Rc::new(Cell::new(Rect::new(0, 0, 0, 0))),
+        }
+    }
+
+    /// 拖放落点是否在辅图 pane 内（辅图未开时矩形为零，恒假）。
+    pub(crate) fn hits_companion(&self, x: i32, y: i32) -> bool {
+        self.companion
+            .get()
+            .contains(windui::geometry::Point { x, y })
+    }
+}
+
 pub struct ImageCanvas {
     viewer: Rc<RefCell<Viewer>>,
     chrome: Rc<Chrome>,
@@ -104,6 +143,8 @@ pub struct ImageCanvas {
     hub: Hub,
     /// 最近一次 `paint` 拿到的内容矩形：事件回调里要算中心点，而事件不带几何信息。
     last: Cell<Rect>,
+    /// 与窗口根节点的拖放回调共享的 pane 几何（判拖放落点）。
+    pane_geom: PaneGeom,
     /// 鸟瞰缩略图状态：图显示尺寸超出视口时（且设置开启）显示导航图，拖动可平移主视图。
     nav_drag: Cell<bool>,
     /// 左键按下、但还没挪够阈值的起点。
@@ -115,6 +156,34 @@ pub struct ImageCanvas {
     wheel_acc: Cell<i32>,
     /// 主位图的上屏纹理缓存（按 gen 代号判脏，见 [`ImageCache`]）。
     main_img: RefCell<ImageCache>,
+    /// 主辅视图的辅图：目标/异步成品。`Rc<RefCell>` 让「跳转到…帧/页」
+    /// 对话框的 'static 闭包也能安全地写回它。
+    companion: Rc<RefCell<CompanionPane>>,
+    /// 辅图的上屏纹理缓存。
+    comp_img: RefCell<ImageCache>,
+    /// 主图实际可用的矩形（开主辅视图时是左半；关时与 `last_work` 相同）。
+    /// 绘制/缩放锚点用它；chrome/胶片条/命中仍用 `last_work`。
+    primary_work: Cell<Rect>,
+    /// 辅图实际可用的矩形（开主辅视图时是右半；关时零矩形）。
+    comp_work: Cell<Rect>,
+    /// 辅图自己的缩放倍率（1.0 = 适应 pane）与平移。
+    /// 用 `Rc<Cell>` 是为了右键「操作 ▸」菜单的闭包也能拿到同一份状态：
+    /// 活动窗是辅图时，菜单里的放大/缩小/适应/1:1 必须和工具栏走同一条路。
+    comp_zoom: Rc<Cell<f32>>,
+    comp_pan: Rc<Cell<(f32, f32)>>,
+    /// 上一帧辅图“适应 pane”时的倍率（`comp_zoom == 1.0` 对应的图像 scale）。
+    /// 工具栏「1:1」与键盘 ActualSize 要靠它把辅图切到原图像素。
+    comp_fit: Rc<Cell<f32>>,
+    /// 辅图左键拖动：起点 + 起始 pan。
+    comp_drag: Cell<Option<CompanionDrag>>,
+    /// 当前辅图目标键（路径/页）；变了就重置缩放/平移。
+    comp_target_key: RefCell<Option<(PathBuf, Option<u32>)>>,
+    /// 上一帧辅图整图的目标矩形（鸟瞰几何/拖动映射用）。
+    comp_dst: Cell<Rect>,
+    /// 正在拖辅图的鸟瞰视口框。
+    comp_nav_drag: Cell<bool>,
+    /// 交换主辅后，新主图需要落到的页/帧（等首帧解码完成后由 paint 兑现）。
+    pending_main_page: Cell<Option<(PathBuf, u32)>>,
     /// 鸟瞰缩略位图的上屏纹理缓存。
     nav_img: RefCell<ImageCache>,
     /// 实时调色状态（每窗一份）：参数窗写、本画布 paint 读。
@@ -617,6 +686,74 @@ fn nav_draw_rect(inner: Rect, idst: Rect, dst: Rect) -> Rect {
     Rect::new(l, t, r - l, b - t)
 }
 
+/// 画一枚鸟瞰：盒底 + 双层描边 + 完整缩略图 + 当前视口框。
+///
+/// 主图和辅图共用，`content` 是这一侧的视口（主图左半 / 辅图右半），
+/// `dst` 是整图在屏上的目标矩形，`idst` 是缩略图源图的对应矩形。
+fn paint_nav(
+    canvas: &mut dyn Canvas,
+    box_r: Rect,
+    thumb: Rect,
+    content: Rect,
+    dst: Rect,
+    tex: Option<&Image>,
+    idst: Rect,
+) {
+    canvas.fill_rect(
+        box_r.x as f32,
+        box_r.y as f32,
+        box_r.w as f32,
+        box_r.h as f32,
+        &Paint::fill(tk::pill_bg()),
+    );
+    canvas.stroke_round_rect(
+        box_r.x as f32 - 1.0,
+        box_r.y as f32 - 1.0,
+        box_r.w as f32 + 2.0,
+        box_r.h as f32 + 2.0,
+        0.0,
+        1.0,
+        &Paint::fill(tk::STROKE_DARK),
+    );
+    canvas.stroke_round_rect(
+        box_r.x as f32,
+        box_r.y as f32,
+        box_r.w as f32,
+        box_r.h as f32,
+        0.0,
+        1.0,
+        &Paint::fill(tk::STROKE_LIGHT),
+    );
+    let inner = if thumb.w >= 3 && thumb.h >= 3 {
+        Rect::new(thumb.x + 1, thumb.y + 1, thumb.w - 2, thumb.h - 2)
+    } else {
+        thumb
+    };
+    if let Some(tex) = tex {
+        let draw = nav_draw_rect(inner, idst, dst);
+        canvas.draw_image(tex, draw, Fit::Fill, 0.0, 1.0);
+    }
+    let u0 = ((content.x as f32 - dst.x as f32) / dst.w as f32).clamp(0.0, 1.0);
+    let u1 = ((content.x as f32 + content.w as f32 - dst.x as f32) / dst.w as f32).clamp(0.0, 1.0);
+    let v0 = ((content.y as f32 - dst.y as f32) / dst.h as f32).clamp(0.0, 1.0);
+    let v1 = ((content.y as f32 + content.h as f32 - dst.y as f32) / dst.h as f32).clamp(0.0, 1.0);
+    let fx = inner.x as f32 + u0 * inner.w as f32;
+    let fy = inner.y as f32 + v0 * inner.h as f32;
+    let fw = ((u1 - u0) * inner.w as f32).max(4.0);
+    let fh = ((v1 - v0) * inner.h as f32).max(4.0);
+    canvas.fill_rect(fx, fy, fw, fh, &Paint::fill(tk::NAV_FILL));
+    canvas.stroke_round_rect(
+        fx - 1.0,
+        fy - 1.0,
+        fw + 2.0,
+        fh + 2.0,
+        0.0,
+        1.0,
+        &Paint::fill(tk::STROKE_DARK),
+    );
+    canvas.stroke_round_rect(fx, fy, fw, fh, 0.0, 1.0, &Paint::fill(tk::STROKE_LIGHT));
+}
+
 /// 「另存为…」的默认文件名：原图主名 + `.png`。
 ///
 /// 以前写死「涂鸦.png」，用户每存一张都要自己重命名一遍——原图叫
@@ -720,6 +857,12 @@ fn edit_actions(
 }
 
 impl ImageCanvas {
+    /// 与窗口根节点的拖放回调共享 pane 几何；`new` 默认自建一份，测试不受影响。
+    pub(crate) fn with_pane_geom(mut self, geom: PaneGeom) -> Self {
+        self.pane_geom = geom;
+        self
+    }
+
     pub fn new(
         viewer: Rc<RefCell<Viewer>>,
         chrome: Rc<Chrome>,
@@ -732,10 +875,23 @@ impl ImageCanvas {
             config,
             hub,
             last: Cell::new(Rect::new(0, 0, 1, 1)),
+            pane_geom: PaneGeom::new(),
             nav_drag: Cell::new(false),
             lmb_pending: Cell::new(None),
             wheel_acc: Cell::new(0),
             main_img: RefCell::new(ImageCache::new().pixelated()),
+            companion: Rc::new(RefCell::new(CompanionPane::new())),
+            comp_img: RefCell::new(ImageCache::new()),
+            primary_work: Cell::new(Rect::new(0, 0, 1, 1)),
+            comp_work: Cell::new(Rect::new(0, 0, 0, 0)),
+            comp_zoom: Rc::new(Cell::new(1.0)),
+            comp_pan: Rc::new(Cell::new((0.0, 0.0))),
+            comp_fit: Rc::new(Cell::new(1.0)),
+            comp_drag: Cell::new(None),
+            comp_target_key: RefCell::new(None),
+            comp_dst: Cell::new(Rect::new(0, 0, 0, 0)),
+            comp_nav_drag: Cell::new(false),
+            pending_main_page: Cell::new(None),
             nav_img: RefCell::new(ImageCache::new()),
             live: LiveState::new(),
             tint_main: RefCell::new(TintCache::new_pixelated()),
@@ -768,9 +924,20 @@ impl ImageCanvas {
 
     fn center(&self) -> (f32, f32) {
         // 用扣掉缩略图条之后的矩形：条占了底部一条，画面中心就该往上抬，
-        // 否则滚轮缩放与鸟瞰导航的锚点都会偏。
-        let c = self.last_work.get();
+        // 否则滚轮缩放与鸟瞰导航的锚点都会偏。主辅视图开时用主图左半。
+        let c = self.view_work();
         (c.x as f32 + c.w as f32 / 2.0, c.y as f32 + c.h as f32 / 2.0)
+    }
+
+    /// 主图实际可用的矩形：`paint` 每帧写 `primary_work`；测试/首帧还没画时
+    /// 回落到 `last_work`，不改变旧几何。
+    fn view_work(&self) -> Rect {
+        let p = self.primary_work.get();
+        if p.w <= 1 && p.h <= 1 {
+            self.last_work.get()
+        } else {
+            p
+        }
     }
 
     /// 当前是否显示底部缩略图条（决定要不要扣布局高度）。
@@ -780,7 +947,9 @@ impl ImageCanvas {
 
     /// 鸟瞰几何：`Some((导航盒, 缩略图区域))`。仅当图显示尺寸超出视口时。
     /// paint（绘制层）与事件（命中/拖动）共用同一份几何，保证两处一致。
-    fn nav_geom(&self, content: Rect, dst: Rect) -> Option<(Rect, Rect)> {
+    /// 鸟瞰几何：鸟瞰锚在 `content`，躲工具栏按 `view` 算。
+    /// 主辅视图下 `content` 是左/右半 pane，`view` 是整块 `work`。
+    fn nav_geom_in(&self, content: Rect, view: Rect, dst: Rect) -> Option<(Rect, Rect)> {
         // 未超出视口（含 1px 容差）不显示——鸟瞰只服务于"放得下"到"放不下"的边界。
         if dst.w <= content.w + 1 && dst.h <= content.h + 1 {
             return None;
@@ -795,7 +964,7 @@ impl ImageCanvas {
         let tw = (dst.w as f32 * s).max(1.0);
         let th = (dst.h as f32 * s).max(1.0);
         // 锚点沿用 nav_box 的右下定位（含躲工具栏的上抬逻辑），缩略图贴齐其右下。
-        let anchor = Self::nav_box(content);
+        let anchor = Self::nav_box_in(content, view);
         let tx = anchor.x as f32 + anchor.w as f32 - tw;
         let ty = anchor.y as f32 + anchor.h as f32 - th;
         // 盒 = 缩略图本身（2026-10-12 用户拍板）：黑白双层框直接贴图缘，替代
@@ -811,13 +980,9 @@ impl ImageCanvas {
     /// 唯一例外是**躲底部工具栏**：窄窗口下浮条（居中）会横到右下角来，压上去就
     /// 变成"缩略图挡住了半透明的按钮"。这时整体上抬到浮条之上；抬不进去（窗口太矮）
     /// 就维持右下——浮条是半透明浮层且会自动隐藏，盖一点比跑出窗口好。
-    fn nav_box(content: Rect) -> Rect {
-        let view = (
-            content.x as f32,
-            content.y as f32,
-            content.w as f32,
-            content.h as f32,
-        );
+    /// 鸟瞰盒：锚在 `content` 右下角，躲工具栏用 `view` 的满格几何。
+    fn nav_box_in(content: Rect, view: Rect) -> Rect {
+        let view = (view.x as f32, view.y as f32, view.w as f32, view.h as f32);
         // 保守取"动画组也在"的那一行：这里若跟随当前显隐，切到动图的一刻缩略图
         // 会跟着往上跳一格——避让位置必须是稳定的。
         let (px, py, pw, ph) = Chrome::pill(view, true, Chrome::cell_reserve(view.2));
@@ -856,10 +1021,11 @@ impl ImageCanvas {
 
     /// 视口内当前的鸟瞰几何（事件路径用；`last` 是最近 paint 存下的内容矩形）。
     fn nav_hit(&self, pos: (f32, f32)) -> Option<(Rect, Rect)> {
-        let content = self.last_work.get();
+        // 主辅视图开时，主图鸟瞰在左半 pane，不在整块 work 的右下角。
+        let content = self.view_work();
         let v = self.viewer.borrow();
         let dst = v.dst_rect(from_rect(content))?;
-        let geom = self.nav_geom(content, to_rect(dst))?;
+        let geom = self.nav_geom_in(content, self.last_work.get(), to_rect(dst))?;
         let (box_r, _) = geom;
         let inside = pos.0 >= box_r.x as f32
             && pos.0 < (box_r.x + box_r.w) as f32
@@ -881,13 +1047,52 @@ impl ImageCanvas {
     ///
     /// 返回**画面是否真的变了**（几何算不出来时也算不出"变"，返 `false`）。
     fn nav_pan_at(&self, pos: (f32, f32)) -> bool {
-        let content = self.last_work.get();
+        let content = self.view_work();
         let dst = self.viewer.borrow().dst_rect(from_rect(content));
         let Some(dst) = dst else { return false };
-        let Some((_, thumb)) = self.nav_geom(content, to_rect(dst)) else {
+        let Some((_, thumb)) = self.nav_geom_in(content, self.last_work.get(), to_rect(dst)) else {
             return false;
         };
         self.nav_pan_to(to_rect(dst), thumb, pos)
+    }
+
+    /// 辅图鸟瞰几何：只在该 pane 里图显示尺寸超出视口时出现。
+    fn comp_nav_geom(&self) -> Option<(Rect, Rect)> {
+        if !self.chrome.companion.get() {
+            return None;
+        }
+        let dst = self.comp_dst.get();
+        if dst.w <= 0 || dst.h <= 0 {
+            return None;
+        }
+        self.nav_geom_in(self.comp_work.get(), self.last_work.get(), dst)
+    }
+
+    /// 拖辅图鸟瞰：把缩略图上的点映射回辅图，让该点对准辅图 pane 中心。
+    fn comp_nav_pan_to(&self, dst: Rect, thumb: Rect, mouse: (f32, f32)) -> bool {
+        let u = ((mouse.0 - thumb.x as f32) / thumb.w as f32).clamp(0.0, 1.0);
+        let v = ((mouse.1 - thumb.y as f32) / thumb.h as f32).clamp(0.0, 1.0);
+        let img_pt = (
+            dst.x as f32 + u * dst.w as f32,
+            dst.y as f32 + v * dst.h as f32,
+        );
+        let c = self.comp_work.get();
+        let center = (c.x as f32 + c.w as f32 / 2.0, c.y as f32 + c.h as f32 / 2.0);
+        let pan = self.comp_pan.get();
+        let next = (pan.0 + center.0 - img_pt.0, pan.1 + center.1 - img_pt.1);
+        if next == pan {
+            return false;
+        }
+        self.comp_pan.set(next);
+        // 同一帧可能还会来 Move；先把映射用的 dst 跟着 pan 推一格，
+        // 否则连续拖动会按旧矩形反复算，视口框追不上鼠标。
+        self.comp_dst.set(Rect::new(
+            dst.x + (next.0 - pan.0).round() as i32,
+            dst.y + (next.1 - pan.1).round() as i32,
+            dst.w,
+            dst.h,
+        ));
+        true
     }
 
     /// 鸟瞰一击：命中就把视口中心挪到该点。返回是否落在鸟瞰盒上。
@@ -913,10 +1118,134 @@ impl ImageCanvas {
         true
     }
 
+    /// 底栏当前是否归辅图：活动窗是辅图、且辅图真有页/帧号。
+    fn companion_owns_index(&self) -> bool {
+        !chrome::borderless()
+            && !self.chrome.companion_sync_view.get()
+            && self.chrome.companion.get()
+            && self.chrome.active_pane.get() == Pane::Companion
+            && self.companion.borrow().has_index()
+    }
+
+    /// 活动辅图的逐页/逐帧键：命中就翻辅图自己的页，不碰主图。
+    fn companion_frame_key(&self, k: &KeyEvent) -> bool {
+        if !self.companion_owns_index() {
+            return false;
+        }
+        let Some(ki) = to_key_input(k) else {
+            return false;
+        };
+        let delta = match self.config.borrow().hotkeys.match_action(&ki) {
+            Some(Action::FramePrev) => -1,
+            Some(Action::FrameNext) => 1,
+            _ => return false,
+        };
+        self.companion.borrow_mut().step_index(delta)
+    }
+
+    /// 活动窗是不是辅图（只有开主辅视图时才有意义）。
+    fn companion_view_active(&self) -> bool {
+        !chrome::borderless()
+            && !self.chrome.companion_sync_view.get()
+            && self.chrome.companion.get()
+            && self.chrome.active_pane.get() == Pane::Companion
+    }
+
+    /// 活动辅图是否处于「自由翻页」：左右方向键/边缘箭头改翻辅图自己的清单。
+    fn companion_free(&self) -> bool {
+        self.companion_view_active() && self.chrome.companion_link.get() == LinkMode::Free
+    }
+
+    /// 自由翻页的文件导航键：`Prev` / `Next`（方向键、PageUp/PageDown）。
+    /// 页/帧键（`,`/`.`）由 [`Self::companion_frame_key`] 单独处理。
+    fn companion_file_key(&self, k: &KeyEvent) -> bool {
+        if !self.companion_free() {
+            return false;
+        }
+        let Some(ki) = to_key_input(k) else {
+            return false;
+        };
+        let delta = match self.config.borrow().hotkeys.match_action(&ki) {
+            Some(Action::Prev) => -1,
+            Some(Action::Next) => 1,
+            _ => return false,
+        };
+        self.companion.borrow_mut().step_file(delta)
+    }
+
+    /// 活动辅图的缩放/平移键：ZoomIn/Out、Fit、ActualSize、WASD 平移。
+    /// 文件翻页键由 [`Self::companion_file_key`] 单独处理。
+    fn companion_view_key(&self, k: &KeyEvent) -> bool {
+        if !self.companion_view_active() {
+            return false;
+        }
+        let Some(ki) = to_key_input(k) else {
+            return false;
+        };
+        let action = self.config.borrow().hotkeys.match_action(&ki);
+        let Some(action) = action else {
+            return false;
+        };
+        let z = self.comp_zoom.get();
+        let mut handled = true;
+        match action {
+            Action::ZoomIn => self.comp_zoom.set((z * 1.25).clamp(0.1, 8.0)),
+            Action::ZoomOut => self.comp_zoom.set((z / 1.25).clamp(0.1, 8.0)),
+            Action::Fit => {
+                self.comp_zoom.set(1.0);
+                self.comp_pan.set((0.0, 0.0));
+            }
+            Action::ActualSize => {
+                let fit = self.comp_fit.get().max(0.0001);
+                self.comp_zoom.set((1.0 / fit).clamp(0.1, 8.0));
+                self.comp_pan.set((0.0, 0.0));
+            }
+            Action::PanUp | Action::PanLeft | Action::PanDown | Action::PanRight => {
+                let (sx, sy) = Chrome::wasd_signs(wasd_dir(action));
+                let (px, py) = self.comp_pan.get();
+                self.comp_pan.set((px + sx * 40.0, py + sy * 40.0));
+            }
+            _ => handled = false,
+        }
+        handled
+    }
+
     /// 执行一次悬浮层按钮/箭头/标题栏按钮的动作。调用点保证命中仍成立。
     fn exec(&self, ctx: &mut EventCtx, press: Press) {
         match press {
+            Press::Btn(b)
+                if self.companion_view_active()
+                    && matches!(b, Btn::Out | Btn::In | Btn::Fit | Btn::Actual) =>
+            {
+                companion_zoom_button(
+                    b,
+                    &self.chrome,
+                    &self.comp_zoom,
+                    &self.comp_pan,
+                    &self.comp_fit,
+                );
+            }
+            Press::Btn(Btn::FrameBack) if self.companion_owns_index() => {
+                self.chrome.slide_stop();
+                self.companion.borrow_mut().step_index(-1);
+            }
+            Press::Btn(Btn::FrameFwd) if self.companion_owns_index() => {
+                self.chrome.slide_stop();
+                self.companion.borrow_mut().step_index(1);
+            }
+            // 辅图底栏没有播放钮；真被旧几何命中也不影响主图播放状态。
+            Press::Btn(Btn::PlayPause) if self.companion_owns_index() => {
+                self.chrome.slide_stop();
+            }
             Press::Btn(b) => exec_btn(ctx, &self.viewer, &self.chrome, b),
+            Press::Arrow(Arrow::Prev) if self.companion_free() => {
+                self.chrome.slide_stop();
+                self.companion.borrow_mut().step_file(-1);
+            }
+            Press::Arrow(Arrow::Next) if self.companion_free() => {
+                self.chrome.slide_stop();
+                self.companion.borrow_mut().step_file(1);
+            }
             Press::Arrow(Arrow::Prev) => {
                 self.chrome.slide_stop();
                 self.viewer.borrow_mut().step(-1);
@@ -1244,8 +1573,14 @@ impl ImageCanvas {
             it
         });
 
+        // ── 主辅视图（m322）：开关 / 来源 / 联动方式收进子菜单 ──
+        // 无边框形态不开放：它没有 chrome/标题栏，分栏与工具栏都无处落，
+        // 强行开放只会多一套要适配的布局。
+        if !chrome::borderless() {
+            items.push(MenuItem::submenu("主辅视图", self.companion_items()));
+        }
+
         // ── 左键拖图：指针交互的开关（ini 键：drag_image），留在顶层 ──
-        //
         // 2026-11-03 用户点名进菜单（"和极简模式那些放一起"）。理由成立：这条改的是手感，
         // 而手感不对的时候人正盯着画面——不该要先开设置页才能试另一种分工。
         // 2026-11-04 收进子菜单、11-07 改名「外观 ▸」时，本项按手势分工 ≠ 外观留在顶层。
@@ -1308,6 +1643,227 @@ impl ImageCanvas {
     /// 棋盘格只在本菜单与设置页「外观」卡（m247 已从浮条 / 「操作 ▸」撤走）。
     /// 放映改的是浏览行为、左键拖图改的是手势分工，留在顶层不进来。
     /// 不透明度保留自己的档位子菜单：十档铺平会把这里撑成一长列，三级反而好找。
+    /// 「主辅视图 ▸」子菜单（m322）：开关 / 来源 / 辅图翻页 / 交换主辅。
+    /// 活动窗不在这里——点击左/右 pane 就直接切，菜单项是重复入口（用户 2026-11-12 拍板删）。
+    /// 主图标题与底栏不受影响；这里只改右栏辅图。
+    /// 第三参数是 `checked`，不是 `enabled`：动作项一律 `false`，开关项再显式设
+    /// `checkable/checked`，禁用项只碰 `enabled`。
+    fn companion_items(&self) -> Vec<MenuItem> {
+        let mut items = Vec::new();
+        let on = self.chrome.companion.get();
+        items.push({
+            let chrome = self.chrome.clone();
+            let mut it = MenuItem::run(
+                "显示辅图",
+                move |ctx| {
+                    let on = !chrome.companion.get();
+                    chrome.companion.set(on);
+                    if !on {
+                        chrome.active_pane.set(Pane::Primary);
+                    }
+                    ctx.mark_dirty();
+                },
+                false,
+            );
+            it.checkable = true;
+            it.checked = on;
+            it.shortcut = self.config.borrow().hotkeys.display(Action::Companion);
+            it
+        });
+
+        let source = self.chrome.companion_source.get();
+        let picked = self.chrome.companion_picked.borrow().clone();
+        let mut source_items = Vec::new();
+        source_items.push({
+            let chrome = self.chrome.clone();
+            let mut it = MenuItem::run(
+                "主序列下一张",
+                move |ctx| {
+                    chrome.companion_source.set(CompanionSource::NextInPrimary);
+                    ctx.mark_dirty();
+                },
+                false,
+            );
+            it.checkable = true;
+            it.checked = source == CompanionSource::NextInPrimary;
+            it
+        });
+        source_items.push({
+            let chrome = self.chrome.clone();
+            let label = match picked.as_deref() {
+                Some(p) => format!("自选辅图…（{}）", companion_path_label(p)),
+                None => "自选辅图…".to_string(),
+            };
+            let mut it = MenuItem::run(
+                label,
+                move |ctx| {
+                    let exts = crate::core::archive::pick_exts();
+                    let chrome2 = chrome.clone();
+                    ctx.request_pick_file(
+                        windui::prelude::PickDialog::new()
+                            .title("自选辅图")
+                            .filter("图片", &exts),
+                        move |p| {
+                            if let Some(p) = p {
+                                chrome2.companion_source.set(CompanionSource::OwnSequence);
+                                *chrome2.companion_picked.borrow_mut() = Some(p);
+                                chrome2.companion.set(true);
+                            }
+                        },
+                    );
+                },
+                false,
+            );
+            it.checkable = true;
+            it.checked = source == CompanionSource::OwnSequence;
+            it
+        });
+        items.push(MenuItem::submenu("辅图来源", source_items));
+
+        let link = self.chrome.companion_link.get();
+        let mut flip = Vec::new();
+        flip.push({
+            let chrome = self.chrome.clone();
+            let mut it = MenuItem::run(
+                "跟随主图",
+                move |ctx| {
+                    chrome.companion_link.set(LinkMode::Linked);
+                    ctx.mark_dirty();
+                },
+                false,
+            );
+            it.checkable = true;
+            it.checked = link == LinkMode::Linked;
+            it
+        });
+        flip.push({
+            let chrome = self.chrome.clone();
+            let mut it = MenuItem::run(
+                "固定不动",
+                move |ctx| {
+                    chrome.companion_link.set(LinkMode::Pinned);
+                    ctx.mark_dirty();
+                },
+                false,
+            );
+            it.checkable = true;
+            it.checked = link == LinkMode::Pinned;
+            it
+        });
+        flip.push({
+            let chrome = self.chrome.clone();
+            let mut it = MenuItem::run(
+                "自由翻页",
+                move |ctx| {
+                    chrome.companion_link.set(LinkMode::Free);
+                    ctx.mark_dirty();
+                },
+                false,
+            );
+            it.checkable = true;
+            it.checked = link == LinkMode::Free;
+            it
+        });
+        items.push(MenuItem::submenu("辅图翻页", flip));
+
+        items.push({
+            let chrome = self.chrome.clone();
+            let mut it = MenuItem::run(
+                "同步缩放/平移",
+                move |ctx| {
+                    let on = !chrome.companion_sync_view.get();
+                    chrome.companion_sync_view.set(on);
+                    if on {
+                        // 同步视图由主图驱动：活动窗收回主图，辅图只做镜像。
+                        chrome.active_pane.set(Pane::Primary);
+                    }
+                    ctx.mark_dirty();
+                },
+                false,
+            );
+            it.checkable = true;
+            it.checked = self.chrome.companion_sync_view.get();
+            it
+        });
+
+        items.push({
+            let chrome = self.chrome.clone();
+            let can_swap = self.companion.borrow().current_target().is_some();
+            let mut it = MenuItem::run(
+                "交换主辅",
+                move |ctx| {
+                    chrome.companion_swap.set(true);
+                    ctx.mark_dirty();
+                },
+                false,
+            );
+            it.enabled = can_swap;
+            it
+        });
+        items
+    }
+    /// 交换主辅：把当前辅图变成主图，旧主图钉成辅图。
+    ///
+    /// 页式文件也允许交换：主图落到辅图当前页，旧主图那一页成为新的辅图页。
+    /// 同文件不同页也走同一套（只是主图用 `jump_anim`，不重开文件）。
+    fn swap_companion(&self) {
+        if !self.chrome.companion.get() {
+            return;
+        }
+        let Some(target) = self.companion.borrow().current_target().cloned() else {
+            return;
+        };
+        let (old, old_page) = {
+            let v = self.viewer.borrow();
+            let Some(path) = v.current_path() else {
+                return;
+            };
+            (path, v.anim_info().map(|a| a.index).unwrap_or(0))
+        };
+        let target_page = target.page.unwrap_or(0);
+        if old == target.path {
+            if old_page == target_page {
+                return;
+            }
+            // 同一文件里的两页：主图按号跳，辅图钉回旧页。
+            self.viewer.borrow_mut().jump_anim(target_page);
+        } else {
+            self.viewer.borrow_mut().open(&target.path);
+            if target.page.is_some() {
+                // 首帧解码完成后才能按号跳；paint 每帧兑一次。
+                self.pending_main_page
+                    .set(Some((target.path.clone(), target_page)));
+            }
+        }
+        let sort = self.config.borrow().sort_spec();
+        self.companion.borrow_mut().pin_to(&old, sort, old_page);
+        self.chrome
+            .companion_source
+            .set(CompanionSource::OwnSequence);
+        *self.chrome.companion_picked.borrow_mut() = Some(old);
+        self.chrome.companion_link.set(LinkMode::Pinned);
+        self.chrome.active_pane.set(Pane::Primary);
+    }
+
+    /// 兑现交换后的“新主图落到第 N 页”：解码器回填总数之前不动，到点后只跳一次。
+    fn apply_pending_main_page(&self) {
+        let Some((path, page)) = self.pending_main_page.take() else {
+            return;
+        };
+        let mut v = self.viewer.borrow_mut();
+        if v.current_path().as_deref() != Some(path.as_path()) {
+            self.pending_main_page.set(Some((path, page)));
+            return;
+        }
+        match v.anim_info() {
+            None => self.pending_main_page.set(Some((path, page))),
+            Some(a) if a.has_index() && page < a.count => {
+                v.jump_anim(page);
+            }
+            Some(_) => {}
+        }
+    }
+
     fn appearance_items(&self) -> Vec<MenuItem> {
         let mut out = Vec::new();
 
@@ -1434,9 +1990,17 @@ impl ImageCanvas {
                     {
                         let cfg = self.config.clone();
                         let hub = theme_hub.clone();
+                        let chrome = self.chrome.clone();
                         move |ctx| {
                             persist_session(&cfg, &hub, |c| c.ui_theme = t);
-                            ctx.mark_dirty();
+                            // 令牌必须在这里就换：菜单动作的 ctx 属于“借来的”目标控件，
+                            // 菜单关闭那一帧是整窗重绘，若等 16ms 定时器再推令牌，
+                            // 用户看到的就是“点完没变、下一次右键才变”。
+                            tk::set_theme(tk::Theme::from_config(t));
+                            // 按旧主题色预渲染的位图（标题栏图钉）不能跟着换。
+                            chrome.invalidate_theme_caches();
+                            windui::anim::request_repaint();
+                            ctx.mark_dirty_all();
                         }
                     },
                     cur_theme == t,
@@ -1476,6 +2040,16 @@ impl ImageCanvas {
             );
         }
         out.push(MenuItem::submenu("不透明度", op_items));
+        // 无边框形态没有 chrome/标题栏/缩略图条：这几个开关改了也看不见，
+        // 留在菜单里只会变成“点了没反应”。主题色同样没有承载面。
+        if chrome::borderless() {
+            out.retain(|it| {
+                !matches!(
+                    it.label.as_str(),
+                    "显示操作按钮" | "极简模式" | "棋盘格背景" | "缩略图条" | "主题色"
+                )
+            });
+        }
         out
     }
 
@@ -1771,14 +2345,28 @@ impl ImageCanvas {
         // 名字里写明"帧/页"，免得被当成"跳到清单里第几张"——那是对一组图做的事，
         // 归「排序 ▸」与前后翻页；这一项只在同一张图的帧/页之间挪。
         {
-            let anim = self.viewer.borrow().anim_info();
+            let comp_active =
+                self.chrome.companion.get() && self.chrome.active_pane.get() == Pane::Companion;
+            let count = if comp_active {
+                self.companion.borrow().anim_info().map(|a| a.count)
+            } else {
+                self.viewer.borrow().anim_info().map(|a| a.count)
+            };
             let v = self.viewer.clone();
+            let comp = self.companion.clone();
+            let chrome = self.chrome.clone();
             let mut it = MenuItem::run(
                 "跳转到…帧/页",
-                move |ctx| super::goto_dialog::open(ctx, &v),
+                move |ctx| {
+                    if chrome.companion.get() && chrome.active_pane.get() == Pane::Companion {
+                        super::goto_dialog::open_companion(ctx, &v, &comp);
+                    } else {
+                        super::goto_dialog::open(ctx, &v);
+                    }
+                },
                 false,
             );
-            it.enabled = anim.is_some_and(|a| a.count > 1);
+            it.enabled = count.is_some_and(|c| c > 1);
             out.push(it);
         }
 
@@ -1902,8 +2490,13 @@ impl ImageCanvas {
                 {
                     let v = self.viewer.clone();
                     let chrome = self.chrome.clone();
+                    let zoom = self.comp_zoom.clone();
+                    let pan = self.comp_pan.clone();
+                    let fit = self.comp_fit.clone();
                     move |ctx| {
-                        exec_btn(ctx, &v, &chrome, b);
+                        if !companion_zoom_button(b, &chrome, &zoom, &pan, &fit) {
+                            exec_btn(ctx, &v, &chrome, b);
+                        }
                         ctx.mark_dirty();
                     }
                 },
@@ -1971,6 +2564,44 @@ fn align_menu_columns(level: &mut [MenuItem]) {
         return;
     };
     first.checkable = true;
+}
+
+/// 活动辅图的缩放按钮（工具栏与右键「操作 ▸」共用）。
+/// 返回 `true` = 这一颗归辅图，调用方不要再转给主图。
+fn companion_zoom_button(
+    b: Btn,
+    chrome: &Chrome,
+    zoom: &Cell<f32>,
+    pan: &Cell<(f32, f32)>,
+    fit: &Cell<f32>,
+) -> bool {
+    if chrome::borderless()
+        || chrome.companion_sync_view.get()
+        || !chrome.companion.get()
+        || chrome.active_pane.get() != Pane::Companion
+    {
+        return false;
+    }
+    if !matches!(b, Btn::Out | Btn::In | Btn::Fit | Btn::Actual) {
+        return false;
+    }
+    chrome.slide_stop();
+    let z = zoom.get();
+    match b {
+        Btn::Out => zoom.set((z / 1.25).clamp(0.1, 8.0)),
+        Btn::In => zoom.set((z * 1.25).clamp(0.1, 8.0)),
+        Btn::Fit => {
+            zoom.set(1.0);
+            pan.set((0.0, 0.0));
+        }
+        Btn::Actual => {
+            let fit = fit.get().max(0.0001);
+            zoom.set((1.0 / fit).clamp(0.1, 8.0));
+            pan.set((0.0, 0.0));
+        }
+        _ => {}
+    }
+    true
 }
 
 /// 执行一次工具栏按钮的动作：**浮条点击与右键菜单「操作」子菜单共用的唯一入口**。
@@ -2093,7 +2724,31 @@ fn work_of(content: Rect, side: Option<filmstrip::Side>, tree_w: i32) -> Rect {
     Rect::new(x, y, w, h)
 }
 
-/// 扣掉文件树之后、留给"缩略图条 + 画面"的那块宽度。
+/// 辅图解码框：`pane` 尺寸 × `detail`，再按单边 / 总像素上限**等比**缩。
+///
+/// 等比是关键：两根轴各自 clamps 会改变长宽比，解码器再按 box 适配一次，
+/// 屏幕上看到的比例没错，但白烧一块面积。`detail` 已由调用方做过下限/上限。
+fn companion_decode_box(pane: Rect, detail: f32) -> (u32, u32) {
+    let mut w = (pane.w as f32 * detail).ceil().max(1.0);
+    let mut h = (pane.h as f32 * detail).ceil().max(1.0);
+    let side = w.max(h);
+    if side > COMPANION_MAX_SIDE {
+        let k = COMPANION_MAX_SIDE / side;
+        w *= k;
+        h *= k;
+    }
+    let px = w * h;
+    if px > COMPANION_MAX_PIXELS {
+        let k = (COMPANION_MAX_PIXELS / px).sqrt();
+        // ★ 这里用 floor 不用 ceil：乘完已经贴着上限，再向上取整就会多出一行/一列，
+        //   总像素闸当场失效（测试 `companion_decode_box_caps_keep_aspect...` 钉着）。
+        w = (w * k).floor().max(1.0);
+        h = (h * k).floor().max(1.0);
+    }
+    (w as u32, h as u32)
+}
+
+/// 扣掉文件树之后、留给“缩略图条 + 画面”的那块宽度。
 ///
 /// 树不显示时 `tree_w = 0`，逐字节等于 m300 之前的行为。
 fn strip_area(content: Rect, tree_w: i32) -> Rect {
@@ -2121,6 +2776,14 @@ impl Widget for ImageCanvas {
         _style: &Style,
     ) {
         self.last.set(content);
+        // 交换主辅请求（菜单置位）：在读取任何几何之前换掉主图，避免本帧用旧路径。
+        if self.chrome.companion_swap.replace(false) {
+            self.swap_companion();
+        }
+        // 交换到页式文件时，等首帧回填总数后落到辅图那一页（只跳一次）。
+        self.apply_pending_main_page();
+        self.comp_work.set(Rect::new(0, 0, 0, 0));
+        self.pane_geom.companion.set(Rect::new(0, 0, 0, 0));
         // 缩略图条占掉一条边（它是常驻的地，不是浮层）：摆图、悬浮层、命中测试
         // 一律用扣掉之后的 `work`——**画在哪就要点在哪**，三者共用一份几何。
         // m253：贴底扣高、贴左扣宽（`filmstrip_left`），两根主轴共用一套格子。
@@ -2237,6 +2900,22 @@ impl Widget for ImageCanvas {
             }
         }
         self.last_work.set(work);
+        // 主辅视图（m322）：默认关；窗口够宽才分栏，太窄退回单栏。
+        // `last_work` 仍是 chrome/胶片条/命中的整块；主图只用 `primary_work`。
+        let companion_on = self.chrome.companion.get() && work.w >= 720 && !chrome::borderless();
+        let companion_gap = if companion_on { 1 } else { 0 };
+        let primary_work = if companion_on {
+            Rect::new(
+                work.x,
+                work.y,
+                ((work.w - companion_gap) / 2).max(1),
+                work.h,
+            )
+        } else {
+            work
+        };
+        self.primary_work.set(primary_work);
+        self.pane_geom.primary.set(primary_work);
         let (vx, vy, vw, vh) = (work.x as f32, work.y as f32, work.w as f32, work.h as f32);
         let (checker_a, checker_b) = (tk::checker_a(), tk::checker_b());
         let checker_on = self.chrome.checker.get();
@@ -2300,12 +2979,18 @@ impl Widget for ImageCanvas {
         );
         {
             let mut v = self.viewer.borrow_mut();
-            v.on_viewport(vx, vy, vw, vh, canvas.dpi_scale());
+            v.on_viewport(
+                primary_work.x as f32,
+                primary_work.y as f32,
+                primary_work.w as f32,
+                primary_work.h as f32,
+                canvas.dpi_scale(),
+            );
             v.set_chrome_top(chrome_top);
             // ★ 画的是**位图**的目标矩形（SVG 切片 ≠ 整图 dst），而鸟瞰几何仍用整图 dst。
-            let base_dst = v.dst_rect(from_rect(work));
+            let base_dst = v.dst_rect(from_rect(primary_work));
             let img_src = v.image();
-            let img_dst = v.image_dst(from_rect(work));
+            let img_dst = v.image_dst(from_rect(primary_work));
             let error = v.error_text();
             if let (Some(src), Some(idst)) = (img_src, img_dst) {
                 // 目标矩形已经是我们算好的等比尺寸，故用 `Fill` 直铺即可（不会拉伸变形）。
@@ -2326,7 +3011,12 @@ impl Widget for ImageCanvas {
                     cache.obtain(src)
                 };
                 if let Some(img) = shown {
+                    // 主图也按自己的 pane 裁剪：以前只裁辅图，主图平移能侵到右栏，
+                    // 而辅图越不过去，两边手感不对称。现在两块地各自裁齐。
+                    canvas.save();
+                    canvas.clip_rect(primary_work);
                     canvas.draw_image(img, to_rect(idst), Fit::Fill, 0.0, 1.0);
+                    canvas.restore();
                 } else if src.width > MAX_TEXTURE_SIDE || src.height > MAX_TEXTURE_SIDE {
                     // ★ 显卡放不下这张图 ⇒ **给一句人话**，而不是留一片空白。
                     //   （正常路径上显示位图已由 `core::derive` 降过边，这里是兜底。）
@@ -2335,7 +3025,12 @@ impl Widget for ImageCanvas {
                         src.width, src.height
                     );
                     let z = chrome::ARROW_ZONE as i32;
-                    let slot = Rect::new(work.x + z, work.y, (work.w - 2 * z).max(60), work.h);
+                    let slot = Rect::new(
+                        primary_work.x + z,
+                        primary_work.y,
+                        (primary_work.w - 2 * z).max(60),
+                        primary_work.h,
+                    );
                     canvas.draw_text(&msg, slot, tk::error_text(), Align::Center, &hint_ts);
                 }
                 drop(tinted);
@@ -2344,7 +3039,11 @@ impl Widget for ImageCanvas {
                 // 几何锚在**整图** dst 上（位图是切片时映射关系也不变，见 viewer 的
                 // 归一化坐标设计）。位图存在则整图 dst 必然存在。
                 if let Some(bd) = base_dst {
-                    nav = self.nav_geom(work, to_rect(bd));
+                    nav = self.nav_geom_in(
+                        if companion_on { primary_work } else { work },
+                        work,
+                        to_rect(bd),
+                    );
                 }
             } else if let Some(e) = error {
                 // 中央这一句现在是错误的**唯一**载体（状态格里不再重复一遍），所以两头
@@ -2352,7 +3051,12 @@ impl Widget for ImageCanvas {
                 // 让宽之后 DirectWrite 自动折行（软硬两后端都按 rect.w 排版、纵向仍居中），
                 // 长错误变成两行而不是一行两头截断。
                 let z = chrome::ARROW_ZONE as i32;
-                let slot = Rect::new(work.x + z, work.y, (work.w - 2 * z).max(60), work.h);
+                let slot = Rect::new(
+                    primary_work.x + z,
+                    primary_work.y,
+                    (primary_work.w - 2 * z).max(60),
+                    primary_work.h,
+                );
                 canvas.draw_text(&e, slot, tk::error_text(), Align::Center, &hint_ts);
             } else {
                 // 首图还在解 = 说"载入中"，不许写"把图片拖进来"（m71）：后者是
@@ -2367,117 +3071,320 @@ impl Widget for ImageCanvas {
                 } else {
                     ("把图片拖进来 · 右键打开", tk::hint_invite())
                 };
-                canvas.draw_text(hint, work, color, Align::Center, &hint_ts);
+                canvas.draw_text(hint, primary_work, color, Align::Center, &hint_ts);
             }
         }
 
         // ③ 鸟瞰层：右下角缩略图 + 当前视口框。全程直角（用户拍板 2026-10-10）。
+        //   主辅视图开时，主图的鸟瞰锚在**左半 pane**，不再占整窗右下角。
+        let nav_content = if companion_on { primary_work } else { work };
         if let Some((box_r, thumb)) = nav {
-            // 盒底。
-            canvas.fill_rect(
-                box_r.x as f32,
-                box_r.y as f32,
-                box_r.w as f32,
-                box_r.h as f32,
-                &Paint::fill(tk::pill_bg()),
+            let v = self.viewer.borrow();
+            let nav_img = v.nav_image_dst(from_rect(nav_content));
+            let box_dst = v.dst_rect(from_rect(nav_content));
+            if let Some(dst) = box_dst {
+                let dst = to_rect(dst);
+                // 主图鸟瞰画的是 ≤512 的整图缩略（不是主位图），仍按 idst↔dst 映射。
+                let mut cache = self.nav_img.borrow_mut();
+                let mut tinted = self.tint_nav.borrow_mut();
+                let (idst, shown) = match nav_img {
+                    Some((src, idst)) => {
+                        let shown = if let Some(t) = &live {
+                            tinted.obtain(src, t.values, t.gamma, rotate_deg)
+                        } else if rotate_deg != 0 {
+                            tinted.obtain(
+                                src,
+                                crate::core::pixels::CHANNEL_NEUTRAL,
+                                crate::core::pixels::GAMMA_NEUTRAL,
+                                rotate_deg,
+                            )
+                        } else {
+                            cache.obtain(src)
+                        };
+                        (to_rect(idst), shown)
+                    }
+                    None => (dst, None),
+                };
+                paint_nav(canvas, box_r, thumb, nav_content, dst, shown, idst);
+            }
+        }
+
+        // ④ 主辅视图：右栏辅图。主图已经画完；这里只画辅图、分隔线和徽标。
+        if companion_on {
+            let active = self.chrome.active_pane.get();
+            let comp_work = Rect::new(
+                primary_work.x + primary_work.w + companion_gap,
+                work.y,
+                (work.w - primary_work.w - companion_gap).max(1),
+                work.h,
             );
-            // 盒框双层高对比描边（与视口框同款，2026-10-12 用户拍板）：
-            // 内白 1px + 外黑 1px——鸟瞰面板压在任意底色的图片上都能看清边界。
-            canvas.stroke_round_rect(
-                box_r.x as f32 - 1.0,
-                box_r.y as f32 - 1.0,
-                box_r.w as f32 + 2.0,
-                box_r.h as f32 + 2.0,
-                0.0,
-                1.0,
+            self.comp_work.set(comp_work);
+            self.pane_geom.companion.set(comp_work);
+            self.comp_dst.set(Rect::new(0, 0, 0, 0));
+            let (primary_pos, next_path, next_page, peek2) = {
+                let v = self.viewer.borrow();
+                // ★ 辅图的“位置”始终用**文件在清单里的下标**。页式文件翻页时
+                //   `gallery_pos` 不变，自选辅图才不会把页号当成文件号、跳到别的文件。
+                let primary_pos = v.gallery_pos().saturating_sub(1);
+                let peek2 = v.peek_path(2);
+                if let Some(a) = v.anim_info().filter(|a| a.paged && a.count > 1) {
+                    (
+                        primary_pos,
+                        v.current_path(),
+                        Some((a.index + 1) % a.count),
+                        peek2,
+                    )
+                } else {
+                    (primary_pos, v.peek_path(1), None, peek2)
+                }
+            };
+            {
+                let mut c = self.companion.borrow_mut();
+                let sort = self.config.borrow().sort_spec();
+                c.set_source(
+                    self.chrome.companion_source.get(),
+                    self.chrome.companion_picked.borrow().as_deref(),
+                    sort,
+                );
+                let pair = c.resolve_target(
+                    self.chrome.companion_link.get(),
+                    primary_pos,
+                    next_path,
+                    next_page,
+                );
+                // 预读提示：NextInPrimary 没有自己的清单，由这里算“下一项的下一项”。
+                let hint = if self.chrome.companion_source.get() == CompanionSource::NextInPrimary
+                    && self.chrome.companion_link.get() != LinkMode::Free
+                {
+                    match pair.as_ref() {
+                        Some((path, Some(page))) => c
+                            .anim_info()
+                            .filter(|a| a.count > 0)
+                            .map(|a| (path.clone(), Some((page + 1) % a.count))),
+                        Some((_, None)) => peek2.clone().map(|p| (p, None)),
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                c.set_prefetch_hint(hint);
+                // 解码框按**物理像素**给：1.0 就是 pane 在屏上的真实像素。
+                // 不再乘 1.25 余量——那会让每次翻页多解 56% 的像素，
+                // 翻页卡顿的主因；放大到 1.5 倍以上时另有按需重解。
+                // 只乘逻辑宽会让高 DPI 屏上的 PDF 字发虚。上限由
+                // `companion_decode_box` 统一收口，不让 4× 缩放把整图解成上亿像素。
+                let dpi = canvas.dpi_scale().max(0.5);
+                let detail = (dpi * self.comp_zoom.get().max(1.0)).min(6.0);
+                let (max_w, max_h) = companion_decode_box(comp_work, detail);
+                let target = pair.map(|(path, page)| super::companion::CompanionTarget {
+                    path,
+                    page,
+                    max_w,
+                    max_h,
+                });
+                c.set_target(target);
+                c.poll();
+            }
+            let key = self
+                .companion
+                .borrow()
+                .current_target()
+                .map(|t| (t.path.clone(), t.page));
+            let prev_key = self.comp_target_key.replace(key.clone());
+            // 同一文件翻页/换帧只换内容，不重置用户已经调好的缩放与平移；
+            // 换文件（或从有目标变成没目标）才归位。
+            let reset_view = match (&prev_key, &key) {
+                (Some((a, _)), Some((b, _))) => a != b,
+                (None, None) => false,
+                _ => true,
+            };
+            if reset_view {
+                self.comp_zoom.set(1.0);
+                self.comp_pan.set((0.0, 0.0));
+                self.comp_drag.set(None);
+                self.comp_nav_drag.set(false);
+            }
+            // 分隔线：主/辅之间一像素，压在图片上也要看得见。
+            canvas.fill_rect(
+                (primary_work.x + primary_work.w) as f32,
+                work.y as f32,
+                companion_gap as f32,
+                work.h as f32,
                 &Paint::fill(tk::STROKE_DARK),
             );
+            // ★ 不 clone 位图：这里每帧都会走到，整张 RgbaImage 深拷一次
+            //   （百万像素级就是几 MB/帧）正是辅图缩放卡顿的主因。
+            //   只借住 `CompanionPane`，绘制期间没有任何地方会再对它 `borrow_mut`。
+            let companion = self.companion.borrow();
+            let image = companion.image();
+            if let Some(img) = image {
+                // ★ 显示比例取**原图尺寸**，不取解码位图尺寸：解码器的原生降采样
+                //   偶尔会给出与 natural 不同的宽高比，按位图尺寸算 dst 会顺着
+                //   坏比例继续拉伸。纹理仍用位图，`Fit::Fill` 会把内容拉回正确比例。
+                let (nw, nh) = companion
+                    .natural()
+                    .filter(|(w, h)| *w > 0 && *h > 0)
+                    .unwrap_or((img.width, img.height));
+                let fit = (comp_work.w as f32 / nw.max(1) as f32)
+                    .min(comp_work.h as f32 / nh.max(1) as f32);
+                self.comp_fit.set(fit.max(0.0001));
+                // 同步视图：直接用主图的**实际比例 + 像素偏移**，整组一起缩放/平移。
+                let (scale, pan) = if self.chrome.companion_sync_view.get() {
+                    let v = self.viewer.borrow();
+                    (v.scale(), v.pan())
+                } else {
+                    (
+                        fit * self.comp_zoom.get().clamp(0.1, 8.0),
+                        self.comp_pan.get(),
+                    )
+                };
+                let dw = (nw as f32 * scale).max(1.0);
+                let dh = (nh as f32 * scale).max(1.0);
+                let dst = Rect::new(
+                    comp_work.x + ((comp_work.w as f32 - dw) / 2.0 + pan.0).round() as i32,
+                    comp_work.y + ((comp_work.h as f32 - dh) / 2.0 + pan.1).round() as i32,
+                    dw.round().max(1.0) as i32,
+                    dh.round().max(1.0) as i32,
+                );
+                let comp_nav = self.nav_geom_in(comp_work, work, dst);
+                self.comp_dst.set(dst);
+                let mut cache = self.comp_img.borrow_mut();
+                if let Some(tex) = cache.obtain(img) {
+                    canvas.save();
+                    canvas.clip_rect(comp_work);
+                    canvas.draw_image(tex, dst, Fit::Fill, 0.0, 1.0);
+                    canvas.restore();
+                    if let Some((box_r, thumb)) = comp_nav {
+                        paint_nav(canvas, box_r, thumb, comp_work, dst, Some(tex), dst);
+                    }
+                }
+            } else {
+                let (msg, color) = {
+                    let c = self.companion.borrow();
+                    if c.current_target().is_none() {
+                        ("没有下一张", tk::hint_text())
+                    } else if c.failed() {
+                        ("辅图无法解码", tk::error_text())
+                    } else {
+                        ("辅图载入中…", tk::hint_text())
+                    }
+                };
+                let slot = Rect::new(
+                    comp_work.x + 8,
+                    comp_work.y + comp_work.h / 2 - 10,
+                    (comp_work.w - 16).max(40),
+                    20,
+                );
+                canvas.draw_text(msg, slot, color, Align::Center, &hint_ts);
+            }
+            // ★ 徽标必须让开标题栏：`comp_work.y` 是窗口内容顶，而标题栏是
+            //   后画的半透明浮层（40dp）——钉在 +8 就等于把「辅」埋在标题栏底下，
+            //   浅色主题的白条会把它洗成一片白。`chrome_top` 与浮层绘制同源。
+            //
+            // 样式保持原设计：主题胶囊 + 主题文字。不按活动态换绿底，也不在
+            // 旁边挂文件名——活动窗由 pane 四周那圈白描边表达，文件名底栏已有。
+            let pane_top = comp_work.y + chrome_top as i32 + 8;
+            let badge = Rect::new(comp_work.x + 8, pane_top, 22, 18);
+            canvas.fill_round_rect(
+                badge.x as f32,
+                badge.y as f32,
+                badge.w as f32,
+                badge.h as f32,
+                4.0,
+                &Paint::fill(tk::pill_bg()),
+            );
+            canvas.draw_text(
+                "辅",
+                badge,
+                tk::overlay_text(),
+                Align::Center,
+                &TextStyle::new(12.0),
+            );
+            let primary_badge = Rect::new(
+                primary_work.x + 8,
+                primary_work.y + chrome_top as i32 + 8,
+                22,
+                18,
+            );
+            canvas.fill_round_rect(
+                primary_badge.x as f32,
+                primary_badge.y as f32,
+                primary_badge.w as f32,
+                primary_badge.h as f32,
+                4.0,
+                &Paint::fill(tk::pill_bg()),
+            );
+            canvas.draw_text(
+                "主",
+                primary_badge,
+                tk::overlay_text(),
+                Align::Center,
+                &TextStyle::new(12.0),
+            );
+            let active_rect = match active {
+                Pane::Primary => primary_work,
+                Pane::Companion => comp_work,
+            };
             canvas.stroke_round_rect(
-                box_r.x as f32,
-                box_r.y as f32,
-                box_r.w as f32,
-                box_r.h as f32,
+                active_rect.x as f32 + 0.5,
+                active_rect.y as f32 + 0.5,
+                (active_rect.w - 1).max(1) as f32,
+                (active_rect.h - 1).max(1) as f32,
                 0.0,
                 1.0,
                 &Paint::fill(tk::STROKE_LIGHT),
             );
-            // 缩略图：**鸟瞰永远显示完整图片**（菠萝 NavigatorView 语义）。画的
-            // 是 viewer 那份 ≤512 的整图缩略（`nav_image_dst`），不是主位图——
-            // 主位图在 ≥100% 时是原图档位，拿它当鸟瞰要为一整张 6055×6055 再传
-            // 一份预乘纹理（实测 139.9 MB、0.09–0.14 s，M9 查账）。仍需缩放映射进
-            // thumb（idst 与 thumb 两套坐标，直接用会画在原位）。
-            let v = self.viewer.borrow();
-            let nav = v.nav_image_dst(from_rect(work));
-            let box_dst = v.dst_rect(from_rect(work));
-            // 盒的最外 1 px 是内白描边的地，缩略与视口框都在它**以内**——四条边一律如此。
-            // ★ m103：以前图画到 box 上，左右上下不对称（截断让右/下各少 1 px，于是
-            // 那两条边露出描边/盒底）。极端长宽比的条图盒子短边只有 1–2 px，抠不出
-            // 这一圈，就整盒画（宁可不描边，也不要 0 宽的图）。
-            let inner = if thumb.w >= 3 && thumb.h >= 3 {
-                Rect::new(thumb.x + 1, thumb.y + 1, thumb.w - 2, thumb.h - 2)
-            } else {
-                thumb
-            };
-            if let (Some((src, idst)), Some(dst)) = (nav, box_dst) {
-                let (idst, dst) = (to_rect(idst), to_rect(dst));
-                let draw = nav_draw_rect(inner, idst, dst);
-                let mut cache = self.nav_img.borrow_mut();
-                let mut tinted = self.tint_nav.borrow_mut();
-                let shown = if let Some(t) = &live {
-                    tinted.obtain(src, t.values, t.gamma, rotate_deg)
-                } else if rotate_deg != 0 {
-                    // 没调色但转了角度：仍要走 tinted 那一趟，只不过参数取中性。
-                    tinted.obtain(
-                        src,
-                        crate::core::pixels::CHANNEL_NEUTRAL,
-                        crate::core::pixels::GAMMA_NEUTRAL,
-                        rotate_deg,
-                    )
-                } else {
-                    cache.obtain(src)
-                };
-                if let Some(img) = shown {
-                    canvas.draw_image(img, draw, Fit::Fill, 0.0, 1.0);
-                }
-            }
-            // 视口框：content 在整图 dst 中的归一化范围映射到缩略所在的 `inner`
-            // （与图对齐，不是与盒对齐——差的那 1 px 描边不该算进视角位置）。直角描边。
-            if let Some(dst) = box_dst {
-                let dst = to_rect(dst);
-                let u0 = ((work.x as f32 - dst.x as f32) / dst.w as f32).clamp(0.0, 1.0);
-                let u1 =
-                    ((work.x as f32 + work.w as f32 - dst.x as f32) / dst.w as f32).clamp(0.0, 1.0);
-                let v0 = ((work.y as f32 - dst.y as f32) / dst.h as f32).clamp(0.0, 1.0);
-                let v1 =
-                    ((work.y as f32 + work.h as f32 - dst.y as f32) / dst.h as f32).clamp(0.0, 1.0);
-                let fx = inner.x as f32 + u0 * inner.w as f32;
-                let fy = inner.y as f32 + v0 * inner.h as f32;
-                let fw = ((u1 - u0) * inner.w as f32).max(4.0);
-                let fh = ((v1 - v0) * inner.h as f32).max(4.0);
-                canvas.fill_rect(fx, fy, fw, fh, &Paint::fill(tk::NAV_FILL));
-                // 视口框双层高对比描边（用户拍板 2026-10-12）：内白 1px + 外黑 1px
-                // ——黑图片上白线可见、白图片上黑线可见，单色框在极端底色下会隐身。
-                // 直角描边 = 圆角半径 0（windui 只有圆角描边原语）。
-                canvas.stroke_round_rect(
-                    fx - 1.0,
-                    fy - 1.0,
-                    fw + 2.0,
-                    fh + 2.0,
-                    0.0,
-                    1.0,
-                    &Paint::fill(tk::STROKE_DARK),
-                );
-                canvas.stroke_round_rect(fx, fy, fw, fh, 0.0, 1.0, &Paint::fill(tk::STROKE_LIGHT));
-            }
         }
 
         // ④ 悬浮层（箭头 + 工具栏 + 信息条）。三者同一条门控：极简模式下都靠悬停浮现
         //    （箭头看 `Chrome::hover_edge` 那两位，见 `chrome::paint`），传统模式常驻。
+        // 辅图是活动窗：底栏状态、顶栏文件名都跟活动窗走；只有辅图真有
+        // 页/帧号时才挂「上一页/下一页」，且永远不挂播放钮（播放属于主图）。
+        let comp_active =
+            self.chrome.companion.get() && self.chrome.active_pane.get() == Pane::Companion;
+        let comp_index = comp_active && self.companion.borrow().has_index();
+        let comp_free = comp_active
+            && self.chrome.companion_link.get() == LinkMode::Free
+            && self.companion.borrow().gallery_len() > 1;
+        let comp_scale = if self.chrome.companion_sync_view.get() {
+            self.viewer.borrow().scale()
+        } else {
+            self.comp_fit.get() * self.comp_zoom.get().clamp(0.1, 8.0)
+        };
         let v = self.viewer.borrow();
-        let info = v.status();
-        let has_prev = v.has_prev();
-        let has_next = v.has_next();
-        let title = v.title();
+        // NextInPrimary 没有自己的清单：用主图清单推算“辅图在第几张”。
+        let comp_file = if self.companion.borrow().gallery_len() > 0 {
+            None
+        } else {
+            let len = v.gallery_len();
+            if len == 0 {
+                None
+            } else {
+                let paged = v.anim_info().is_some_and(|a| a.paged && a.count > 1);
+                let pos = v.gallery_pos();
+                let next = if paged {
+                    pos
+                } else if pos >= len {
+                    1
+                } else {
+                    pos + 1
+                };
+                Some((next, len))
+            }
+        };
+        let comp_status =
+            comp_active.then(|| self.companion.borrow().status(comp_scale, comp_file));
+        let info = comp_status.clone().unwrap_or_else(|| v.status());
+        let has_prev = if comp_free { true } else { v.has_prev() };
+        let has_next = if comp_free { true } else { v.has_next() };
+        let title = if comp_active {
+            self.companion
+                .borrow()
+                .file_title()
+                .unwrap_or_else(|| v.title())
+        } else {
+            v.title()
+        };
         // 动画组该不该出现、暂停钮画 ▶ 还是 ⏸——都从 viewer 现算，不另存一份真相。
         // 这里只回灌不标脏：状态一变（首帧落地 / 按 P）那条路径自己会标，本轮绘制
         // 就在标脏之后发生，再标一次是空转。
@@ -2485,11 +3392,22 @@ impl Widget for ImageCanvas {
         // ★ `chrome.anim` 的语义是"**有没有帧/页号**"（= `has_index()`），不是"是不是
         //   动图"（= `is_animated()`）。静态位图没有号 ⇒ 播放组整组不出现；只有真动图
         //   与多页文档才挂。字形仍按真实播放态走：没在播 → ▶，动图 → ⏸/▶ 按 `anim_paused`。
-        let has_index = v.has_index();
-        let anim = v.is_animated();
-        let paused = if anim { v.anim_paused() } else { true };
+        let (has_index, paused, index_pair) = if comp_active {
+            (comp_index, true, comp_index)
+        } else {
+            (
+                v.has_index(),
+                if v.is_animated() {
+                    v.anim_paused()
+                } else {
+                    true
+                },
+                false,
+            )
+        };
         drop(v);
         self.chrome.anim.set(has_index);
+        self.chrome.index_pair.set(index_pair);
         self.chrome.paused.set(paused);
         // 状态文本一变就把浮条叫醒：逐帧是按键操作，鼠标不动，极简模式下不叫的话
         // 帧号（屏幕上唯一的载体）根本没地方显示。判据见 `Chrome::wake_on_status_change`。
@@ -2622,7 +3540,11 @@ impl Widget for ImageCanvas {
         // ⑥ 取色器浮层（m217）：最后画，压在包括鸟瞰/缩略图条在内的所有图层之上。
         // 判据与点击复制共用 `Viewer::pick_at` —— 屏上显示哪一格，就复制哪一格。
         if let (true, Some(pos)) = (self.chrome.picker.get(), self.chrome.picker_at.get()) {
-            if let Some(pk) = self.viewer.borrow().pick_at(from_rect(work), pos) {
+            if let Some(pk) = self
+                .viewer
+                .borrow()
+                .pick_at(from_rect(self.view_work()), pos)
+            {
                 let [r, g, b, _] = pk.rgba;
                 let hex = format!("#{r:02X}{g:02X}{b:02X}");
                 let text = format!("{hex} · rgb({r}, {g}, {b}) · ({}, {})", pk.at.0, pk.at.1);
@@ -2666,7 +3588,6 @@ impl Widget for ImageCanvas {
             }
         }
     }
-
     fn on_event(&mut self, ctx: &mut EventCtx, ev: &Event) -> bool {
         match ev {
             Event::Pointer(p) => self.on_pointer(ctx, p),
@@ -2684,6 +3605,21 @@ impl Widget for ImageCanvas {
                 // 其它键照常派发——切图/缩放时取色器保持开启，方便连续取色。
                 if self.chrome.picker.get() && k.key == Key::Escape {
                     self.chrome.close_picker();
+                    ctx.mark_dirty();
+                    return true;
+                }
+                // 自由翻页：左右方向键先归辅图自己的清单。
+                if self.companion_file_key(k) {
+                    ctx.mark_dirty();
+                    return true;
+                }
+                // 活动辅图有页/帧号时，逐页键先归辅图（与底栏那两颗同源）。
+                if self.companion_frame_key(k) {
+                    ctx.mark_dirty();
+                    return true;
+                }
+                // 活动辅图的缩放/平移键也归辅图；主图不动。
+                if self.companion_view_key(k) {
                     ctx.mark_dirty();
                     return true;
                 }
@@ -2951,12 +3887,107 @@ impl ImageCanvas {
                 return true;
             }
         }
+        // 主辅视图：点左/右任一 pane 切换活动窗。点在 chrome 浮层上时照旧让给按钮。
+        if p.kind == PointerKind::Down
+            && p.button == MouseButton::Left
+            && self.chrome.companion.get()
+            && self.chrome_hit(pos).is_none()
+        {
+            if self.comp_work.get().contains(p.pos) {
+                if self.chrome.companion_sync_view.get() {
+                    // 同步视图：右栏按下也交给主图平移，辅图下一帧镜像。
+                    self.chrome.active_pane.set(Pane::Primary);
+                } else {
+                    self.chrome.active_pane.set(Pane::Companion);
+                    // ★ 顶部标题栏那一条永远拖窗口，不是拖图。旧写法只要落在右 pane
+                    //   就先开始 `comp_drag`，于是标题栏空白处按下去只会平移到图片，
+                    //   窗口拖不动（用户实报「活动窗的标题栏没有交互」）。
+                    //   标题钮已由 `chrome_hit` 先挑走，这里剩的是纯标题栏空白。
+                    if !Chrome::in_title_strip(pos, self.work_tuple()) {
+                        // 辅图鸟瞰优先于拖图：拖的是视口框，不是整张图。
+                        if let Some((box_r, thumb)) = self.comp_nav_geom() {
+                            if box_r.contains(p.pos) {
+                                self.comp_nav_drag.set(true);
+                                self.comp_drag.set(None);
+                                self.comp_nav_pan_to(self.comp_dst.get(), thumb, pos);
+                                ctx.mark_dirty();
+                                return true;
+                            }
+                        }
+                        self.comp_drag.set(Some((pos, self.comp_pan.get())));
+                        ctx.mark_dirty();
+                        return true;
+                    }
+                }
+            }
+            if self.primary_work.get().contains(p.pos)
+                && self.chrome.active_pane.get() == Pane::Companion
+            {
+                self.chrome.active_pane.set(Pane::Primary);
+                ctx.mark_dirty();
+            }
+        }
+        if self.comp_nav_drag.get() {
+            match p.kind {
+                PointerKind::Move => {
+                    if let Some((_, thumb)) = self.comp_nav_geom() {
+                        self.comp_nav_pan_to(self.comp_dst.get(), thumb, pos);
+                    }
+                    ctx.mark_dirty();
+                    return true;
+                }
+                PointerKind::Up => {
+                    self.comp_nav_drag.set(false);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if let Some((start, start_pan)) = self.comp_drag.get() {
+            match p.kind {
+                PointerKind::Move => {
+                    self.comp_pan
+                        .set((start_pan.0 + pos.0 - start.0, start_pan.1 + pos.1 - start.1));
+                    ctx.mark_dirty();
+                    return true;
+                }
+                PointerKind::Up => {
+                    self.comp_drag.set(None);
+                    return true;
+                }
+                _ => {}
+            }
+        }
         match p.kind {
             PointerKind::Wheel(delta) => {
                 // ★ 放映让位挂在**滚轮事件本身**上，不挂在翻页节奏闸上：默认档里滚轮是缩放
                 // （默认档 `wheel == Zoom`），那条路根本不进 `wheel_gate`——2026-10-31 用户实测
                 // "滚轮没用、方向键有用"就是这个错位。缩放同样是"用户插手了画面"。
                 self.chrome.slide_stop();
+                if self.chrome.companion.get()
+                    && self.chrome.companion_sync_view.get()
+                    && self.comp_work.get().contains(p.pos)
+                    && self.chrome_hit(pos).is_none()
+                {
+                    // 同步视图：在右栏滚轮也改主图比例，辅图下一帧镜像。
+                    self.chrome.active_pane.set(Pane::Primary);
+                    let z =
+                        self.viewer.borrow().scale() * if delta > 0 { 1.25 } else { 1.0 / 1.25 };
+                    self.viewer.borrow_mut().zoom_at_center(z);
+                    ctx.mark_dirty();
+                    return true;
+                }
+                if self.chrome.companion.get()
+                    && self.comp_work.get().contains(p.pos)
+                    && self.chrome_hit(pos).is_none()
+                {
+                    self.chrome.active_pane.set(Pane::Companion);
+                    let z = self.comp_zoom.get();
+                    let nz = if delta > 0 { z * 1.25 } else { z / 1.25 };
+                    self.comp_zoom.set(nz.clamp(0.1, 8.0));
+                    ctx.mark_dirty();
+                    return true;
+                }
                 // 锁定已在 `on_pointer` 入口统一吞掉，这里不必再判一次。
                 // 缩略图条（m259）：条内滚轮 = 翻列表，**不换图**。
                 // 这里不看 `config.wheel`——列表上的滚轮就是滚动列表，条上也没有
@@ -3214,6 +4245,8 @@ impl ImageCanvas {
                 let was_tree_scrub = self.tree_scrub.replace(None).is_some();
                 self.strip_dragged.set(false);
                 let was_pending = self.lmb_pending.replace(None).is_some();
+                let was_comp_drag = self.comp_drag.replace(None).is_some();
+                let was_comp_nav = self.comp_nav_drag.replace(false);
                 let was_drag = self.viewer.borrow().dragging();
                 if was_drag {
                     self.viewer.borrow_mut().end_drag();
@@ -3229,6 +4262,8 @@ impl ImageCanvas {
                     || was_tree_scrub
                     || was_pending
                     || was_drag
+                    || was_comp_drag
+                    || was_comp_nav
                 {
                     ctx.mark_dirty();
                 }
@@ -3252,7 +4287,7 @@ impl ImageCanvas {
                     let pick = self
                         .viewer
                         .borrow()
-                        .pick_at(from_rect(self.last_work.get()), pos);
+                        .pick_at(from_rect(self.view_work()), pos);
                     self.chrome.close_picker();
                     match pick {
                         Some(pk) => {
@@ -3397,6 +4432,12 @@ impl ImageCanvas {
                     && self.chrome.anim.get()
                     && self.chrome.in_info_cell(pos)
                 {
+                    // 辅图活动时状态格是辅图的页号：打开辅图自己的跳转窗，
+                    // 不再把用户带进主图的对话框。
+                    if self.companion_owns_index() {
+                        super::goto_dialog::open_companion(ctx, &self.viewer, &self.companion);
+                        return true;
+                    }
                     super::goto_dialog::open(ctx, &self.viewer);
                     ctx.mark_dirty();
                     return true;
@@ -3819,11 +4860,36 @@ fn exec_action(
     match a {
         // ── 仅动 viewer：各臂内部临时 borrow_mut，绝不跨臂持有借用 ──
         Action::Prev => {
-            viewer.borrow_mut().step(-1);
+            let pair = pair_step(chrome.companion_source.get(), chrome.companion_link.get());
+            let paired = !chrome::borderless()
+                && chrome.companion.get()
+                && pair > 1
+                && !viewer.borrow().anim_info().is_some_and(|a| a.paged);
+            viewer.borrow_mut().step(if paired { -pair } else { -1 });
             true
         }
         Action::Next => {
-            viewer.borrow_mut().step(1);
+            let pair = pair_step(chrome.companion_source.get(), chrome.companion_link.get());
+            let paired = !chrome::borderless()
+                && chrome.companion.get()
+                && pair > 1
+                && !viewer.borrow().anim_info().is_some_and(|a| a.paged);
+            viewer.borrow_mut().step(if paired { pair } else { 1 });
+            true
+        }
+        Action::Companion => {
+            // 无边框不开放主辅视图：单图极简形态没有 pane/chrome 可承载。
+            if chrome::borderless() {
+                return true;
+            }
+            let on = !chrome.companion.get();
+            chrome.companion.set(on);
+            if !on {
+                chrome.active_pane.set(Pane::Primary);
+            }
+            if let Some(ctx) = ctx {
+                ctx.mark_dirty();
+            }
             true
         }
         // 幻灯片放映：**这里只开关，不翻页**。到点由 16 ms 轮询的 `Chrome::tick_slideshow`
@@ -3886,11 +4952,25 @@ fn exec_action(
         // `App::on_shortcut` 走一遍——早先这里透传了 `step_anim` 的返回值，等于报"没消费"，
         // 同一次按键被两条路各执行一次（按一下退两帧）。
         Action::FramePrev => {
-            viewer.borrow_mut().step_anim(-1);
+            let pair = pair_step(chrome.companion_source.get(), chrome.companion_link.get());
+            let paired = !chrome::borderless()
+                && chrome.companion.get()
+                && pair > 1
+                && viewer.borrow().anim_info().is_some_and(|a| a.paged);
+            viewer
+                .borrow_mut()
+                .step_anim(if paired { -pair as i32 } else { -1 });
             true
         }
         Action::FrameNext => {
-            viewer.borrow_mut().step_anim(1);
+            let pair = pair_step(chrome.companion_source.get(), chrome.companion_link.get());
+            let paired = !chrome::borderless()
+                && chrome.companion.get()
+                && pair > 1
+                && viewer.borrow().anim_info().is_some_and(|a| a.paged);
+            viewer
+                .borrow_mut()
+                .step_anim(if paired { pair as i32 } else { 1 });
             true
         }
         // WASD 平移（m216）：一记一步，范围与拖动共用同一份钳位（`pan_limits`）。
@@ -5166,7 +6246,7 @@ fn system_body(h: &Handles) -> Element {
     fn nav_box_sits_inside_the_viewport() {
         for (w, h) in [(360, 260), (520, 300), (1040, 700), (1920, 1080)] {
             let content = Rect::new(0, 0, w, h);
-            let b = ImageCanvas::nav_box(content);
+            let b = ImageCanvas::nav_box_in(content, content);
             assert!(
                 b.x >= content.x && b.y >= content.y,
                 "{w}x{h}: 盒子左上角出界"
@@ -5188,7 +6268,7 @@ fn system_body(h: &Handles) -> Element {
         for (dw, dh) in [(100, 16384), (16384, 100), (1, 4000), (4000, 1)] {
             let dst = Rect::new(0, 0, dw, dh);
             let (nav, thumb) = canvas
-                .nav_geom(content, dst)
+                .nav_geom_in(content, content, dst)
                 .unwrap_or_else(|| panic!("{dw}x{dh} 显示尺寸远超视口，该出鸟瞰"));
             assert!(
                 nav.w >= 1 && nav.h >= 1,
@@ -5223,7 +6303,7 @@ fn system_body(h: &Handles) -> Element {
         ] {
             let dst = Rect::new(0, 0, dw, dh);
             let (_, box_r) = canvas
-                .nav_geom(content, dst)
+                .nav_geom_in(content, content, dst)
                 .unwrap_or_else(|| panic!("{dw}x{dh} 远超视口，该出鸟瞰"));
             assert_eq!(
                 nav_draw_rect(box_r, dst, dst),
@@ -5237,7 +6317,7 @@ fn system_body(h: &Handles) -> Element {
         for dw in (901..8000).step_by(37) {
             for dh in (661..8000).step_by(53) {
                 let dst = Rect::new(0, 0, dw, dh);
-                let Some((_, box_r)) = canvas.nav_geom(content, dst) else {
+                let Some((_, box_r)) = canvas.nav_geom_in(content, content, dst) else {
                     continue;
                 };
                 swept += 1;
@@ -5502,7 +6582,7 @@ fn system_body(h: &Handles) -> Element {
         canvas.nav_drag.set(true);
         let content = canvas.last.get();
         let dst = to_rect(viewer.borrow().dst_rect(from_rect(content)).unwrap());
-        let (_box, thumb) = canvas.nav_geom(content, dst).unwrap();
+        let (_box, thumb) = canvas.nav_geom_in(content, content, dst).unwrap();
         let at = |u: f32, v: f32| {
             PointerEvent::single(
                 PointerKind::Move,
@@ -5763,7 +6843,7 @@ fn system_body(h: &Handles) -> Element {
         canvas.nav_drag.set(true);
         let content = canvas.last.get();
         let dst = to_rect(viewer.borrow().dst_rect(from_rect(content)).unwrap());
-        let (_box, thumb) = canvas.nav_geom(content, dst).unwrap();
+        let (_box, thumb) = canvas.nav_geom_in(content, content, dst).unwrap();
         let at = |u: f32, v: f32| {
             PointerEvent::single(
                 PointerKind::Move,
@@ -5831,7 +6911,7 @@ fn system_body(h: &Handles) -> Element {
             .dst_rect(from_rect(content))
             .expect("图应该画得出来");
         let (box_r, _thumb) = canvas
-            .nav_geom(content, to_rect(dst))
+            .nav_geom_in(content, content, to_rect(dst))
             .expect("图比视口大时鸟瞰必须出现");
 
         // 命中盒子中心。
@@ -5861,7 +6941,7 @@ fn system_body(h: &Handles) -> Element {
     fn nav_box_never_covers_the_toolbar_pill() {
         for (w, h) in [(360, 260), (520, 300), (1040, 700), (1920, 1080)] {
             let content = Rect::new(0, 0, w, h);
-            let b = ImageCanvas::nav_box(content);
+            let b = ImageCanvas::nav_box_in(content, content);
             // 与 nav_box 同一口径：按"动画组也在"的最宽一行避让。
             let (px, py, pw, ph) = Chrome::pill(
                 (0.0, 0.0, w as f32, h as f32),
@@ -6485,5 +7565,123 @@ fn system_body(h: &Handles) -> Element {
             !canvas.current_image_items(false)[4].enabled,
             "空窗没有像素可采样，取色器必须置灰"
         );
+    }
+
+    /// m322：来源与辅图翻页都是“二选一 ▸”子菜单；`交换主辅`是动作项，
+    /// 不能像开关那样带勾选（第三参是 `checked` 不是 `enabled`）。
+    #[test]
+    fn companion_menu_uses_submenus_and_swap_is_never_checked() {
+        let (canvas, _) = zoomed_canvas();
+        canvas.chrome.companion.set(true);
+        *canvas.chrome.companion_picked.borrow_mut() =
+            Some(std::path::PathBuf::from(r"C:\pics\sub\a.jpg"));
+
+        let items = canvas.companion_items();
+        assert!(
+            !items.iter().any(|i| i.separator),
+            "主辅视图子菜单条目不多，分隔线只会把一组功能切碎"
+        );
+        assert!(
+            !items.iter().any(|i| i.label.starts_with("活动窗")),
+            "活动窗只靠点击 pane 切换，菜单不再重复放入口"
+        );
+        let source = items
+            .iter()
+            .find(|i| i.label == "辅图来源")
+            .expect("来源应是子菜单");
+        assert_eq!(source.submenu.len(), 2, "来源只有两种：下一张 / 自选");
+        assert_eq!(source.submenu[0].label, "主序列下一张");
+        assert!(source.submenu[0].checkable && source.submenu[0].checked);
+        assert!(
+            source.submenu[1].label.contains(r"sub\a.jpg"),
+            "自选项要带来源路径，实得 {}",
+            source.submenu[1].label
+        );
+        assert!(!source.submenu[1].checked);
+
+        let flip = items
+            .iter()
+            .find(|i| i.label == "辅图翻页")
+            .expect("辅图翻页应是子菜单");
+        assert_eq!(flip.submenu.len(), 3, "辅图翻页有跟随 / 固定 / 自由");
+        assert_eq!(flip.submenu[0].label, "跟随主图");
+        assert_eq!(flip.submenu[1].label, "固定不动");
+        assert_eq!(flip.submenu[2].label, "自由翻页");
+        assert!(flip.submenu[0].checked, "默认跟随");
+        assert!(
+            !items.iter().any(|i| i.label == "同步缩放"),
+            "同步缩放对尺寸不同的图没有普遍意义，已撤掉"
+        );
+
+        let swap = items
+            .iter()
+            .find(|i| i.label == "交换主辅")
+            .expect("交换主辅应在菜单里");
+        assert!(!swap.checkable, "交换主辅是动作，不是开关");
+        assert!(!swap.checked, "动作项永远不带勾");
+        let sync = items
+            .iter()
+            .find(|i| i.label == "同步缩放/平移")
+            .expect("同步视图应在菜单里");
+        assert!(sync.checkable && !sync.checked, "同步视图默认关");
+    }
+
+    /// 活动辅图时，工具栏/菜单的放大、缩小、适应、1:1 必须改辅图，不能偷偷改主图。
+    #[test]
+    fn companion_zoom_buttons_route_only_when_companion_is_active() {
+        let chrome = Chrome::new(false);
+        let zoom = std::cell::Cell::new(1.0);
+        let pan = std::cell::Cell::new((10.0, 10.0));
+        let fit = std::cell::Cell::new(0.5);
+        // 主图活动：一颗都不接。
+        assert!(!companion_zoom_button(Btn::In, &chrome, &zoom, &pan, &fit));
+        assert_eq!(zoom.get(), 1.0);
+        // 辅图活动：+ 一档。
+        chrome.companion.set(true);
+        chrome.active_pane.set(Pane::Companion);
+        assert!(companion_zoom_button(Btn::In, &chrome, &zoom, &pan, &fit));
+        assert_eq!(zoom.get(), 1.25);
+        // 1:1 = 1 / fit；平移归位。
+        assert!(companion_zoom_button(
+            Btn::Actual,
+            &chrome,
+            &zoom,
+            &pan,
+            &fit
+        ));
+        assert_eq!(zoom.get(), 2.0);
+        assert_eq!(pan.get(), (0.0, 0.0));
+        // 非缩放按钮不归它。
+        assert!(!companion_zoom_button(
+            Btn::FrameFwd,
+            &chrome,
+            &zoom,
+            &pan,
+            &fit
+        ));
+    }
+
+    /// 拖放落到右 pane 时进辅图；几何为零（辅图未开）时一律不进。
+    #[test]
+    fn pane_geom_routes_drop_by_companion_rect() {
+        let g = PaneGeom::new();
+        assert!(!g.hits_companion(600, 100), "辅图未开时右半边不算辅图");
+        g.companion.set(Rect::new(500, 0, 500, 600));
+        assert!(g.hits_companion(600, 100));
+        assert!(!g.hits_companion(499, 100));
+        assert!(!g.hits_companion(1200, 100));
+    }
+
+    /// 辅图解码框的上限必须**等比**生效：单边与总像素两道闸都不能把长宽比拉歪。
+    #[test]
+    fn companion_decode_box_caps_keep_aspect_and_never_collapse() {
+        let pane = Rect::new(0, 0, 800, 600);
+        assert_eq!(companion_decode_box(pane, 1.0), (800, 600));
+        let (w, h) = companion_decode_box(pane, 8.0);
+        assert!(w <= COMPANION_MAX_SIDE as u32 && h <= COMPANION_MAX_SIDE as u32);
+        assert!((w as f32 / h as f32 - 800.0 / 600.0).abs() < 0.02);
+        assert!(w as u64 * h as u64 <= COMPANION_MAX_PIXELS as u64);
+        let (w, h) = companion_decode_box(Rect::new(0, 0, 1, 1), 0.1);
+        assert!(w >= 1 && h >= 1, "极小 pane 不许算出 0×0");
     }
 }

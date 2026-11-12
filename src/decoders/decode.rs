@@ -429,7 +429,8 @@ impl Host {
         // ICC 尾段照常取出（相机 RAW 实现实际恒报 0），像素段交给下游。
         let icc = take_icc(&mut buf, pix_len, icc_len);
         let rgba = to_rgba8(buf, aw, ah, info.pixel_format, info.bit_depth)?;
-        let mut bitmap = fit_to(rgba, aw, ah, max_w, max_h);
+        let alpha_format = pixel_format_has_alpha(info.pixel_format);
+        let mut bitmap = fit_to_with_alpha(rgba, aw, ah, max_w, max_h, alpha_format);
         apply_icc(&mut bitmap, &icc, path);
         Ok(Decoded {
             natural: (aw, ah),
@@ -862,7 +863,8 @@ impl Host {
         //   块划分改成远端锚定，于是"整张 48 MB 跨步搬运"那一趟可以省掉——结果与
         //   `fit_to(oriented(..))` **逐字节相同**（用例 `fit_oriented_matches_orient_then_fit`）。
         //   12 MP 竖拍首屏因此少 ~80 ms；方向 1（绝大多数图）走的还是原来的 `fit_to`。
-        let mut bitmap = fit_oriented(rgba, aw, ah, orient, max_w, max_h);
+        let alpha_format = pixel_format_has_alpha(info.pixel_format);
+        let mut bitmap = fit_oriented_with_alpha(rgba, aw, ah, orient, max_w, max_h, alpha_format);
         apply_icc(&mut bitmap, &icc, path);
         let t_post = t0.elapsed();
         if trace {

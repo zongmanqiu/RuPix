@@ -33,4 +33,6 @@ pub mod shell_selection;
 pub mod spacehook;
 pub mod userchoice_hash;
 pub mod window_frame;
+/// 跨线程按窗唤醒（补投一条 `WM_TIMER`，让目标窗的 `on_interval` 立刻跑一拍）。
+pub mod window_wake;
 pub mod working_set;

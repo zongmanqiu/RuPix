@@ -10,7 +10,7 @@
 ## 一、它是什么、不是什么
 
 RuPix 本体不实现 MCP 协议，不常驻、不监听端口、不弹 GUI 窗口、不进单实例闸门。
-它只提供四个**不开窗也能调用**的命令行动词；MCP 会话由独立适配器持有：
+它只提供五个**不开窗也能调用**的命令行动词；MCP 会话由独立适配器持有：
 
 ```
 AI 客户端 ──stdio JSON-RPC──> 独立适配器（仓外组件，本包不提供）
@@ -20,7 +20,7 @@ AI 客户端 ──stdio JSON-RPC──> 独立适配器（仓外组件，本包
 - 适配器不是 RuPix 的一部分：可以独立发版、独立安装、独立选语言与协议栈，
   协议栈 / JSON-RPC / SDK 都不进本包，也不编进 exe。
 - 每个 AI 客户端各自起一个适配器，客户端关掉它就没了；这不是全局后台服务。
-- 四个动词全部只读：不改设置、不联网；目录输入与出像素的三个动词不写盘。
+- 五个动词全部只读：不改设置、不联网；目录输入与出像素的四个动词不写盘。
   `--list` 吃压缩包时会展开到 `<exe>/temp/`，是唯一例外（见 §二）。Win10 与 Win11 行为一致。
 
 ## 二、宿主契约（这才是本包真正提供的东西）
@@ -31,8 +31,9 @@ AI 客户端 ──stdio JSON-RPC──> 独立适配器（仓外组件，本包
 | `--metadata` | 文件 | 大小 / 时间 / 后缀 / EXIF 六行 / orientation；**不解码** |
 | `--thumbnail` | 文件 | 240×180 框内缩略图的 PNG（base64 内联） |
 | `--render` | 文件，可选 `宽 高` | 按框渲染的 PNG（base64 内联）、原图尺寸与帧数；缺宽高按原尺寸 |
+| `--list-formats` | 无 | 内置扩展名、各解码器自述（含 health / enabled）、唯一扩展名并集与计数；**不读文件** |
 
-**`--list` 认压缩包（m305）**：把 `.zip` / `.cbz` / `.7z` / `.rar` / `.cbr` / `.tar`
+**`--list` 认压缩包（m305）**：把 `.zip` / `.cbz` / `.7z` / `.cb7` / `.rar` / `.cbr` / `.tar`
 等容器路径直接传给 `--list`，宿主展开它的**根层**到 `<exe>/temp/rupix-zip-*/L*/`，
 再按与 GUI 同一份清单规则回条目。此时 `dir` 是落盘后的层目录，`entries[].path` 是落盘
 后的真实文件路径，可原样交给 `--metadata` / `--thumbnail` / `--render`；响应多出
@@ -43,7 +44,7 @@ AI 客户端 ──stdio JSON-RPC──> 独立适配器（仓外组件，本包
 
 - 只列**根层**：包内子目录 / 子包不在 `entries` 里，命令面没有「包内定位」语法；
   要翻子层走 GUI 的左侧文件树。
-- 这是命令面**唯一写盘**的一条路（其余三个动词与目录输入仍零临时文件）。展开目录与
+- 这是命令面**唯一写盘**的一条路（其余四个动词与目录输入仍零临时文件）。展开目录与
   GUI 共用、由 RuPix 在 GUI 退出时统一清理；**适配器不要自行删这些路径**，它们要活到
   随后那次 `--render`。纯无头部署（永不启 GUI）时，残留按 `rupix-zip-` 前缀由运维清理。
 - 只读介质上「不写盘」的前提对包输入不成立：写不进 `temp/` 会回 `code=3`。
@@ -55,7 +56,7 @@ AI 客户端 ──stdio JSON-RPC──> 独立适配器（仓外组件，本包
 - 像素在 `png_b64` 字段，`mime` 恒为 `image/png`；调用方把它解成标准 MCP
   `{ "type": "image", "data": "<base64>", "mimeType": "image/png" }` content block 即可，
   **不需要转码、不需要落临时文件**。文本类动词直接塞 text content。
-- `--list` 认哪些后缀**取决于 `decoders/` 里已装的 DLL**（见 §六）。
+- `--list` 认哪些后缀**取决于 `decoders/` 里已装的 DLL**（见 §六）；`--list-formats` 直接回这份动态并集。
 - 没有 `open` 动词、没有写操作、没有逐帧动词、没有窗口控制 —— 这是设计，不是缺漏。
 
 > `rupix.exe` 是 GUI 子系统程序，调用方必须自己重定向 stdout 才能读到那一行。
@@ -64,7 +65,7 @@ AI 客户端 ──stdio JSON-RPC──> 独立适配器（仓外组件，本包
 
 ## 三、接进 AI 客户端
 
-1. 先取得或实现一个适配器：把 §二 四个动词映射成 MCP 工具。**这一步不在本包内完成**。
+1. 先取得或实现一个适配器：把 §二 五个动词映射成 MCP 工具。**这一步不在本包内完成**。
 2. 在客户端的 MCP 配置里加一条 stdio server，指向**你放置的适配器**：
 
 ```json
@@ -98,8 +99,9 @@ AI 客户端 ──stdio JSON-RPC──> 独立适配器（仓外组件，本包
 | `rupix_metadata` | `--metadata` | `path` | text |
 | `rupix_thumbnail` | `--thumbnail` | `path` | image + text |
 | `rupix_render` | `--render` | `path`，可选 `width` + `height` | image + text |
+| `rupix_list_formats` | `--list-formats` | 无 | text |
 
-工具名、入参 schema、annotations、错误语义都由适配器决定；稳定不变的是 §二 那四个动词。
+工具名、入参 schema、annotations、错误语义都由适配器决定；稳定不变的是 §二 那五个动词。
 适配器应把工具内失败做成 `isError: true` + 可读文本，协议级失败才用 JSON-RPC `error`。
 
 ## 四、换一个 AI 来验收：把下面这段原样发给它
@@ -132,17 +134,20 @@ rupix.exe --list "<某个压缩包>"          > out-list-archive.json
 rupix.exe --metadata "<某张图片>"       > out-meta.json
 rupix.exe --thumbnail "<某张图片>"      > out-thumb.json
 rupix.exe --render "<某张图片>" 320 240 > out-render.json
+rupix.exe --list-formats                  > out-formats.json
 ```
 
-四个检查点：
+五个检查点：
 
 1. 每个文件**恰好一行**合法 JSON，`ok:true` / `code:0`；
 2. 退出码与 `code` 同值（缺参数应得 `2`，不存在的文件应得 `3`）；
 3. 解出 `png_b64` 后前 8 字节应为 PNG 签名 `89 50 4E 47 0D 0A 1A 0A`，
    且实际字节数与 `bytes` 一致；
-4. 全程不弹窗口；目录与像素动词不产生临时文件（`--list` 吃包例外，见 §二）。
+4. 全程不弹窗口；目录与像素动词不产生临时文件（`--list` 吃包例外，见 §二）；
+5. `out-formats.json` 的 `count` 等于 `formats` 长度，`builtin` 含 `svg`；
+   `decoders` 里 `health != "ok"` 的条目要看得到，而不是被静默删掉。
 
-这四步过了，宿主侧就是好的；剩下的问题都在适配器或客户端配置。
+这五步过了，宿主侧就是好的；剩下的问题都在适配器或客户端配置。
 
 | 红在哪 | 多半是 |
 |---|---|
@@ -168,7 +173,7 @@ rupix.exe --render "<某张图片>" 320 240 > out-render.json
 | 把 `decoders/` 换成空目录 | 上述位图全部 `code=3`「扩展名无人认领」，只有 SVG 仍能解 |
 | 只留 `modern` 一枚 DLL | 只有 `avif` / `heic` / `jng` / `jxl` 能解；`--list` 认出的后缀从 16 种缩到 4 种 |
 
-四个诚实边界：
+五个诚实边界：
 
 1. **只有第一帧**：命令面没有逐帧动词，`frames` 只告诉你总帧数。动图 / 多页要看第 N 帧得走 GUI。
 2. **`--metadata` 不解码**：它只回 `size` / `mtime` / `ext` 与 EXIF 六行 + orientation；
@@ -178,10 +183,13 @@ rupix.exe --render "<某张图片>" 320 240 > out-render.json
    想在 MCP 侧少认一种格式，就该动 `decoders/` 目录，而不是改 ini。
 4. **RAW 样本**：几个 RAW golden 样本是裁切片，`raw` 解码器会报「文件已损坏」；
    错误来自解码器内部、不是「无人认领」，用完整的 RAW 原片才能验这条格式。
+5. **`--list-formats` 报的是「认领」不是「每个文件都解得出」**：它逐个 `LoadLibrary`
+   读 DLL 自述，慢于纯目录 `--list`；坏 DLL 会以 `health != "ok"` 出现在 `decoders` 里，
+   但不计入 `formats`（与 `declared_exts()` 同一口径）。
 
 ## 七、安全边界
 
-- 四个动词只读；命令面不开端口、不注册服务、不碰注册表，写盘范围见 §二。
+- 五个动词只读；命令面不开端口、不注册服务、不碰注册表，写盘范围见 §二。
 - 路径必须是本机真实存在的文件或目录；上限（清单条数、像素总量）由宿主拒绝，回 `code=4`。
 - 单客户端 stdio 形态，不是全局后台服务：多个 AI 客户端各起各的适配器，彼此不共享状态。
   把整包拷到只读介质也能用（诊断物与缓存写不进去时静默降级）；但 `--list` 读包
@@ -190,9 +198,10 @@ rupix.exe --render "<某张图片>" 320 240 > out-render.json
 ## 八、随包文件与契约漂移
 
 `docs/` 下与本主题相关的**只有本文**，另有 `decoders.json` / `plugins.json` / `update.json`
-三份清单与两份许可。真源是 `main/docs/MCP接入指南.md`，由部署脚本复制进发布目录并校验
+三份清单、`formats.md` / `formats.json` 两份**部署时生成**的格式覆盖，以及两份许可。
+真源是 `main/docs/MCP接入指南.md`，由部署脚本复制进发布目录并校验
 「存在 / UTF-8 / 非空 / 落地字节同源」；**不要手改发布目录里的副本**，下次部署会覆盖。
 
 ★ **分仓形态下有一处风险**：宿主改了 JSON 字段或退出码语义，仓外适配器不会自动变红。
-适配器一侧应当自带契约漂移判据（起真实 exe 跑四个动词、断言字段与退出码），
+适配器一侧应当自带契约漂移判据（起真实 exe 跑五个动词、断言字段与退出码），
 这是唯一能在改完宿主当场发现不一致的地方。本包不替适配器承担这件事。

@@ -22,12 +22,14 @@
 
 use std::sync::Mutex;
 
-use windows::Win32::Foundation::POINT;
+use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::Graphics::Gdi::{
-    CreateBitmap, CreateDIBSection, DeleteObject, MonitorFromPoint, BITMAPINFO, BITMAPINFOHEADER,
-    BI_RGB, DIB_RGB_COLORS, HGDIOBJ, MONITOR_DEFAULTTONEAREST,
+    CreateBitmap, CreateDIBSection, DeleteObject, MonitorFromPoint, ScreenToClient, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ, MONITOR_DEFAULTTONEAREST,
 };
-use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::HiDpi::{
+    GetDpiForMonitor, GetDpiForWindow, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, DestroyIcon, GetCursorPos, GetSystemMetrics, LoadCursorW, SetCursor,
     HCURSOR, HICON, ICONINFO, IDC_ARROW, IDC_CROSS, SM_CXCURSOR,
@@ -42,6 +44,25 @@ pub fn screen_pos() -> Option<(i32, i32)> {
         Ok(()) => Some((p.x, p.y)),
         Err(_) => None,
     }
+}
+
+/// 当前光标在**指定窗口客户区**的逻辑坐标。
+///
+/// 文件拖放回调只给路径、不给落点；拖放结束那一刻系统光标就在落点上，所以这里
+/// 从系统光标反算。窗口句柄由调用方给（`ui` 从 `windui::platform::native_window_handle`
+/// 取），本层不依赖 UI 框架。拿不到句柄/坐标就返回 `None`，调用方回落到主图。
+pub fn client_pos_logical(hwnd: isize) -> Option<(f32, f32)> {
+    let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+    let mut p = POINT::default();
+    if unsafe { GetCursorPos(&mut p) }.is_err() {
+        return None;
+    }
+    if !unsafe { ScreenToClient(hwnd, &mut p) }.as_bool() {
+        return None;
+    }
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as f32;
+    let s = dpi / 96.0;
+    Some((p.x as f32 / s, p.y as f32 / s))
 }
 
 /// 系统光标边长（物理像素）。win32 按这个尺寸挑/缩光标位图，据此光栅化才不糊。

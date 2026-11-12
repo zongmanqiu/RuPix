@@ -12,6 +12,8 @@ use std::rc::Rc;
 
 use windui::prelude::*;
 
+use super::canvas::PaneGeom;
+use super::companion::{CompanionSource, LinkMode, Pane};
 use super::{Chrome, Hub, ImageCanvas};
 use crate::core::config::Config;
 use crate::core::viewer::Viewer;
@@ -22,6 +24,10 @@ pub(crate) fn build_root(
     config: &Rc<RefCell<Config>>,
     hub: &Hub,
 ) -> Element {
+    // 拖放要判“落在主图还是辅图”：画布每帧把两块 pane 几何写进这里，
+    // 根节点的拖放回调用系统光标（拖放结束时光标就在落点）去比。
+    let pane_geom = PaneGeom::new();
+    let drop_geom = pane_geom.clone();
     Element::stack()
         .fill()
         // ★ m269：**根节点不铺底色**。窗口底色由 `App::bg`（宿主每帧清底）负责，
@@ -33,9 +39,23 @@ pub(crate) fn build_root(
         .on_drop_files({
             let v = viewer.clone();
             let config = config.clone();
+            let chrome = chrome.clone();
             move |ctx, paths| {
                 if let Some(p) = paths.first() {
-                    super::raw_dialog::open_path(&v, &config, p);
+                    let on_companion = chrome.companion.get()
+                        && windui::platform::native_window_handle()
+                            .and_then(crate::platform::cursor::client_pos_logical)
+                            .is_some_and(|(x, y)| drop_geom.hits_companion(x as i32, y as i32));
+                    if on_companion {
+                        // 拖到右栏 = 当作“自选辅图”：钉住这一张，不再跟主图换。
+                        chrome.companion_source.set(CompanionSource::OwnSequence);
+                        *chrome.companion_picked.borrow_mut() = Some(p.clone());
+                        chrome.companion_link.set(LinkMode::Pinned);
+                        chrome.active_pane.set(Pane::Companion);
+                    } else {
+                        super::raw_dialog::open_path(&v, &config, p);
+                        chrome.active_pane.set(Pane::Primary);
+                    }
                     ctx.mark_dirty();
                 }
             }
@@ -44,12 +64,10 @@ pub(crate) fn build_root(
         .child(
             Element::col()
                 .fill()
-                .widget(ImageCanvas::new(
-                    viewer.clone(),
-                    chrome.clone(),
-                    config.clone(),
-                    hub.clone(),
-                ))
+                .widget(
+                    ImageCanvas::new(viewer.clone(), chrome.clone(), config.clone(), hub.clone())
+                        .with_pane_geom(pane_geom),
+                )
                 .autofocus(),
         )
 }

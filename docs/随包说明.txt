@@ -8,6 +8,7 @@ RuPix {{VERSION}} - Windows x64
   rupix.exe                        主程序
   LICENSE                          AGPL-3.0 许可全文
   THIRD-PARTY-NOTICES.md           第三方组件声明
+  docs/formats.md                  本包实际格式覆盖（部署时按已装解码器生成）
 
 首次使用
   本包只包含主程序：开箱可直接查看 SVG / SVGZ 矢量图。
@@ -24,6 +25,8 @@ RuPix {{VERSION}} - Windows x64
   右键菜单    打开 / 系统菜单 / 复制 / 排序 / 属性 / 本图 / 插件 / 外观 / 幻灯片放映 / 设置
   系统菜单    右键「系统菜单」弹的是资源管理器对着这个文件右键的那一份，
               打开方式 / 发送到 / 压缩 / 扫描这些由系统与其它程序提供
+  格式覆盖    看 docs/formats.md；想知道这台机器现在能开什么，
+              运行 rupix.exe --list-formats（一行 JSON）
   卸载        删除本文件夹即可；文件关联可在 Windows「默认应用」里改回
 
 源码与反馈

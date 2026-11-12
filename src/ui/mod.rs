@@ -56,6 +56,7 @@ pub mod association;
 pub mod brand;
 pub mod canvas;
 pub mod chrome;
+pub mod companion;
 pub mod dialog_footer;
 pub mod filmstrip;
 pub mod goto_dialog;

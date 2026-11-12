@@ -256,6 +256,14 @@ pub fn to_rgba8(buf: Vec<u8>, w: u32, h: u32, pf: u32, _bit_depth: u32) -> Resul
     }
 }
 
+/// 该像素格式是否携带 alpha 通道（用于决定要不要扫透明像素）。
+///
+/// 只认真正的 RGBA/BGRA 布局；灰度/RGB 归一化后虽然也是 4 字节，但 alpha 恒 255，
+/// 不该为此多扫一遍。
+pub fn pixel_format_has_alpha(pf: u32) -> bool {
+    matches!(pf, PF_RGBA8 | PF_BGRA8 | PF_RGBA16 | PF_RGBA_F32)
+}
+
 /// 该像素格式每个样本的通道数（归一化路径专用）。
 pub fn channels_of(pf: u32) -> usize {
     match pf {
@@ -385,6 +393,20 @@ mod tests {
             to_rgba8(vec![1, 2, 3], 2, 1, PF_RGB8, 8).is_err(),
             "偏小要报错"
         );
+    }
+
+    /// 只有真正带 alpha 的布局才该触发 alpha 扫描；灰度/RGB 归一化后补的 255 不算。
+    #[test]
+    fn only_rgba_layouts_carry_alpha() {
+        assert!(pixel_format_has_alpha(PF_RGBA8));
+        assert!(pixel_format_has_alpha(PF_BGRA8));
+        assert!(pixel_format_has_alpha(PF_RGBA16));
+        assert!(pixel_format_has_alpha(PF_RGBA_F32));
+        assert!(!pixel_format_has_alpha(PF_RGB8));
+        assert!(!pixel_format_has_alpha(PF_RGB16));
+        assert!(!pixel_format_has_alpha(PF_GRAY8));
+        assert!(!pixel_format_has_alpha(PF_GRAY16));
+        assert!(!pixel_format_has_alpha(PF_GRAY_F32));
     }
 
     #[test]

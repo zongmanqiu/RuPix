@@ -15,7 +15,7 @@
 | ③ | `3_build_ext.bat` | 调解码器仓库自己的 `build.ps1`：**fmt 检查** + 编译 + 测试 + 发布 DLL 到 `<项目>\.temp\decoder-dist\`（并同步 `.build\decoders`）（格式或测试失败不发布） | exit 1 |
 | ④ | `4_build.bat` | `cd main` + `CARGO_INCREMENTAL=0` + `cargo build --release`；不拷贝任何东西 | exit 1 |
 | ⑤ | `5_test.bat` | **真门禁**两层：`cargo test --release`（集成，含 docs_consistency）→ `--lib`（单元）；均 `--test-threads=1`（杀软锁新链接二进制会假死） | 任一层失败 → exit 1 |
-| ⑥ | `6_deploy.bat` | `deploy.py`：**两道 PE 硬门禁**（RT_GROUP_ICON 档位表 + RT_VERSION 键与版本值须等于 `Cargo.toml`）+ **许可门禁** `license_gate`（`LICENSE` 全文与 `THIRD-PARTY-NOTICES.md` 必须随包落到 `.build\`，三问都查：在不在、够不够长（`LICENSE` ≥ 30,000 B、清单 ≥ 1,000 B）、标志串对不对（`LICENSE` 要见 `GNU AFFERO GENERAL PUBLIC LICENSE`，清单要写明 `AGPL-3.0`）——空壳与误拷别人的许可证都会拦下）→ exe 原子换名部署 + MD5/SIZE 对账 + 符号归档 + 解码器清单核对 + 随包 `docs/decoders.json`（从解码器仓库的发布清单复制）；**解码器或本地清单缺失 = 不可分发 = exit 1**。★ 这两道 PE 门禁不可省：两份 `.rc` 都走 `manifest_optional()`，资源编不进只降级成一条 cargo 警告（K70）——deploy 这两道是唯一的硬拦截点 | exit 1 |
+| ⑥ | `6_deploy.bat` | `deploy.py`：**两道 PE 硬门禁**（RT_GROUP_ICON 档位表 + RT_VERSION 键与版本值须等于 `Cargo.toml`）+ **许可门禁** `license_gate`（`LICENSE` 全文与 `THIRD-PARTY-NOTICES.md` 必须随包落到 `.build\`，三问都查：在不在、够不够长（`LICENSE` ≥ 30,000 B、清单 ≥ 1,000 B）、标志串对不对（`LICENSE` 要见 `GNU AFFERO GENERAL PUBLIC LICENSE`，清单要写明 `AGPL-3.0`）——空壳与误拷别人的许可证都会拦下）→ exe 原子换名部署 + MD5/SIZE 对账 + 符号归档 + 解码器清单核对 + 随包 `docs/decoders.json`（从解码器仓库的发布清单复制）；**解码器或本地清单缺失 = 不可分发 = exit 1**。★ 这两道 PE 门禁不可省：两份 `.rc` 都走 `manifest_optional()`，资源编不进只降级成一条 cargo 警告（K70）——deploy 这两道是唯一的硬拦截点；m317 起 deploy 还跑一次 `rupix.exe --list-formats` 生成 `docs/formats.md` / `formats.json`，并用 `formats_gate` 校验版本 / 计数 / 至少一枚可用解码器 | exit 1 |
 
 环境开关：`RUPIX_SKIP_TESTS=1`（跳过第⑤步）/ `RUPIX_CARGO_ARGS`（第④步附加参数）。
 

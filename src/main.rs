@@ -34,7 +34,7 @@ fn main() {
     // 打印只发生在 bin 真入口：lib 里的 `headless` 是纯函数，卫生门禁不许它带打印宏。
     if args.headless_flag && args.headless.is_none() {
         let (code, line) = rupix_lib::headless::arg_error(
-            "用法：rupix.exe --list|--metadata|--thumbnail|--render <路径>",
+            "用法：rupix.exe --list|--metadata|--thumbnail|--render <路径>；或 --list-formats（无路径）",
         );
         println!("{line}");
         std::process::exit(code);
@@ -67,7 +67,7 @@ fn main() {
     // 全进程只在这里装一次；无头模块不许另起后端。
     rupix_lib::install_decode_stack();
 
-    // 无头命令面（m293）：四个纯读动词，各回一行 JSON 后退出，不建窗、不进托盘。
+    // 无头命令面（m293）：五个纯读动词，各回一行 JSON 后退出，不建窗、不进托盘。
     // 排在老探针之前是因为它自带退出码；老两条通道一个字没改。
     if let Some(h) = args.headless.as_ref() {
         let (code, line) = rupix_lib::headless::run(h);

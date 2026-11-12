@@ -25,10 +25,9 @@
 //! ★ **契约边界（2026-11-05 裁决：按 DLL 串行，m229 落地）**：每 worker 一份私有后端 ⇒ 多开时
 //! 两窗真并行解；同一枚 DLL 靠 per-DLL 有界等待的锁收口。正本 `docs/架构总览.md` §二。
 //!
-//! ★ 已知代价：m90 那条"回包直接叫醒一帧"的加速在常驻模式下用不了——`App::channel`
-//! 的回调拿到的 `EventCtx` 背后没有具体窗口（零主窗），`mark_dirty` 无处可落。回包改由
-//! 各窗口自己的 16ms 轮询收（实拍 ≈31 ms 一拍）。翻页上屏因此比单窗时代慢半拍，
-//! 换来的是"一个进程、一个托盘"这条用户口径。
+//! ★ m318：m90 的"回包直接叫醒一帧"在常驻多窗模式下已恢复——解码线程回包后
+//! 按窗补投 `WM_TIMER`（[`crate::platform::window_wake`]），目标窗的 `on_interval`
+//! 立即跑一拍；16ms 轮询仍是动画节拍与兜底。多窗互不误唤醒，单窗时代的"半拍"代价不再需要。
 
 /// 默认打开方式的自愈调度（m314：启动满 60 秒首查，之后每 60 分钟）。
 pub mod assoc;
@@ -38,7 +37,9 @@ pub mod update;
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use windui::core::EventCtx;
@@ -50,14 +51,23 @@ use crate::core::viewer::Viewer;
 use crate::platform::dir_watch::{DirEvent, DirWatcher};
 use crate::ui::canvas::handle_key;
 use crate::ui::chrome::{Chrome, CopyWait};
+use crate::ui::companion::{pair_step, Pane};
 use crate::ui::settings::Hub;
 use crate::ui::window::build_root;
 
 /// 兜底轮询的间隔（悬浮层显隐 / 启动动作补刀 / 回包收取 / 动画节拍）。
 ///
 /// 请求值 16 ms 只是名义值：Windows 定时器按 15.6 ms 量化，`SetTimer(16)` 实际约
-/// 31 ms 一拍。多窗口模式下这也是**回包上屏的唯一节拍**（见模块头的代价说明）。
+/// 31 ms 一拍。它是动画节拍与兜底；主画面回包另有按窗唤醒（见模块头与
+/// [`crate::platform::window_wake`]），不再等这一拍。
 const POLL: Duration = Duration::from_millis(16);
+
+/// 唤醒目标 interval 的周期。它只用于让 windui 注册第二个 `WM_TIMER` id；
+/// 平时一小时才自然触发一次，真正的用途是解码线程 `PostMessage` 投它。
+const WAKE_KEEPALIVE: Duration = Duration::from_secs(3600);
+/// [`WAKE_KEEPALIVE`] 在窗口 `on_interval` 注册顺序里的平台 id（1 起 = 下标 + 1）。
+/// 本窗只注册 `POLL`（id 1）和它（id 2）；增减 interval 必须同步改这里。
+const WAKE_TIMER_ID: u32 = 2;
 
 /// 窗口标题。所有看图窗口同一个名字：任务栏靠缩略图区分，标题栏是我们自绘的。
 const TITLE: &str = "RuPix";
@@ -215,6 +225,13 @@ fn apply_session_flags(chrome: &Chrome, cfg: &Config) -> bool {
     let mut changed = crate::ui::chrome::set_toolbar_buttons(cfg.show_toolbar_buttons);
     // m269：形态开关也是全局镜像；值变了要标脏，否则切换后不重绘、热区也还旧着。
     changed |= crate::ui::chrome::set_borderless(cfg.borderless);
+    // 无边框不开放主辅视图：进入这个形态时把会话态收回单图，
+    // 否则隐藏的辅图仍会影响步长/快捷键，留下一套看不见的旁路。
+    if cfg.borderless && chrome.companion.get() {
+        chrome.companion.set(false);
+        chrome.active_pane.set(Pane::Primary);
+        changed = true;
+    }
     let was_strip = (chrome.filmstrip.get(), chrome.filmstrip_left.get());
     for (slot, want) in [
         (&chrome.checker, cfg.checker),
@@ -379,6 +396,24 @@ impl Shared {
 
 // ── 一个看图窗口 ──────────────────────────────────────────────
 
+/// 主图翻页的步长（纯函数，供 `WinRt::nav_step` 与单测共用）。
+///
+/// 联动 + 主序列来源的 `+2` 是为**文件对**设计的（13+14 → 15+16）；一旦主图
+/// 进入页式文件内部翻页，辅图页已经冻结，再 +2 会把主图直接跳过一页，
+/// 两边永远对不上。故页式文件内部一律 +1，只有换文件时才走 `pair_step`。
+fn navigation_step(
+    companion: bool,
+    source: crate::ui::companion::CompanionSource,
+    link: crate::ui::companion::LinkMode,
+    indexed: bool,
+) -> isize {
+    if !companion || indexed {
+        1
+    } else {
+        pair_step(source, link)
+    }
+}
+
 /// 一个看图窗口的全部运行期状态。**除 [`Shared`] 之外的一切都在这里**。
 struct WinRt {
     id: u64,
@@ -391,6 +426,10 @@ struct WinRt {
     applied_stay: Cell<bool>,
     applied_window: Cell<(InitWindow, u32, u32)>,
     applied_opacity: Cell<u8>,
+    /// 上一次见到的全局主题令牌。主题是**全局原子**，而重绘是**按窗**的：
+    /// 只靠“改令牌的那一帧”标脏，只会有第一扇窗变色，其余窗口要等下一次输入。
+    /// 每窗各存一份“见过的值”，窗口段差分标整窗。
+    seen_theme: Cell<crate::ui::tokens::Theme>,
     startup_ops: RefCell<Vec<StartOp>>,
     was_maximized: Cell<bool>,
     /// 无边框形态是否已经推给框架（框架默认不透明，故初值 false）。
@@ -406,9 +445,19 @@ struct WinRt {
     watched_dir: RefCell<Option<PathBuf>>,
     watch_retry_at: Cell<Instant>,
     last_dir_rescan: Cell<Instant>,
+    /// 解码线程回包后向本窗补投 `WM_TIMER` 的句柄（0 = 窗口还没建好）。
+    wake_hwnd: Arc<AtomicIsize>,
     /// 本窗口自己的目录变化通道（两个窗口开在两个目录时不能互相串）。
     dir_tx: std::sync::mpsc::Sender<DirEvent>,
     dir_rx: RefCell<Receiver<DirEvent>>,
+}
+
+impl Drop for WinRt {
+    /// 窗口状态销毁时把唤醒句柄清零：晚到的回包最多发现 0，不会往可能已被系统复用的
+    /// `HWND` 上继续投 `WM_TIMER`。
+    fn drop(&mut self) {
+        self.wake_hwnd.store(0, Ordering::Relaxed);
+    }
 }
 
 impl WinRt {
@@ -416,12 +465,18 @@ impl WinRt {
     fn create(shared: Rc<Shared>, initial: Option<PathBuf>) -> Rc<Self> {
         let (done_tx, done_rx) = channel::<Done>();
         let (meta_tx, meta_rx) = channel::<MetaEvent>();
-        // 回程里那条唤醒现在是空的（模块头的代价说明）：常驻模式没有可被叫醒的窗口，
-        // 回包由本窗 16ms 轮询收。留着这个接口是为了将来框架补上"按窗口投一帧"时
-        // 只改这一处，而不是再翻一遍解码层。
+        // 解码线程回包后的按窗唤醒：句柄在首帧 `window_tick` 里从
+        // `windui::platform::native_window_handle()` 回填；首帧之前为 0，由 16ms 兜底。
+        let wake_hwnd = Arc::new(AtomicIsize::new(0));
+        let wake_for_decode = wake_hwnd.clone();
         let sink = DecodeSink {
             meta: meta_tx,
-            wake: Box::new(|| {}),
+            wake: Box::new(move || {
+                let h = wake_for_decode.load(Ordering::Relaxed);
+                if h != 0 {
+                    crate::platform::window_wake::post_interval_tick(h, WAKE_TIMER_ID);
+                }
+            }),
         };
         let decoder = Rc::new(Decoder::spawn_with_sink(done_tx, Some(sink)));
         let config = shared.config.clone();
@@ -471,6 +526,7 @@ impl WinRt {
             applied_stay: Cell::new(config.borrow().stay_on_top),
             applied_window,
             applied_opacity,
+            seen_theme: Cell::new(crate::ui::tokens::theme()),
             startup_ops,
             was_maximized: Cell::new(false),
             borderless_applied,
@@ -486,6 +542,7 @@ impl WinRt {
             watched_dir: RefCell::new(None),
             watch_retry_at: Cell::new(now),
             last_dir_rescan: Cell::new(now),
+            wake_hwnd,
             dir_tx,
             dir_rx: RefCell::new(dir_rx),
         });
@@ -504,7 +561,8 @@ impl WinRt {
             let c = self.shared.config.borrow();
             (c.window_w as i32 - fw, c.window_h as i32 - fh)
         };
-        let tick = self.clone();
+        let tick_poll = self.clone();
+        let tick_wake = self.clone();
         let key = self.clone();
         let close = self.clone();
         let content = self.clone();
@@ -525,7 +583,9 @@ impl WinRt {
                     activation.shared.active.set(activation.id);
                 }
             })
-            .on_interval(POLL, move |ctx| tick.tick(ctx))
+            .on_interval(POLL, move |ctx| tick_poll.tick(ctx))
+            // 第二个 interval 只当按窗唤醒的落点（见 `WAKE_TIMER_ID`）。
+            .on_interval(WAKE_KEEPALIVE, move |ctx| tick_wake.tick(ctx))
             .on_shortcut(move |_ctx, ev| key.on_key(&ev))
             .on_close_request(move |ctx| close.close(ctx));
         request.content(move || {
@@ -753,7 +813,12 @@ impl WinRt {
         // 看图窗口配色（m200）：设置页换下拉 → 配置变了 → 这里下一帧换令牌并重绘。
         // 只影响浮层那一组颜色；设置页自己的配色是另一个人写的常量，不经过这里。
         if apply_theme(&config.borrow()) {
-            ctx.mark_dirty();
+            // 主题令牌是整窗读者（背景 / 标题 / 浮条 / 状态文字），不是某个节点；
+            // 标局部脏区会出现“菜单变了、主画面还旧色”的半截状态。
+            ctx.mark_dirty_all();
+            // 定时器回调里的 mark_dirty_all 已足够出帧；再显式要一帧是兜底：
+            // 主题是全局原子，任何一条改配置的路径都不该等到下一次用户输入才见效。
+            windui::anim::request_repaint();
         }
         // 配置保存防抖（M1）：UI 侧只置脏，这里到期统一落盘。
         crate::core::config::poll_save(&config.borrow());
@@ -763,8 +828,40 @@ impl WinRt {
         crate::ui::settings::refresh_open_metadata(&self.viewer);
     }
 
+    /// 本窗主图翻页的步长。
+    ///
+    /// 联动 + 主序列来源的 `+2` 是为**文件对**设计的（13+14 → 15+16）；一旦主图
+    /// 进入页式文件内部翻页，辅图页已经冻结，再 +2 会把主图直接跳过一页，
+    /// 两边永远对不上。故页式文件内部一律 +1，只有换文件时才走 `pair_step`。
+    fn nav_step(&self) -> isize {
+        if crate::ui::chrome::borderless() {
+            return 1;
+        }
+        navigation_step(
+            self.chrome.companion.get(),
+            self.chrome.companion_source.get(),
+            self.chrome.companion_link.get(),
+            self.viewer
+                .borrow()
+                .anim_info()
+                .is_some_and(|a| a.has_index()),
+        )
+    }
+
     /// 窗口段：本窗口自己的一切。
     fn window_tick(&self, ctx: &mut EventCtx) {
+        // 主题色是全局令牌，任何一扇窗（设置页改了 / 菜单改了 / 手改 ini）
+        // 改了它，本窗下一拍就整窗重绘；不能等下一次鼠标事件才刷。
+        let theme = crate::ui::tokens::theme();
+        if self.seen_theme.replace(theme) != theme {
+            self.chrome.invalidate_theme_caches();
+            ctx.mark_dirty_all();
+        }
+        // `native_window_handle` 只在 UI 线程、事件/定时器分发期间有效；这里正是
+        // `WM_TIMER` 的回调里，写下的就是本窗句柄。每拍一次 store 只是一条 relaxed 写。
+        if let Some(h) = windui::platform::native_window_handle() {
+            self.wake_hwnd.store(h, Ordering::Relaxed);
+        }
         let config = self.shared.config.clone();
         // 拖拽/命令行打开的裸数据：在这里补弹参数窗（那些入口没有 EventCtx）。
         //
@@ -1056,18 +1153,21 @@ impl WinRt {
         }
         // 滚轮翻页的节奏闸兜底（A3 / m64）。
         if let Some(dir) = self.chrome.tick_wheel_pace() {
-            self.viewer.borrow_mut().step(dir);
+            let step = self.nav_step();
+            self.viewer.borrow_mut().step(dir * step);
             ctx.mark_dirty();
         }
         // 键盘翻页的节奏闸兜底（m81）。
         if let Some(dir) = self.chrome.tick_key_pace() {
-            self.viewer.borrow_mut().step(dir);
+            let step = self.nav_step();
+            self.viewer.borrow_mut().step(dir * step);
             ctx.mark_dirty();
         }
         // 幻灯片放映（m167）：到点翻一张。间隔每次现读配置。
         let pace = std::time::Duration::from_secs(config.borrow().slide_interval as u64);
         if self.chrome.tick_slideshow(pace) {
-            self.viewer.borrow_mut().step(1);
+            let step = self.nav_step();
+            self.viewer.borrow_mut().step(step);
             ctx.mark_dirty();
         }
         // 进度横条**只在换了一格的那一帧**重绘（默认档 = 每间隔 8 次）。
@@ -1598,5 +1698,41 @@ mod tests {
         cfg.ui_theme = UiTheme::Dark;
         assert!(apply_theme(&cfg));
         assert_eq!(crate::ui::tokens::theme(), crate::ui::tokens::Theme::Dark);
+    }
+
+    /// 页式文件 / 动图内部翻页必须只走 +1：辅图页已冻结，再 +2 会让主图跳过一页/帧。
+    #[test]
+    fn paged_primary_navigation_never_double_steps() {
+        use crate::ui::companion::{CompanionSource, LinkMode};
+        assert_eq!(
+            navigation_step(true, CompanionSource::NextInPrimary, LinkMode::Linked, true),
+            1,
+            "页式文件内部不能 +2"
+        );
+        assert_eq!(
+            navigation_step(
+                true,
+                CompanionSource::NextInPrimary,
+                LinkMode::Linked,
+                false
+            ),
+            2,
+            "非页式文件仍按文件对 +2"
+        );
+        assert_eq!(
+            navigation_step(true, CompanionSource::OwnSequence, LinkMode::Linked, false),
+            1,
+            "自选来源只走 +1"
+        );
+        assert_eq!(
+            navigation_step(
+                false,
+                CompanionSource::NextInPrimary,
+                LinkMode::Linked,
+                false
+            ),
+            1,
+            "主辅视图关闭时永远 +1"
+        );
     }
 }

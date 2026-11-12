@@ -53,7 +53,8 @@ pub mod catalog;
 
 use crate::core::abi::*;
 use crate::core::decode::RawParams;
-use crate::core::geometry::{fit_oriented, fit_to};
+use crate::core::geometry::{fit_oriented_with_alpha, fit_to_with_alpha};
+use crate::core::pixels::pixel_format_has_alpha;
 use crate::core::pixels::to_rgba8;
 use crate::core::pixels::{Bitmap, Decoded, MAX_PIXELS};
 use crate::platform::dll::harden_search_path;

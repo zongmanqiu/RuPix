@@ -82,6 +82,47 @@ pub(crate) fn open(ctx: &mut EventCtx, viewer: &Rc<RefCell<Viewer>>) {
     }
     let scope = super::singleton::window_scope(viewer);
     let key = super::singleton::scoped("goto", scope);
+    let jump: Rc<dyn Fn(u32)> = {
+        let viewer = viewer.clone();
+        Rc::new(move |index| {
+            viewer.borrow_mut().jump_anim(index);
+        })
+    };
+    open_dialog(ctx, key, anim, jump);
+}
+
+/// 辅图版本的「跳转到…帧/页」：写回 `CompanionPane` 的页游标，主图不动。
+pub(crate) fn open_companion(
+    ctx: &mut EventCtx,
+    viewer: &Rc<RefCell<Viewer>>,
+    pane: &Rc<RefCell<super::companion::CompanionPane>>,
+) {
+    let Some(anim) = pane.borrow().anim_info() else {
+        ctx.toast_err("辅图没有多帧/多页可跳");
+        return;
+    };
+    if anim.count == 0 {
+        ctx.toast_err("这个文件的帧数还没数出来，先播一会儿再跳");
+        return;
+    }
+    let scope = super::singleton::window_scope(viewer);
+    let key = super::singleton::scoped("goto-companion", scope);
+    let jump: Rc<dyn Fn(u32)> = {
+        let pane = pane.clone();
+        Rc::new(move |index| {
+            pane.borrow_mut().jump_index(index);
+        })
+    };
+    open_dialog(ctx, key, anim, jump);
+}
+
+/// 两扇「跳转」窗共用的版式与提交逻辑。
+fn open_dialog(
+    ctx: &mut EventCtx,
+    key: String,
+    anim: crate::core::pixels::Anim,
+    jump: Rc<dyn Fn(u32)>,
+) {
     if windui::event::window_open(&key) {
         return;
     }
@@ -93,8 +134,8 @@ pub(crate) fn open(ctx: &mut EventCtx, viewer: &Rc<RefCell<Viewer>>) {
 
     // 同一段落地逻辑挂两处（底栏「跳转」+ 输入框回车）：`Rc<dyn Fn>` 而不是两份闭包，
     // 免得"按钮那版夹取、回车那版不夹取"这类两套规则。
-    let jump: Rc<dyn Fn(&mut EventCtx)> = {
-        let viewer = viewer.clone();
+    let submit: Rc<dyn Fn(&mut EventCtx)> = {
+        let jump = jump.clone();
         Rc::new(move |ctx: &mut EventCtx| {
             // 填错了必须说话且**不关窗**（与裸数据参数窗同一条规矩）：解析失败就闭窗，
             // 用户看到的是"窗没了、图也没换"，等于点了没反应。
@@ -102,13 +143,12 @@ pub(crate) fn open(ctx: &mut EventCtx, viewer: &Rc<RefCell<Viewer>>) {
                 ctx.toast_err(format!("得填 1…{count} 之间的整数"));
                 return;
             };
-            viewer.borrow_mut().jump_anim(index);
+            jump(index);
             ctx.request_close();
         })
     };
-    let jump_btn = jump.clone();
-    let confirm = move |ctx: &mut EventCtx| jump_btn(ctx);
-    let jump_enter = jump.clone();
+    let confirm = submit.clone();
+    let enter = submit.clone();
     let cancel = |ctx: &mut EventCtx| ctx.request_close();
 
     ctx.open_window(
@@ -130,10 +170,10 @@ pub(crate) fn open(ctx: &mut EventCtx, viewer: &Rc<RefCell<Viewer>>) {
                     vec![content_row(
                         input,
                         format!("1…{count} {unit}"),
-                        move |ctx| jump_enter(ctx),
+                        move |ctx| enter(ctx),
                     )],
                     vec![
-                        super::dialog_footer::action("跳转", confirm),
+                        super::dialog_footer::action("跳转", move |ctx| confirm(ctx)),
                         super::dialog_footer::action("取消", cancel),
                     ],
                 )

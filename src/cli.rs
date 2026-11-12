@@ -13,17 +13,21 @@ use std::path::PathBuf;
 /// `--bench-thumb` 缺省重复次数：够中位数稳（本项目配对基准的口径是 n≥200）。
 pub const BENCH_DEFAULT_REPS: usize = 200;
 
-/// 无头命令面的四个纯读动词（m293）。
+/// 无头命令面的五个纯读动词（m293；m317 加 `list-formats`）。
 ///
 /// 全部以 `--<动词>` 选项形式出现，**不做位置参数**：`initial_path` 取首个非 `--`
-/// 参数当要打开的文件，位置动词会被它抢走。四个动词都不建窗、不进单实例闸门，
+/// 参数当要打开的文件，位置动词会被它抢走。五个动词都不建窗、不进单实例闸门，
 /// 输出由 `headless` 模块统一回一行 JSON。
+///
+/// `list-formats` 是唯一**不带路径**的动词：它回答「这台机器现在能开哪些后缀」，
+/// 输入是解码器目录本身，不是某个文件。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadlessCmd {
     List,
     Metadata,
     Thumbnail,
     Render,
+    ListFormats,
 }
 
 impl HeadlessCmd {
@@ -34,6 +38,7 @@ impl HeadlessCmd {
             Self::Metadata => "metadata",
             Self::Thumbnail => "thumbnail",
             Self::Render => "render",
+            Self::ListFormats => "list-formats",
         }
     }
 
@@ -44,8 +49,15 @@ impl HeadlessCmd {
             "--metadata" => Some(Self::Metadata),
             "--thumbnail" => Some(Self::Thumbnail),
             "--render" => Some(Self::Render),
+            "--list-formats" => Some(Self::ListFormats),
             _ => None,
         }
+    }
+
+    /// 这条动词是否必须带路径。`list-formats` 是唯一例外：它读的是解码器目录，
+    /// 不是某个文件；把「没给路径」判成参数错会把一条合法命令变成 GUI。
+    pub const fn needs_path(self) -> bool {
+        !matches!(self, Self::ListFormats)
     }
 }
 
@@ -129,6 +141,16 @@ pub fn parse(argv: &[String]) -> Args {
             out.safe_mode = true;
         } else if let Some(cmd) = HeadlessCmd::from_option(a) {
             out.headless_flag = true;
+            if !cmd.needs_path() {
+                // `--list-formats` 不吃路径：紧跟其后的参数留给 `initial_path`，
+                // 但它本来就不建窗，不会被当成「要打开的文件」消费。
+                out.headless = Some(Headless {
+                    cmd,
+                    path: PathBuf::new(),
+                    target: None,
+                });
+                continue;
+            }
             let path = it.next().map(PathBuf::from);
             // 只有 `--render` 吃可选目标框；两数必须同时给且都 > 0，缺一按原尺寸。
             let target = if cmd == HeadlessCmd::Render {
@@ -264,7 +286,7 @@ mod tests {
         assert!(parse(&v).safe_mode, "两处判据必须同时成立");
     }
 
-    /// 四个无头动词都认得、都不进 `unknown`；`--render` 的可选目标框要两数齐备。
+    /// 五个无头动词都认得、都不进 `unknown`；`--render` 的可选目标框要两数齐备。
     #[test]
     fn headless_verbs_parse_with_optional_box() {
         let check = |opt: &str, cmd: HeadlessCmd| {
@@ -278,6 +300,17 @@ mod tests {
         check("--metadata", HeadlessCmd::Metadata);
         check("--thumbnail", HeadlessCmd::Thumbnail);
         check("--render", HeadlessCmd::Render);
+
+        // `--list-formats` 是唯一不带路径的动词：没有路径也必须成为一条请求，
+        // 不能落进 `main` 的「标志出现过但没给路径」参数错分支。
+        let f = parse(&argv(&["rupix.exe", "--list-formats"]));
+        assert_eq!(f.unknown, Vec::<String>::new());
+        assert_eq!(
+            f.headless.as_ref().map(|h| h.cmd),
+            Some(HeadlessCmd::ListFormats)
+        );
+        assert!(f.headless.as_ref().unwrap().path.as_os_str().is_empty());
+        assert!(f.headless_flag);
 
         let r = parse(&argv(&["rupix.exe", "--render", "D:\\a.png", "800", "600"]));
         assert_eq!(r.headless.as_ref().unwrap().target, Some((800, 600)));
@@ -302,10 +335,14 @@ mod tests {
         assert!(a.headless_flag);
         assert_eq!(a.headless, None);
         assert!(a.unknown.is_empty());
+        // 负向臂：`--list-formats` 不带路径是**合法**的，不许跟着降级成 None。
+        let f = parse(&argv(&["rupix.exe", "--list-formats"]));
+        assert!(f.headless_flag);
+        assert!(f.headless.is_some(), "无路径动词不许被判成缺路径");
     }
 
-    /// 闸门例外：四个动词一律绕开，GUI 一律进，老探针 / 基准照旧绕开。
-    /// ★ 负向臂：把 `is_headless` 这一项从判据里拿掉（即旧公式），四个动词就会
+    /// 闸门例外：五个动词一律绕开，GUI 一律进，老探针 / 基准照旧绕开。
+    /// ★ 负向臂：把 `is_headless` 这一项从判据里拿掉（即旧公式），五个动词就会
     /// 被判成"要进闸门"——那正是「命令被转发给 GUI、自己没跑」的老故障。
     #[test]
     fn headless_bypasses_instance_gate_with_negative_arm() {
@@ -314,6 +351,7 @@ mod tests {
             HeadlessCmd::Metadata,
             HeadlessCmd::Thumbnail,
             HeadlessCmd::Render,
+            HeadlessCmd::ListFormats,
         ] {
             let a = Args {
                 headless: Some(Headless {
@@ -344,7 +382,7 @@ mod tests {
         assert!(!needs_instance_gate(&bench), "老基准通道不许被改坏");
     }
 
-    /// 新增四个动词后，老的 `--probe-decode` / `--bench-thumb` 解析逐值不变。
+    /// 新增五个动词后，老的 `--probe-decode` / `--bench-thumb` 解析逐值不变。
     #[test]
     fn legacy_probe_channels_unchanged() {
         let a = parse(&argv(&["rupix.exe", "--probe-decode", "D:\\a.tif"]));
