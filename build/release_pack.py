@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Build the **single** RuPix release package plus the updater envelope.
+"""Build the single RuPix release package.
 
-Release model (2026-11-13, corrected):
+One package only: `RuPix_<ver>.zip` = exe + LICENSE + notices + README +
+`classic` / `common` / `modern` / `pro` / `raw` (each DLL **and** its
+`<id>_<version>/` license/metadata folder) + `docs/decoders.json` /
+`plugins.json` / `MCP接入指南.md`.
 
-- `RuPix_<ver>.zip` — the only user-facing package. It always carries the
-  baseline decoders: classic, common, modern, pro, raw.
-- `updater/RuPix_<ver>.zip` — a four-file, machine-only envelope used by
-  `update.json` so 0.3.x/0.4.x auto-update keeps working (old updaters reject
-  extra ZIP entries). It is uploaded to the technical `<ver>-update` release,
-  not offered as a "normal package".
+There is no "normal vs full" split. The four-file auto-update envelope used in
+0.4.0 is retired; 0.3.x auto-update is intentionally paused for this release
+because its updater rejects any ZIP entry outside its four-file whitelist.
+The next release will make the updater accept this single package.
 
 Usage (from main/):
     python build/release_pack.py
@@ -28,8 +29,10 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BUILD = ROOT.parent / ".build"
-OUT = ROOT.parent / ".temp" / "release-out"
+PROJECT = ROOT.parent
+BUILD = PROJECT / ".build"
+DECODER_PACKAGES = PROJECT / ".temp" / "decoder-packages"
+OUT = PROJECT / ".temp" / "release-out"
 
 BASELINE = ("classic", "common", "modern", "pro", "raw")
 SHELL_FILES = ("rupix.exe", "LICENSE", "THIRD-PARTY-NOTICES.md", "README.txt")
@@ -82,18 +85,7 @@ def decoder_catalog() -> dict[str, dict]:
     return {str(item.get("id")): item for item in data if isinstance(item, dict)}
 
 
-def stage_shell(version: str, parent: Path) -> Path:
-    """Four-file updater envelope; never offered as a user package."""
-    stage = parent / f"RuPix_{version}"
-    shutil.rmtree(stage, ignore_errors=True)
-    stage.mkdir(parents=True)
-    for name in SHELL_FILES:
-        copy_file(BUILD / name, stage / name)
-    return stage
-
-
-def stage_portable(version: str, catalog: dict[str, dict]) -> Path:
-    """The one user-facing package: shell + 5 baseline decoders + docs."""
+def stage_package(version: str, catalog: dict[str, dict]) -> Path:
     stage = OUT / f"RuPix_{version}"
     shutil.rmtree(stage, ignore_errors=True)
     stage.mkdir(parents=True)
@@ -114,23 +106,15 @@ def stage_portable(version: str, catalog: dict[str, dict]) -> Path:
         ver = str(item.get("version") or "")
         file = f"{ident}_{ver}.dll"
         copy_file(BUILD / "decoders" / file, decoders / file)
-        # 同版本的许可/说明目录：有就带，没有不臆造。
-        pkg = BUILD / "decoders" / f"{ident}_{ver}"
-        if pkg.is_dir():
-            shutil.copytree(pkg, decoders / pkg.name)
+        # 每枚 DLL 必须带同版本文件夹（许可 / 元数据 / README）。来源是解码器仓
+        # `package_decoders.py` 的 stage，不是 `.build/decoders` 里可能过期的旧目录。
+        pkg = DECODER_PACKAGES / f"{ident}_{ver}.stage" / f"{ident}_{ver}"
+        if not pkg.is_dir():
+            fail(
+                f"缺解码器许可目录：{pkg}（先在解码器仓跑 build.ps1 / package_decoders.py）"
+            )
+        shutil.copytree(pkg, decoders / pkg.name)
     return stage
-
-
-def generate_formats(stage: Path, version: str) -> None:
-    """Run the staged exe with only the bundled decoders, then render docs/formats.*."""
-    exe = stage / "rupix.exe"
-    docs = stage / "docs"
-    sys.path.insert(0, str(ROOT / "build"))
-    from deploy import generate_formats as render  # noqa: PLC0415
-
-    errors, _payload = render(exe, docs, version)
-    if errors:
-        fail("生成 formats.md/json 失败：\n  " + "\n  ".join(errors))
 
 
 def make_zip(seven: str, stage: Path, out: Path) -> None:
@@ -165,24 +149,13 @@ def main() -> None:
     seven = find_7za()
 
     catalog = decoder_catalog()
-    portable = stage_portable(version, catalog)
-    generate_formats(portable, version)
-    # `--list-formats` 会按运行期约定建 temp/ 日志；分发物里不许带运行期落点。
-    shutil.rmtree(portable / "temp", ignore_errors=True)
-    shutil.rmtree(portable / "cache", ignore_errors=True)
+    stage = stage_package(version, catalog)
+    zip_path = OUT / f"RuPix_{version}.zip"
+    make_zip(seven, stage, zip_path)
 
-    updater_dir = OUT / "updater"
-    updater_dir.mkdir(exist_ok=True)
-    updater = stage_shell(version, updater_dir)
-
-    portable_zip = OUT / f"RuPix_{version}.zip"
-    updater_zip = updater_dir / f"RuPix_{version}.zip"
-    make_zip(seven, portable, portable_zip)
-    make_zip(seven, updater, updater_zip)
-
-    print(f"[ok] package {portable_zip}  {portable_zip.stat().st_size} bytes")
-    print(f"[ok] updater {updater_zip}  {updater_zip.stat().st_size} bytes")
+    print(f"[ok] package {zip_path}  {zip_path.stat().st_size} bytes")
     print("     baseline decoders: " + ", ".join(BASELINE))
+    print("     each DLL has its <id>_<version>/ license folder")
 
 
 if __name__ == "__main__":

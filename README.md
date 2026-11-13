@@ -43,8 +43,9 @@ Windows 10/11 上的小巧极速看图器。**宿主只做「看图」，位图�
 
 - **可下载档位并集**：[`docs/格式覆盖.md`](docs/格式覆盖.md)（生成物，源是解码器仓的
   `decoders.json` 与宿主内置登记表）。
-- **这个发布包实际覆盖**：`docs/formats.md`（按随包的 5 枚基础解码器生成，
-  同一份数据另有 `formats.json`）。
+- **发布包实际覆盖**：随包带 `classic` / `common` / `modern` / `pro` / `raw` 5 枚；
+  `doc` / `texture` / `doc-legacy` 按需下载。具体清单以本机 `--list-formats` 为准，
+  包里不放手写/快照格式表。
 - **这台机器现在覆盖**：`rupix.exe --list-formats`，一行 JSON，含内置、各解码器自述与
   唯一扩展名总数；与设置页「解码器」三张卡同源。
 

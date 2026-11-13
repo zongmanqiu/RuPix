@@ -32,26 +32,24 @@
 ```powershell
 cd main
 python build\release_pack.py --version 0.4.0
-python build\gen_update_json.py --version 0.4.0 --asset-tag 0.4.0-update --notes ..\.temp\release-out\RELEASE_NOTES.md
 ```
 
-产出在 `../.temp/release-out/`：
+产出在 `../.temp/release-out/`，只有一个包：
 
-| 产物 | 内容 | 用途 |
-|---|---|---|
-| `RuPix_<ver>.zip` | `rupix.exe` / `LICENSE` / `THIRD-PARTY-NOTICES.md` / `README.txt` + `classic` / `common` / `modern` / `pro` / `raw` 5 枚基础解码器 + 许可目录 + `docs/`（`decoders.json` / `plugins.json` / `MCP接入指南.md` / 本包 `formats.*`） | **唯一的用户下载包** |
-| `updater/RuPix_<ver>.zip` | 四文件：`rupix.exe` / `LICENSE` / `THIRD-PARTY-NOTICES.md` / `README.txt` | 自动更新信封，放技术 tag `<ver>-update`；不是用户包 |
+| 产物 | 内容 |
+|---|---|
+| `RuPix_<ver>.zip` | `rupix.exe` / `LICENSE` / `THIRD-PARTY-NOTICES.md` / `README.txt` + `classic` / `common` / `modern` / `pro` / `raw` 5 枚 DLL，**每枚都带同版本 `<id>_<version>/` 许可文件夹** + `docs/decoders.json` / `plugins.json` / `MCP接入指南.md` |
 
-- `doc`（PDF/PS/AI/DXF，约 26.7 MB）**不进基础包**；`texture` / `doc-legacy` 也不进。
-  三者都在设置页「解码器 → 可下载」按需安装，便携包里的 `docs/decoders.json` 已经列全。
-- 两个产物都不带 `rupix.ini` / `recent.txt` / `reading.txt` / `cache/` / `temp/` /
-  `plugins/` / 样本图。
-- 打包固定 7-Zip 标准 ZIP/Deflate（`-mx=9 -mtm=off -mta=off -mtc=off`）；`release_pack.py`
-  会在便携包里重新跑 `--list-formats`，所以 `formats.md|json` 只描述实际随包的 5 枚。
-- 上传：便携包放正式 tag `<ver>`；更新信封放技术 tag `<ver>-update`，两侧都要有。
-  `update.json` 只指向信封，且必须等两侧信封上传、`check_update_asset.py` 通过后再推。
-- 为什么信封还留着：0.3.x 的更新器只接受四文件包，ZIP 里多一个 `decoders/` 就拒绝；
-  这不是给用户选的第二个包，只是旧更新器的兼容层。
+- `doc`（PDF/PS/AI/DXF，约 26.7 MB）**不进包**；`texture` / `doc-legacy` 也不进。
+  三者都在设置页「解码器 → 可下载」按需安装，包里的 `docs/decoders.json` 已经列全。
+- 不带 `rupix.ini` / `recent.txt` / `reading.txt` / `cache/` / `temp/` / `plugins/` /
+  样本图；也不带 `formats.md|json`——格式覆盖需要时跑 `rupix.exe --list-formats`。
+- 解码器许可文件夹从 `.temp/decoder-packages/<id>_<ver>.stage/<id>_<ver>/` 取；缺任何
+  一枚，`release_pack.py` 直接中止，不会生成"少一个文件夹"的包。
+- 打包固定 7-Zip 标准 ZIP/Deflate（`-mx=9 -mtm=off -mta=off -mtc=off`）。
+- **0.4.0 自动更新暂停**：0.3.x 更新器只接受四文件包，遇到 `decoders/` 会拒绝；本版不
+  发布新的 `update.json`，0.3.x 用户手动下载。下一版先把更新器改成接受这个单包，再恢复
+  自动更新；不再另造"更新信封"。
 
 ## 两条静态体检（只读，可单独跑）
 

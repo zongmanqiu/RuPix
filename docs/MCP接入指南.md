@@ -197,8 +197,10 @@ rupix.exe --list-formats                  > out-formats.json
 
 ## 八、随包文件与契约漂移
 
-`docs/` 下与本主题相关的**只有本文**，另有 `decoders.json` / `plugins.json` / `update.json`
-三份清单、`formats.md` / `formats.json` 两份**部署时生成**的格式覆盖，以及两份许可。
+`docs/` 下与本主题相关的**只有本文**，另有 `decoders.json` / `plugins.json`
+两份可下载清单；发布包**不再附带** `formats.md|json` 或本地 `update.json`，
+格式覆盖按需跑 `rupix.exe --list-formats`。另有 `LICENSE` 与
+`THIRD-PARTY-NOTICES.md` 两份许可。
 真源是 `main/docs/MCP接入指南.md`，由部署脚本复制进发布目录并校验
 「存在 / UTF-8 / 非空 / 落地字节同源」；**不要手改发布目录里的副本**，下次部署会覆盖。
 

@@ -30,7 +30,7 @@
 | `docs/扩展体系.md` | 扩展 manifest / 能力 / 目录约定 / 分层 / 安全底线变化时；未落地项随 P0.1b 更新 | `cargo test --release --lib core::ext -- --test-threads=1` + `python build/layering_scan.py` + 自检 |
 | `docs/架构总览.md` | 五层分层、§三关键类型（`DecodeBackend` / `Fail` / `ImageCache` 等）、§五解码路由与清单规则（**只写动态并集，不登记具体 DLL**）、§七性能红线、§八改动影响面任一变化；「明确不做」清单（§九）变化 | `python build/layering_scan.py` + `hygiene_scan.py` 均 `violations: 0` |
 | `docs/解码器开发规范.md`（**宿主侧 ABI 对接说明**，自包含） | 宿主看到的 ABI 版本、导出、结构体、错误码、缓冲所有权、能力路由变化时更新；契约结构体以 `vendor/rupix-abi` 为准 | 宿主 `cargo test --release --lib core::abi -- --test-threads=1` 全绿 + `cargo test --release --test docs_consistency -- --test-threads=1` |
-| `docs/图片格式与后缀名.md` | 宿主内置路径（只有 resvg 一枚，管 svg/svgz）与「动态并集」规则变化；**具体解码器清单不写在这里**（清单真源在解码器侧，运行时用 `--list-formats`；生成视图见 `docs/格式覆盖.md` 与发布包 `docs/formats.md`） | `ext` 组测试（`python build/gate.py run ext`）+ 真实文件冒烟 |
+| `docs/图片格式与后缀名.md` | 宿主内置路径（只有 resvg 一枚，管 svg/svgz）与「动态并集」规则变化；**具体解码器清单不写在这里**（清单真源在解码器侧，运行时用 `--list-formats`；生成视图见 `docs/格式覆盖.md`；发布包不附快照，按需 `--list-formats`） | `ext` 组测试（`python build/gate.py run ext`）+ 真实文件冒烟 |
 | `docs/格式覆盖.md` | **生成物，勿手改**：解码器仓 `decoders.json` 或 `BUILTIN_DECODERS` 变化时重跑 `python build/gen_formats.py` | `python build/gen_formats.py --check` + 自检 |
 | `docs/待办.md` | **唯一清单**（2026-11-09 m291 合并两份）：只收「还开着、且真有可能做」的条目、等外力项与已知边界；已拥有 / 不值得做 / 永久不提供的一律不列。新增或关闭条目时更新 | 自检 + `cargo test --release --test docs_consistency -- --test-threads=1`（j12 不写体积数字） |
 | `docs/产品定位与边界.md` | 战略定位 / 职责边界 / "轻量"硬定义 / 明确不做清单任一变化；本文件是战略层，内容长期稳定，改动应稀少 | 自检 + `python build/layering_scan.py`（引用分层结论时） + `cargo test --release --test docs_consistency` 全绿 |
