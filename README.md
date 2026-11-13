@@ -1,9 +1,9 @@
 # RuPix
 
-**[⬇️ 下载 0.4.0 完整包 (Gitee)](https://gitee.com/qiuzongman/RuPix/releases/download/0.4.0/RuPix_0.4.0_full.zip)**
- ｜ **[⬇️ 下载 0.4.0 完整包 (GitHub)](https://github.com/zongmanqiu/RuPix/releases/download/0.4.0/RuPix_0.4.0_full.zip)**
+**[⬇️ 下载 0.4.0 (Gitee)](https://gitee.com/qiuzongman/RuPix/releases/download/0.4.0/RuPix_0.4.0.zip)**
+ ｜ **[⬇️ 下载 0.4.0 (GitHub)](https://github.com/zongmanqiu/RuPix/releases/download/0.4.0/RuPix_0.4.0.zip)**
 
-> 完整包已带 `classic` / `common` / `modern` / `pro` / `raw` 5 枚基础解码器；`doc`（PDF/PS/AI/DXF）、
+> 发布包已带 `classic` / `common` / `modern` / `pro` / `raw` 5 枚基础解码器；`doc`（PDF/PS/AI/DXF）、
 > `texture`、`doc-legacy` 仍可在 设置 → 解码器 里按需下载。已有旧版的用户可直接在「关于」页更新。
 
 > 宿主仓库（本仓）: [Gitee](https://gitee.com/qiuzongman/RuPix) | [GitHub](https://github.com/zongmanqiu/RuPix)
@@ -43,8 +43,8 @@ Windows 10/11 上的小巧极速看图器。**宿主只做「看图」，位图�
 
 - **可下载档位并集**：[`docs/格式覆盖.md`](docs/格式覆盖.md)（生成物，源是解码器仓的
   `decoders.json` 与宿主内置登记表）。
-- **这个发布包实际覆盖**：完整包里的 `docs/formats.md`（按随包的 5 枚基础解码器生成，
-  同一份数据另有 `formats.json`）；自更新空壳不带解码器，格式覆盖等于当前机器上已装的那批。
+- **这个发布包实际覆盖**：`docs/formats.md`（按随包的 5 枚基础解码器生成，
+  同一份数据另有 `formats.json`）。
 - **这台机器现在覆盖**：`rupix.exe --list-formats`，一行 JSON，含内置、各解码器自述与
   唯一扩展名总数；与设置页「解码器」三张卡同源。
 
@@ -112,7 +112,7 @@ Windows 10/11 上的小巧极速看图器。**宿主只做「看图」，位图�
   （元数据全在 DLL 内；在线源的 `decoders.json` 只服务下载器，不参与运行时路由）
 - **PDF 不在这份"不做"清单里**：它走解码器路线——由 `doc` 这枚解码库认领 `pdf` 后缀，
   一页当一帧，翻页与动图共用同一组键（宪章 §5.2 的口径是"多认一个格式"，不是"做导出"）。
-  `doc` 约 26.7 MB，**不随完整包分发**，在设置 → 解码器里按需安装。
+  `doc` 约 26.7 MB，**不随发布包分发**，在设置 → 解码器里按需安装。
 
 ## 快速开始
 

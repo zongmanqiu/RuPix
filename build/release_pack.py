@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Build the two release ZIPs from `.build/`:
+"""Build the **single** RuPix release package plus the updater envelope.
 
-- `RuPix_<ver>.zip`      self-update shell: 4 files only.
-- `RuPix_<ver>_full.zip` first-install/offline package: shell + baseline decoders.
+Release model (2026-11-13, corrected):
 
-Baseline (user decision 2026-11-13): classic, common, modern, pro, raw.
-`doc` is deliberately NOT bundled (26.7 MB; still downloadable in-app), and
-`texture` / `doc-legacy` stay optional downloads too.
+- `RuPix_<ver>.zip` — the only user-facing package. It always carries the
+  baseline decoders: classic, common, modern, pro, raw.
+- `updater/RuPix_<ver>.zip` — a four-file, machine-only envelope used by
+  `update.json` so 0.3.x/0.4.x auto-update keeps working (old updaters reject
+  extra ZIP entries). It is uploaded to the technical `<ver>-update` release,
+  not offered as a "normal package".
 
 Usage (from main/):
     python build/release_pack.py
@@ -31,7 +33,7 @@ OUT = ROOT.parent / ".temp" / "release-out"
 
 BASELINE = ("classic", "common", "modern", "pro", "raw")
 SHELL_FILES = ("rupix.exe", "LICENSE", "THIRD-PARTY-NOTICES.md", "README.txt")
-FULL_DOCS = ("decoders.json", "plugins.json", "MCP接入指南.md")
+PORTABLE_DOCS = ("decoders.json", "plugins.json", "MCP接入指南.md")
 ZIP_FLAGS = ("-tzip", "-mx=9", "-mtm=off", "-mta=off", "-mtc=off")
 
 
@@ -80,8 +82,9 @@ def decoder_catalog() -> dict[str, dict]:
     return {str(item.get("id")): item for item in data if isinstance(item, dict)}
 
 
-def stage_shell(version: str) -> Path:
-    stage = OUT / f"RuPix_{version}"
+def stage_shell(version: str, parent: Path) -> Path:
+    """Four-file updater envelope; never offered as a user package."""
+    stage = parent / f"RuPix_{version}"
     shutil.rmtree(stage, ignore_errors=True)
     stage.mkdir(parents=True)
     for name in SHELL_FILES:
@@ -89,8 +92,9 @@ def stage_shell(version: str) -> Path:
     return stage
 
 
-def stage_full(version: str, catalog: dict[str, dict]) -> Path:
-    stage = OUT / f"RuPix_{version}_full"
+def stage_portable(version: str, catalog: dict[str, dict]) -> Path:
+    """The one user-facing package: shell + 5 baseline decoders + docs."""
+    stage = OUT / f"RuPix_{version}"
     shutil.rmtree(stage, ignore_errors=True)
     stage.mkdir(parents=True)
     for name in SHELL_FILES:
@@ -98,7 +102,7 @@ def stage_full(version: str, catalog: dict[str, dict]) -> Path:
 
     docs = stage / "docs"
     docs.mkdir()
-    for name in FULL_DOCS:
+    for name in PORTABLE_DOCS:
         copy_file(BUILD / "docs" / name, docs / name)
 
     decoders = stage / "decoders"
@@ -117,10 +121,10 @@ def stage_full(version: str, catalog: dict[str, dict]) -> Path:
     return stage
 
 
-def generate_formats(stage_full: Path, version: str) -> None:
+def generate_formats(stage: Path, version: str) -> None:
     """Run the staged exe with only the bundled decoders, then render docs/formats.*."""
-    exe = stage_full / "rupix.exe"
-    docs = stage_full / "docs"
+    exe = stage / "rupix.exe"
+    docs = stage / "docs"
     sys.path.insert(0, str(ROOT / "build"))
     from deploy import generate_formats as render  # noqa: PLC0415
 
@@ -132,7 +136,7 @@ def generate_formats(stage_full: Path, version: str) -> None:
 def make_zip(seven: str, stage: Path, out: Path) -> None:
     if out.exists():
         out.unlink()
-    run([seven, "a", *ZIP_FLAGS, str(out), stage.name], cwd=OUT)
+    run([seven, "a", *ZIP_FLAGS, str(out), stage.name], cwd=stage.parent)
     listing = subprocess.run(
         [seven, "l", "-slt", str(out)],
         capture_output=True,
@@ -161,20 +165,23 @@ def main() -> None:
     seven = find_7za()
 
     catalog = decoder_catalog()
-    shell = stage_shell(version)
-    full = stage_full(version, catalog)
-    generate_formats(full, version)
+    portable = stage_portable(version, catalog)
+    generate_formats(portable, version)
     # `--list-formats` 会按运行期约定建 temp/ 日志；分发物里不许带运行期落点。
-    shutil.rmtree(full / "temp", ignore_errors=True)
-    shutil.rmtree(full / "cache", ignore_errors=True)
+    shutil.rmtree(portable / "temp", ignore_errors=True)
+    shutil.rmtree(portable / "cache", ignore_errors=True)
 
-    shell_zip = OUT / f"RuPix_{version}.zip"
-    full_zip = OUT / f"RuPix_{version}_full.zip"
-    make_zip(seven, shell, shell_zip)
-    make_zip(seven, full, full_zip)
+    updater_dir = OUT / "updater"
+    updater_dir.mkdir(exist_ok=True)
+    updater = stage_shell(version, updater_dir)
 
-    print(f"[ok] shell {shell_zip}  {shell_zip.stat().st_size} bytes")
-    print(f"[ok] full  {full_zip}  {full_zip.stat().st_size} bytes")
+    portable_zip = OUT / f"RuPix_{version}.zip"
+    updater_zip = updater_dir / f"RuPix_{version}.zip"
+    make_zip(seven, portable, portable_zip)
+    make_zip(seven, updater, updater_zip)
+
+    print(f"[ok] package {portable_zip}  {portable_zip.stat().st_size} bytes")
+    print(f"[ok] updater {updater_zip}  {updater_zip.stat().st_size} bytes")
     print("     baseline decoders: " + ", ".join(BASELINE))
 
 

@@ -8,14 +8,14 @@ RuPix {{VERSION}} - Windows x64
   rupix.exe                        主程序
   LICENSE                          AGPL-3.0 许可全文
   THIRD-PARTY-NOTICES.md           第三方组件声明
-  decoders/                        基础解码器（完整包）
+  decoders/                        基础解码器
     classic / common / modern / pro / raw
   docs/formats.md                  本包实际格式覆盖（按随包解码器生成）
   docs/decoders.json               可下载解码器清单
   docs/plugins.json                可下载插件清单
 
 首次使用
-  完整包已带 5 枚基础解码器：常见位图、旧式位图、现代格式、专业格式、相机 RAW
+  本发布包已带 5 枚基础解码器：常见位图、旧式位图、现代格式、专业格式、相机 RAW
   开箱即用。PDF / PostScript / AI / DXF 等文档格式需要额外的 doc 解码器；
   texture / doc-legacy 也是按需安装。打开「设置 > 解码器 > 可下载」，
   点「刷新」取得清单后安装即可。插件同理，在「设置 > 插件」页下载。
@@ -31,7 +31,7 @@ RuPix {{VERSION}} - Windows x64
   右键菜单    文件 / 最近 / 排序 / 画面 / 本图 / 插件 / 界面 / 主辅视图 / 设置
   系统菜单    右键「系统菜单」弹的是资源管理器对着这个文件右键的那一份，
               打开方式 / 发送到 / 压缩 / 扫描这些由系统与其它程序提供
-  格式覆盖    看 docs/formats.md（完整包按随包 5 枚解码器生成）；
+  格式覆盖    看 docs/formats.md（按随包 5 枚解码器生成）；
               想知道这台机器现在能开什么，运行 rupix.exe --list-formats（一行 JSON）
   卸载        删除本文件夹即可；文件关联可在 Windows「默认应用」里改回
 

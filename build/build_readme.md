@@ -32,23 +32,26 @@
 ```powershell
 cd main
 python build\release_pack.py --version 0.4.0
+python build\gen_update_json.py --version 0.4.0 --asset-tag 0.4.0-update --notes ..\.temp\release-out\RELEASE_NOTES.md
 ```
 
 产出在 `../.temp/release-out/`：
 
-| 包 | 内容 | 用途 |
+| 产物 | 内容 | 用途 |
 |---|---|---|
-| `RuPix_<ver>.zip` | `rupix.exe` / `LICENSE` / `THIRD-PARTY-NOTICES.md` / `README.txt` | 自更新空壳；`update.json` 指向它 |
-| `RuPix_<ver>_full.zip` | 上述四件 + `classic` / `common` / `modern` / `pro` / `raw` 5 枚基础解码器 + 许可目录 + `docs/`（`decoders.json` / `plugins.json` / `MCP接入指南.md` / 本包 `formats.*`） | 首次安装 / 离线；首次打开就有基础图片能力 |
+| `RuPix_<ver>.zip` | `rupix.exe` / `LICENSE` / `THIRD-PARTY-NOTICES.md` / `README.txt` + `classic` / `common` / `modern` / `pro` / `raw` 5 枚基础解码器 + 许可目录 + `docs/`（`decoders.json` / `plugins.json` / `MCP接入指南.md` / 本包 `formats.*`） | **唯一的用户下载包** |
+| `updater/RuPix_<ver>.zip` | 四文件：`rupix.exe` / `LICENSE` / `THIRD-PARTY-NOTICES.md` / `README.txt` | 自动更新信封，放技术 tag `<ver>-update`；不是用户包 |
 
 - `doc`（PDF/PS/AI/DXF，约 26.7 MB）**不进基础包**；`texture` / `doc-legacy` 也不进。
-  三者都在设置页「解码器 → 可下载」按需安装，完整包里的 `docs/decoders.json` 已经列全。
-- 两个包都只带程序与基础解码器，不带 `rupix.ini` / `recent.txt` / `reading.txt` /
-  `cache/` / `temp/` / `plugins/` / 样本图。
+  三者都在设置页「解码器 → 可下载」按需安装，便携包里的 `docs/decoders.json` 已经列全。
+- 两个产物都不带 `rupix.ini` / `recent.txt` / `reading.txt` / `cache/` / `temp/` /
+  `plugins/` / 样本图。
 - 打包固定 7-Zip 标准 ZIP/Deflate（`-mx=9 -mtm=off -mta=off -mtc=off`）；`release_pack.py`
-  会在完整包里重新跑 `--list-formats`，所以 `formats.md|json` 只描述实际随包的 5 枚。
-- 上传：自更新空壳与完整包都要上 Gitee / GitHub 两侧；`update.json` 只指向空壳，且必须
-  等两侧资产上传、`check_update_asset.py` 通过后再推。
+  会在便携包里重新跑 `--list-formats`，所以 `formats.md|json` 只描述实际随包的 5 枚。
+- 上传：便携包放正式 tag `<ver>`；更新信封放技术 tag `<ver>-update`，两侧都要有。
+  `update.json` 只指向信封，且必须等两侧信封上传、`check_update_asset.py` 通过后再推。
+- 为什么信封还留着：0.3.x 的更新器只接受四文件包，ZIP 里多一个 `decoders/` 就拒绝；
+  这不是给用户选的第二个包，只是旧更新器的兼容层。
 
 ## 两条静态体检（只读，可单独跑）
 
