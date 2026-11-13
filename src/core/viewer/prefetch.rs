@@ -441,7 +441,7 @@ impl Viewer {
             self.anim_due_at = None;
         } else {
             let now = Instant::now();
-            let delay = anim_wait(anim.delay_ms);
+            let delay = anim_wait(anim.delay_ms, self.anim_speed);
             let chain = match (self.anim_due_at, self.loaded.as_ref()) {
                 (Some(prev), Some(l)) if l.path == path && l.anim.index != anim.index => {
                     Some(prev + delay)
@@ -487,8 +487,15 @@ impl Viewer {
         //      在 A 图按过 `,` 之后切到 B 图，B 会带着 A 的暂停态打开——表现就是
         //      "GIF 打开不动了"（用户 2026-11-02 报的正是这个，容易误看成按钮没了）。
         if prev_anim.is_none() {
-            self.anim_paused = false;
+            // m334：新图按「动图/文档自动播放」决定起点。静态图没有可播的
+            // 时间线，不挂假暂停态（与 `toggle_anim_pause` 的静图分支同口径）。
+            let autoplay = self.config.borrow().anim_autoplay;
+            let has_index = self.loaded.as_ref().is_some_and(|l| l.anim.has_index());
+            self.anim_paused = !autoplay && has_index;
         }
+        // m333：打开时查到的阅读记忆在这一帧恢复。放在 `rebuild_image` 之前，
+        // 让第一次派生就按记忆里的倍率取档；页码跳转也在这里发（不重解当前帧）。
+        self.apply_pending_reading_restore(&cache_path);
         // 派生线程接得住就让它算；接不住（线程起不来）退回同步——宁可 UI 线程顿一下，
         // 也不许画面停在旧档不动。
         if !(carried.is_some() && self.post_level(want)) {

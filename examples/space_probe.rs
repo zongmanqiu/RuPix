@@ -172,7 +172,7 @@ fn main() {
             // 3s 才稳；生产环境用户早就选好了，这个等待只是探针贴平现场。
             std::thread::sleep(Duration::from_secs(3));
         }
-        let all = |_: &str| true;
+        let all = |_: &std::path::Path| true;
         // 前台取件轮询 10s：窗口注册与选中就绪都可能慢（K38 实测：/select 窗口
         // 前台就绪 ≠ 选择集就绪）。
         let mut got = None;

@@ -28,8 +28,8 @@ pub fn decode(
     region: Option<&RegionReq>,
     max_w: u32,
     max_h: u32,
-) -> Result<Decoded, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("读取失败：{e}"))?;
+) -> Result<Decoded, crate::core::error::ViewFailure> {
+    let bytes = std::fs::read(path).map_err(crate::core::error::ViewFailure::from_io)?;
     decode_bytes(&bytes, region, max_w, max_h)
 }
 
@@ -51,7 +51,8 @@ fn decode_bytes(
     region: Option<&RegionReq>,
     max_w: u32,
     max_h: u32,
-) -> Result<Decoded, String> {
+) -> Result<Decoded, crate::core::error::ViewFailure> {
+    use crate::core::error::ViewFailure;
     use std::borrow::Cow;
     use windui::render::image::Image;
 
@@ -66,14 +67,14 @@ fn decode_bytes(
         flate2::read::GzDecoder::new(bytes)
             .take(SVGZ_MAX_DECOMPRESSED)
             .read_to_end(&mut out)
-            .map_err(|e| format!("svgz 解压失败：{e}"))?;
+            .map_err(|e| ViewFailure::decode(format!("svgz 解压失败：{e}")))?;
         if out.len() as u64 >= SVGZ_MAX_DECOMPRESSED {
-            return Err(format!(
+            return Err(ViewFailure::decode(format!(
                 "svgz 解压结果达到上限（{SVGZ_MAX_DECOMPRESSED} B），疑似恶意构造"
-            ));
+            )));
         }
         if out.is_empty() {
-            return Err("svgz 解压结果为空".into());
+            return Err(ViewFailure::decode("svgz 解压结果为空"));
         }
         Cow::Owned(out)
     } else {
@@ -81,7 +82,8 @@ fn decode_bytes(
     };
     // 只解析拿固有尺寸（不渲染）。早先"先按固有尺寸完整渲一遍只为拿宽高"是
     // 双倍渲染浪费，大 SVG 上直接表现为打开慢。
-    let natural = Image::svg_intrinsic_size(&bytes).map_err(|e| e.to_string())?;
+    let natural =
+        Image::svg_intrinsic_size(&bytes).map_err(|e| ViewFailure::decode(e.to_string()))?;
     log::debug!(
         "svg_decode：解析固有尺寸 {}×{} 用时 {} ms（route={}）",
         natural.0,
@@ -120,7 +122,7 @@ fn decode_bytes(
                     Some(target.0)
                 },
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| ViewFailure::decode(e.to_string()))?;
             (img, None)
         }
         Some(r) => {
@@ -139,8 +141,8 @@ fn decode_bytes(
                 let f = (MAX_PIXELS as f64 / px as f64).sqrt() as f32;
                 k *= f;
             }
-            let img =
-                Image::from_svg_region(&bytes, r.origin, r.size, k).map_err(|e| e.to_string())?;
+            let img = Image::from_svg_region(&bytes, r.origin, r.size, k)
+                .map_err(|e| ViewFailure::decode(e.to_string()))?;
             (
                 img,
                 Some(Region {

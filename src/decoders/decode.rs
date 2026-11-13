@@ -102,7 +102,7 @@ impl Host {
         max_h: u32,
         frame_index: u32,
         allow_scaled: bool,
-    ) -> Option<Result<Decoded, String>> {
+    ) -> Option<Result<Decoded, crate::core::error::ViewFailure>> {
         if safe_mode() {
             return None;
         }
@@ -120,7 +120,7 @@ impl Host {
             match r {
                 Ok(d) => return Some(Ok(d)),
                 // 硬失败（损坏/过大/panic）：换解码器没意义，原错误直接交出去。
-                Err(e) if !e.worth_sniff() => return Some(Err(e.into_msg())),
+                Err(e) if !e.worth_sniff() => return Some(Err(e.into_failure())),
                 // 内容不认 / 本解码器不支持：扩展名只说明"名字像"，内容可能是别的格式
                 // （.jxl 改名 .png 是典型），也可能是冠军刻意让位的子集（CMYK / 调色板
                 // TIFF）。按嗅探榜单逐个再试，见 [`Host::try_chain`]。
@@ -136,7 +136,7 @@ impl Host {
                         max_h,
                         frame_index,
                         allow_scaled,
-                        Some(e.into_msg()),
+                        Some(e.into_failure()),
                     );
                 }
             }
@@ -267,16 +267,16 @@ impl Host {
         max_h: u32,
         frame_index: u32,
         allow_scaled: bool,
-        first_verdict: Option<String>,
-    ) -> Option<Result<Decoded, String>> {
+        first_verdict: Option<crate::core::error::ViewFailure>,
+    ) -> Option<Result<Decoded, crate::core::error::ViewFailure>> {
         let mut first_soft = first_verdict;
         for (_score, key) in ranked {
             match self.decode_with(&key, path, None, max_w, max_h, frame_index, allow_scaled) {
                 Ok(d) => return Some(Ok(d)),
-                Err(e) if !e.worth_sniff() => return Some(Err(e.into_msg())),
+                Err(e) if !e.worth_sniff() => return Some(Err(e.into_failure())),
                 Err(e) => {
                     if first_soft.is_none() {
-                        first_soft = Some(e.into_msg());
+                        first_soft = Some(e.into_failure());
                     }
                 }
             }
@@ -295,7 +295,7 @@ impl Host {
         params: RawParams,
         max_w: u32,
         max_h: u32,
-    ) -> Option<Result<Decoded, String>> {
+    ) -> Option<Result<Decoded, crate::core::error::ViewFailure>> {
         if safe_mode() {
             return None;
         }
@@ -311,20 +311,21 @@ impl Host {
         params: RawParams,
         max_w: u32,
         max_h: u32,
-    ) -> Result<Decoded, String> {
+    ) -> Result<Decoded, crate::core::error::ViewFailure> {
         let (render_raw, last_error, id) = {
             let Some(l) = self.loaded.get(key) else {
-                return Err("解码器已卸载".into());
+                return Err(crate::core::error::ViewFailure::decode("解码器已卸载"));
             };
             (l.sym.render_raw, l.sym.last_error, l.desc.id.clone())
         };
         let Some(render_raw) = render_raw else {
-            return Err(format!(
+            return Err(crate::core::error::ViewFailure::unsupported(format!(
                 "解码器「{id}」不支持裸数据参数化解码（缺少 iv_render_raw 导出）"
-            ));
+            )));
         };
         // 同一枚 DLL 的调用权（见 `dll_lock` 模块头）。
-        let _dll = super::dll_lock::enter(key, &id, self.class())?;
+        let _dll = super::dll_lock::enter(key, &id, self.class())
+            .map_err(crate::core::error::ViewFailure::unsupported)?;
         let mapped = std::fs::File::open(path)
             .ok()
             .and_then(|f| unsafe { memmap2::Mmap::map(&f).ok() });
@@ -332,7 +333,7 @@ impl Host {
         let data: &[u8] = match &mapped {
             Some(m) => &m[..],
             None => {
-                fallback = std::fs::read(path).map_err(|e| format!("读不到文件：{e}"))?;
+                fallback = std::fs::read(path).map_err(crate::core::error::ViewFailure::from_io)?;
                 &fallback
             }
         };
@@ -373,27 +374,39 @@ impl Host {
                 if code == ERR_PANIC {
                     self.penalize(&id);
                 }
-                return Err(describe_code(&id, code, &detail));
+                let msg = describe_code(&id, code, &detail);
+                return Err(if code == ERR_UNSUPPORTED {
+                    crate::core::error::ViewFailure::unsupported(msg)
+                } else {
+                    crate::core::error::ViewFailure::decode(msg)
+                });
             }
             Err(e) => {
                 self.charge_fault(&id, e.as_ref());
-                return Err(format!("解码器「{id}」出错，已隔离"));
+                return Err(crate::core::error::ViewFailure::decode(format!(
+                    "解码器「{id}」出错，已隔离"
+                )));
             }
         }
 
         let (aw, ah) = (info.actual_w, info.actual_h);
         if aw == 0 || ah == 0 {
-            return Err("解码器返回了 0 尺寸".into());
+            return Err(crate::core::error::ViewFailure::decode(
+                "解码器返回了 0 尺寸",
+            ));
         }
         let px = aw as u64 * ah as u64;
         if px > MAX_PIXELS || info.bytes_needed > MAX_PIXELS * 4 {
-            return Err(too_large_msg(aw, ah));
+            return Err(crate::core::error::ViewFailure::decode(too_large_msg(
+                aw, ah,
+            )));
         }
 
         // ② 渲染阶段：宿主按契约分配 `bytes_needed + icc_len`（规范 §十一：ICC 紧跟像素之后）。
         // 两段长度**取查询阶段的值**并在分配前过闸——渲染阶段解码器会覆写 info，之后再读就是拿
         // 解码器自己填的数当分配依据了。
-        let (pix_len, icc_len) = out_segments(&info)?;
+        let (pix_len, icc_len) =
+            out_segments(&info).map_err(crate::core::error::ViewFailure::decode)?;
         let mut buf = vec![0u8; pix_len + icc_len];
         let r = invoke(|| unsafe {
             render_raw(
@@ -415,11 +428,18 @@ impl Host {
                 if code == ERR_PANIC {
                     self.penalize(&id);
                 }
-                return Err(describe_code(&id, code, &detail));
+                let msg = describe_code(&id, code, &detail);
+                return Err(if code == ERR_UNSUPPORTED {
+                    crate::core::error::ViewFailure::unsupported(msg)
+                } else {
+                    crate::core::error::ViewFailure::decode(msg)
+                });
             }
             Err(e) => {
                 self.charge_fault(&id, e.as_ref());
-                return Err(format!("解码器「{id}」出错，已隔离"));
+                return Err(crate::core::error::ViewFailure::decode(format!(
+                    "解码器「{id}」出错，已隔离"
+                )));
             }
         }
         // 渲染成功 = "连续出错"这条链断了，三振计数复位（审计 V10）。
@@ -428,7 +448,8 @@ impl Host {
         // ③ 后处理：与常规路径同一条管线（参数化实现通常恒报 PF_RGBA8，to_rgba8 零拷贝）。
         // ICC 尾段照常取出（相机 RAW 实现实际恒报 0），像素段交给下游。
         let icc = take_icc(&mut buf, pix_len, icc_len);
-        let rgba = to_rgba8(buf, aw, ah, info.pixel_format, info.bit_depth)?;
+        let rgba = to_rgba8(buf, aw, ah, info.pixel_format, info.bit_depth)
+            .map_err(crate::core::error::ViewFailure::decode)?;
         let alpha_format = pixel_format_has_alpha(info.pixel_format);
         let mut bitmap = fit_to_with_alpha(rgba, aw, ah, max_w, max_h, alpha_format);
         apply_icc(&mut bitmap, &icc, path);
@@ -453,7 +474,7 @@ impl Host {
         path: &Path,
         ext: &str,
         region: &crate::core::decode::RegionReq,
-    ) -> Option<Result<Decoded, String>> {
+    ) -> Option<Result<Decoded, crate::core::error::ViewFailure>> {
         if safe_mode() {
             return None;
         }
@@ -567,7 +588,11 @@ impl Host {
                 }
             }
         }
-        Some(Err(last_err))
+        Some(Err(if last_err.is_empty() {
+            crate::core::error::ViewFailure::unsupported("解码器正忙，本次区域重渲没有执行")
+        } else {
+            crate::core::error::ViewFailure::decode(last_err)
+        }))
     }
 
     // 参数平铺：调用面与 ABI 请求面一一对应，见 `core::decode::DecodeBackend::decode` 的同款取舍。
@@ -622,8 +647,7 @@ impl Host {
         let data: &[u8] = match &mapped {
             Some(m) => &m[..],
             None => {
-                fallback =
-                    std::fs::read(path).map_err(|e| Fail::Hard(format!("读不到文件：{e}")))?;
+                fallback = std::fs::read(path).map_err(Fail::Io)?;
                 &fallback
             }
         };

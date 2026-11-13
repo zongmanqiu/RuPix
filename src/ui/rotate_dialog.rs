@@ -14,6 +14,8 @@
 //!
 //! 角度绑定图片路径（[`Chrome::rotate_path`]）：换图后旧值自动失效，不用定时器清，
 //! 也不会串到另一扇窗（每窗一份 `Chrome`）。会话临时态，不落盘、不写 ini。
+//! m329：主窗 tick 在换图时把角度归零并重新绑定——窗留着，但永远对着**当前这张**，
+//! 不会出现"窗还开着、旧角度还在、却对新图不起作用"的孤儿状态。
 //!
 //! ## 版式
 //!
@@ -74,23 +76,31 @@ pub(crate) fn open(ctx: &mut EventCtx, chrome: &Rc<Chrome>, viewer: &Rc<RefCell<
     };
     let scope = super::singleton::window_scope(viewer);
     let key = super::singleton::scoped("rotate", scope);
+
+    // 换图后旧角度失效：登记新路径并归零（与 `LiveTint.path` 同一条判据）。
+    // ★ m329：这段必须在 `window_open` 早退**之前**——否则窗开着时切图，入口被早退
+    //   吞掉，旧路径永远不会重新绑定（用户报障：切图后点入口，当前图没反应）。
+    if chrome.rotate_path.get().as_deref() != Some(path.as_path()) {
+        chrome.rotate_deg.set(0.0);
+        chrome.rotate_base.set(0.0);
+        chrome.rotate_path.set(Some(path.clone()));
+    }
     if windui::event::window_open(&key) {
         return;
     }
 
-    // 换图后旧角度失效：登记新路径并归零（与 `LiveTint.path` 同一条判据）。
-    if chrome.rotate_path.get().as_deref() != Some(path.as_path()) {
-        chrome.rotate_deg.set(0.0);
-        chrome.rotate_path.set(Some(path));
-    }
     let opening = chrome.rotate_deg.get();
+    // 「取消」的基线：本张图打开这扇窗时的角度（切图后已被主窗 tick 归零）。
+    chrome.rotate_base.set(opening);
     // `Signal` 是 Copy：这里拿的是同一格信号的句柄，不是拷贝一份值。
     let sig = chrome.rotate_deg;
 
-    // 「取消」把角度还原到打开这一刻，下一拍 tick 差分感知后主窗转回去。
+    // 「取消」把角度还原到**本张图**的基线，下一拍 tick 差分感知后主窗转回去。
+    // m329：基线读 `rotate_base` 而不是闭包里捕获的 `opening`——切图后基线已归零，
+    // 不能再把上一张的角度盖过来。
     let ch_cancel = chrome.clone();
     let cancel = move |ctx: &mut EventCtx| {
-        ch_cancel.rotate_deg.set(opening);
+        ch_cancel.rotate_deg.set(ch_cancel.rotate_base.get());
         ctx.request_close();
     };
     let confirm = |ctx: &mut EventCtx| ctx.request_close();

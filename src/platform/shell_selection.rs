@@ -85,7 +85,7 @@ pub fn is_typing_context() -> bool {
 ///    `IShellWindows::FindWindowSW(SWC_DESKTOP)` 单独一跳。前置：前台类名是
 ///    Progman/WorkerW 且内含 `SHELLDLL_DefView`（壁纸层的 WorkerW 没有图标视图，
 ///    不加这层守卫会拿错选择集）。
-pub fn foreground_selected_file(allowed: &dyn Fn(&str) -> bool) -> Option<PathBuf> {
+pub fn foreground_selected_file(allowed: &dyn Fn(&std::path::Path) -> bool) -> Option<PathBuf> {
     let _com = ComGuard::new();
     unsafe {
         let fg = GetForegroundWindow();
@@ -207,7 +207,7 @@ pub fn foreground_selected_file(allowed: &dyn Fn(&str) -> bool) -> Option<PathBu
 /// 兜底保留 Items 一条：桌面 defview 对它有响应，主路万一在某代外壳上缺席时不断链。
 unsafe fn selected_via_browser(
     browser_svc: &IShellBrowser,
-    allowed: &dyn Fn(&str) -> bool,
+    allowed: &dyn Fn(&std::path::Path) -> bool,
 ) -> Option<PathBuf> {
     let view = browser_svc.QueryActiveShellView().ok()?;
     if let Some(p) = selection_via_dataobject(&view, allowed) {
@@ -252,7 +252,7 @@ unsafe fn selected_via_browser(
 /// 只认文件系统路径，转不出一样是 `None`，多一路白多一层。
 unsafe fn selection_via_dataobject(
     view: &windows::Win32::UI::Shell::IShellView,
-    allowed: &dyn Fn(&str) -> bool,
+    allowed: &dyn Fn(&std::path::Path) -> bool,
 ) -> Option<PathBuf> {
     use windows::Win32::System::Com::{IDataObject, DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL};
     use windows::Win32::System::Ole::{ReleaseStgMedium, CF_HDROP};
@@ -303,17 +303,18 @@ unsafe fn selection_via_dataobject(
     take_if_allowed(String::from_utf16_lossy(&buf[..end]), allowed)
 }
 
-/// 后缀过滤的唯一出口：空串 / 无后缀 / 非放行后缀一律 `None`。
-fn take_if_allowed(s: String, allowed: &dyn Fn(&str) -> bool) -> Option<PathBuf> {
+/// 准入过滤的唯一出口：空串一律 `None`；其余交给调用方按**完整路径**判。
+///
+/// ★ m331：以前这里先抽 `extension()` 再交给 `allowed(&str)`，无后缀文件在抽扩展名
+///   那一步就 `?` 掉了，调用方永远看不到它。现在把路径整根递出去——由
+///   `formats::is_previewable_path` 决定“已知后缀看清单 / 未知后缀读魔数”。
+fn take_if_allowed(s: String, allowed: &dyn Fn(&std::path::Path) -> bool) -> Option<PathBuf> {
     if s.is_empty() {
         return None;
     }
-    let ext = std::path::Path::new(&s)
-        .extension()?
-        .to_string_lossy()
-        .to_lowercase();
-    if allowed(&ext) {
-        Some(PathBuf::from(s))
+    let p = PathBuf::from(s);
+    if allowed(&p) {
+        Some(p)
     } else {
         None
     }

@@ -339,8 +339,8 @@ pub struct Done {
     /// 与发起请求时相同的世代号。
     pub seq: u64,
     pub path: PathBuf,
-    /// `Ok` 里带原图尺寸 + 位图；`Err` 是可直接显示给用户的人话。
-    pub out: Result<Decoded, String>,
+    /// `Ok` 里带原图尺寸 + 位图；`Err` 是带分类的判词（显示用标题 + 原文）。
+    pub out: Result<Decoded, crate::core::error::ViewFailure>,
 }
 
 /// 查询阶段的元信息（**未经渲染确认**，仅用于提前反馈给 UI）。
@@ -846,7 +846,7 @@ pub trait DecodeBackend: Send {
         frame_index: u32,
         raw: Option<RawParams>,
         allow_scaled: bool,
-    ) -> Result<Decoded, String>;
+    ) -> Result<Decoded, crate::core::error::ViewFailure>;
 
     /// 本次请求是**后台预取**还是用户正等的那一笔（m237）。
     ///
@@ -869,7 +869,7 @@ pub trait DecodeBackend: Send {
         path: &Path,
         ext: &str,
         region: &RegionReq,
-    ) -> Option<Result<Decoded, String>> {
+    ) -> Option<Result<Decoded, crate::core::error::ViewFailure>> {
         let _ = (path, ext, region);
         None
     }
@@ -879,7 +879,8 @@ pub trait DecodeBackend: Send {
 ///
 /// ★ 这条槽**只服务内置 svg/svgz**：解码器认领的矢量格式一律由**解码器自己**渲染
 /// （宪章 §5.2），宿主不再接受"解码器交出矢量文档、宿主用 resvg 渲染"那条路。
-pub type SvgDecodeFn = fn(&Path, Option<&RegionReq>, u32, u32) -> Result<Decoded, String>;
+pub type SvgDecodeFn =
+    fn(&Path, Option<&RegionReq>, u32, u32) -> Result<Decoded, crate::core::error::ViewFailure>;
 
 static BACKEND: std::sync::OnceLock<std::sync::Mutex<Box<dyn DecodeBackend>>> =
     std::sync::OnceLock::new();
@@ -931,16 +932,23 @@ pub fn set_svg_decoder(f: SvgDecodeFn) {
 
 /// 在后端上跑一次解码。未装入时返回可诊断的错误，不 panic——
 /// 启动顺序错位只影响解码，不该把进程带崩。
-fn with_backend<T>(f: impl FnOnce(&mut dyn DecodeBackend) -> T) -> Result<T, String> {
+fn with_backend<T>(
+    f: impl FnOnce(&mut dyn DecodeBackend) -> T,
+) -> Result<T, crate::core::error::ViewFailure> {
+    use crate::core::error::ViewFailure;
     // ★ 解码 worker 线程：用**自己那份**后端（见 [`BackendFactory`]）。
     if LOCAL_BACKEND.with(|b| b.borrow().is_some()) {
         return LOCAL_BACKEND.with(|b| match b.borrow_mut().as_mut() {
             Some(backend) => Ok(f(&mut **backend)),
-            None => Err("解码后端未安装（启动装配遗漏 install_decode_stack）".into()),
+            None => Err(ViewFailure::decode(
+                "解码后端未安装（启动装配遗漏 install_decode_stack）",
+            )),
         });
     }
     let Some(m) = BACKEND.get() else {
-        return Err("解码后端未安装（启动装配遗漏 install_decode_stack）".into());
+        return Err(ViewFailure::decode(
+            "解码后端未安装（启动装配遗漏 install_decode_stack）",
+        ));
     };
     let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
     Ok(f(&mut **g))
@@ -1127,7 +1135,7 @@ fn note_hung(id: &str) {
 
 /// 一笔解码作业（worker → 监督者）。
 struct JobDone {
-    out: Result<Decoded, String>,
+    out: Result<Decoded, crate::core::error::ViewFailure>,
 }
 
 /// 解码 worker：一条长驻线程 + 一份**私有后端**（[`BackendFactory`]）。
@@ -1156,7 +1164,11 @@ impl Worker {
     }
 
     /// 跑一笔。`None` = 超时，或 worker 已经没了（调用方负责熔断与换 worker）。
-    fn run(&self, req: &Req, timeout: Option<Duration>) -> Option<Result<Decoded, String>> {
+    fn run(
+        &self,
+        req: &Req,
+        timeout: Option<Duration>,
+    ) -> Option<Result<Decoded, crate::core::error::ViewFailure>> {
         self.job_tx.send(req.clone()).ok()?;
         let got = match timeout {
             Some(t) => self.res_rx.recv_timeout(t),
@@ -1274,7 +1286,7 @@ fn decode_loop(
             // Done 用 Err 空串占位——`viewer::apply` 的过期分支只看 seq，不进错误
             // 弹窗；预读分支见 Err 不 cache，只清 prefetch_seq。空串确保万一路径
             // 撞进错误显示也不出乱码。
-            Err(String::new())
+            Err(crate::core::error::ViewFailure::other(""))
         } else {
             match worker.run(&req, timeout) {
                 Some(out) => out,
@@ -1298,7 +1310,11 @@ fn decode_loop(
                         current_phase()
                     );
                     worker = Worker::spawn(meta_tx.clone());
-                    Err(hang_error(&req, hung.as_deref(), timeout))
+                    Err(crate::core::error::ViewFailure::decode(hang_error(
+                        &req,
+                        hung.as_deref(),
+                        timeout,
+                    )))
                 }
             }
         };
@@ -1333,7 +1349,7 @@ fn decode_loop(
 ///   同一张图在两台机器上必须解出同一个结果（宪章 §5.1）。
 ///   （2026-10-10 删的是**WIC 兜底**，2026-10-20 它以"可被点名的内置库"回归、
 ///   2026-10-25 又整层删掉——三段历史都不改"兜底永远不做"这条底线。）
-fn decode_one(req: &Req) -> Result<Decoded, String> {
+fn decode_one(req: &Req) -> Result<Decoded, crate::core::error::ViewFailure> {
     set_phase(PHASE_OPEN);
     // 排队优先级（m237）：预取让位给用户正等的那一笔——跨窗共用同一枚 DLL 时，
     // "没人等的下一张"不该挡在前面。后端实例是长驻的，所以**每次请求都要设**。
@@ -1341,8 +1357,16 @@ fn decode_one(req: &Req) -> Result<Decoded, String> {
     let _ = with_backend(|b| b.set_background(req.kind == ReqKind::Prefetch));
     // 0 字节没有可解码的字节：在路由之前直说。交给后端的话，解码器探测只会答
     // 「不认识这个文件」——把"文件是空的"说成"格式不认"，排查方向就反了。
-    if std::fs::metadata(&req.path).is_ok_and(|m| m.len() == 0) {
-        return Err("文件是空的（0 字节）".into());
+    // 同一笔 stat 顺带把"文件不在 / 读不到"分类成 FileMissing / Other：比让每个
+    // 解码器各报一次 I/O 错误更早、更一致（无后缀文件也走得到这里）。
+    match std::fs::metadata(&req.path) {
+        Ok(m) if m.len() == 0 => {
+            return Err(crate::core::error::ViewFailure::decode(
+                "文件是空的（0 字节）",
+            ))
+        }
+        Err(e) => return Err(crate::core::error::ViewFailure::from_io(e)),
+        Ok(_) => {}
     }
     let ext = req
         .path
@@ -1356,12 +1380,15 @@ fn decode_one(req: &Req) -> Result<Decoded, String> {
     // 压缩档（WebP/QOI）且限尺寸。跨会话重开省的那 100–340 ms 不值这个形态。
     // 会话内的加速由另外两层负责，都不落盘：`viewer` 的邻图预读（视口档，RAM）与
     // 换档本地派生（整图已在内存）。
-    catch_unwind(AssertUnwindSafe(|| decode_route(req, &ext)))
-        .unwrap_or_else(|_| Err("解码时发生内部错误（已拦截，不影响后续图片）".into()))
+    catch_unwind(AssertUnwindSafe(|| decode_route(req, &ext))).unwrap_or_else(|_| {
+        Err(crate::core::error::ViewFailure::decode(
+            "解码时发生内部错误（已拦截，不影响后续图片）",
+        ))
+    })
 }
 
 /// 真正的解码路由：内置库（按登记表认领）交内置实现，其余交后端。见 [`decode_one`] 的口径说明。
-fn decode_route(req: &Req, ext: &str) -> Result<Decoded, String> {
+fn decode_route(req: &Req, ext: &str) -> Result<Decoded, crate::core::error::ViewFailure> {
     // 内置路**按登记表认领**，不再在这里硬编码后缀（m56）：清单真源是
     // [`crate::core::formats::BUILTIN_DECODERS`]，`gallery` 的后缀判定与设置页的候选
     // 都从同一张表派生，所以"清单里有、路由不接"这种半拉子状态结构上不可能出现。
@@ -1377,14 +1404,17 @@ fn decode_route(req: &Req, ext: &str) -> Result<Decoded, String> {
                 // 矢量要按**目标尺寸**光栅化才有无损放大，与"位图解码后缩放"本质不同，
                 // 所以它带 region 而不是 frame_index/allow_scaled。
                 let f = SVG.get().ok_or_else(|| {
-                    format!("内置解码库「{}」未装入（启动装配遗漏 install_decode_stack）", b.id)
+                    crate::core::error::ViewFailure::decode(format!(
+                        "内置解码库「{}」未装入（启动装配遗漏 install_decode_stack）",
+                        b.id
+                    ))
                 })?;
                 return f(&req.path, req.region.as_ref(), req.max_w, req.max_h);
             }
             other => {
-                return Err(format!(
+                return Err(crate::core::error::ViewFailure::decode(format!(
                     "内置解码库「{other}」在登记表里标了 auto_claim，但路由没有它的分支（登记表与路由脱节）"
-                ))
+                )))
             }
         }
     }
@@ -1446,7 +1476,7 @@ pub fn probe_decode(path: &Path, max_w: u32, max_h: u32) -> Result<Decoded, Stri
         kind: ReqKind::Main,
         allow_scaled: false,
     };
-    decode_one(&req)
+    decode_one(&req).map_err(|e| e.detail)
 }
 
 /// 同 [`probe_decode`]，但点亮**原生降采样**（[`Decoder::request_frame_scaled`] 的
@@ -1463,7 +1493,7 @@ pub fn probe_scaled(path: &Path, max_w: u32, max_h: u32) -> Result<Decoded, Stri
         kind: ReqKind::Main,
         allow_scaled: true,
     };
-    decode_one(&req)
+    decode_one(&req).map_err(|e| e.detail)
 }
 
 /// 缩略图口径的探针：与 [`probe_decode`] 走**同一条生产链路**，但请求语义换成
@@ -1483,7 +1513,7 @@ pub fn probe_thumb(path: &Path, max_w: u32, max_h: u32) -> Result<Decoded, Strin
         kind: ReqKind::Thumb,
         allow_scaled: false,
     };
-    decode_one(&req)
+    decode_one(&req).map_err(|e| e.detail)
 }
 
 /// 同 [`probe_decode`]，但解码动画的第 `frame_index` 帧（0 起）。
@@ -1507,7 +1537,7 @@ pub fn probe_decode_frame(
         kind: ReqKind::Main,
         allow_scaled: false,
     };
-    decode_one(&req)
+    decode_one(&req).map_err(|e| e.detail)
 }
 
 /// 同 [`probe_decode_frame`]，但点亮原生降采样；辅图首屏用。
@@ -1528,7 +1558,7 @@ pub fn probe_scaled_frame(
         kind: ReqKind::Main,
         allow_scaled: true,
     };
-    decode_one(&req)
+    decode_one(&req).map_err(|e| e.detail)
 }
 
 #[cfg(test)]
@@ -1651,12 +1681,12 @@ pub(crate) mod tests {
         let h = thread::spawn(move || {
             let _ = job_rx.recv();
             let _ = res_tx.send(JobDone {
-                out: Err("boom".into()),
+                out: Err(crate::core::error::ViewFailure::decode("boom")),
             });
         });
         let w = Worker { job_tx, res_rx };
         let got = w.run(&req(2, ReqKind::Main), Some(Duration::from_secs(1)));
-        assert!(matches!(got, Some(Err(m)) if m == "boom"));
+        assert!(matches!(got, Some(Err(m)) if m.detail == "boom"));
         let _ = h.join();
     }
 
@@ -1793,14 +1823,14 @@ pub(crate) mod tests {
         let d1 = done_rx.recv().expect("应有 50 号 Done");
         assert_eq!(d1.seq, 50);
         assert!(
-            matches!(&d1.out, Err(s) if s.is_empty()),
+            matches!(&d1.out, Err(s) if s.detail.is_empty()),
             "过期 Main 应发空串 Err 早退，实际 {d1:?}"
         );
 
         let d2 = done_rx.recv().expect("应有 99 号 Done");
         assert_eq!(d2.seq, 99);
         assert!(
-            matches!(&d2.out, Err(s) if s.is_empty()),
+            matches!(&d2.out, Err(s) if s.detail.is_empty()),
             "过期 Prefetch 应发空串 Err 早退"
         );
 
@@ -1827,7 +1857,7 @@ pub(crate) mod tests {
             let d = done_rx.recv().expect("应有 Done");
             assert_eq!(d.seq, seq);
             assert!(
-                matches!(&d.out, Err(s) if !s.is_empty()),
+                matches!(&d.out, Err(s) if !s.detail.is_empty()),
                 "seq={seq} 不该被取消，应走真解码并拿到非空 Err"
             );
         }
@@ -1847,6 +1877,24 @@ pub(crate) mod tests {
             msg.contains("空的"),
             "0 字节文件应直说为空，而不是转述解码器认不认：{msg}"
         );
+    }
+
+    /// 文件不在时必须在**路由之前**判成 FileMissing（无后缀文件也走得到），
+    /// 而不是让“没人认领”把它说成 Unsupported。
+    #[test]
+    fn missing_file_is_file_missing_before_routing() {
+        let p = crate::core::paths::test_scratch_root()
+            .join(format!("rupix_missing_{}.png", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let mut r = req(0, ReqKind::Main);
+        r.path = p;
+        let failure = decode_one(&r).expect_err("不存在的文件不该解码成功");
+        assert_eq!(
+            failure.kind,
+            crate::core::error::FailureKind::FileMissing,
+            "实得 {failure:?}"
+        );
+        assert!(!failure.detail.is_empty(), "OS 原文必须保留");
     }
 
     /// 主画面回包必须叫醒 UI，缩略图/预读不许。

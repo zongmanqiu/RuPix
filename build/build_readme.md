@@ -25,6 +25,31 @@
 
 `build.bat` 是留在原地的旧入口名，跑的就是 `full.bat` 这一条六步流水线。
 
+## 发布包（六步之后，人工/发布脚本）
+
+`full.bat` 只把产物落到 `.build\`；release 资产由 `release_pack.py` 从 `.build\` 生成：
+
+```powershell
+cd main
+python build\release_pack.py --version 0.4.0
+```
+
+产出在 `../.temp/release-out/`：
+
+| 包 | 内容 | 用途 |
+|---|---|---|
+| `RuPix_<ver>.zip` | `rupix.exe` / `LICENSE` / `THIRD-PARTY-NOTICES.md` / `README.txt` | 自更新空壳；`update.json` 指向它 |
+| `RuPix_<ver>_full.zip` | 上述四件 + `classic` / `common` / `modern` / `pro` / `raw` 5 枚基础解码器 + 许可目录 + `docs/`（`decoders.json` / `plugins.json` / `MCP接入指南.md` / 本包 `formats.*`） | 首次安装 / 离线；首次打开就有基础图片能力 |
+
+- `doc`（PDF/PS/AI/DXF，约 26.7 MB）**不进基础包**；`texture` / `doc-legacy` 也不进。
+  三者都在设置页「解码器 → 可下载」按需安装，完整包里的 `docs/decoders.json` 已经列全。
+- 两个包都只带程序与基础解码器，不带 `rupix.ini` / `recent.txt` / `reading.txt` /
+  `cache/` / `temp/` / `plugins/` / 样本图。
+- 打包固定 7-Zip 标准 ZIP/Deflate（`-mx=9 -mtm=off -mta=off -mtc=off`）；`release_pack.py`
+  会在完整包里重新跑 `--list-formats`，所以 `formats.md|json` 只描述实际随包的 5 枚。
+- 上传：自更新空壳与完整包都要上 Gitee / GitHub 两侧；`update.json` 只指向空壳，且必须
+  等两侧资产上传、`check_update_asset.py` 通过后再推。
+
 ## 两条静态体检（只读，可单独跑）
 
 ```

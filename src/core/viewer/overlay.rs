@@ -13,8 +13,11 @@ impl Viewer {
     }
 
     /// 解码错误文本（画布居中显示用）。`None` = 没有错误。
+    ///
+    /// 返回的是已经排好的两行：分类标题 + 下一步提示（原文判词见 `ViewFailure::detail`，
+    /// 已由 `fail` / `report_failure` 写进日志）。
     pub fn error_text(&self) -> Option<String> {
-        self.error.clone()
+        self.error.as_ref().map(ViewFailure::display_text)
     }
 
     /// 原图像素尺寸（「文件信息」菜单用）。

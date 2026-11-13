@@ -357,6 +357,9 @@ pub fn open_decoder_info(
     let abi = e
         .abi
         .map_or_else(|| "（未知）".to_string(), |n| n.to_string());
+    let health = e.health.clone();
+    let health_label = health.label();
+    let skipped = matches!(health, Health::LoadSkipped);
     let exts = if e.extensions.is_empty() {
         "（无）".to_string()
     } else {
@@ -400,6 +403,25 @@ pub fn open_decoder_info(
         }
     };
 
+    // 清除上次崩溃留下的 `<dll>.loading`，然后重扫触发一次重新加载。
+    // 这是用户显式选择"再试一次"；如果 DLL 仍然崩，宿主会再次留下标记。
+    let retry = {
+        let h = *h;
+        let config = config.clone();
+        let path = e.path.clone();
+        move |ctx: &mut EventCtx| {
+            match crate::decoders::clear_load_marker(&path) {
+                Ok(()) => {
+                    h.refresh_after_dir_change(&config.borrow());
+                    ctx.toast_ok("已清除加载标记，正在重试");
+                    ctx.request_close();
+                }
+                Err(err) => ctx.toast_err(format!("清除加载标记失败：{err}")),
+            }
+            ctx.mark_dirty();
+        }
+    };
+
     // 字段按用户口径「够用+重要」定，值一律取自 DLL 自述（除文件名派生的 DLL 版本、
     let content = move || {
         Element::scroll()
@@ -413,6 +435,7 @@ pub fn open_decoder_info(
                     .child(row("标识", e.id.clone()))
                     .child(row("版本", ver.clone()))
                     .child(row("ABI 版本", abi.clone()))
+                    .child(row("状态", health_label.clone()))
                     .child(row("作者", author.clone()))
                     .child(row("许可证", license.clone()))
                     .child(row("发行时间", released.clone()))
@@ -422,6 +445,20 @@ pub fn open_decoder_info(
                     .child(divider())
                     .child(row("大小", size.clone()))
                     .child(row("DLL 文件", e.file.clone()))
+                    .child(
+                        Element::row()
+                            .fill()
+                            .cross(Align::Center)
+                            .padding_xy(0, 8)
+                            .child(
+                                Element::label("上次加载时宿主崩溃，本次已跳过。")
+                                    .font_size(FONT_MD)
+                                    .fg(to_color(TEXT_SECONDARY))
+                                    .weight(1.0),
+                            )
+                            .child(btn("清除标记并重试").on_click(retry))
+                            .visible_when(move || skipped),
+                    )
                     .child(Element::leaf().height(10))
                     // 卸载按钮：走主题 `danger` 语义（红底 + 圆角，与"窗口/工具栏
                     // 里的危险操作按钮"同源），不硬编 bg/fg 破坏主题。右对齐。
@@ -503,6 +540,7 @@ pub mod tests {
             long_fit: sig(false),
             dcb: signal(0),
             slide_secs: signal("3".into()),
+            anim_speed: signal(2),
             wheel: signal(0),
             ctrl_wheel: signal(0),
             alt_wheel: signal(3),
@@ -511,8 +549,10 @@ pub mod tests {
             borderless: sig(false),
             win_size: signal(String::new()),
             prefetch: signal(false),
+            anim_autoplay: sig(true),
             to_tray: sig(false),
             space_preview: sig(false),
+            space_hold_close: sig(false),
             drag_image: sig(false),
             show_toolbar_buttons: sig(true),
             filmstrip_pos: signal(0),

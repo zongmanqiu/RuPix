@@ -19,8 +19,8 @@ use windui::signal::{signal, Signal};
 
 use super::update_state::UpdateState;
 use crate::core::config::{
-    clamp_window_size, opacity_to_slider, slider_to_opacity, Config, CtrlWheel, DblClick,
-    InitWindow, SourceId, UiTheme, Wheel,
+    clamp_window_size, opacity_to_slider, slider_to_opacity, AnimSpeed, Config, CtrlWheel,
+    DblClick, InitWindow, SourceId, UiTheme, Wheel,
 };
 use crate::core::hotkey::{Action, Hotkey};
 use crate::core::util::fmt_bytes;
@@ -149,7 +149,7 @@ impl Card {
     }
 }
 
-/// 缩略图条三态的标签（m262）：设置页下拉与右键「外观 ▸ 缩略图条」**共用这一根轴**，
+/// 缩略图条三态的标签（m262）：设置页下拉与右键「界面 ▸ → 缩略图条」**共用这一根轴**，
 /// 下标就是档位。配置层仍是 `filmstrip` + `filmstrip_left` 两个 bool ini 键，
 /// 翻译只在这两个函数里发生一次，两处 UI 不许各写一套。
 pub(crate) const FILMSTRIP_POS: [&str; 3] = ["关闭", "下方", "左侧"];
@@ -195,6 +195,11 @@ pub struct Handles {
     /// 只存**间隔**，不存"是不是在放"——放映是会话态，关窗即停（见 `Chrome::toggle_slideshow`）。
     /// 用文本框而不是下拉（用户 2026-10-31 点名）：秒数是整数，四档下拉是把整数轴压成档位。
     pub slide_secs: Signal<String>,
+    /// 动图/文档播放速度（下拉：0.25× … 8×；ini 键 `anim_speed`，默认 1×）。
+    ///
+    /// 与右键「画面 ▸ → 动图/文档播放速度 ▸」写同一份配置；`runtime` 每帧把配置
+    /// 对齐给 `Viewer`，改速只重排下一帧、不重解当前帧。
+    pub anim_speed: Signal<usize>,
     pub wheel: Signal<usize>,
     pub ctrl_wheel: Signal<usize>,
     /// Alt+滚轮（m278）：与上面两行共用同一张定制下拉，出厂「无」。
@@ -210,16 +215,22 @@ pub struct Handles {
     pub win_size: Signal<String>,
     /// 图片预读开关（ini 键 prefetch 的 UI 写点）：邻图 ±N + 缩略图条可见一屏。
     /// 默认开：关掉它是给低配机 / 省电用的。
-    /// ★ m266：这一行住「看图」卡（m273 前叫「看图与操作」），与「适应长图」「幻灯片间隔」同组。
+    /// ★ m266：这一行住「画面」卡（m273 前叫「看图与操作」，m328 前叫「看图」），与「适应长图」「幻灯片间隔」同组。
     pub prefetch: Signal<bool>,
+    /// 动图 / 分页文档打开后自动播放（ini 键 `anim_autoplay`，m334）。默认开；
+    /// 关掉后新图停在第 0 帧/页，P 键仍可手动开始。
+    pub anim_autoplay: Signal<bool>,
     pub to_tray: Signal<bool>,
     /// 空格预览总开关（ini 键 space_preview 的 UI 写点）。默认关：抢占空格是强行为。
     pub space_preview: Signal<bool>,
+    /// 空格预览里长按松手收起（ini 键 space_hold_close 的 UI 写点）。默认关；
+    /// 只在「空格看图」开启时有意义，所以那一行跟着它置灰。
+    pub space_hold_close: Signal<bool>,
     /// 左键拖动的分工（ini 键 drag_image 的 UI 写点）。默认开 = 画布里拖图片、
     /// 标题栏拖窗口；判据本体在 `ui::canvas::left_drag`。
     pub drag_image: Signal<bool>,
     /// 底部浮条显不显示操作按钮（ini 键 show_toolbar_buttons，m245）。默认开；
-    /// 关掉 = 只留信息并水平居中。同一个开关也在右键「外观 ▸」里。
+    /// 关掉 = 只留信息并水平居中。同一个开关也在右键「界面 ▸」里。
     pub show_toolbar_buttons: Signal<bool>,
     /// 多开开关（ini 键 allow_multiple 的 UI 写点）。默认关 = 单窗口（二次启动就地换图）；
     /// 开 = 二次启动在同一进程里新开一扇窗口，进程与托盘仍只有一个。
@@ -379,6 +390,12 @@ impl Handles {
                 dirty = true;
             }
         }
+        // ini 键：anim_speed（0.25× / 0.5× / 1× / 2× / 4× / 8×）。
+        let speed = AnimSpeed::from_ui_index(self.anim_speed.get());
+        if c.anim_speed != speed {
+            c.anim_speed = speed;
+            dirty = true;
+        }
         // ini 键：wheel_behavior（滚轮：0 缩放 / 1 翻页，设置页「滚轮行为」下拉）
         let wh = Wheel::from_index(self.wheel.get() as i64);
         if c.wheel != wh {
@@ -420,8 +437,16 @@ impl Handles {
             }
         }
         set(&mut dirty, &mut c.prefetch, self.prefetch.get());
+        // ini 键：anim_autoplay（默认开）。关掉后新图停在第 0 帧/页；
+        // runtime 差分时也会把当前这张一并暂停/恢复。
+        set(&mut dirty, &mut c.anim_autoplay, self.anim_autoplay.get());
         set(&mut dirty, &mut c.close_to_tray, self.to_tray.get());
         set(&mut dirty, &mut c.space_preview, self.space_preview.get());
+        set(
+            &mut dirty,
+            &mut c.space_hold_close,
+            self.space_hold_close.get(),
+        );
         set(&mut dirty, &mut c.drag_image, self.drag_image.get());
         set(
             &mut dirty,
@@ -569,6 +594,7 @@ impl Handles {
         };
         put_u(&self.filmstrip_pos, filmstrip_index(c));
         put_u(&self.dcb, c.dbl_click.index() as usize);
+        put_u(&self.anim_speed, c.anim_speed.ui_index());
         put_u(&self.wheel, c.wheel.index() as usize);
         put_u(&self.ctrl_wheel, c.ctrl_wheel.index() as usize);
         put_u(&self.alt_wheel, c.alt_wheel.index() as usize);
@@ -582,8 +608,10 @@ impl Handles {
             self.plugin.source_changed();
         }
         put_b(&self.prefetch, c.prefetch);
+        put_b(&self.anim_autoplay, c.anim_autoplay);
         put_b(&self.to_tray, c.close_to_tray);
         put_b(&self.space_preview, c.space_preview);
+        put_b(&self.space_hold_close, c.space_hold_close);
         put_b(&self.drag_image, c.drag_image);
         put_b(&self.show_toolbar_buttons, c.show_toolbar_buttons);
         put_b(&self.allow_multiple, c.allow_multiple);
@@ -874,6 +902,7 @@ pub(crate) fn settings_window(config: &Rc<RefCell<Config>>, hub: &Hub) -> Window
             long_fit: sig(c.long_image_fit),
             dcb: signal(c.dbl_click.index() as usize),
             slide_secs: signal(c.slide_interval.to_string()),
+            anim_speed: signal(c.anim_speed.ui_index()),
             wheel: signal(c.wheel.index() as usize),
             ctrl_wheel: signal(c.ctrl_wheel.index() as usize),
             alt_wheel: signal(c.alt_wheel.index() as usize),
@@ -882,8 +911,10 @@ pub(crate) fn settings_window(config: &Rc<RefCell<Config>>, hub: &Hub) -> Window
             borderless: sig(c.borderless),
             win_size: signal(format!("{}, {}", c.window_w, c.window_h)),
             prefetch: sig(c.prefetch),
+            anim_autoplay: sig(c.anim_autoplay),
             to_tray: sig(c.close_to_tray),
             space_preview: sig(c.space_preview),
+            space_hold_close: sig(c.space_hold_close),
             drag_image: sig(c.drag_image),
             show_toolbar_buttons: sig(c.show_toolbar_buttons),
             allow_multiple: sig(c.allow_multiple),
@@ -1222,6 +1253,7 @@ pub(crate) mod tests {
             long_fit: sig(false),
             dcb: signal(0),
             slide_secs: signal("3".into()),
+            anim_speed: signal(2),
             wheel: signal(0),
             ctrl_wheel: signal(0),
             alt_wheel: signal(3),
@@ -1230,8 +1262,10 @@ pub(crate) mod tests {
             borderless: sig(false),
             win_size: signal(String::new()),
             prefetch: signal(false),
+            anim_autoplay: sig(true),
             to_tray: sig(false),
             space_preview: sig(false),
+            space_hold_close: sig(false),
             drag_image: sig(false),
             show_toolbar_buttons: sig(true),
             allow_multiple: sig(false),
@@ -1479,7 +1513,7 @@ pub(crate) mod tests {
         assert_eq!(
             cards.len(),
             4,
-            "选项页应有四张卡：外观 / 窗口 / 看图 / 系统"
+            "选项页应有四张卡：看图 / 界面 / 窗口 / 系统"
         );
         // m244：系统与网络卡 2→3（新增「文件关联」入口行——它没有 ini 键，状态住注册表）。
         // m246：外观卡 5→6（补「缩略图条」），整页 17→18 行。
@@ -1489,7 +1523,14 @@ pub(crate) mod tests {
         // m269：窗口卡 5→6（新增「无边框」），启动窗口同时收成二选一；整页 18→19 行。
         // m273：只重排窗口卡与看图卡的卡内项序、第三张卡改名「看图」——**行数一个没变**，
         //   所以下面这组数是"重排没顺手丢一项 / 没顺手多塞一项"的守门员。
-        let want = [6, 6, 5, 2];
+        // m324：看图卡 5→6（新增「长按空格松手收起」），整页 19→20 行。
+        // m328：外观→界面（看图保持原名，只搬走空格两项到窗口）；
+        //   四卡 6/6/6/2 → 4/6/8/2，整页仍 20 行。
+        // m332：看图卡 4→5（新增「播放倍速」，m335 改名「动图/文档播放速度」），
+        //   整页 20→21 行。
+        // m334：看图卡 5→6（新增「动图/文档自动播放」），整页 21→22 行。
+        // m335：速度行与「幻灯片间隔」交换，行数不变。
+        let want = [6, 6, 8, 2];
         let mut rows = 0;
         for (i, (card, n)) in cards.iter().zip(want).enumerate() {
             let node = tree.get(*card).expect("卡");
@@ -1503,14 +1544,15 @@ pub(crate) mod tests {
             assert_eq!(got, n, "卡 {i} 行数不对（分组串位了？）");
             rows += got;
         }
-        assert_eq!(rows, 19, "19 项一项都不能在分组里丢");
+        assert_eq!(rows, 22, "22 项一项都不能在分组里丢");
 
-        let expanded_card_h = tree.get(cards[1]).expect("窗口卡").bounds.h;
+        // m328：卡序变成 看图 / 界面 / 窗口 / 系统，窗口卡是第 3 张。
+        let expanded_card_h = tree.get(cards[2]).expect("窗口卡").bounds.h;
         let expanded_content_h = tree.get(root).expect("页面").content_h;
         h.card_window.set(false);
         tree.layout_root(size, &mut NullTextEngine);
         assert_eq!(
-            tree.get(cards[1]).expect("窗口卡").bounds.h,
+            tree.get(cards[2]).expect("窗口卡").bounds.h,
             CARD_HEADER_H,
             "收起「窗口」后卡片应只剩标题条那么高"
         );
@@ -1521,7 +1563,7 @@ pub(crate) mod tests {
         h.card_window.set(true);
         tree.layout_root(size, &mut NullTextEngine);
         assert_eq!(
-            tree.get(cards[1]).expect("窗口卡").bounds.h,
+            tree.get(cards[2]).expect("窗口卡").bounds.h,
             expanded_card_h,
             "再点「窗口」应展开回原高"
         );

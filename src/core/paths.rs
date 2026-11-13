@@ -11,16 +11,18 @@
 //! 3. **卸载残留**：删掉目录还留下一份文件在看不见的地方，与"拷走即用、删掉即净"
 //!    的便携前提冲突。
 //!
-//! 因此**任何**持久化只往一个地方写：`exe` 的同级目录——其中**用户要看的**（配置）
-//! 直接放在根，**只用来取证的**（日志、转储、会话戳）收进根下的 `temp\` 一枚子目录，
-//! 按天命名、启动时清掉 7 天之前的（`KEEP_DAYS`）；**纯提速件**（丢了你只会觉得
-//! 慢一点，如 SVG 字体索引缓存）收进根下的 `cache\`，不参与按天清理。根目录里
-//! 因此只剩 `rupix.ini` 与 `decoders\`，一眼看得完；删目录仍然即净卸载（`temp\`
-//! 与 `cache\` 都在目录里）。外部目录一个字节都不碰。
+//! 因此**任何**持久化只往一个地方写：`exe` 的同级目录——其中**用户要看的**（配置、
+//! 最近打开列表、阅读位置）直接放在根，**只用来取证的**（日志、转储、会话戳）收进根下的
+//! `temp\` 一枚子目录，按天命名、启动时清掉 7 天之前的（`KEEP_DAYS`）；**纯提速件**
+//! （丢了你只会觉得慢一点，如 SVG 字体索引缓存）收进根下的 `cache\`，不参与按天清理。
+//! 根目录里因此只剩 `rupix.ini`、`recent.txt`、`reading.txt` 与 `decoders\`，一眼看得完；
+//! 删目录仍然即净卸载（`temp\` 与 `cache\` 都在目录里）。外部目录一个字节都不碰。
 //!
 //! | 产物           | 路径                          |
 //! |----------------|-------------------------------|
 //! | 配置文件       | `<exe 目录>/rupix.ini`    |
+//! | 最近打开列表   | `<exe 目录>/recent.txt`（一行一个路径，最多 100 条） |
+//! | 阅读位置       | `<exe 目录>/reading.txt`（一本"书"一行，最多 200 条） |
 //! | 解码器清单     | `<exe 目录>/docs/decoders.json`（发布随包提供；「刷新」时覆盖） |
 //! | 运行日志       | `<exe 目录>/temp/rupix-<YYYY-MM-DD>.log`（按天，写满即停见 `RUN_LOG_MAX_BYTES`） |
 //! | 崩溃报告       | `<exe 目录>/temp/crash-<YYYY-MM-DD>.log`（同一天的几次崩追加进同一枚） |
@@ -40,6 +42,18 @@ use std::path::{Path, PathBuf};
 
 /// 配置文件名（exe 同级目录）。
 pub const CONFIG_FILE: &str = "rupix.ini";
+
+/// 最近打开列表文件名（exe 同级目录）。
+///
+/// 它是用户会打开看的持久化产物（与 `rupix.ini` 同类），不进 `temp\`（那里按天清理）
+/// 也不进 `cache\`（丢了只损失速度）。一行一个绝对路径，UTF-8，最多 100 条。
+pub const RECENT_FILE: &str = "recent.txt";
+
+/// 阅读位置记忆文件名（exe 同级目录）。
+///
+/// 与 `recent.txt` 同类：用户会打开看的持久化产物，不进 `temp\` / `cache\`。
+/// 一本"书"一行，UTF-8，最多 200 条（见 `core::reading`）。
+pub const READING_FILE: &str = "reading.txt";
 
 /// 诊断物子目录名（exe 同级之下）。
 pub const DIAGNOSTICS_DIR: &str = "temp";
@@ -107,6 +121,16 @@ fn current_exe_dir() -> Option<PathBuf> {
 /// 配置文件路径：`<exe 目录>/rupix.ini`。
 pub fn config_path() -> Option<PathBuf> {
     Some(exe_dir()?.join(CONFIG_FILE))
+}
+
+/// 最近打开列表路径：`<exe 目录>/recent.txt`。
+pub fn recent_path() -> Option<PathBuf> {
+    Some(exe_dir()?.join(RECENT_FILE))
+}
+
+/// 阅读位置记忆路径：`<exe 目录>/reading.txt`。
+pub fn reading_path() -> Option<PathBuf> {
+    Some(exe_dir()?.join(READING_FILE))
 }
 
 /// 已安装插件根目录：`<exe 目录>/plugins`。这里只是**路径**，建目录由安装器/用户负责。

@@ -33,12 +33,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::core::config::Config;
+use crate::core::config::{AnimSpeed, Config};
 use crate::core::decode::{Decoder, Done, Meta, MetaEvent, RegionReq, ReqKind};
-use crate::core::error::ViewError;
+use crate::core::error::{ViewError, ViewFailure};
 use crate::core::gallery::{Gallery, Jump, SortSpec};
 use crate::core::geometry::{downscale, fit_dims, transformed, RectI};
 use crate::core::pixels::{Anim, Decoded, Region, RgbaImage, MAX_PIXELS};
+use crate::core::reading::Memento;
 use crate::core::thumbs::Thumbs;
 
 /// 缩放倍率上下限（相对**原图**，1.0 = 100%）。
@@ -141,9 +142,28 @@ const NAV_THUMB_MAX: u32 = 512;
 /// 没有任何真实内容（最慢的幻灯片 GIF 也就十几秒），夹住它换的是"能往下动"。
 const ANIM_MAX_DELAY_MS: u32 = 60_000;
 
-/// 把解码器报的延时折算成排表用的 `Duration`：夹在 `[1, ANIM_MAX_DELAY_MS]`。
-fn anim_wait(delay_ms: u32) -> Duration {
-    Duration::from_millis(delay_ms.clamp(1, ANIM_MAX_DELAY_MS) as u64)
+/// 加速档的最小帧间隔（m332）：8× 时 100 ms 的帧会折成 12.5 ms，
+/// 单解码线程追不上只会堆积请求；夹到 16 ms（≈60 fps）把上限钉住。
+/// 只对 `factor > 1` 生效——1× 仍按文件原速，不改现有播放手感。
+const ANIM_MIN_DELAY_MS: u32 = 16;
+
+/// 把解码器报的延时按倍率折算成排表用的 `Duration`。
+///
+/// 先按 `[1, ANIM_MAX_DELAY_MS]` 夹住原始延时，再除以倍率；加速档
+/// （`factor > 1`）额外夹最小 16 ms（且不把原本更短的帧拖慢），慢速档仍受 60 s 上限约束。
+/// **动图切帧与分页文档切页共用这一条**（m332）。
+fn anim_wait(delay_ms: u32, speed: AnimSpeed) -> Duration {
+    let base = delay_ms.clamp(1, ANIM_MAX_DELAY_MS) as f32;
+    let factor = speed.factor();
+    let scaled = base / factor;
+    let scaled = if factor > 1.0 {
+        // 加速档不低于 16 ms；但**绝不比原速更慢**——原帧间隔本来就短于 16 ms
+        // 时（高帧率 GIF），解码器已经追不上，再"加速"只能原地踏步，不能反向拖慢。
+        scaled.max(ANIM_MIN_DELAY_MS as f32).min(base)
+    } else {
+        scaled
+    };
+    Duration::from_millis(scaled.min(ANIM_MAX_DELAY_MS as f32).round() as u64)
 }
 
 /// 交给编辑/分析型插件的那一份整图。
@@ -282,7 +302,7 @@ pub struct Viewer {
     pub(super) loaded: Option<Loaded>,
     /// 已应用的编辑覆盖（path → 覆盖），见 [`edited`] 模块；只存内存，会话级。
     edited: std::collections::HashMap<PathBuf, edited::EditedKeep>,
-    pub(super) error: Option<String>,
+    pub(super) error: Option<ViewFailure>,
     /// 查询阶段（`iv_render(out=NULL)`）先到的元信息，仅在 `loaded` 为空时
     /// 作为 info bar / 「按原始像素开窗」的**预览**来源；渲染结果一到就作废。
     /// 契约：查询值不作数，以 `Decoded.natural` 为准（见 `decode::Meta`）。
@@ -428,6 +448,19 @@ pub struct Viewer {
     pub(super) anim_due_at: Option<Instant>,
     /// 动画暂停（P 键切换）。只停推进，不影响其他查看操作。
     pub(super) anim_paused: bool,
+    /// 动图/文档播放速度（m332，m335 改名）：帧与页共用的折算档位。
+    /// 配置是唯一真值，这里只是 runtime 每帧对齐过来的投影。
+    pub(super) anim_speed: AnimSpeed,
+    /// 当前"书"的键（m333，见 `core::reading`）：普通文件 / 目录 / 压缩包层。
+    /// `None` = 还没有成功建立的清单。
+    pub(super) book_key: Option<String>,
+    /// 当前书是压缩包层：保存 `item` 时只存层内文件名（解压目录每次启动都变）。
+    pub(super) book_archive: bool,
+    /// 文件键打开的那一枚文件。`Some` 时只有它仍是清单当前项才保存——
+    /// 同目录翻到邻居（后缀/PDF 下同一清单）不该把这一本的记忆写串。
+    pub(super) book_opened: Option<PathBuf>,
+    /// 打开时查到的阅读记忆；等这一本的首帧落地后恢复帧页/视图（见 `install`）。
+    pub(super) pending_restore: Option<Memento>,
     /// 逐帧按键的**在途目标帧**：`Some(n)` = 已经按到第 n 帧、回包还没上屏。
     ///
     /// ★ 为什么需要它：目标帧号原本按"当前显示的这一帧"算，而后退一步可能要付一次

@@ -7,6 +7,23 @@ use super::output::*;
 use super::select::*;
 use super::*;
 
+/// m336：残留 `<dll>.loading` 必须在 `LoadLibrary` **之前**丢弃，坏 DLL 不能再碰。
+#[test]
+fn stale_load_marker_skips_before_touching_the_dll() {
+    let dir = crate::core::paths::test_scratch_root()
+        .join(format!("decoder-skip-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dll = dir.join("bad_9.9.9.dll");
+    std::fs::write(&dll, b"not a real dll").unwrap();
+    std::fs::write(super::marker::path_for(&dll), b"pid=1\n").unwrap();
+    match inspect(&dll) {
+        Inspect::Skipped => {}
+        _ => panic!("残留标记必须直接返回 Skipped，不许尝试加载"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 版本区间判定：v5 起「相等才收」改为「区间即收」——v5 之后的 DLL 不再因
 /// 宿主升级而集体作废（这是 ABI 前向兼容的核心承诺，见 `MIN_ABI_VERSION`）。
 #[test]

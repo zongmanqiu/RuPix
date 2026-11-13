@@ -371,7 +371,7 @@ impl Viewer {
                 .loaded
                 .as_ref()
                 .filter(|l| l.anim.delay_ms > 0)
-                .map(|l| anim_wait(l.anim.delay_ms));
+                .map(|l| anim_wait(l.anim.delay_ms, self.anim_speed));
             if let Some(wait) = wait {
                 let due = Instant::now() + wait;
                 self.anim_next_at = Some(due);
@@ -379,6 +379,61 @@ impl Viewer {
                 // 基准，整段播放就退回"落地 + 延时"那一套慢放。
                 self.anim_due_at = Some(due);
             }
+        }
+    }
+
+    /// 设置页「动图/文档自动播放」切换时作用于**当前这张**（m334）。
+    ///
+    /// 只处理有帧/页的图：静图没有可播的时间线，不挂假暂停态。
+    /// 之后 P 键仍可单独暂停/恢复；这里只在配置值变化时被 runtime 调一次。
+    pub fn set_anim_autoplay(&mut self, on: bool) {
+        let Some(l) = self.loaded.as_ref() else {
+            return;
+        };
+        if !l.anim.has_index() {
+            return;
+        }
+        if on {
+            if self.anim_paused {
+                self.set_anim_paused(false);
+            }
+        } else if !self.anim_paused {
+            self.set_anim_paused(true);
+        }
+    }
+
+    /// 当前动图/文档播放速度（m332，m335 改名）。
+    pub fn anim_speed(&self) -> AnimSpeed {
+        self.anim_speed
+    }
+
+    /// 改动图/文档播放速度：只重排当前帧之后的时刻，**不重解当前帧**。
+    ///
+    /// 暂停中不改表——恢复时 [`Self::set_anim_paused`] 会按新倍率重排。
+    /// 若此刻已有一帧在途（`anim_next_at == None`），**不许**把闸重新立起来：
+    /// 那会让 `tick_anim` 在旧回包落地前再发一次请求，破坏"同一时刻只有一个
+    /// 在途帧"。只作废时间线，让那帧落地时按新倍率重新起表。
+    pub fn set_anim_speed(&mut self, speed: AnimSpeed) {
+        if self.anim_speed == speed {
+            return;
+        }
+        self.anim_speed = speed;
+        if self.anim_paused {
+            return;
+        }
+        let Some(l) = self.loaded.as_ref() else {
+            return;
+        };
+        if l.anim.delay_ms == 0 {
+            return;
+        }
+        if self.anim_next_at.is_some() {
+            let due = Instant::now() + anim_wait(l.anim.delay_ms, self.anim_speed);
+            self.anim_due_at = Some(due);
+            self.anim_next_at = Some(due);
+        } else {
+            // 在途帧：清掉旧时间线，等 `install` 用新倍率重排（见上方注释）。
+            self.anim_due_at = None;
         }
     }
 
@@ -434,6 +489,12 @@ impl Viewer {
         // 这里每步都规规矩矩发一次解码请求。
         let (w, h) = self.desired_pixels();
         self.want_seq = self.send_decode(&path, w, h, target, ReqKind::Main, false);
+    }
+
+    /// 是否有一次按号跳帧/页在途（m333）。阅读位置保存据此避开中间态：
+    /// 恢复页码时画面可能还停在旧页，此时写盘会把旧页存成新的阅读位置。
+    pub fn is_seeking(&self) -> bool {
+        self.step_target.is_some()
     }
 
     /// 跳到第 `to` 张（帧 / 页，0 起）——右键「本图 ▸ 跳转到…帧/页」与状态格点击的落地（m275）。
@@ -692,6 +753,7 @@ impl Viewer {
                     return false;
                 }
                 self.loaded = None;
+                log::warn!("[view-fail] kind={:?} detail={}", msg.kind, msg.detail);
                 self.error = Some(msg);
                 self.bump_image_gen();
                 true

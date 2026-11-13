@@ -360,6 +360,7 @@ fn place_package(
             }
         }
         Inspect::AbiMismatch { got } => Err(format!("它自述 abi {got}，本宿主收不了")),
+        Inspect::Skipped => Err("这枚 DLL 上次加载时崩溃，已按残留标记跳过".into()),
         Inspect::Error(err) => Err(format!("读不出自述：{err}")),
     };
     if let Err(msg) = verdict {

@@ -132,6 +132,16 @@ impl Host {
                         ),
                     );
                 }
+                Inspect::Skipped => {
+                    log::warn!(
+                        "解码器 {} 上次加载崩溃，本次跳过（在设置 → 解码器中清除标记后可重试）",
+                        p.display()
+                    );
+                    self.failed.insert(
+                        p,
+                        "上次加载崩溃，本次已跳过（清除标记后可重试）".to_string(),
+                    );
+                }
                 Inspect::Error(e) => {
                     log::warn!("加载解码器 {} 失败：{e}", p.display());
                     self.failed.insert(p, e);

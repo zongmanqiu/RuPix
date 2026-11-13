@@ -35,6 +35,12 @@ pub mod json;
 /// 便携模式的唯一落点（exe 同级目录）。config 与 panic_guard 都从这里取路径。
 pub mod paths;
 pub mod pixels;
+/// 阅读位置记忆（`<exe>/reading.txt`，最多 200 本）：按"书"记当前项 / 帧页 /
+/// 视图，供重开恢复；记录点在 `runtime` 防抖，恢复在 `Viewer::open`。
+pub mod reading;
+/// 最近打开的文件（`<exe>/recent.txt`，最多 100 条）：只服务右键「最近 ▸」，
+/// 不做书签 / 会话恢复 / 启动页；记录点在 `viewer::Viewer::open` 成功之后。
+pub mod recent;
 /// 缩略图条的后台解码账本（在途请求 + 内存缓存 + LRU 淘汰）。
 pub mod thumbs;
 /// 宿主自更新的纯逻辑：版本 / 清单 / 「文件名 + 版本号」两条判据（离屏可测）。

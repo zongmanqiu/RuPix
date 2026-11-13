@@ -204,6 +204,29 @@ impl Viewer {
         self.fit
     }
 
+    /// 恢复阅读记忆里的视图（m333）：fit 位 + 手动倍率 + 平移。
+    ///
+    /// 手改 ini / 记忆文件写坏时倍率由 [`MIN_ZOOM`] / [`MAX_ZOOM`] 夹住；
+    /// 平移再由 `clamp_pan` 按当前图与视口重新夹，绝不把图推出画面外。
+    pub(super) fn restore_view(&mut self, m: &Memento) {
+        if m.fit {
+            self.fit = true;
+            self.pan = (0.0, 0.0);
+        } else {
+            let scale = if m.scale.is_finite() { m.scale } else { 1.0 };
+            let pan = if m.pan.0.is_finite() && m.pan.1.is_finite() {
+                m.pan
+            } else {
+                (0.0, 0.0)
+            };
+            self.zoom = scale.clamp(MIN_ZOOM, MAX_ZOOM);
+            self.fit = false;
+            self.pan = pan;
+            self.clamp_pan();
+        }
+        self.mark_need();
+    }
+
     /// 顺时针旋转 90°。
     ///
     /// 位图是"缩到上屏"的尺寸时旋转是毫秒级，当场算；**手里是原图档**（≥100% 档）

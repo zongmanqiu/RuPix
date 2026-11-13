@@ -9,6 +9,8 @@
 //! | `stay_on_top`     | 启动时窗口置顶                              | `0`  |
 //! | `double_click`    | 双击**画面区**：0 无 / 1 关窗 / 2 最大化 / 3 全屏；标题栏双击恒为最大化/恢复 | `1`  |
 //! | `slide_interval`  | 幻灯片每张停留秒数（1..=600）        | `3`  |
+//! | `anim_speed`      | 动图切帧 / 分页切页倍速：`0.25`/`0.5`/`1`/`2`/`4`/`8` | `1`  |
+//! | `anim_autoplay`   | 动图 / 分页文档打开后自动播放（关 = 停在第 0 帧/页） | `1`  |
 //! | `show_title_bar`  | 标题条：1 完整（文件名+三钮）/ 0 无按钮     | `1`  |
 //! | `long_image_fit`  | 长图自动按宽适应（竖向可拖）                | `0`  |
 //! | `wheel_behavior`  | 滚轮：0 放大/缩小 / 1 下一张·上一张 / 2 不透明度± / 3 无 | `0`  |
@@ -24,6 +26,7 @@
 //! | `prefetch_depth`  | **只写 ini**：每个方向预读几张（1..=4，默认 3）；界面不出现 | `3` |
 //! | `close_to_tray`   | 关闭改为收进系统托盘（即时生效）            | `0`  |
 //! | `space_preview`   | 空格预览：资源管理器选中图片按空格弹预览（QuickLook 式） | `0`  |
+//! | `space_hold_close`| 空格预览里长按 ≥750ms 再松手收起（轻点保持打开） | `0`  |
 //! | `drag_image`      | 左键拖动图片：画布里拖动只平移图片，移动窗口交给标题栏 | `1`  |
 //! | `sort_by`         | 清单排序维度：0 文件名 / 1 大小 / 2 创建日期 / 3 修改日期 | `0`  |
 //! | `sort_desc`       | 排序方向：0 升序 / 1 倒序                    | `0`  |
@@ -494,6 +497,117 @@ impl UiTheme {
     //   由 runtime 调用——桥放在允许"高层认识低层"的那一侧。
 }
 
+/// 动图 / 分页文档的播放速度（ini 键 `anim_speed`，m332；m335 改名）。
+///
+/// ★ 只改**播放节奏**：不动文件、不重新编码、不碰解码器。唯一折算点是
+///   `core::viewer::anim_wait`，动图切帧与分页文档切页共用那一条。
+/// ★ 存**字符串**而不是数字下标：手改 ini 时 `anim_speed=2` 自解释，也不会像
+///   [`InitWindow`] 那样因为退役值占号而需要两套下标映射。
+/// ★ 默认 [`AnimSpeed::X1`]：老配置缺键就是原速，与 m332 之前逐字节一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AnimSpeed {
+    /// 0.25×（四倍慢放）。
+    X025,
+    /// 0.5×（两倍慢放）。
+    X05,
+    /// 1×（默认，文件原速）。
+    #[default]
+    X1,
+    /// 2×。
+    X2,
+    /// 4×。
+    X4,
+    /// 8×。
+    X8,
+}
+
+impl AnimSpeed {
+    /// 下拉框 / 遍历用的有序清单。顺序即设置页与右键菜单的显示顺序。
+    pub const ALL: [AnimSpeed; 6] = [
+        AnimSpeed::X025,
+        AnimSpeed::X05,
+        AnimSpeed::X1,
+        AnimSpeed::X2,
+        AnimSpeed::X4,
+        AnimSpeed::X8,
+    ];
+
+    /// ini 里存的稳定标识（同时也是手改 ini 的写法）。
+    pub fn id(self) -> &'static str {
+        match self {
+            AnimSpeed::X025 => "0.25",
+            AnimSpeed::X05 => "0.5",
+            AnimSpeed::X1 => "1",
+            AnimSpeed::X2 => "2",
+            AnimSpeed::X4 => "4",
+            AnimSpeed::X8 => "8",
+        }
+    }
+
+    /// 下拉框 / 菜单文案。整数档不拖小数点。
+    pub fn label(self) -> &'static str {
+        match self {
+            AnimSpeed::X025 => "0.25×",
+            AnimSpeed::X05 => "0.5×",
+            AnimSpeed::X1 => "1×",
+            AnimSpeed::X2 => "2×",
+            AnimSpeed::X4 => "4×",
+            AnimSpeed::X8 => "8×",
+        }
+    }
+
+    /// 帧延时的折算倍率（`anim_wait` 里除以它）。
+    pub fn factor(self) -> f32 {
+        match self {
+            AnimSpeed::X025 => 0.25,
+            AnimSpeed::X05 => 0.5,
+            AnimSpeed::X1 => 1.0,
+            AnimSpeed::X2 => 2.0,
+            AnimSpeed::X4 => 4.0,
+            AnimSpeed::X8 => 8.0,
+        }
+    }
+
+    /// 从 ini 值还原。
+    ///
+    /// 空值 / 笔误 / NaN / 非正数一律回落默认 1×；能解析成数但不在六档上的
+    /// （例如手写 `3`）取**最近档**——用户表达了"要更快/更慢"的方向，不该被
+    /// 静默当成没写。
+    pub fn from_id(s: &str) -> AnimSpeed {
+        let Ok(v) = s.trim().parse::<f32>() else {
+            return AnimSpeed::X1;
+        };
+        if !v.is_finite() || v <= 0.0 {
+            return AnimSpeed::X1;
+        }
+        Self::ALL
+            .iter()
+            .copied()
+            .min_by(|a, b| (a.factor() - v).abs().total_cmp(&(b.factor() - v).abs()))
+            .unwrap_or(AnimSpeed::X1)
+    }
+
+    /// 设置页下拉里的**位置**（0 = 0.25× … 5 = 8×）。
+    ///
+    /// 与 [`AnimSpeed::id`] 分工：`id()` 是落盘写法，这里是下拉序号。两者
+    /// **不要合并**——将来加档位时序号必须连续，落盘值却不该跟着挪。
+    pub fn ui_index(self) -> usize {
+        match self {
+            AnimSpeed::X025 => 0,
+            AnimSpeed::X05 => 1,
+            AnimSpeed::X1 => 2,
+            AnimSpeed::X2 => 3,
+            AnimSpeed::X4 => 4,
+            AnimSpeed::X8 => 5,
+        }
+    }
+
+    /// 下拉位置 → 枚举；越界回落 1×（与下拉自身夹取行为一致）。
+    pub fn from_ui_index(i: usize) -> AnimSpeed {
+        Self::ALL.get(i).copied().unwrap_or(AnimSpeed::X1)
+    }
+}
+
 /// 固定尺寸档的窗口宽/高下限（用户拍板 2026-10-10：最低 100×100）。
 pub const WINDOW_MIN: u32 = 100;
 /// 固定尺寸档的窗口宽/高上限（防手滑把 ini 写成天文数字）。
@@ -593,6 +707,18 @@ pub struct Config {
     pub dbl_click: DblClick,
     /// 幻灯片放映每张停留的**秒数**（m167；放映本身的开关**不落盘**，只有这个档位落盘）。
     pub slide_interval: u32,
+    /// 动图 / 分页文档的播放速度（m332，ini 键 `anim_speed`，默认 [`AnimSpeed::X1`]）。
+    ///
+    /// **同时作用于动图切帧与分页文档切页**：两条路共用 `viewer::anim_wait` 这个
+    /// 唯一折算点。设置页「看图」卡与右键「画面 ▸ → 动图/文档播放速度 ▸」写同一份值；
+    /// 改完即时生效（runtime 每帧把配置对齐给 `Viewer`），不重解当前帧。
+    pub anim_speed: AnimSpeed,
+    /// 动图 / 分页文档打开后是否自动播放（m334，默认开）。
+    ///
+    /// 开 = 沿用旧行为：新图从播放态开始（GIF 自己动、PDF 按 1 秒/页翻）。
+    /// 关 = 新图停在第 0 帧/页；用户仍可按 P 或播放按钮手动开始。
+    /// 设置页切换时 runtime 会把当前这张一并暂停/恢复；之后 P 仍可单独控制。
+    pub anim_autoplay: bool,
     /// 极简模式：开启后隐藏标题栏、底部工具栏、信息条；鼠标悬停/移动时显示，静止 2 秒后隐藏。
     /// 关闭时始终显示上述 UI（传统模式）。
     pub minimal_mode: bool,
@@ -702,6 +828,12 @@ pub struct Config {
     /// 输入链路介入，交给用户显式开启。运行期即时生效：16ms 轮询差分装/摘钩子并
     /// 连带收起预览（平台侧见 `platform::spacehook` 模块文档）。
     pub space_preview: bool,
+    /// 空格预览里「长按空格 ≥750 ms 再松手」收起预览（2026-11-13 新增，默认关）。
+    ///
+    /// 关 = 老行为：预览开着时再按一下空格（DOWN 即收）就收起。
+    /// 开 = 轻点空格不再收起（保持打开），只有按住 ≥750 ms 后松手才收起；
+    /// Esc / 点击外部等关闭路径不受影响。判据与常量在 `platform::spacehook`。
+    pub space_hold_close: bool,
     /// **左键拖动的分工**（2026-11-03 用户加的功能开关，默认开）。
     ///
     /// 开 = 画布（标题栏那一条以外）按住左键拖动 **只平移图片**，窗口不动；
@@ -726,7 +858,7 @@ pub struct Config {
     /// 排序方向：`false` 升序 / `true` 倒序（m275，ini 键 `sort_desc`）。
     pub sort_desc: bool,
     /// **底部浮条显不显示操作按钮**（m245，ini 键 `show_toolbar_buttons`，默认开）。
-    /// 关掉 = 只留信息格并水平居中；按钮对应的操作在右键「操作 ▸」里全都在，
+    /// 关掉 = 只留信息格并水平居中；按钮对应的操作在右键「画面 ▸」里全都在，
     /// 信息（页码 / 缩放 / 帧号）没有别的载体，所以只隐按钮不隐信息。
     pub show_toolbar_buttons: bool,
     /// 裸数据参数窗的「上次使用值」（宽/高/布局），新裸数据文件的预填默认。
@@ -826,6 +958,8 @@ impl Default for Config {
             stay_on_top: false,
             dbl_click: DblClick::CloseWindow,
             slide_interval: 3,
+            anim_speed: AnimSpeed::X1,
+            anim_autoplay: true,
             minimal_mode: false,
             checker: false,
             filmstrip: false,
@@ -851,6 +985,7 @@ impl Default for Config {
             prefetch_depth: PREFETCH_DEPTH_DEFAULT,
             close_to_tray: false,
             space_preview: false,
+            space_hold_close: false,
             drag_image: true,
             sort_by: SortBy::Name,
             sort_desc: false,
@@ -1003,6 +1138,10 @@ impl Config {
                 "slide_interval" => {
                     cfg.slide_interval = clamp_slide_interval(v.parse().unwrap_or(3));
                 }
+                // 播放速度（m332）：认不出的值回落 1×；能解析但不在档位上的取最近档。
+                "anim_speed" => cfg.anim_speed = AnimSpeed::from_id(v),
+                // 自动播放（m334）：默认开；写坏回默认开（与其它 bool 同一条规则）。
+                "anim_autoplay" => set_bool(&mut cfg.anim_autoplay, v, "anim_autoplay"),
                 "minimal_mode" => {
                     // 只有合法值才算"现行键显式出现"：写坏了要允许旧键兜底。
                     if let Some(on) = parse_bool(v, "minimal_mode") {
@@ -1087,6 +1226,7 @@ impl Config {
                 "close_to_tray" => set_bool(&mut cfg.close_to_tray, v, "close_to_tray"),
                 // 空格预览（QuickLook 式）：16ms 轮询差分装/摘低级键盘钩子。
                 "space_preview" => set_bool(&mut cfg.space_preview, v, "space_preview"),
+                "space_hold_close" => set_bool(&mut cfg.space_hold_close, v, "space_hold_close"),
                 "drag_image" => set_bool(&mut cfg.drag_image, v, "drag_image"),
                 // 排序口径（m275）：维度存号（0 文件名 / 1 大小 / 2 创建 / 3 修改），
                 // 方向单独一格。写坏了回落默认（文件名升序），不"猜一个近似的"。
@@ -1194,14 +1334,16 @@ impl Config {
             .map(|r| format!("{}x{}:{}", r.width, r.height, r.layout))
             .unwrap_or_default();
         let body = format!(
-            "stay_on_top={}\ndouble_click={}\nslide_interval={}\nminimal_mode={}\n\
+            "stay_on_top={}\ndouble_click={}\nslide_interval={}\nanim_speed={}\nanim_autoplay={}\nminimal_mode={}\n\
              checker={}\nfilmstrip={}\nfilmstrip_left={}\nlocked={}\n\
              long_image_fit={}\nwheel_behavior={}\nctrl_wheel={}\nalt_wheel={}\nshift_wheel={}\ninit_window={}\nborderless={}\nwindow_w={}\n\
              window_h={}\nopacity={}\nsort_by={}\nsort_desc={}\n\
-             assoc_exts={}\nassoc_heal={}\ndecoders_disabled={}\nextensions_disabled={}\nextensions_isolated={}\ndecoders_preferred={}\nprefetch={}\nprefetch_depth={}\nclose_to_tray={}\nspace_preview={}\ndrag_image={}\nshow_toolbar_buttons={}\nraw_last={}\ndownload_source={}\nui_theme={}\ndecoder_index_gitee={}\ndecoder_index_github={}\nplugin_index_gitee={}\nplugin_index_github={}\nupdate_index_gitee={}\nupdate_index_github={}\nhotkeys={}\nallow_multiple={}\ndecode_timeout_s={}\nui_cards={}\n",
+             assoc_exts={}\nassoc_heal={}\ndecoders_disabled={}\nextensions_disabled={}\nextensions_isolated={}\ndecoders_preferred={}\nprefetch={}\nprefetch_depth={}\nclose_to_tray={}\nspace_preview={}\nspace_hold_close={}\ndrag_image={}\nshow_toolbar_buttons={}\nraw_last={}\ndownload_source={}\nui_theme={}\ndecoder_index_gitee={}\ndecoder_index_github={}\nplugin_index_gitee={}\nplugin_index_github={}\nupdate_index_gitee={}\nupdate_index_github={}\nhotkeys={}\nallow_multiple={}\ndecode_timeout_s={}\nui_cards={}\n",
             self.stay_on_top as i32,
             self.dbl_click.index(),
             self.slide_interval,
+            self.anim_speed.id(),
+            self.anim_autoplay as i32,
             self.minimal_mode as i32,
             self.checker as i32,
             self.filmstrip as i32,
@@ -1229,6 +1371,7 @@ impl Config {
             self.prefetch_depth,
             self.close_to_tray as i32,
             self.space_preview as i32,
+            self.space_hold_close as i32,
             self.drag_image as i32,
             self.show_toolbar_buttons as i32,
             raw_last,
@@ -1378,6 +1521,16 @@ double_click=1
 # 幻灯片放映每张停留的秒数（1..=600，越界夹紧；放映的开与关本身不落盘，关窗即停）
 slide_interval=3
 
+# 动图 / 分页文档的播放速度：0.25 / 0.5 / 1 / 2 / 4 / 8（默认 1 = 原速）。
+# 同时作用于动图切帧与 PDF 等分页文档的切页；改完即时生效，不重解当前帧。
+# 加速档最小帧间隔 16 ms（约 60 fps）；慢速档仍受单帧 60 秒上限约束。
+anim_speed=1
+
+# 动图 / 分页文档打开后自动播放（默认开）。
+# 关 = 新图停在第 0 帧/页；仍可按 P 或播放按钮手动开始。
+# 在设置页切换时，当前这张也会立即暂停/恢复。
+anim_autoplay=1
+
 # 极简模式：1 隐藏标题栏/工具栏/信息条，悬停显示 / 0 传统模式始终显示
 minimal_mode=0
 
@@ -1463,6 +1616,10 @@ close_to_tray=0
 # 须显式开启；改动即时生效
 space_preview=0
 
+# 空格预览里「长按空格 ≥750ms 再松手」收起预览；轻点空格保持打开（默认关）。
+# 关 = 老行为：预览开着时再按一下空格就收起。Esc / 点击外部关闭不受影响。
+space_hold_close=0
+
 # 左键拖动的分工：开（默认）= 画布（标题栏那一条以外）按住左键拖动只平移图片，
 # 窗口不动；移动窗口交给顶部标题栏。图比窗口小也拖得动，图边还能越过窗口边——
 # 但永远留 24dp 的图在画面里，所以图拖不丢。
@@ -1480,7 +1637,7 @@ sort_by=0
 sort_desc=0
 
 # 底部浮条显示操作按钮：开（默认）= 按钮 + 信息；关 = 只留信息并水平居中。
-# 按钮对应的操作在右键「操作 ▸」里全都在，信息（页码 / 缩放 / 帧号）没有别的载体。
+# 按钮对应的操作在右键「画面 ▸」里全都在，信息（页码 / 缩放 / 帧号）没有别的载体。
 show_toolbar_buttons=1
 
 # 允许多开：勾上后再双击图片，在**同一个进程**里新开一扇看图窗口——
@@ -1544,10 +1701,12 @@ hotkeys={hotkeys}
 ///   ★ 写在 UI 写点处的 `ini 键：<名>` 注释是**给人导航的约定，没有测试读它**（2026-10-24 实测：
 ///   20 个键里 13 个标了，没标的是 `double_click`、`filmstrip`、`locked`、`long_image_fit`、
 ///   `decoders_disabled`、`window_w`、`window_h`）——别把它当成门禁。
-pub const ALL_KEYS: [&str; 45] = [
+pub const ALL_KEYS: [&str; 48] = [
     "stay_on_top",
     "double_click",
     "slide_interval",
+    "anim_speed",
+    "anim_autoplay",
     "minimal_mode",
     "checker",
     "filmstrip",
@@ -1573,6 +1732,7 @@ pub const ALL_KEYS: [&str; 45] = [
     "prefetch_depth",
     "close_to_tray",
     "space_preview",
+    "space_hold_close",
     "drag_image",
     "sort_by",
     "sort_desc",
@@ -1840,8 +2000,11 @@ mod tests {
                 ("png".to_string(), "png".to_string()),
             ]),
             prefetch: false,
+            anim_speed: AnimSpeed::X4,
+            anim_autoplay: false,
             close_to_tray: true,
             space_preview: true,
+            space_hold_close: true,
             // 默认是**开**，所以"翻转成非默认"这一路要写 false。
             drag_image: false,
             // m245：同样是默认开，喂 false 才证得出「关」能存住。
@@ -1869,6 +2032,11 @@ mod tests {
         assert_eq!(back.wheel, WheelAction::Navigate);
         assert_eq!(back.init_window, InitWindow::Fullscreen);
         assert_eq!(back.ui_theme, UiTheme::Light, "ui_theme 没存住");
+        assert_eq!(back.anim_speed, AnimSpeed::X4, "anim_speed 没存住");
+        assert!(
+            !back.anim_autoplay,
+            "anim_autoplay 没存住（默认开，这里喂关）"
+        );
         assert_eq!(
             (back.window_w, back.window_h),
             (1024, 768),
@@ -1878,6 +2046,7 @@ mod tests {
         assert!(!back.prefetch, "prefetch 没存住");
         assert!(back.close_to_tray, "close_to_tray 没存住");
         assert!(back.space_preview, "space_preview 没存住");
+        assert!(back.space_hold_close, "space_hold_close 没存住");
         assert!(
             !back.drag_image,
             "drag_image 没存住（默认开，这里喂的是关）"
@@ -2164,6 +2333,53 @@ plugin_source=github
         assert_eq!(UiTheme::from_ui_index(9), UiTheme::Dark, "越界回落默认");
     }
 
+    /// `anim_speed` 的 ini 写法：六档往返成立、空白容错、坏值回落默认 1×。
+    ///
+    /// 手改 ini 是最容易出错的入口（` 2 ` / `3` / `0` / 打错成 `fast`），
+    /// 四种都得给出可预期结果，且**绝不 panic**。
+    #[test]
+    fn anim_speed_ids_round_trip_and_bad_values_fall_back() {
+        for s in AnimSpeed::ALL {
+            assert_eq!(AnimSpeed::from_id(s.id()), s, "id 与 from_id 必须互逆");
+        }
+        assert_eq!(AnimSpeed::from_id(" 2 "), AnimSpeed::X2, "两侧空白要吃掉");
+        assert_eq!(
+            AnimSpeed::from_id("2.9"),
+            AnimSpeed::X2,
+            "不在档位上的取最近档"
+        );
+        assert_eq!(AnimSpeed::from_id(""), AnimSpeed::X1, "空值回落默认");
+        assert_eq!(AnimSpeed::from_id("fast"), AnimSpeed::X1, "拼错回落默认");
+        assert_eq!(AnimSpeed::from_id("0"), AnimSpeed::X1, "非正数回落默认");
+        assert_eq!(AnimSpeed::from_id("-4"), AnimSpeed::X1, "负数回落默认");
+        assert_eq!(AnimSpeed::from_id("NaN"), AnimSpeed::X1, "NaN 回落默认");
+
+        for (i, s) in AnimSpeed::ALL.iter().enumerate() {
+            assert_eq!(s.ui_index(), i, "下拉位置必须与 ALL 同序");
+            assert_eq!(AnimSpeed::from_ui_index(i), *s);
+        }
+        assert_eq!(AnimSpeed::from_ui_index(99), AnimSpeed::X1, "越界回落默认");
+        assert_eq!(Config::default().anim_speed, AnimSpeed::X1, "出厂默认 1×");
+        assert_eq!(AnimSpeed::X1.label(), "1×");
+        assert_eq!(AnimSpeed::X025.label(), "0.25×");
+        assert_eq!(AnimSpeed::X8.label(), "8×");
+    }
+
+    /// `anim_autoplay` 默认开；写坏回落默认开（与其它 bool 同一条规则）。
+    #[test]
+    fn anim_autoplay_defaults_on_and_bad_values_keep_default() {
+        assert!(Config::default().anim_autoplay, "出厂默认必须自动播放");
+        let p = temp_ini("autoplay");
+        std::fs::write(&p, "anim_autoplay=0\n").unwrap();
+        assert!(!Config::load_from(&p).anim_autoplay);
+        std::fs::write(&p, "anim_autoplay=maybe\n").unwrap();
+        assert!(
+            Config::load_from(&p).anim_autoplay,
+            "看不懂的布尔值回落默认开"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
     /// M4 消费方测试之一：默认配置写出的键集合必须与 [`ALL_KEYS`] **完全一致**——
     /// 加了键忘登记、登记了却没写盘，都在这里红。
     #[test]
@@ -2193,7 +2409,7 @@ plugin_source=github
             "stay_on_top=1\ndouble_click=3\nminimal_mode=1\n\
              long_image_fit=1\nwheel_behavior=1\nctrl_wheel=0\ninit_window=1\nborderless=1\nwindow_w=1024\n\
              window_h=768\nopacity=30\n\
-             decoders_disabled=abc;def\nextensions_disabled=com.example.ocr\ndecoders_preferred=jpg=jpeg;png=png\nprefetch=0\nclose_to_tray=1\nspace_preview=1\ndrag_image=0\nsort_by=3\nsort_desc=1\nraw_last=1x2:3\ndownload_source=github\n\
+             decoders_disabled=abc;def\nextensions_disabled=com.example.ocr\ndecoders_preferred=jpg=jpeg;png=png\nprefetch=0\nanim_speed=8\nanim_autoplay=0\nclose_to_tray=1\nspace_preview=1\ndrag_image=0\nsort_by=3\nsort_desc=1\nraw_last=1x2:3\ndownload_source=github\n\
              decoder_index_gitee=https://a.example/d.json\ndecoder_index_github=https://b.example/d.json\n\
              plugin_index_gitee=https://a.example/p.json\nplugin_index_github=https://b.example/p.json\n\
              hotkeys=prev:Right\nui_cards=options.appearance;keys.plugins\n",
@@ -2248,6 +2464,8 @@ plugin_source=github
         );
         // 默认是"开"，所以这里喂 `0` 才验得出这条键真有人消费。
         assert!(!c.prefetch, "prefetch 没有消费方");
+        assert_eq!(c.anim_speed, AnimSpeed::X8, "anim_speed 没有消费方");
+        assert!(!c.anim_autoplay, "anim_autoplay 没有消费方（默认开，喂 0）");
         assert!(c.close_to_tray, "close_to_tray 没有消费方");
         assert!(c.space_preview, "space_preview 没有消费方");
         // 与 prefetch 同一条理由：默认是**开**，所以喂 `0` 才验得出这条键真有人消费。

@@ -113,6 +113,8 @@ pub(super) enum Inspect {
     AbiMismatch {
         got: u32,
     },
+    /// 上次加载时宿主崩溃/硬故障，盘上还留着 `<dll>.loading`：本次不碰它。
+    Skipped,
     Error(String),
 }
 
@@ -187,13 +189,37 @@ pub(super) fn caps_of(
 /// 提前返回时又会 `FreeLibrary`（`DllMain(DLL_PROCESS_DETACH)`）——这两处以前
 /// 不在任何 SEH/panic 闸门里，一个坏 `DllMain` 能直接带走宿主。
 pub(super) fn inspect(path: &Path) -> Inspect {
+    // 上次加载没有正常走完（进程崩溃 / SEH 硬故障，Drop 没跑）：本次直接跳过。
+    // 这是防"坏 DLL 每次启动都在同一处把宿主带走"的唯一持久化闸门。
+    if marker::stale(path) {
+        log::warn!(
+            "解码器 {} 上次加载时崩溃，本次跳过（清除标记后可重试）",
+            path.display()
+        );
+        return Inspect::Skipped;
+    }
     match invoke(|| inspect_inner(path)) {
         Ok(v) => v,
-        Err(_) => Inspect::Error("解码器加载/卸载时崩溃，已隔离".into()),
+        Err(_) => {
+            // SEH 硬故障不会跑 Rust 析构，标记会留下；本次也按"已跳过"收口，
+            // 让设置页当场能显示/清除，而不是只报一句泛化错误。
+            if marker::stale(path) {
+                log::warn!(
+                    "解码器 {} 加载时发生硬故障，本次跳过（标记已留下）",
+                    path.display()
+                );
+                Inspect::Skipped
+            } else {
+                Inspect::Error("解码器加载/卸载时崩溃，已隔离".into())
+            }
+        }
     }
 }
 
 pub(super) fn inspect_inner(path: &Path) -> Inspect {
+    // 必须在 `Library::new` 之前落盘：`DllMain` / 静态初始化就崩在这里面。
+    // 正常返回（含普通错误 / panic）由 guard 的 Drop 清掉；崩溃才留下。
+    let _loading = marker::begin(path);
     harden_search_path();
 
     // SAFETY: 绝对路径加载；`lib` 在 `Inspect::Ok` 里被持有到函数指针失效为止。

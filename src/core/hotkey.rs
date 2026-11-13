@@ -1166,7 +1166,7 @@ mod tests {
             Action::Minimize,
             Action::Maximize,
             // 放映也一样出厂不绑键（与上面那一组同一条规矩：不给老用户制造新拦截）。
-            // 入口是右键「操作」子菜单那一项，想要键的人在快捷键页自绑——那一页
+            // 入口是右键「画面」子菜单那一项，想要键的人在快捷键页自绑——那一页
             // 遍历 `Action::ALL`，这一行是自动多出来的。
             Action::Slideshow,
             Action::Companion,

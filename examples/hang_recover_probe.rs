@@ -40,13 +40,17 @@ impl DecodeBackend for HangBackend {
         _frame_index: u32,
         _raw: Option<decode::RawParams>,
         _allow_scaled: bool,
-    ) -> Result<Decoded, String> {
+    ) -> Result<Decoded, rupix_lib::core::error::ViewFailure> {
         let n = CALLS.fetch_add(1, Ordering::SeqCst);
         if n == 0 {
             println!("[probe] 第 1 次调用：故意挂 60 秒（模拟解码器死循环）");
             std::thread::sleep(Duration::from_secs(60));
         }
-        Err(format!("假后端：{}（第 {} 次调用）", path.display(), n + 1))
+        Err(rupix_lib::core::error::ViewFailure::decode(format!(
+            "假后端：{}（第 {} 次调用）",
+            path.display(),
+            n + 1
+        )))
     }
 }
 
@@ -80,10 +84,10 @@ fn main() {
         }
         if done.seq == seq1 {
             first_ms = ms;
-            first_err = done.out.err().unwrap_or_default();
+            first_err = done.out.err().map(|e| e.detail).unwrap_or_default();
         } else {
             second_ms = ms;
-            second_err = done.out.err().unwrap_or_default();
+            second_err = done.out.err().map(|e| e.detail).unwrap_or_default();
         }
     }
 

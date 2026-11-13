@@ -29,6 +29,228 @@ fn rect_map_display_and_image_are_inverses() {
     }
 }
 
+/// m332：倍率折算——1× 不改原速，加速档夹 16 ms，慢速档仍受 60 s 上限。
+#[test]
+fn anim_speed_scales_delay_and_floors_the_fast_end() {
+    assert_eq!(anim_wait(100, AnimSpeed::X1).as_millis(), 100);
+    assert_eq!(anim_wait(100, AnimSpeed::X2).as_millis(), 50);
+    assert_eq!(
+        anim_wait(100, AnimSpeed::X8).as_millis(),
+        16,
+        "8× 夹到 16 ms"
+    );
+    assert_eq!(anim_wait(100, AnimSpeed::X025).as_millis(), 400);
+    assert_eq!(
+        anim_wait(1, AnimSpeed::X1).as_millis(),
+        1,
+        "1× 不改现有手感"
+    );
+    assert_eq!(
+        anim_wait(10, AnimSpeed::X8).as_millis(),
+        10,
+        "加速档不许把原本更快的帧反向拖慢"
+    );
+    assert_eq!(
+        anim_wait(60_000, AnimSpeed::X025).as_millis(),
+        60_000,
+        "慢速仍受 60 s 上限"
+    );
+    assert_eq!(
+        anim_wait(Anim::PAGE_DELAY_MS, AnimSpeed::X8).as_millis(),
+        125,
+        "分页文档切页也走同一条折算"
+    );
+}
+
+/// m333：阅读状态要能回答"哪本书、哪一项、第几页、视图多大"。
+#[test]
+fn reading_state_records_book_item_page_and_view() {
+    use crate::core::pixels::{Anim, Bitmap};
+    let (_dir, [pa, _pb, _pc]) = gallery_dir();
+    let (tx, _rx) = std::sync::mpsc::channel::<Done>();
+    let mut v = Viewer::new(
+        Rc::new(Decoder::spawn_with(tx)),
+        Rc::new(RefCell::new(Config::default())),
+    );
+    v.on_viewport(0.0, 0.0, 2000.0, 2000.0, 1.0);
+    v.open(&pa);
+    let frame = Decoded {
+        natural: (100, 100),
+        region: None,
+        anim: Anim {
+            index: 1,
+            count: 4,
+            delay_ms: 100,
+            paged: true,
+        },
+        bitmap: Bitmap {
+            width: 2,
+            height: 2,
+            rgba: vec![0u8; 16],
+        },
+    };
+    assert!(v.install(pa.clone(), frame));
+    v.set_fit(false);
+    v.zoom_at_center(2.0);
+
+    let m = v.reading_state().expect("已上屏的当前项应能读出阅读状态");
+    assert_eq!(m.key, crate::core::reading::file_key(&pa));
+    assert_eq!(m.item, crate::core::reading::item_path(&pa));
+    assert_eq!(m.index, 0);
+    assert_eq!(m.page, 1);
+    assert!(!m.fit);
+    assert!((m.scale - 2.0).abs() < 0.01);
+}
+
+/// m333：待恢复的视图/页码只应用一次，并真的发出按号请求。
+#[test]
+fn pending_reading_restore_applies_view_and_page_once() {
+    use crate::core::pixels::{Anim, Bitmap};
+    let (_dir, [pa, _pb, _pc]) = gallery_dir();
+    let (tx, _rx) = std::sync::mpsc::channel::<Done>();
+    let mut v = Viewer::new(
+        Rc::new(Decoder::spawn_with(tx)),
+        Rc::new(RefCell::new(Config::default())),
+    );
+    v.on_viewport(0.0, 0.0, 2000.0, 2000.0, 1.0);
+    v.open(&pa);
+    let frame = Decoded {
+        natural: (100, 100),
+        region: None,
+        anim: Anim {
+            index: 0,
+            count: 4,
+            delay_ms: 100,
+            paged: true,
+        },
+        bitmap: Bitmap {
+            width: 2,
+            height: 2,
+            rgba: vec![0u8; 16],
+        },
+    };
+    assert!(v.install(pa.clone(), frame));
+
+    v.pending_restore = Some(crate::core::reading::Memento {
+        key: crate::core::reading::file_key(&pa),
+        item: crate::core::reading::item_path(&pa),
+        index: 0,
+        page: 2,
+        fit: false,
+        scale: 2.0,
+        pan: (10.0, -5.0),
+    });
+    v.apply_pending_reading_restore(&pa);
+
+    assert!(!v.is_fit(), "记忆是手动档，恢复后不能停在适应窗口");
+    assert!((v.scale() - 2.0).abs() < 0.01, "倍率没恢复");
+    assert_eq!(v.step_target, Some(2), "页码恢复必须发按号请求");
+    assert!(v.pending_restore.is_none(), "同一份记忆只恢复一次");
+}
+
+/// m333：目录书按 item 找槽位；文件没了就整条作废，不按旧下标硬套。
+#[test]
+fn saved_directory_item_is_found_or_dropped() {
+    let (dir, [_pa, pb, _pc]) = gallery_dir();
+    let (tx, _rx) = std::sync::mpsc::channel::<Done>();
+    let mut v = Viewer::new(
+        Rc::new(Decoder::spawn_with(tx)),
+        Rc::new(RefCell::new(Config::default())),
+    );
+    v.open(&dir);
+    let mut m = crate::core::reading::Memento {
+        key: crate::core::reading::dir_key(&dir),
+        item: crate::core::reading::item_path(&pb),
+        index: 1,
+        page: 0,
+        fit: true,
+        scale: 1.0,
+        pan: (0.0, 0.0),
+    };
+    assert!(v.jump_to_saved_item(&m), "清单里还在的项要能找到");
+    assert_eq!(
+        v.gallery.as_ref().unwrap().position(),
+        2,
+        "b.svg 是第 2 项（position 1 起）"
+    );
+
+    m.item = crate::core::reading::item_path(&dir.join("gone.png"));
+    assert!(!v.jump_to_saved_item(&m), "文件没了整条作废");
+}
+
+/// m332：Viewer 开局就按配置档位排表，别让首帧先按 1× 停一次。
+#[test]
+fn viewer_starts_at_the_configured_anim_speed() {
+    let (tx, _rx) = std::sync::mpsc::channel::<Done>();
+    let cfg = Config {
+        anim_speed: AnimSpeed::X4,
+        ..Config::default()
+    };
+    let v = Viewer::new(Rc::new(Decoder::spawn_with(tx)), Rc::new(RefCell::new(cfg)));
+    assert_eq!(v.anim_speed(), AnimSpeed::X4);
+}
+
+/// m332：改速只重排当前帧之后的时刻，不重解当前帧；在途帧不许被重复排闸。
+#[test]
+fn anim_speed_reschedules_without_breaking_the_single_inflight_gate() {
+    use crate::core::pixels::{Anim, Bitmap};
+    let (_dir, [pa, _pb, _pc]) = gallery_dir();
+    let (tx, _rx) = std::sync::mpsc::channel::<Done>();
+    let mut v = Viewer::new(
+        Rc::new(Decoder::spawn_with(tx)),
+        Rc::new(RefCell::new(Config::default())),
+    );
+    v.on_viewport(0.0, 0.0, 2000.0, 2000.0, 1.0);
+    let frame = Decoded {
+        natural: (100, 100),
+        region: None,
+        anim: Anim {
+            index: 0,
+            count: 4,
+            delay_ms: 200,
+            paged: true,
+        },
+        bitmap: Bitmap {
+            width: 2,
+            height: 2,
+            rgba: vec![0u8; 16],
+        },
+    };
+    assert!(v.install(pa, frame), "分页帧应装屏成功");
+    let lead = |t: Instant| -> i64 {
+        let now = Instant::now();
+        if t > now {
+            t.duration_since(now).as_millis() as i64
+        } else {
+            -(now.duration_since(t).as_millis() as i64)
+        }
+    };
+
+    v.set_anim_speed(AnimSpeed::X2);
+    let l = lead(v.anim_next_at.expect("无在途帧时应重排闸"));
+    assert!(
+        (30..=120).contains(&l),
+        "2× 后 200 ms 应变 100 ms，实际 {l}"
+    );
+
+    v.set_anim_speed(AnimSpeed::X025);
+    let l = lead(v.anim_next_at.expect("慢速档重排闸"));
+    assert!(
+        (700..=900).contains(&l),
+        "0.25× 后 200 ms 应变 800 ms，实际 {l}"
+    );
+
+    // 模拟"已发请求、回包未到"：闸已清、时间线还在。改速只能作废时间线，
+    // 不许重新立闸——否则旧回包落地前会再发一帧，违反单在途约束。
+    v.anim_next_at = None;
+    v.anim_due_at = Some(Instant::now() + Duration::from_millis(500));
+    v.set_anim_speed(AnimSpeed::X8);
+    assert!(
+        v.anim_next_at.is_none() && v.anim_due_at.is_none(),
+        "在途帧期间改速：闸保持空、旧时间线作废，等 install 重排"
+    );
+}
+
 /// ★ 补丁 011 的承重前提：超过 100% 时上屏位图**封顶在原图档位**，而目标框比它大。
 ///
 /// windui 侧那条"声明了 pixelated、且目标物理尺寸超出源像素才换最近邻"的判据，
@@ -3022,7 +3244,9 @@ fn status_shows_frame_without_pause_label() {
 #[test]
 fn error_does_not_enter_the_status_line() {
     let (mut v, _pa) = anim_viewer();
-    v.error = Some("文件已损坏： PNG 库报错 \"Unknown filter method 68.\"".to_string());
+    v.error = Some(crate::core::error::ViewFailure::other(
+        "文件已损坏： PNG 库报错 \"Unknown filter method 68.\"",
+    ));
     let s = v.status();
     assert!(!s.contains("损坏"), "状态栏不许重复错误，实际：{s}");
     assert!(!s.contains("载入中"), "失败态不许谎称还在载入，实际：{s}");
@@ -3048,7 +3272,9 @@ fn failed_upgrade_keeps_the_image_on_screen() {
         !v.apply(Done {
             seq,
             path: pa.clone(),
-            out: Err("解码器「x」解到一半崩了".to_string()),
+            out: Err(crate::core::error::ViewFailure::decode(
+                "解码器「x」解到一半崩了",
+            )),
         }),
         "当前帧还在屏上，没有可见变化，不该标脏"
     );
@@ -3087,7 +3313,7 @@ fn failed_first_decode_does_not_keep_the_previous_image() {
         v.apply(Done {
             seq,
             path: cur.clone(),
-            out: Err("B 解不开".to_string()),
+            out: Err(crate::core::error::ViewFailure::decode("B 解不开")),
         }),
         "清掉旧图是可见变化，必须标脏"
     );
@@ -3271,7 +3497,9 @@ fn wait_is_silent_while_the_current_image_is_on_screen() {
 #[test]
 fn wait_is_silent_after_an_error() {
     let (mut v, _pa) = waiting_viewer();
-    v.error = Some("解码器「x」解码失败".to_string());
+    v.error = Some(crate::core::error::ViewFailure::decode(
+        "解码器「x」解码失败",
+    ));
     sent_ago(&v, Duration::from_secs(11));
     assert_eq!(v.status(), "1/3", "出错后状态栏只留位置号");
     assert!(!v.awaiting_first_bitmap(), "出错不算首图空白期");
@@ -3309,13 +3537,68 @@ fn stall_log_is_once_per_request_and_reset_by_the_next_one() {
     assert!(v.pending_wait().is_none(), "刚发出的请求不该立刻被当成卡住");
 }
 
-/// 新图一律从**播放态**开始（2026-11-02 用户拍板"多帧/多页都自动播放，否则看不出来"）。
+/// 新图默认从**播放态**开始（`anim_autoplay` 默认开；2026-11-02 用户拍板
+/// "多帧/多页都自动播放，否则看不出来"）。
 ///
 /// ★ 防三条回归：
 /// 1. 打开分页文档必须**正在播**（1 秒/页），不许停在第 1 页等人按 ▶。
 /// 2. 同一张图翻到下一页**不许**把用户按下的暂停态吃掉（装档与换图走同一个函数）。
 /// 3. 换到别的图必须**归零**——`anim_paused` 是跨图的单字段，不归零就是"在 PDF 上
 ///    停过之后，切到的 GIF 也不动"（用户 2026-11-02 报的"gif 按钮/动画没了"）。
+#[test]
+fn anim_autoplay_off_starts_paused_and_setting_toggles_the_current_picture() {
+    use crate::core::pixels::{Anim, Bitmap};
+    let (_dir, [pa, pb, _pc]) = gallery_dir();
+    let (tx, _rx) = std::sync::mpsc::channel::<Done>();
+    let cfg = Rc::new(RefCell::new(Config {
+        anim_autoplay: false,
+        ..Config::default()
+    }));
+    let mut v = Viewer::new(Rc::new(Decoder::spawn_with(tx)), cfg);
+    v.on_viewport(0.0, 0.0, 2000.0, 2000.0, 1.0);
+    let gif = |index: u32| Decoded {
+        natural: (100, 100),
+        region: None,
+        anim: Anim {
+            index,
+            count: 3,
+            delay_ms: 100,
+            paged: false,
+        },
+        bitmap: Bitmap {
+            width: 2,
+            height: 2,
+            rgba: vec![0u8; 16],
+        },
+    };
+    let still = Decoded {
+        natural: (100, 100),
+        region: None,
+        anim: Anim::STATIC,
+        bitmap: Bitmap {
+            width: 2,
+            height: 2,
+            rgba: vec![0u8; 16],
+        },
+    };
+
+    assert!(v.install(pa.clone(), gif(0)));
+    assert!(v.anim_paused(), "自动播放关：GIF 首帧应停住");
+    assert!(v.install(pa.clone(), gif(1)));
+    assert!(v.anim_paused(), "同一张图翻页不许吃掉暂停态");
+
+    assert!(v.install(pb.clone(), still));
+    assert!(!v.anim_paused(), "静态图没有可播时间线，不该挂假暂停态");
+
+    assert!(v.install(pa.clone(), gif(0)));
+    assert!(v.anim_paused(), "换回 GIF 仍按配置停在第 0 帧");
+
+    v.set_anim_autoplay(true);
+    assert!(!v.anim_paused(), "设置页打开自动播放，当前这张应立即恢复");
+    v.set_anim_autoplay(false);
+    assert!(v.anim_paused(), "设置页关闭自动播放，当前这张应立即暂停");
+}
+
 #[test]
 fn every_new_picture_starts_playing_and_paging_keeps_the_users_state() {
     use crate::core::pixels::{Anim, Bitmap};
@@ -3749,7 +4032,11 @@ fn empty_layer_hint_points_at_the_tree_not_the_removed_menu() {
         skipped: 0,
     };
     v.open_layer(&layer);
-    let msg = v.error.clone().unwrap_or_default();
+    let msg = v
+        .error
+        .as_ref()
+        .map(|f| f.detail.clone())
+        .unwrap_or_default();
     assert!(msg.contains("左侧文件树"), "空层提示没指路：{msg}");
     // 负向臂：撤掉的入口名一个字都不许回来。
     assert!(
@@ -3761,7 +4048,10 @@ fn empty_layer_hint_points_at_the_tree_not_the_removed_menu() {
     // 负向臂二：**没有**子层时只报事实。给一句走不通的指令比不给更糟。
     std::fs::write(dir.join("subs.tsv"), "#images 0\n#skipped 0\n").unwrap();
     v.open_layer(&layer);
-    assert_eq!(v.error.as_deref(), Some("这一层没有图片"));
+    assert_eq!(
+        v.error.as_ref().map(|f| f.detail.as_str()),
+        Some("这一层没有图片")
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

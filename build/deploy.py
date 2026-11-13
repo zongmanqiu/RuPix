@@ -88,6 +88,22 @@ ZIP_RE = re.compile(r"^(?P<id>.+)_(?P<ver>\d+\.\d+\.\d+)\.zip$")
 # ICO 档位：由 examples/gen_icon.rs 固定写死；与 brand 的同步测试同源。
 EXPECTED_ICON_SIZES = [16, 24, 32, 48, 64, 256]
 
+
+def _replace_with_retry(tmp: Path, dst: Path, attempts: int = 6) -> None:
+    """Windows：`os.replace` 撞上杀软/索引器的短暂持有会报 WinError 5。
+
+    退避重试几次即可；超过上限照旧抛——真正的权限问题不能被重试掩盖。
+    `--selftest` 在 `cargo test` 的负载下曾因这一个窗口偶发失败（m331 记录）。
+    """
+    for i in range(attempts):
+        try:
+            os.replace(tmp, dst)
+            return
+        except PermissionError:
+            if i + 1 == attempts:
+                raise
+            time.sleep(0.05 * (i + 1))
+
 # ── 许可与署名随发布物到达（m182）───────────────────────────────────────
 # 两个子仓的包形都是「产物 + 许可全文 + 许可与源码位置说明」（解码器包内 `LICENSE` 与 README 的
 # 「许可与源码」一节、插件包内 `LICENSE` 与 `LICENSE-NOTICE.md`）。宿主的发布物不是 ZIP 而是
@@ -398,7 +414,7 @@ def license_gate(main_dir: Path, out_dir: Path, *, ship: bool = True) -> list[st
             dst = out_dir / name
             tmp = dst.with_name(dst.name + ".tmp")
             shutil.copy2(src, tmp)
-            os.replace(tmp, dst)
+            _replace_with_retry(tmp, dst)
     return bad
 
 
@@ -457,7 +473,7 @@ def ship_readme_gate(
         dst = out_dir / SHIP_README
         tmp = dst.with_name(dst.name + ".tmp")
         tmp.write_bytes(data)
-        os.replace(tmp, dst)
+        _replace_with_retry(tmp, dst)
         if dst.read_bytes() != data:
             bad.append(f"{SHIP_README} 落地后字节与渲染结果不一致")
     return bad
@@ -493,7 +509,7 @@ def mcp_docs_gate(main_dir: Path, out_dir: Path, ship: bool = True) -> list[str]
             dst.parent.mkdir(parents=True, exist_ok=True)
             tmp = dst.with_name(dst.name + ".tmp")
             tmp.write_bytes(raw)
-            os.replace(tmp, dst)
+            _replace_with_retry(tmp, dst)
             if dst.read_bytes() != raw:
                 bad.append(f"{target} 落地后字节与真源不一致")
     if ship and (out_dir / "docs").is_dir():
@@ -623,7 +639,7 @@ def generate_formats(out_exe: Path, docs_dir: Path, version: str) -> tuple[list[
         dst = docs_dir / name
         tmp = dst.with_name(dst.name + ".tmp")
         tmp.write_text(body, encoding="utf-8")
-        os.replace(tmp, dst)
+        _replace_with_retry(tmp, dst)
     return [], payload
 
 
@@ -1108,7 +1124,7 @@ def main() -> int:
         # 应用可能正开着读这份文件：先写 .tmp 再换名，读到的永远是完整的一份。
         tmp = CATALOG_DST.with_name(CATALOG_DST.name + ".tmp")
         shutil.copy2(CATALOG_SRC, tmp)
-        os.replace(tmp, CATALOG_DST)
+        _replace_with_retry(tmp, CATALOG_DST)
         print(f"  catalogue: {CATALOG_DST} ({len(items)} entries, {len(raw)} bytes)")
     elif CATALOG_DST.is_file():
         print(f"  catalogue: WARNING source missing, keeping existing {CATALOG_DST}")

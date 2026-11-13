@@ -203,8 +203,9 @@ fn close_action(locked: bool, others_open: bool, close_to_tray: bool) -> CloseAc
 /// 把配置里的极简模式差分推给当前窗口；返回窗口态是否真的翻了（要不要重绘）。
 ///
 /// ★ 判据是 `applied`（上次从配置推出去的值），**不是** `chrome.minimal_mode` 现值：
-/// 菜单/快捷键改的是当前窗口的临时态、不落盘，拿现值比对会把它每帧覆写回去。
-/// 单独成函数是为了能测这条"不覆盖临时切换"的不变量（m51-D）。
+/// m330 起菜单 / 快捷键 / 设置页三处入口都写配置，本来可以拿现值比；保留 `applied`
+/// 是为了**配置没变就不碰窗口**——`Signal::set` 是 App 级标脏，每帧写一次等于永久重绘。
+/// 直接改 `chrome`（旧版菜单路径 / 测试）也不会被覆盖回去（m51-D 的老不变量）。
 fn apply_minimal_mode(chrome: &Chrome, want: bool, applied: &Cell<bool>) -> bool {
     if applied.get() == want {
         return false;
@@ -213,6 +214,57 @@ fn apply_minimal_mode(chrome: &Chrome, want: bool, applied: &Cell<bool>) -> bool
     let changed = chrome.minimal_mode.get() != want;
     chrome.minimal_mode.set(want);
     changed
+}
+
+/// 切图后把旋转角度归零、重新绑到当前这张图；返回是否真的换过绑定。
+///
+/// ★ m329：角度是**按图**的（`rotate_path` 绑定，与 `LiveTint.path` 同一条判据）。
+///   换图时只让绘制层"按 0° 画"是不够的：打开着的旋转窗还显示旧角度，改它也不会
+///   作用于新图——用户看到的是一个"没有作用对象"的窗。所以这里把信号也归零，
+///   stepper 下一拍跟着跳回 0，窗继续对当前图有效。
+///
+/// `rotate_base`（取消基线）一起归零：切图后「取消」应该回到新图的 0°，
+/// 不能把上一张的角度盖过来。
+fn note_image_change(last: &RefCell<Option<PathBuf>>, current: &Option<PathBuf>) -> bool {
+    let mut slot = last.borrow_mut();
+    if slot.as_deref() == current.as_deref() {
+        return false;
+    }
+    *slot = current.clone();
+    true
+}
+
+/// 换图时关掉**绑定在旧图上的表单窗**：跳转与 RAW 参数。
+///
+/// 两个窗都是"打开时把旧图的数字抄进输入框、提交时按旧图解释"的一次性表单：
+/// - 跳转：`count` / 单位是打开那一刻的，换图后校验的是旧总数；
+/// - RAW 参数：提交会 `viewer.open(旧 path)`，把画面拉回旧文件。
+///
+/// 它们不像属性窗那样每帧刷新（`refresh_open_metadata`），也不像旋转窗那样可以
+/// 重绑（正在输的数字属于旧图），所以换图即关——下一次点入口按新图重建。
+/// ★ 辅图版跳转（`goto-companion`）不在此列：它绑的是右栏辅图，辅图可能被钉住不随
+///   主图翻；主图的 `ctx` 也关不掉它，强行关会在"钉住辅图"时误伤。
+fn close_image_bound_forms(ctx: &mut EventCtx, viewer: &Rc<RefCell<Viewer>>) {
+    let scope = crate::ui::singleton::window_scope(viewer);
+    for name in ["goto", "raw-params"] {
+        let key = crate::ui::singleton::scoped(name, scope);
+        if windui::event::window_open(&key) {
+            ctx.close_window(&key);
+        }
+    }
+}
+
+fn rebind_rotate(chrome: &Chrome, current: Option<&std::path::Path>) -> bool {
+    if chrome.rotate_path.get().as_deref() == current {
+        return false;
+    }
+    chrome.rotate_deg.set(0.0);
+    chrome.rotate_base.set(0.0);
+    chrome.rotate_seen.set(0.0);
+    chrome
+        .rotate_path
+        .set(current.map(std::path::Path::to_path_buf));
+    true
 }
 
 /// 把三个会话态（棋盘格 / 缩略图条 / 锁定）从配置对齐到当前窗口。
@@ -351,6 +403,22 @@ impl Shared {
         self.wins.borrow_mut().push(Rc::downgrade(w));
     }
 
+    /// 退出兜底：把所有还活着的窗口的阅读位置立即落盘（m333）。
+    ///
+    /// `quit_app` / 托盘退出不经过每扇窗的 `WM_CLOSE`，不能只靠 `WinRt::close`；
+    /// 这里与 `config::flush_save` 并列，保证"无论从哪条路退出，阅读位置都写下去"。
+    fn flush_reading(&self) {
+        let wins: Vec<Rc<WinRt>> = self
+            .wins
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for w in wins {
+            w.save_reading_now();
+        }
+    }
+
     /// 取一个新的窗口 id（1 起，进程内唯一）。
     fn alloc_id(&self) -> u64 {
         let id = self.next_id.get();
@@ -426,6 +494,9 @@ struct WinRt {
     applied_stay: Cell<bool>,
     applied_window: Cell<(InitWindow, u32, u32)>,
     applied_opacity: Cell<u8>,
+    /// 上一次下发的「动图/文档自动播放」（m334）。只在配置翻转时动手——
+    /// 每帧强推会把用户按 P 的手动暂停又拽回播放。
+    applied_anim_autoplay: Cell<bool>,
     /// 上一次见到的全局主题令牌。主题是**全局原子**，而重绘是**按窗**的：
     /// 只靠“改令牌的那一帧”标脏，只会有第一扇窗变色，其余窗口要等下一次输入。
     /// 每窗各存一份“见过的值”，窗口段差分标整窗。
@@ -437,6 +508,9 @@ struct WinRt {
     /// 上次按哪张图、哪个自然尺寸调过窗口（仅「图片尺寸」档用；换图即重算，
     /// 不每帧重复下发。与无边框无关——那是另一条轴）。
     natural_size: RefCell<Option<(PathBuf, u32, u32)>>,
+    /// 上一拍看到的当前图片路径。换图时用来关掉**绑定在旧图上的表单窗**
+    /// （跳转 / RAW 参数）：它们把旧图的数字/总数抄进了输入框，留着只会对不上号。
+    last_image_path: RefCell<Option<PathBuf>>,
     size_settle: Cell<u32>,
     size_seen: Cell<(InitWindow, u32, u32)>,
     window_pending: Cell<Option<(InitWindow, u32, u32)>>,
@@ -450,6 +524,11 @@ struct WinRt {
     /// 本窗口自己的目录变化通道（两个窗口开在两个目录时不能互相串）。
     dir_tx: std::sync::mpsc::Sender<DirEvent>,
     dir_rx: RefCell<Receiver<DirEvent>>,
+    /// 阅读位置（m333）：上一拍看到的完整状态。变化才置节流计时；
+    /// 书切换时先把旧书立即写盘，避免"看到 B 的第一帧才想起没存 A"。
+    reading_seen: RefCell<Option<crate::core::reading::Memento>>,
+    /// 节流落盘时刻；`None` = 没有待写状态。
+    reading_due_at: Cell<Option<Instant>>,
 }
 
 impl Drop for WinRt {
@@ -526,11 +605,13 @@ impl WinRt {
             applied_stay: Cell::new(config.borrow().stay_on_top),
             applied_window,
             applied_opacity,
+            applied_anim_autoplay: Cell::new(config.borrow().anim_autoplay),
             seen_theme: Cell::new(crate::ui::tokens::theme()),
             startup_ops,
             was_maximized: Cell::new(false),
             borderless_applied,
             natural_size,
+            last_image_path: RefCell::new(None),
             size_settle: Cell::new(0),
             size_seen: Cell::new({
                 let c = config.borrow();
@@ -545,6 +626,8 @@ impl WinRt {
             wake_hwnd,
             dir_tx,
             dir_rx: RefCell::new(dir_rx),
+            reading_seen: RefCell::new(None),
+            reading_due_at: Cell::new(None),
         });
         shared.add(&me);
         // 带图启动：裸数据会压入待办队列，由全局段补弹参数窗。
@@ -824,6 +907,7 @@ impl WinRt {
         crate::core::config::poll_save(&config.borrow());
         // 空格预览：开关差分（同值零动作）。接管判定/解码/开窗全在哨兵线程。
         crate::platform::spacehook::set_enabled(config.borrow().space_preview);
+        crate::platform::spacehook::set_hold_close(config.borrow().space_hold_close);
         // 属性窗跟随当前图：图片切换 / 解码完成时重算并刷新那扇窗。
         crate::ui::settings::refresh_open_metadata(&self.viewer);
     }
@@ -869,7 +953,18 @@ impl WinRt {
         //   "活动的那一扇"在跑——于是后台窗口排的裸数据会一直等到它被点中才弹窗，
         //   用户看到的是"我拖进来的文件没反应"。窗口段每扇窗都跑，各取各的队。
         crate::ui::raw_dialog::poll_pending(ctx, &self.viewer, &config);
-        // 旋转角度（m280）：stepper 在独立对话框里改信号，这里拿的是**主窗**的 ctx，
+        // 旋转角度（m280 / m329）：先处理"换图"——归零并重新绑定，再差分标脏。
+        // 两件事分开：绑定变了要整窗重绘（即使角度同为 0），角度变了也要重绘。
+        let cur_path = self.viewer.borrow().current_path();
+        // 换图同时关掉"绑定在旧图上的表单窗"（跳转 / RAW 参数）。与旋转不同：
+        // 那两个窗的输入值属于旧图，重绑无意义，关掉后下一次点入口按新图重建。
+        if note_image_change(&self.last_image_path, &cur_path) {
+            close_image_bound_forms(ctx, &self.viewer);
+        }
+        if rebind_rotate(&self.chrome, cur_path.as_deref()) {
+            ctx.mark_dirty_all();
+        }
+        // stepper 在独立对话框里改信号，这里拿的是**主窗**的 ctx，
         // 标脏一定落到主窗；差分比对，同值零动作，不会让空闲窗口空转重绘。
         // 与上面 `poll_pending` 同一条「窗口段每扇窗各跑各的」跨窗范式。
         let deg = self.chrome.rotate_deg.get();
@@ -907,7 +1002,8 @@ impl WinRt {
         }
         // 窗口置顶 / 窗口大小 / 固定尺寸即时生效（m54）：三项原来只影响下次
         // 开窗，设置页贴着「下次启动生效」。置顶只在**配置值**变过时动手，
-        // 且按窗口现态决定翻不翻——标题栏 📌 是会话态，配置没变就不碰它。
+        // 且按窗口现态决定翻不翻——m330 起标题栏 📌 / 快捷键也写配置，所以
+        // "配置值变了"就等于"用户刚点了"，不再有会话态与配置各说各话的窗口。
         let ws = ctx.window_state();
         let mode = config.borrow().init_window;
         if needs_restored_size(self.was_maximized.get(), ws.maximized, ws.fullscreen, mode) {
@@ -979,6 +1075,24 @@ impl WinRt {
         if apply_session_flags(&self.chrome, &config.borrow()) {
             ctx.mark_dirty();
         }
+        // 动图/文档播放速度（m332，m335 改名）：配置是唯一真值，`Viewer` 只是投影。差分对齐；
+        // 改速只重排下一帧的时刻，不重解当前帧（见 `Viewer::set_anim_speed`）。
+        {
+            let want = config.borrow().anim_speed;
+            let mut v = self.viewer.borrow_mut();
+            if v.anim_speed() != want {
+                v.set_anim_speed(want);
+            }
+        }
+        // 动图/文档自动播放（m334）：只在配置翻转时推给 Viewer。每帧强推会
+        // 把用户按 P 的手动暂停又拽回播放；新图起点由 `install` 自己读配置。
+        let want_autoplay = config.borrow().anim_autoplay;
+        if self.applied_anim_autoplay.get() != want_autoplay {
+            self.applied_anim_autoplay.set(want_autoplay);
+            self.viewer.borrow_mut().set_anim_autoplay(want_autoplay);
+        }
+        // 阅读位置（m333）：变化防抖 600 ms 落盘，书切换时旧书立即写。
+        self.tick_reading();
         // m254：条放不下时 `paint` 算好的放大目标在这里落地（物理像素，工作区由框架夹）。
         // 窗口操作槽一拍只发一个：被占就放回去，下一拍再试。
         if let Some((w, h)) = self.chrome.strip_resize.take() {
@@ -1221,7 +1335,65 @@ impl WinRt {
         crate::ui::settings::forget_metadata_window(scope);
     }
 
+    /// 阅读位置节流（m333）：状态变了才置一次 600 ms 计时；书切换时旧书立即落盘。
+    ///
+    /// 这里用**节流**而不是尾随防抖：动图/分页文档播放时页码一直在变，尾随防抖
+    /// 会让计时永远重置——播十分钟，一次也不落盘。节流保证"每 600 ms 至少写一次
+    /// 最新状态"，停手后的最后一拍也一定写。
+    fn tick_reading(&self) {
+        let Some(state) = self.viewer.borrow().reading_state() else {
+            // 画面还没切到清单当前项 / 正在按号跳页：**不消费防抖计时**。
+            // 否则恢复 PDF 第 5 页的中途会把第 0 页当成新位置写下去。
+            return;
+        };
+        let changed = self.reading_seen.borrow().as_ref() != Some(&state);
+        if changed {
+            let old = self.reading_seen.borrow().clone();
+            if let Some(old) = old {
+                if old.key != state.key {
+                    crate::core::reading::put(old);
+                }
+            }
+            *self.reading_seen.borrow_mut() = Some(state);
+            if self.reading_due_at.get().is_none() {
+                self.reading_due_at
+                    .set(Some(Instant::now() + Duration::from_millis(600)));
+            }
+        }
+        if self
+            .reading_due_at
+            .get()
+            .is_some_and(|due| Instant::now() >= due)
+        {
+            if let Some(state) = self.reading_seen.borrow().clone() {
+                crate::core::reading::put(state);
+            }
+            self.reading_due_at.set(None);
+        }
+    }
+
+    /// 立即写当前阅读位置（关窗 / 进程退出）。画面还没切到清单当前项时，
+    /// 退回上一拍看到的状态——宁可用旧一帧，也不把上一张的页码记成新书。
+    fn save_reading_now(&self) {
+        let state = {
+            let v = self.viewer.borrow();
+            // 按号跳页在途：当前 loaded 还是旧页，写下去就是错的。等落地后
+            // 由下一次 tick / 关窗再写；此时宁可不记。
+            if v.is_seeking() {
+                self.reading_due_at.set(None);
+                return;
+            }
+            v.reading_state()
+        };
+        let state = state.or_else(|| self.reading_seen.borrow().clone());
+        if let Some(state) = state {
+            crate::core::reading::put(state);
+        }
+        self.reading_due_at.set(None);
+    }
+
     fn close(&self, ctx: &mut EventCtx) -> bool {
+        self.save_reading_now();
         let config = self.shared.config.clone();
         crate::core::config::flush_save(&config.borrow());
         let others = self.shared.prune() > 1;
@@ -1440,6 +1612,7 @@ pub fn run(initial: Option<PathBuf>) {
     // 框架 `quit_app() → DestroyWindow`——那条路不经过 `WM_CLOSE`。放在 `run()` 返回之后：
     // 无论从哪条路退出，落盘必然执行且只此一处。
     crate::core::config::flush_save(&config.borrow());
+    shared.flush_reading();
     // 空格预览的低级钩子挂在系统钩子链上。显式停用把收权从「赌进程消亡时系统替我摘」
     // 变成一句明写的动作；投递走控制线程（摘钩必须在装配它的那条线程上）。
     crate::platform::spacehook::set_enabled(false);
@@ -1612,11 +1785,11 @@ mod tests {
         );
     }
 
-    /// 极简模式的两层态：菜单/快捷键是**当前窗口的临时切换**（配置不变），
-    /// 设置页勾选是配置值。轮询只许在**配置值**变过时推——拿 chrome 现值比
-    /// 会把临时切换每帧推回去（m51-D 的核心不变量）。
+    /// 极简模式的配置→窗口差分：m330 起所有 UI 入口都写配置，但 `applied` 闸仍保证
+    /// **配置没变就不重复推**（`Signal::set` 是 App 级标脏）；直接改 chrome 也不会被
+    /// 每帧覆写回去（m51-D 的老不变量）。
     #[test]
-    fn minimal_mode_sync_keeps_the_menu_toggle_until_config_changes() {
+    fn minimal_mode_sync_pushes_only_when_config_changes() {
         let chrome = Chrome::new(false);
         let applied = Cell::new(false);
 
@@ -1636,6 +1809,64 @@ mod tests {
         assert!(apply_minimal_mode(&chrome, false, &applied));
         assert!(!chrome.minimal_mode.get(), "取消勾选要当场生效");
         assert!(!applied.get());
+    }
+
+    /// m329：旋转角度是**按图**的。切图必须同时做三件事——角度归零、基线归零、
+    /// 重新绑定；同一张图重复 tick 不许每拍重绑，回到空窗要解绑。
+    /// 用户报障的现场：窗开着切图，旧角度留在信号里、绑定却失效，再点入口没反应。
+    #[test]
+    fn switching_images_rebinds_the_rotate_angle() {
+        use std::path::Path;
+        let chrome = Chrome::new(false);
+        let a = Path::new(r"C:\pics\a.jpg");
+        let b = Path::new(r"C:\pics\b.jpg");
+
+        assert!(rebind_rotate(&chrome, Some(a)), "首张图要建立绑定");
+        chrome.rotate_deg.set(21.0);
+
+        assert!(rebind_rotate(&chrome, Some(b)), "换图要重新绑定");
+        assert_eq!(chrome.rotate_deg.get(), 0.0, "换图后角度必须归零");
+        assert_eq!(chrome.rotate_base.get(), 0.0, "取消基线也要归零");
+        assert_eq!(chrome.rotate_path.get().as_deref(), Some(b));
+
+        assert!(!rebind_rotate(&chrome, Some(b)), "同一张图不许每拍重绑");
+        assert!(rebind_rotate(&chrome, None), "回到空窗要解绑");
+        assert!(chrome.rotate_path.get().is_none());
+        assert!(!rebind_rotate(&chrome, None), "空窗重复 tick 不再动手");
+    }
+
+    /// m329：换图只记一次；同一张图重复 tick 不重复触发“关表单窗”。
+    #[test]
+    fn image_change_is_noted_once_per_path() {
+        let last = RefCell::new(None);
+        let a = Some(PathBuf::from(r"C:\pics\a.jpg"));
+        let b = Some(PathBuf::from(r"C:\pics\b.jpg"));
+
+        assert!(note_image_change(&last, &a), "第一张图是一次变化");
+        assert!(!note_image_change(&last, &a), "同一张图不许重复触发");
+        assert!(note_image_change(&last, &b), "换图要触发");
+        assert!(note_image_change(&last, &None), "回到空窗也要触发");
+        assert!(!note_image_change(&last, &None), "空窗重复 tick 不再动手");
+    }
+
+    /// m329：换图时主窗 tick 真的去关了「跳转 / RAW 参数」两扇表单窗，
+    /// 且没有把“钉住辅图”的辅图跳转窗误关掉。
+    #[test]
+    fn image_bound_form_windows_are_closed_on_switch() {
+        let src = include_str!("mod.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]").unwrap_or(src.len())];
+        assert!(
+            prod.contains("close_image_bound_forms(ctx, &self.viewer)"),
+            "window_tick 没接上“换图关表单窗”"
+        );
+        assert!(
+            prod.contains("\"goto\"") && prod.contains("\"raw-params\""),
+            "要关的窗名单少了跳转或 RAW 参数"
+        );
+        assert!(
+            !prod.contains("\"goto-companion\""),
+            "辅图跳转不归主图 tick 管（辅图可能被钉住）"
+        );
     }
 
     /// 三个会话态从配置对齐到窗口：设置页勾上棋盘格的那一帧就上屏；

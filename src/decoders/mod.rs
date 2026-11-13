@@ -65,6 +65,7 @@ mod decode;
 mod dll_lock;
 mod dllmeta;
 mod host;
+mod marker;
 mod output;
 mod registry;
 mod select;
@@ -119,6 +120,14 @@ static RESCAN_GEN: AtomicU64 = AtomicU64::new(1);
 /// （过去它还顺带刷新一枚"解码器身份"喂给磁盘缓存键——那套缓存 2026-10-19 已撤。）
 pub fn request_rescan() {
     RESCAN_GEN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 清除某个 DLL 的加载面包屑（设置页「清除标记并重试」）。
+///
+/// 只删 `<dll>.loading`，不碰 DLL 本身；清除后由调用方 bump 重扫代次，
+/// 下一次目录扫描会重新尝试加载。幂等：标记不在也返回 `Ok`。
+pub fn clear_load_marker(dll: &Path) -> std::io::Result<()> {
+    marker::clear(dll)
 }
 
 pub(super) fn rescan_gen() -> u64 {

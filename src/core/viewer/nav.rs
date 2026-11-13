@@ -4,8 +4,24 @@
 //! 新解码结果由 `Viewer::apply` 原子替换（见 `tests.rs` 的用例）。
 use super::*;
 
+/// 一次打开操作对应的"书"（m333）。
+///
+/// `jump_item` 决定要不要跳到记忆里的清单项：目录 / 压缩包层要跳（打开的是容器，
+/// 上次看的是其中一张）；单个文件不跳（用户点的就是这一张）。
+struct BookId {
+    key: String,
+    /// 压缩包层：`item` 存层内文件名而不是解压临时路径。
+    archive: bool,
+    jump_item: bool,
+    /// 文件键打开的那一枚文件；目录 / 压缩包为 `None`。
+    opened: Option<PathBuf>,
+}
+
 impl Viewer {
     pub fn new(decoder: Rc<Decoder>, config: Rc<RefCell<Config>>) -> Self {
+        // 开局就按配置的档位走：否则首帧会先按 1× 排一次，runtime 对齐后
+        // 才改表——分页文档在 8× 下第一页会多停近一秒。
+        let anim_speed = config.borrow().anim_speed;
         Self {
             sort_epoch: 0,
             decoder,
@@ -46,6 +62,11 @@ impl Viewer {
 
             anim_due_at: None,
             anim_paused: false,
+            anim_speed,
+            book_key: None,
+            book_archive: false,
+            book_opened: None,
+            pending_restore: None,
             step_target: None,
             archive_skipped: 0,
             note: None,
@@ -67,15 +88,51 @@ impl Viewer {
         let layer = match crate::core::archive::resolve(file) {
             Ok(l) => l,
             Err(e) => {
-                self.fail(e);
+                // 压缩包解析失败归 Other；但“包本身不在”应归 FileMissing——
+                // 归档层只报字符串，这里补一次 stat 把两种情况分开。
+                let failure = match std::fs::metadata(file) {
+                    Err(io) => ViewFailure::from_io(io),
+                    Ok(_) => ViewFailure::other(e),
+                };
+                self.fail(failure);
                 return;
             }
         };
-        self.open_at(
+        // 书键按**用户点开的原始对象**算（m333）：压缩包记包路径 + 根层，
+        // 目录记目录，文件记文件；展开临时目录永远不参与。
+        let book = if layer.from_archive {
+            BookId {
+                key: crate::core::reading::archive_key(file, &[]),
+                archive: true,
+                jump_item: true,
+                opened: None,
+            }
+        } else if file.is_dir() {
+            BookId {
+                key: crate::core::reading::dir_key(file),
+                archive: false,
+                jump_item: true,
+                opened: None,
+            }
+        } else {
+            BookId {
+                key: crate::core::reading::file_key(file),
+                archive: false,
+                jump_item: false,
+                opened: Some(file.to_path_buf()),
+            }
+        };
+        let opened = self.open_at(
             &layer.dir,
             layer.from_archive && layer.images == 0,
             layer.skipped,
+            book,
         );
+        if opened {
+            // 最近文件只记**用户点开的原始文件**：压缩包 / PDF 记包本身，不记展开出来的
+            // 临时层目录；拖目录打开会被 `record` 的 `is_file()` 挡掉。
+            crate::core::recent::record(file);
+        }
     }
 
     /// 打开压缩包里**已经展开好**的某一层（左侧文件树点那一行就走这里）。
@@ -83,10 +140,27 @@ impl Viewer {
     /// 空层合法：`1M.zip/ch1` 这种只有子目录的地方照样能停下，画面空着、树里继续往下，
     /// 不当成"打开失败"——`fail` 会把清单清掉，用户连菜单都没有了。
     pub fn open_layer(&mut self, layer: &crate::core::archive::Layer) {
-        self.open_at(&layer.dir, layer.from_archive, layer.skipped);
+        // 层目录自己带着来源包与内部段（`archive::here`），书键从这里来；
+        // 普通目录层（理论上也走这条路）退回目录键。
+        let book = match crate::core::archive::here(&layer.dir) {
+            Some((source, segs)) => BookId {
+                key: crate::core::reading::archive_key(&source, &segs),
+                archive: true,
+                jump_item: true,
+                opened: None,
+            },
+            None => BookId {
+                key: crate::core::reading::dir_key(&layer.dir),
+                archive: false,
+                jump_item: true,
+                opened: None,
+            },
+        };
+        self.open_at(&layer.dir, layer.from_archive, layer.skipped, book);
     }
 
-    fn open_at(&mut self, path: &Path, allow_empty: bool, skipped: usize) {
+    /// 返回是否真的建立了清单（用于「最近打开」记录；空层也算打开成功）。
+    fn open_at(&mut self, path: &Path, allow_empty: bool, skipped: usize, book: BookId) -> bool {
         let t0 = Instant::now();
         // ★ m304：压缩包层里「认得出但打不开」的条数。每次打开新层都重设
         //   （普通目录传 0），状态格据此追加后缀；不放进 Gallery，因为它描述的是
@@ -101,6 +175,11 @@ impl Viewer {
         //   清单的新鲜度本来就不归 `open` 管——目录被外部增删由 `dir_watch` 送到
         //   [`Self::rescan_dir`]，而那条路**同样不清这两个缓存**，本分支与它口径一致。
         //   锚点不在清单里（刚拷进来的新文件、或它其实是个文件夹）⇒ 退回完整重建。
+        //
+        // m333：同目录再开一张只恢复**这个文件自己的**记忆（用户点的就是它，
+        // 不能被目录记忆拽到别的项上）；`jump_item` 为真的目录 / 压缩包不会走到
+        // 这条分支（它们的锚点不是清单里的一张图）。
+        let saved = crate::core::reading::get(&book.key);
         let slot = self.gallery.as_ref().and_then(|g| g.slot_for(path));
         if let Some(idx) = slot {
             let len = self.gallery.as_ref().map_or(0, Gallery::len);
@@ -112,11 +191,16 @@ impl Viewer {
             );
             self.error = None;
             self.note = None;
+            self.book_key = Some(book.key);
+            self.book_archive = book.archive;
+            self.book_opened = book.opened;
+            let restore = saved.filter(|m| self.memento_matches(m, path, book.archive));
+            self.pending_restore = restore;
             if let Some(g) = self.gallery.as_mut() {
                 g.jump_to(idx);
             }
             self.navigate();
-            return;
+            return true;
         }
         let built = if allow_empty && path.is_dir() {
             Gallery::from_dir(path, self.sort(), true)
@@ -132,6 +216,23 @@ impl Viewer {
                 );
                 self.gallery = Some(g);
                 self.error = None;
+                self.book_key = Some(book.key);
+                self.book_archive = book.archive;
+                self.book_opened = book.opened;
+                // m333：目录 / 压缩包先跳到记忆里的那一项；文件留在用户点开的
+                // 这一张。记忆里的项找不到就整条作废——不按旧下标硬套。
+                let mut restore = saved;
+                if let Some(m) = restore.as_ref() {
+                    let keep = if book.jump_item {
+                        self.jump_to_saved_item(m)
+                    } else {
+                        self.memento_matches(m, path, book.archive)
+                    };
+                    if !keep {
+                        restore = None;
+                    }
+                }
+                self.pending_restore = restore;
                 // 换图 = 用户已经在看新东西，旧提示立刻作废（m50-C）。
                 self.note = None;
                 // 换了目录，旧预读全部作废；条那一屏的索引也换了目录，一并清掉。
@@ -152,13 +253,13 @@ impl Viewer {
                     //   旧提示」），而且是**给了一条走不通的指令**——比不给更糟。
                     //   按「还有没有子层」分两句：有子层才指路，没有就只说没有。
                     let subs = crate::core::archive::subs_of(path).len();
-                    self.error = Some(if allow_empty && subs > 0 {
+                    self.error = Some(ViewFailure::other(if allow_empty && subs > 0 {
                         "这一层没有图片：从左侧文件树进入它的子层".to_string()
                     } else {
                         "这一层没有图片".to_string()
-                    });
+                    }));
                     self.bump_image_gen();
-                    return;
+                    return true;
                 }
                 // 命中元数据缓存：之前看过这张图，立即填回预览尺寸。
                 if let Some(g) = self.gallery.as_ref() {
@@ -173,8 +274,117 @@ impl Viewer {
                 // 与翻页那条路共用同一条判据。
                 self.request_decode();
                 self.bump_image_gen();
+                true
             }
-            Err(e) => self.fail(e.to_string()),
+            Err(e) => {
+                self.fail(e.into_failure());
+                false
+            }
+        }
+    }
+
+    /// 当前"书"的键（m333）；菜单「清除本书阅读位置」与 runtime 保存都用它。
+    pub fn book_key(&self) -> Option<&str> {
+        self.book_key.as_deref()
+    }
+
+    /// 取当前阅读状态（m333）。画面还没切换到清单当前项时返回 `None`——
+    /// 换图窗口期把上一张的页码/视图存成新书，是比不保存更坏的账。
+    pub fn reading_state(&self) -> Option<Memento> {
+        let key = self.book_key.clone()?;
+        // 按号跳页在途：`loaded` 还是旧页；此时取状态会把旧页当成新位置。
+        if !self.screen_is_current() || self.step_target.is_some() {
+            return None;
+        }
+        let g = self.gallery.as_ref()?;
+        let path = g.current()?;
+        // 文件键只记它自己：同目录翻到邻居时不往这一本里写别人的页码/视图。
+        if let Some(opened) = self.book_opened.as_ref() {
+            if !crate::core::reading::same_path(path, opened) {
+                return None;
+            }
+        }
+        Some(Memento {
+            key,
+            item: self.item_hint(path, self.book_archive),
+            // 0 起下标，与 `page` 同一口径；只作调试/兜底，恢复一律按 `item`。
+            index: g.position().saturating_sub(1),
+            // 只记**分页文档**的页号；GIF/APNG 的播放帧不是"读到哪里"，
+            // 重开时让它从第 0 帧正常播，而不是冻在某一帧。
+            page: self
+                .loaded
+                .as_ref()
+                .filter(|l| l.anim.paged)
+                .map_or(0, |l| l.anim.index),
+            fit: self.fit,
+            scale: self.scale(),
+            pan: self.pan,
+        })
+    }
+
+    /// 记忆里的清单项提示：普通目录 / 文件用完整路径；压缩包层用层内文件名
+    /// （解压临时目录每次启动都变，路径不可比）。
+    fn item_hint(&self, path: &Path, archive: bool) -> String {
+        if archive {
+            path.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            crate::core::reading::item_path(path)
+        }
+    }
+
+    /// 这条记忆是不是**当前这一张**。路径按 Windows 口径大小写不敏感；
+    /// 压缩包层比文件名（原始大小写）。
+    fn memento_matches(&self, m: &Memento, path: &Path, archive: bool) -> bool {
+        let hint = self.item_hint(path, archive);
+        if archive {
+            hint == m.item
+        } else {
+            hint.eq_ignore_ascii_case(&m.item)
+        }
+    }
+
+    /// 把清单跳到记忆里的那一项；找不到返回 `false`（整条记忆作废）。
+    pub(super) fn jump_to_saved_item(&mut self, m: &Memento) -> bool {
+        let Some(g) = self.gallery.as_mut() else {
+            return false;
+        };
+        let target = if self.book_archive {
+            (0..g.len()).find(|&i| {
+                g.peek(i)
+                    .and_then(|p| p.file_name())
+                    .is_some_and(|s| s.to_string_lossy().as_ref() == m.item)
+            })
+        } else {
+            g.slot_for(Path::new(&m.item))
+        };
+        let Some(idx) = target else {
+            return false;
+        };
+        g.jump_to(idx);
+        true
+    }
+
+    /// 首帧落地后恢复记忆里的帧页与视图（m333）。只对**清单当前项**生效；
+    /// 用户在恢复前已经翻到别处就丢弃，不把旧页码盖到新图上。
+    pub(super) fn apply_pending_reading_restore(&mut self, path: &Path) {
+        let Some(m) = self.pending_restore.take() else {
+            return;
+        };
+        let current = self
+            .gallery
+            .as_ref()
+            .and_then(Gallery::current)
+            .map(|p| p.as_path());
+        if current != Some(path) {
+            return;
+        }
+        self.restore_view(&m);
+        if m.page > 0 {
+            // 失败不补跳：总数未知（惰性 GIF）时按号跳无从夹取，留在第 0 帧
+            // 比反复发请求更稳。PDF 等已知页数的文档会在这一句里落页。
+            let _ = self.jump_anim(m.page);
         }
     }
 
@@ -328,7 +538,7 @@ impl Viewer {
             // 目录还在、但一张图都没有了：不能继续显示已经删掉的那张（标题/分母/
             // 画面全是旧账）。读不到目录（盘掉线、权限）才保持旧清单，等它回来。
             Err(e @ ViewError::NoImages(_)) => {
-                self.fail(e.to_string());
+                self.fail(e.into_failure());
                 return true;
             }
             Err(_) => return false,
@@ -442,15 +652,34 @@ impl Viewer {
     /// 而晚到的旧图回包在"没有清单"时不做路径裁决（`apply` 那条判据会跳过），
     /// 于是它还能重新上屏。`cancel_pending()` 预留一个不会被后续请求复用的 seq，
     /// 把这些在途回包全部判成过期。
-    pub(super) fn fail(&mut self, msg: String) {
+    /// 失败统一落在这里：分类 + 原文进日志，画面只取「标题 + 一行提示」。
+    ///
+    /// 原文**必须**进日志：分类是为了让用户知道下一步，排查仍然要靠解码器/系统/
+    /// 压缩包给的那句话（`ViewFailure::detail`）。
+    pub(super) fn fail(&mut self, failure: ViewFailure) {
+        log::warn!(
+            "[view-fail] kind={:?} detail={}",
+            failure.kind,
+            failure.detail
+        );
         self.drop_current();
-        self.error = Some(msg);
+        self.error = Some(failure);
     }
 
-    /// UI 侧把一条错误文本送到画面上（进入包内下一层失败时用）。**不动当前画面**：
+    /// UI 侧把一条错误送到画面上（进入包内下一层失败时用）。**不动当前画面**：
     /// 进不去只是这一步没成，用户还在原处，清空清单等于把他赶出这个包。
+    pub fn report_failure(&mut self, failure: ViewFailure) {
+        log::warn!(
+            "[view-fail] kind={:?} detail={}",
+            failure.kind,
+            failure.detail
+        );
+        self.error = Some(failure);
+    }
+
+    /// 兼容旧入口：没有分类信息的字符串按 Other 收下（压缩包进层失败等）。
     pub fn report_error(&mut self, msg: String) {
-        self.error = Some(msg);
+        self.report_failure(ViewFailure::other(msg));
     }
 
     /// [`Self::fail`] 与 [`Self::clear`] 的共同主体：把"当前这张图"的一切账清干净。

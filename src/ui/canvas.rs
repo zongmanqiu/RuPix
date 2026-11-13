@@ -66,7 +66,7 @@ use windui::text::{TextEngine, TextStyle};
 
 use std::sync::Arc;
 
-use crate::core::config::Config;
+use crate::core::config::{AnimSpeed, Config};
 use crate::core::gallery::{Jump, SortBy};
 use crate::core::geometry::RectI;
 use crate::core::pixels::MAX_TEXTURE_SIDE;
@@ -167,7 +167,7 @@ pub struct ImageCanvas {
     /// 辅图实际可用的矩形（开主辅视图时是右半；关时零矩形）。
     comp_work: Cell<Rect>,
     /// 辅图自己的缩放倍率（1.0 = 适应 pane）与平移。
-    /// 用 `Rc<Cell>` 是为了右键「操作 ▸」菜单的闭包也能拿到同一份状态：
+    /// 用 `Rc<Cell>` 是为了右键「画面 ▸」菜单的闭包也能拿到同一份状态：
     /// 活动窗是辅图时，菜单里的放大/缩小/适应/1:1 必须和工具栏走同一条路。
     comp_zoom: Rc<Cell<f32>>,
     comp_pan: Rc<Cell<(f32, f32)>>,
@@ -1259,73 +1259,149 @@ impl ImageCanvas {
         ctx.mark_dirty();
     }
 
-    /// 右键菜单——与菠萝看图同构，按分组与可达性重排过：
+    /// 右键菜单：**文件 → 对画面做事 → 界面 → 设置**四块，顶层 9 项（m327）。
     ///
     /// ```text
-    /// 打开…
-    /// 系统菜单                  当前文件的资源管理器右键菜单（m313；内容全归外壳）
-    /// 复制 ▸                    画面 PNG / 原文件 / 文件路径（m248 上移，与「打开」同为文件类）
-    /// 属性…                     图片信息窗（m247 从浮条收编到顶层）
+    /// 文件 ▸      打开… / 系统菜单 ── 复制×3 ── 属性…
+    /// 最近 ▸      最近打开（≤100 条，最新在前；m325）
+    /// 排序 ▸      文件名 / 大小 / 创建日期 / 修改日期 ── 倒序（m275）
     /// ─────
-    /// 操作 ▸            **严格等于底部浮条**（m247 后只收操作类，同一份 `Btn::ALL`）
-    /// 本图 ▸                    RAW 参数… / 跳转到…帧/页 / 取色器（m276）
-    /// 插件 ▸                    外部进程命令
+    /// 画面 ▸      缩小 / 放大 / 适应窗口 / 1:1 原尺寸 / 全屏 / 旋转 90° / 水平镜像 /
+    ///            上一帧 / 暂停·继续动画 / 下一帧 ── 左键拖图 / 幻灯片放映 / 动图/文档播放速度 ▸
+    /// 本图 ▸      RAW 参数… / 跳转到…帧/页 / 旋转角度… / 取色器
+    /// 插件 ▸      外部进程命令
     /// ─────
-    /// 外观 ▸                    显示操作按钮（勾选，m263 提到组首）/ 极简模式 / 棋盘格背景 /
-    ///                        缩略图条 / 主题色 ▸ 深色·浅色 / 不透明度 ▸ 10~100%
-    ///                        （m262 起组内不画分隔线）
-    /// 幻灯片放映 / 停止放映
-    /// 左键拖图（勾选）
-    /// 排序 ▸                    文件名 / 大小 / 创建日期 / 修改日期 ── 倒序（m275）
+    /// 界面 ▸      显示操作按钮 / 极简模式 / 棋盘格背景 / 缩略图条 ▸ / 主题色 ▸ /
+    ///            不透明度 ▸（m262 起组内不画分隔线）
+    /// 主辅视图 ▸  开关 / 来源 / 联动（无边框形态不出现）
     /// ─────
-    /// 设置…（「关于」不再单列，它是设置窗五页里的最后一项，见 `settings::rows::NAV_LABELS`）
+    /// 设置…
     /// ```
     ///
-    /// 「本图 ▸」（m276 由「工具 ▸」改名）收的是**只作用于当前这张图**、且**不进浮条**的
-    /// 低频功能：改它的裸数据解码参数（RAW 参数…）、在它自己的帧/页里按号定位
-    /// （跳转到…帧/页）、取它的一个像素（取色器）。与「操作 ▸」的分界不是"对不对这张图
-    /// 做事"，而是**有没有浮条按钮**——操作 ▸ 严格等于 `Btn::ALL`，这一组只进菜单、
-    /// 不占浮条空间（用户口径「一排按钮已经很多了」）。「排序 ▸」改的是"这一组图的
-    /// 下一张是谁"，不针对单张，所以留在顶层浏览区。
+    /// ★ **m327：14 项 → 9 项，层级没变**。竞品里 12–16 项是常态（gwenview / qView /
+    ///   nomacs 都是 16），但它们的顶层大半是**平铺的动作**；我们 14 项里有 8 项是子菜单，
+    ///   等于"点什么都得再进一层"。所以这一轮不是再加一层，而是把**散在同一块里的
+    ///   单项收进已有的组**。
+    /// ★ **两级是硬约束**：本地样本 13 个右键菜单没有一家超过两级（ImageGlass 的三级只
+    ///   出现在它的**主菜单**里，右键反而把通道子菜单拍平成一级）。所以「最近 ▸」「排序 ▸」
+    ///   必须留顶层——它们本身是子菜单，塞进「文件 ▸」就是三级。
+    /// ★ 「排序 ▸」m327 第一版曾拍平进「文件 ▸」，用户实测后要求独立出来，位置定在
+    ///   「最近 ▸」下面——两者都是"接下来看哪张"：最近**往回**挑，排序**往前**排。
     ///
-    /// 「外观 ▸」收的是**改变画面上出现什么 / 长什么样**的开关（m246 改名并补齐）：
-    /// 与设置 → 选项 → 外观卡同一条轴。放映改的是看图行为，左键拖图改的是手势分工，
-    /// 都不是外观，所以留在顶层；放映还因为不在浮条 `Btn::ALL` 里而必须随手可及（见下方 ★）。
+    /// 「文件 ▸」= **磁盘层**：点了都不改屏幕上的像素。打开（读盘）、系统菜单（把文件
+    /// 交给外壳）、复制（写剪贴板）、属性（读元数据）全在这一条轴上；排序也是磁盘层，
+    /// 但 m327 按用户要求独立成顶层一项（见 `sort_menu`）。
+    /// ★ 「复制」m327 **拍平**进本组：它当年做成子菜单是为省顶层空间，现在整块已在
+    ///   「文件 ▸」里，再套一层只是把一次悬停换成两次点击。
+    /// 属性仍在块尾——资源管理器里它永远是最后一项。
+    ///
+    /// ★ m327：**「系统菜单」「属性…」没有进「本图 ▸」**，两条判据：
+    ///   ① 置灰口径——本图四项按"图解没解出来"置灰；系统菜单/属性只要路径在就该能用
+    ///      （解码失败、失败占位、文件坏了，属性照样要能看，文件照样要能交给别的程序）。
+    ///   ② 轴不同——本图改的是像素与取景；系统菜单把文件交给外壳、属性读磁盘元数据，
+    ///      两者都不碰像素。混进去之后这一组就没有一句统一的开关判据了。
+    ///
+    /// 「本图 ▸」（m276 由「工具 ▸」改名）收的是**只作用于当前这张图**、且**不进浮条**的
+    /// 低频功能：改它的裸数据解码参数、在它自己的帧/页里按号定位、换一个取景角度、
+    /// 取它的一个像素。与「画面 ▸」的分界不是"对不对这张图做事"，而是**有没有浮条
+    /// 按钮**——画面 ▸ 线前 10 项严格等于 `Btn::ALL`，这一组只进菜单、不占浮条空间。
+    ///
+    /// 「画面 ▸」（m327 由「画面 ▸」改名）：**对屏幕上这块画面做的事**——缩放、适应、
+    /// 全屏、旋转、镜像、翻帧，加上"怎么拖、怎么自动翻"两颗。旧名「操作」把"看图"
+    /// 说成了"操作软件"，而这十颗都是看一眼就想按的简单动作；「画面」说的是对象，
+    /// 不是动作的抽象层级。★ 横线之后的两项没有浮条按钮（浮条几何由 `Btn::ALL` 驱动），
+    /// 但它们同属"画面"：拖图是拖画面，放映是让画面自己翻。
+    ///
+    /// 「界面 ▸」= 原「外观 ▸」（m246）改名：**这一窗显示什么 / 长什么样**，与设置页
+    /// 「界面」卡同序。★ 放映与左键拖图 m327 起搬进「画面 ▸」——它们是"对画面做的事"
+    /// （动词），不是"显示成什么样"（名词）；搬走之后本组回到纯观感。
     ///
     /// 装配出口会调 [`align_menu_columns`] 把**每一级**的标签左沿对齐：勾选列是
     /// 逐级判定的，纯动作列表（复制 / 插件）不补就会比别的子菜单少缩进一列。
     ///
-    /// 「操作」子菜单由工具栏的 [`Btn::ALL`] **自动生成**（见 [`exec_btn`]），
+    /// 「画面」子菜单的前 10 项由工具栏的 [`Btn::ALL`] **自动生成**（见 [`exec_btn`]），
     /// 底部按钮栏有什么、菜单里就有什么，加按钮不会只改一处。
-    /// 也因此原来顶层的「全屏 / 棋盘格 / 水平翻转」不再单独占一行——它们在操作里。
-    /// ★ 反过来也成立（2026-11-02）：**菜单里不许有浮条上没有的动作**。幻灯片放映
-    ///   因为浮条放不下而只能当菜单项，所以它搬到顶层、不进「操作」——否则那条对账就破了，
-    ///   用户看到的是"菜单里的操作和底部按钮对不上"。
+    /// 也因此原来顶层的「全屏 / 棋盘格 / 水平翻转」不再单独占一行——它们在画面里。
+    /// ★ 对账口径（2026-11-02 立，m327 修订）：**线前 10 项严格等于浮条**；线后两项
+    ///   是浮条放不下的（放映）与不是按钮的（拖图），单独成段，不混进按钮序列。
     fn context_menu(&self, ctx: &mut EventCtx, at: Point) {
         let ws = window_state();
         let has_file = self.viewer.borrow().current_path().is_some();
         let has_image = self.viewer.borrow().image().is_some();
 
-        let mut items = Vec::new();
-
-        // ── 四块 · 三条线（m287 重排项序；线的条数一条没动）──
+        // ── 四块 · 三条线（m327 重排项序；线的条数一条没动）──
         //
         // 规矩：**每条分隔线都要能说出它切开的两种东西是什么**，说不出来就该删线或归并。
         //
-        //   ① 磁盘层      打开… / 系统菜单 / 复制 ▸ / 排序 ▸ / 属性…   ← 五件都不改屏幕像素
+        //   ① 磁盘层      文件 ▸ / 最近 ▸ / 排序 ▸             ← 三件都不改屏幕像素
         //   ── 线①：磁盘 → 像素 ──
-        //   ② 对画面做事  操作 ▸ / 本图 ▸ / 插件 ▸             ← 点了立刻改画面或另开一扇窗
+        //   ② 对画面做事  画面 ▸ / 本图 ▸ / 插件 ▸
         //   ── 线②：做事 → 状态 ──
-        //   ③ 状态开关    外观 ▸ / 幻灯片放映 / 左键拖图        ← 改的是持续态，勾选即是真相
+        //   ③ 状态开关    视图 ▸ / 主辅视图 ▸                ← 改的是持续态，勾选即是真相
         //   ── 线③：功能与设置入口之间 ──
-        //   ④ 设置…                                            ← 唯一一个"离开看图"的入口
+        //   ④ 设置…
         //
         // ★ 别为"对齐设置页四卡"再加线：那四张卡是**配置**的分类，这里是**动作**的分类，
-        //   两套轴不同源。再切细就成了 5 段 11 项、每段一两个，反而更难扫。要加项时先答
-        //   "它属于①②③哪一块"；答不上来，才轮到讨论加线。
+        //   两套轴不同源。要加项时先答"它属于①②③哪一块"；答不上来，才轮到讨论加线。
+
+        let mut items = Vec::with_capacity(10);
+        items.push(MenuItem::submenu(
+            "文件",
+            self.file_items(has_file, has_image),
+        ));
+        items.push(self.recent_menu());
+        items.push(self.sort_menu());
+        items.push(MenuItem::separator());
+        items.push(MenuItem::submenu("画面", self.ops_items(ws)));
+        items.push(MenuItem::submenu(
+            "本图",
+            self.current_image_items(has_image),
+        ));
+        items.push(MenuItem::submenu("插件", self.plugin_items()));
+        items.push(MenuItem::separator());
+        items.push(MenuItem::submenu("界面", self.appearance_items()));
+
+        // ── 主辅视图（m322）：开关 / 来源 / 联动方式收进子菜单 ──
+        // 无边框形态不开放：它没有 chrome/标题栏，分栏与工具栏都无处落，
+        // 强行开放只会多一套要适配的布局。
+        // ★ m327 起旁边那组已经叫「视图」，这一项仍叫「主辅视图」：两者撞名，
+        //   但改名的连带面（文档、设置页、m322 的整套叫法）比省两个字贵；
+        //   真要动，等下一次碰主辅视图时一起改。
+        if !chrome::borderless() {
+            items.push(MenuItem::submenu("主辅视图", self.companion_items()));
+        }
+
+        items.push(MenuItem::separator());
+        items.push({
+            let mut it = MenuItem::run(
+                "设置…",
+                {
+                    let config = self.config.clone();
+                    let hub = self.hub.clone();
+                    move |ctx| settings::open_settings(ctx, &config, &hub)
+                },
+                false,
+            );
+            it.shortcut = self.config.borrow().hotkeys.display(Action::Settings);
+            it
+        });
+        align_menu_columns(&mut items);
+        ctx.show_context_menu(at, items);
+    }
+
+    /// 「文件 ▸」：磁盘层（m327 由顶层五片叶子 + 一个子菜单合并而来）。
+    ///
+    /// 判据沿用 m287——**点了不改屏幕上的像素**。打开（读盘）、系统菜单（把文件交给
+    /// 外壳）、复制（写剪贴板）、属性（读元数据）都在这一条轴上；改像素的在「画面 ▸」
+    /// 「本图 ▸」。排序也是磁盘层，但 m327 按用户要求独立成顶层一项（见 `sort_menu`）。
+    ///
+    /// ★ 块内顺序：打开 / 系统菜单（两条都是"拿这个文件当对象"，内容一个归我们、
+    ///   一个归外壳）→ 复制（写出去）→ 属性（读它是什么）。属性留在块尾，照资源管理器。
+    fn file_items(&self, has_file: bool, has_image: bool) -> Vec<MenuItem> {
+        let mut out = Vec::with_capacity(12);
 
         // ── 打开 ──
-        items.push({
+        out.push({
             let mut it = MenuItem::run(
                 "打开…",
                 {
@@ -1358,11 +1434,6 @@ impl ImageCanvas {
             it
         });
 
-        // m300：原先这里是「本包 ▸」二级菜单。它要求用户先记住自己在哪一层、上一层
-        // 叫什么，包里套包时来回跳很容易迷路；现在换成画面最左侧常驻的文件树
-        // （`ui::tree`），"看见就能点"。菜单整组撤掉，不留兜底——两套入口并存
-        // 只会让"现在到底在哪一层"有两份答案。
-
         // ── 系统菜单（m313，紧跟「打开…」）──
         //
         // 这一项弹出的**不是我们的菜单**：宿主调 explorer 自己的 `IContextMenu`，
@@ -1379,7 +1450,7 @@ impl ImageCanvas {
         //
         // ★ 没有当前文件时置灰（空窗只可能从托盘开出来）：系统菜单是"针对这个文件"
         //   的，没有文件就没有对象，这一项连弹都不该弹。
-        items.push(
+        out.push(
             MenuItem::run(
                 "系统菜单",
                 {
@@ -1415,234 +1486,157 @@ impl ImageCanvas {
             .enabled(has_file),
         );
 
-        // ── 复制（二级菜单，向右弹出）──
-        // m248：紧跟「打开…」——两者都针对文件。m276 把「RAW 参数…」收进「本图 ▸」
-        // 之后，第一块原来是文件类三项（打开 / 复制 / 属性）；m287 把「排序 ▸」也
-        // 收进来，成了**四项**（打开 / 复制 / 排序 / 属性），判据见下面排序那段注释：
-        // 这一块是「**磁盘层**」，四件事都不改屏幕上的像素。
+        out.push(MenuItem::separator());
+
+        // ── 复制（m248 起是子菜单，m327 拍平）──
         // 2026-11-03 用户口径「三个复制收纳到"复制"里面，向右弹出，这样比较节省空间」：
         // 同一次只选一种口径（画面 PNG / 文件本身 / 路径文本），平铺会摊成菜单最长的三段。
-        // 快捷键仍挂在「复制当前」与「复制文件路径」上，收进子菜单不影响按键——显示的
-        // 是同一份 hotkeys。
-        items.push(MenuItem::submenu(
-            "复制",
-            self.copy_items(has_image, has_file),
-        ));
+        // ★ m327 改判：这条口径的前提是"顶层空间不够"。现在整块搬进「文件 ▸」，空间
+        //   已经省下来了；再套一层子菜单只会把一次悬停换成两次点击，反而更难选。
+        //   快捷键仍挂在「复制当前」与「复制文件路径」上，拍平不影响按键。
+        out.append(&mut self.copy_items(has_image, has_file));
 
-        // ── 排序 ▸（m275 立，m287 从"看图区"上移到这里）──
-        //
-        // ini 键 `sort_by` + `sort_desc`。四项维度 + 一条分隔线 + 倒序：先选按什么排、
-        // 再定方向，与资源管理器「排序方式 ▸」同构（那边也是四个维度 + 一个升降序）。
-        //
-        // ★ **为什么在这一块**（m287，用户口径"这个是和文件本体有关的"）：这一块的
-        //   原则不是"操作这个文件"，而是「**磁盘层**」——打开（读文件）、复制（写文件 /
-        //   写路径）、排序（读目录次序并重排清单）、属性（读元数据与 EXIF），四条都
-        //   不碰屏幕上的像素。它原来排在「幻灯片放映」「左键拖图」之后，读起来像
-        //   "又一个看图开关"，可那两项改的是**看的方式**，排序改的是**下一个是谁**。
-        // ★ **为什么在「复制」与「属性」之间**：让「属性」留在这一块的最后一项。
-        //   资源管理器 / 桌面 / 驱动器右键里「属性」**永远是最后一项**，末端读
-        //   "看它是什么"最顺；把排序插在它前面，两头都不破坏。
-        //
-        // ★ 与「跳转到…帧/页」是一对，但**分居两处**：排序是**组间**导航（下一张是谁），
-        //   跳转是**组内**导航（这张的第几帧 / 页），后者只属于这张图 ⇒ 留在「本图 ▸」。
-        //   别为了"配对好看"把两者合并到一处。
-        //
-        // 勾选态直接读配置（唯一正本）；改完**当场**重排——`Viewer::sync_sort` 在
-        // 下一次 tick（16ms 内）对齐，重排拿当前这张当锚点，画面不闪、不重解码。
-        {
-            let cfg = self.config.clone();
-            let cur = self.config.borrow().sort_spec();
-            let mut sub = Vec::new();
-            for by in SortBy::ALL {
-                let cfg = cfg.clone();
-                let hub = self.hub.clone();
-                sub.push(
-                    MenuItem::run(
-                        by.label(),
-                        move |ctx| {
-                            persist_session(&cfg, &hub, |c| c.sort_by = by);
-                            ctx.mark_dirty();
-                        },
-                        cur.by == by,
-                    )
-                    // 四项都要留勾选列：只给勾着的那项 `.check` 会让整列随选项跳。
-                    .check(cur.by == by),
-                );
-            }
-            sub.push(MenuItem::separator());
-            let cfg = self.config.clone();
-            let hub = self.hub.clone();
-            sub.push(
-                MenuItem::run(
-                    "倒序",
-                    move |ctx| {
-                        let on = !cfg.borrow().sort_desc;
-                        persist_session(&cfg, &hub, |c| c.sort_desc = on);
-                        ctx.mark_dirty();
-                    },
-                    cur.desc,
-                )
-                .check(cur.desc),
-            );
-            items.push(MenuItem::submenu("排序", sub));
-        }
+        out.push(MenuItem::separator());
 
-        // ── 新建窗口：**不做**（2026-11-05 用户裁定）──
-        //
-        // 多开开启时这里曾多出一项「新建窗口」，但它的产物是一扇**没有图**的空窗：
-        // 想再开一张图，直接双击/拖放本来就会新开一扇（`allow_multiple` 的语义），
-        // 所以这一项是绕远路。托盘菜单里那一项保留——它在零窗口时是唯一入口。
-
-        // m276：「RAW 参数…」已收进「本图 ▸」——它改的是"这张图怎么解"，
-        // 和取色器 / 跳帧页一样只作用于当前这张图，不属于文件类（打开 / 复制 / 属性）。
-        // 仍**常驻**，只有当前文件确实是无头裸像素时才可点；相机 RAW（CR2/NEF…）
-        // 有完整文件头，参数窗对它们没有意义，所以同样置灰。
-
-        // ── 属性…（m247）：从浮条「!」与「操作 ▸」收编到顶层 ──
+        // ── 属性…（m247）：从浮条「!」与「画面 ▸」收编到顶层，m327 起在「文件 ▸」块尾 ──
         // 文件类最后一项：读的是磁盘上这个文件的元数据与 EXIF，不依赖画面解没解出来。
         // 快捷键 Action::Properties 走 exec_action 那条独立路径，行为不变。
-        items.push({
+        out.push({
             let v = self.viewer.clone();
             let mut it = MenuItem::run("属性…", move |ctx| settings::open_metadata(ctx, &v), false);
             it.shortcut = self.config.borrow().hotkeys.display(Action::Properties);
             it
         });
 
-        items.push(MenuItem::separator());
-
-        // ── 操作：浮条按钮全集，菜单恒列；没有帧/页号时那三颗变灰 ──
-        items.push(MenuItem::submenu("操作", self.ops_items(ws)));
-
-        // ── 本图（m276 由「工具」改名并收编两项）──
-        // 位置不动：仍在「操作」（恒列 `Btn::ALL`）与「插件」之间，都在"对画面做事"这一块。
-        // 三项只作用于当前这张图，且只进菜单不进浮条——用户口径「一排按钮已经很多了」。
-        items.push(MenuItem::submenu(
-            "本图",
-            self.current_image_items(has_image),
-        ));
-
-        // ── 插件：只列已发现且启用的命令型插件；空目录给可读空态 ──
-        items.push(MenuItem::submenu("插件", self.plugin_items()));
-
-        items.push(MenuItem::separator());
-
-        // ── 开关区（勾选态即时反映）──
-        //
-        // 「窗口置顶」入口已移到标题栏置顶钮（📌，读写同一 `ws.topmost`），
-        // 菜单里不再重复。
-        // ── 外观 ▸：改画面长什么样的开关收成一个子菜单（m246 改名）──
-        items.push(MenuItem::submenu("外观", self.appearance_items()));
-
-        // ── 幻灯片放映：改的是"怎么浏览这一组图"，不是窗口外观，所以留在顶层 ──
-        //
-        // 它不在 `Btn::ALL` 里（浮条上没有这一颗：MDL2 的 PUA 字形是赌局，而浮条几何由
-        // `Btn::ALL` 驱动，多一颗要连动命中与窄窗排布），因此只能作为菜单项存在；
-        // 行为仍走 `exec_action` 那唯一入口——键与菜单同一份代码，不存在"菜单里有、点了没反应"。
-        // 名字随状态换（放映中读「停止放映」），双状态写法与 `Btn::PlayPause` 同一条规矩。
-        items.push({
+        // ── 清除本书阅读位置（m333）──
+        // 「书」不是「图」：目录 / 压缩包层 / PDF 各是一本。清除后**当前画面不动**，
+        // 只是下次重开不再回到这里；`remove_with_state` 还会抑制同状态的防抖回写，
+        // 否则刚清完下一拍又被保存回来。
+        out.push({
+            let v = self.viewer.clone();
             let mut it = MenuItem::run(
-                if self.chrome.slideshow_on() {
-                    "停止放映"
-                } else {
-                    "幻灯片放映"
-                },
-                {
-                    let v = self.viewer.clone();
-                    let chrome = self.chrome.clone();
-                    let cfg = self.config.clone();
-                    let hub = self.hub.clone();
-                    move |ctx| {
-                        exec_action(
-                            Some(ctx),
-                            &v,
-                            &chrome,
-                            &cfg,
-                            &hub,
-                            crate::core::hotkey::Action::Slideshow,
-                        );
-                        ctx.mark_dirty();
-                    }
+                "清除本书阅读位置",
+                move |ctx| {
+                    let Some(state) = v.borrow().reading_state() else {
+                        ctx.toast_err("当前没有可清除的阅读位置");
+                        return;
+                    };
+                    crate::core::reading::remove_with_state(&state);
+                    log::info!("清除阅读位置：{}", state.key);
+                    ctx.toast_ok("已清除本书阅读位置");
                 },
                 false,
             );
-            it.shortcut = self
-                .config
-                .borrow()
-                .hotkeys
-                .display(crate::core::hotkey::Action::Slideshow);
+            it.enabled = has_image;
             it
         });
 
-        // ── 主辅视图（m322）：开关 / 来源 / 联动方式收进子菜单 ──
-        // 无边框形态不开放：它没有 chrome/标题栏，分栏与工具栏都无处落，
-        // 强行开放只会多一套要适配的布局。
-        if !chrome::borderless() {
-            items.push(MenuItem::submenu("主辅视图", self.companion_items()));
-        }
-
-        // ── 左键拖图：指针交互的开关（ini 键：drag_image），留在顶层 ──
-        // 2026-11-03 用户点名进菜单（"和极简模式那些放一起"）。理由成立：这条改的是手感，
-        // 而手感不对的时候人正盯着画面——不该要先开设置页才能试另一种分工。
-        // 2026-11-04 收进子菜单、11-07 改名「外观 ▸」时，本项按手势分工 ≠ 外观留在顶层。
-        // 勾选态**直接读 `config.drag_image`**，不像 `filmstrip` 那样另存一份会话位：
-        // canvas 每次按下都现读配置，多存一份就是第二正本（还会漂）。
-        // 不标脏：切换不改这一帧的任何像素，下一次按下自然按新分工走。
-        items.push({
-            let on = self.config.borrow().drag_image;
-            let cfg = self.config.clone();
-            let hub = self.hub.clone();
-            let mut it = MenuItem::run(
-                "左键拖图",
-                move |_ctx| {
-                    let on = !cfg.borrow().drag_image;
-                    persist_session(&cfg, &hub, |c| c.drag_image = on);
-                },
-                on,
-            );
-            it.checkable = true;
-            it.checked = on;
-            it
-        });
-
-        // m276：「跳转到…帧/页」与「RAW 参数…」一起收进「本图 ▸」——它换的是
-        // **这一张图里的第几帧/页**，不是"清单里的第几张"，与「排序 ▸」（改下一张是谁）
-        // 不是同一件事。状态格 `(12/340)` 的点击入口照旧留着，那是鼠标最短的一条路。
-        //
-        // m287：「排序 ▸」已上移到**文件块**（见上面「复制」之后那段注释）。这一块
-        // 从此只剩"改画面 / 改手感"三颗，正好一条轴：外观 ▸（画面长什么样）→
-        // 幻灯片放映（怎么自动翻）→ 左键拖图（鼠标怎么分工）。
-
-        items.push(MenuItem::separator());
-        items.push({
-            let mut it = MenuItem::run(
-                "设置…",
-                {
-                    let config = self.config.clone();
-                    let hub = self.hub.clone();
-                    move |ctx| settings::open_settings(ctx, &config, &hub)
-                },
-                false,
-            );
-            it.shortcut = self.config.borrow().hotkeys.display(Action::Settings);
-            it
-        });
-        align_menu_columns(&mut items);
-        ctx.show_context_menu(at, items);
+        out
     }
 
-    /// 「外观 ▸」子菜单：只放**改变画面上出现什么 / 长什么样**的开关（m246）。
+    /// 「最近 ▸」（m325）：只服务"再打开一次刚才那张"。
     ///
-    /// ★ m262：内部**不画分隔线**。顶层那条已经把「开关区」整体分出来了，这里再按
-    ///   「显隐 vs 观感」切一次是同一维度切两遍；删掉后六项连成一块，与设置页
-    ///   「外观」卡（卡片里本来也没有分隔线）版式对齐。
+    /// 列表来自 `core::recent`，最多 100 条，最新在前。点一条 = 与「打开…」走同一条
+    /// `raw_dialog::open_path`（裸像素也先自动推断）。路径失效时不移出菜单装没看见——
+    /// 提示一句并把它从列表里摘掉，下次打开就干净了。
     ///
-    /// 与设置 → 选项 → 外观卡同一条轴：显示操作按钮（浮条按钮，m263 提到组首 —— 这组里
-    /// 最常切的一颗）、极简模式（chrome 显隐）、棋盘格背景、缩略图条（底部常驻区）、
-    /// 主题色、不透明度（整窗 alpha）。组内先看使用频次，再排几何尺度。
-    /// 全部读写同一份 `Config`，`runtime::apply_session_flags` 每帧把配置推给窗口信号。
-    /// 棋盘格只在本菜单与设置页「外观」卡（m247 已从浮条 / 「操作 ▸」撤走）。
-    /// 放映改的是浏览行为、左键拖图改的是手势分工，留在顶层不进来。
-    /// 不透明度保留自己的档位子菜单：十档铺平会把这里撑成一长列，三级反而好找。
+    /// ★ m327：必须留在**顶层**。它本身是子菜单，收进「文件 ▸」就是三级；样本里
+    ///   没有一家右键菜单做到三级。（qView 也是这么放的：菜单栏里 Recents 在 File 下，
+    ///   右键里它自己占一行。）
+    fn recent_menu(&self) -> MenuItem {
+        let recent = crate::core::recent::list();
+        let mut sub = Vec::new();
+        if recent.is_empty() {
+            sub.push(MenuItem::run("（还没有）", |_| {}, false));
+        } else {
+            for path in &recent {
+                let target = path.clone();
+                let v = self.viewer.clone();
+                let cfg = self.config.clone();
+                let label = crate::core::recent::label(path);
+                sub.push(MenuItem::run(
+                    label,
+                    move |ctx| {
+                        if !target.is_file() {
+                            crate::core::recent::remove(&target);
+                            ctx.toast_err(format!(
+                                "文件已不存在，已从最近列表移除：{}",
+                                target.display()
+                            ));
+                            ctx.mark_dirty();
+                            return;
+                        }
+                        super::raw_dialog::open_path(&v, &cfg, &target);
+                    },
+                    false,
+                ));
+            }
+            sub.push(MenuItem::separator());
+            sub.push(MenuItem::run(
+                "清空最近",
+                |ctx| {
+                    crate::core::recent::clear();
+                    ctx.toast_ok("已清空最近打开");
+                    ctx.mark_dirty();
+                },
+                false,
+            ));
+        }
+        MenuItem::submenu("最近", sub).enabled(!recent.is_empty())
+    }
+
+    /// 「排序 ▸」（m275；m327 从「文件 ▸」里独立出来，紧跟「最近 ▸」）。
+    ///
+    /// ini 键 `sort_by` + `sort_desc`。四项维度 + 一条分隔线 + 倒序：先选按什么排、
+    /// 再定方向，与资源管理器「排序方式 ▸」同构（那边也是四个维度 + 一个升降序）。
+    ///
+    /// ★ m327 第一版曾把它拍平进「文件 ▸」，用户实测后要求独立：「排序改的是下一张是谁，
+    ///   值得自己占一行」。位置定在「最近 ▸」下面——两者都是"接下来看哪张"：最近
+    ///   **往回**挑，排序**往前**排。
+    ///
+    /// ★ 与「跳转到…帧/页」是一对，但**分居两处**：排序是**组间**导航（下一张是谁），
+    ///   跳转是**组内**导航（这张的第几帧 / 页），后者只属于这张图 ⇒ 留在「本图 ▸」。
+    ///   别为了"配对好看"把两者合并到一处。
+    ///
+    /// 勾选态直接读配置（唯一正本）；改完**当场**重排——`Viewer::sync_sort` 在
+    /// 下一次 tick（16ms 内）对齐，重排拿当前这张当锚点，画面不闪、不重解码。
+    fn sort_menu(&self) -> MenuItem {
+        let cur = self.config.borrow().sort_spec();
+        let mut sub = Vec::with_capacity(6);
+        for by in SortBy::ALL {
+            let cfg = self.config.clone();
+            let hub = self.hub.clone();
+            sub.push(
+                MenuItem::run(
+                    by.label(),
+                    move |ctx| {
+                        persist_session(&cfg, &hub, |c| c.sort_by = by);
+                        ctx.mark_dirty();
+                    },
+                    cur.by == by,
+                )
+                // 四项都要留勾选列：只给勾着的那项 `.check` 会让整列随选项跳。
+                .check(cur.by == by),
+            );
+        }
+        sub.push(MenuItem::separator());
+        let cfg = self.config.clone();
+        let hub = self.hub.clone();
+        sub.push(
+            MenuItem::run(
+                "倒序",
+                move |ctx| {
+                    let on = !cfg.borrow().sort_desc;
+                    persist_session(&cfg, &hub, |c| c.sort_desc = on);
+                    ctx.mark_dirty();
+                },
+                cur.desc,
+            )
+            .check(cur.desc),
+        );
+        MenuItem::submenu("排序", sub)
+    }
+
     /// 「主辅视图 ▸」子菜单（m322）：开关 / 来源 / 辅图翻页 / 交换主辅。
     /// 活动窗不在这里——点击左/右 pane 就直接切，菜单项是重复入口（用户 2026-11-12 拍板删）。
     /// 主图标题与底栏不受影响；这里只改右栏辅图。
@@ -1864,13 +1858,27 @@ impl ImageCanvas {
         }
     }
 
+    /// 「界面 ▸」：**改变画面上出现什么 / 长什么样**的六项开关（m246 立；m327 起
+    /// 放映与拖图搬去「画面 ▸」，本组回到纯观感）。
+    ///
+    /// ★ m262：**本函数内部不画分隔线**。六项是一条轴（显隐四件 → 整窗观感两件），
+    ///   与设置页「界面」卡（卡片里本来也没有分隔线）版式对齐。
+    ///
+    /// 与设置 → 选项 → 界面卡同一条轴：显示操作按钮（浮条按钮，m263 提到组首 —— 这组里
+    /// 最常切的一颗）、极简模式（chrome 显隐）、棋盘格背景、缩略图条（底部常驻区）、
+    /// 主题色、不透明度（整窗 alpha）。组内先看使用频次，再排几何尺度。
+    /// 全部读写同一份 `Config`，`runtime::apply_session_flags` 每帧把配置推给窗口信号。
+    /// 棋盘格只在本菜单与设置页「界面」卡（m247 已从浮条 / 「画面 ▸」撤走）。
+    /// ★ m327：放映与左键拖图不在这里——它们是"对画面做的事"（动词），属于「画面 ▸」；
+    ///   本组只收"显示成什么样"（名词）。
+    /// 不透明度保留自己的档位子菜单：十档铺平会把这里撑成一长列，三级反而好找。
     fn appearance_items(&self) -> Vec<MenuItem> {
         let mut out = Vec::new();
 
         // ── 显示操作按钮（m245，ini 键 show_toolbar_buttons；m263 提到组首）──
         // 这组里最常切的一颗：右键是「正盯着图顺手切」，先给最常切的那颗。
-        // 按钮对应的操作在右键「操作 ▸」里一颗不缺，信息（页码 / 缩放 / 帧号）
-        // 却只有浮条这一处载体 ⇒ 只隐按钮、留信息并水平居中。归「外观 ▸」：
+        // 按钮对应的操作在右键「画面 ▸」里一颗不缺，信息（页码 / 缩放 / 帧号）
+        // 却只有浮条这一处载体 ⇒ 只隐按钮、留信息并水平居中。归「界面 ▸」：
         // 改的是画面上出现什么（m246 口径）。
         out.push({
             let on = self.config.borrow().show_toolbar_buttons;
@@ -1892,15 +1900,21 @@ impl ImageCanvas {
             it
         });
 
-        // ── 极简模式：当前窗口临时切换（不落盘）──
+        // ── 极简模式：勾选即写配置（m330）──
+        // 同一个开关也在设置页「界面」卡。m329 之前这里只改 `chrome`，重启就回原样
+        // —— 同一个名字两套行为。现在菜单 / 快捷键 / 设置页三处都写同一份
+        // `minimal_mode`；`chrome` 只是本窗镜像，当场推一下少等一帧。
         out.push({
-            let on = self.chrome.minimal_mode.get();
+            let on = self.config.borrow().minimal_mode;
             let chrome = self.chrome.clone();
+            let cfg = self.config.clone();
+            let hub = self.hub.clone();
             let mut it = MenuItem::run(
                 "极简模式",
                 move |ctx| {
-                    let on = !chrome.minimal_mode.get();
+                    let on = !cfg.borrow().minimal_mode;
                     chrome.minimal_mode.set(on);
+                    persist_session(&cfg, &hub, |c| c.minimal_mode = on);
                     // 不提示：元素当场消失/出现，屏幕自己已经说了（2026-10-16 清理）。
                     ctx.mark_dirty();
                 },
@@ -1914,7 +1928,7 @@ impl ImageCanvas {
 
         // ── 棋盘格背景（m246，ini 键 checker）──
         //
-        // m247 起棋盘格只在这里和设置页「外观」卡；浮条与「操作 ▸」里那颗已撤走
+        // m247 起棋盘格只在这里和设置页「界面」卡；浮条与「画面 ▸」里那颗已撤走
         // （显示开关不是操作）。这里带勾选态，读写同一份 `Config`、走 `persist_session`，
         // 并当场推窗口信号，切换当下就重绘。
         out.push({
@@ -2320,7 +2334,7 @@ impl ImageCanvas {
     /// （`delay>0` 但只有一帧）没有第二张可去；RAW 参数判据是"无头裸像素"，
     /// 相机 RAW 有完整文件头，参数窗对它们没有意义。
     ///
-    /// 取色器是**会话临时态**（同极简模式，不落盘）：开关与指针位置都在 `Chrome`，
+    /// 取色器是**会话临时态**（不像极简模式那样落盘）：开关与指针位置都在 `Chrome`，
     /// 菜单回调、画布事件、paint 三者读同一份；切换时清掉旧指针位置，免得下次
     /// 一开模式就有一枚停在别处的浮层。没有图时置灰——空窗没有像素可采样。
     fn current_image_items(&self, has_image: bool) -> Vec<MenuItem> {
@@ -2372,7 +2386,7 @@ impl ImageCanvas {
 
         // ── 旋转角度…（m280）：整数度数 + ± 微调，输入即变 ──
         // 与上面两项同属「打开一个关于这张图的窗」，排在分隔线之前；
-        // 不进浮条也不进「操作 ▸」（那一组严格等于 `Btn::ALL`，m247 铁律）。
+        // 不进浮条也不进「画面 ▸」（那一组线前 10 项严格等于 `Btn::ALL`，m247 铁律）。
         {
             let chrome = self.chrome.clone();
             let v = self.viewer.clone();
@@ -2518,14 +2532,115 @@ impl ImageCanvas {
             }
             out.push(it);
         }
-        // ★「幻灯片放映」**不在这里**（2026-11-02 用户要求）：它留在顶层，要随手可及。
+        // ── 线后两项：没有浮条按钮，但同属"对画面做的事"（m327）──
+        //
+        // ★ 线前 10 项**严格等于** `Btn::ALL`（同一份正本、同一顺序）；这条线之后才是
+        //   "菜单独有"的部分。对账时按"线前 = 浮条"读，不会混。
         //   菜单恒列 `Btn::ALL` 全量；浮条另按 `Chrome::row` 裁剪，两者允许不一致——
         //   差集只是"变灰"，不是"消失"。
+        // ★ 为什么放在这里：拖图是拖画面（只改视口），放映是让画面自己翻；两项都是
+        //   "对画面做的事"，不是"显示成什么样"。它们曾经和显示开关挤在同一组，
+        //   用户实测后指出"怪怪的"——那是名词/动词混在一组，不是位置不对。
+        out.push(MenuItem::separator());
+
+        // ── 左键拖图：指针交互的开关（ini 键：drag_image）──
+        // 2026-11-03 用户点名进菜单。理由成立：这条改的是手感，而手感不对的时候人正
+        // 盯着画面——不该要先开设置页才能试另一种分工。
+        // 勾选态**直接读 `config.drag_image`**，不像 `filmstrip` 那样另存一份会话位：
+        // canvas 每次按下都现读配置，多存一份就是第二正本（还会漂）。
+        // 不标脏：切换不改这一帧的任何像素，下一次按下自然按新分工走。
+        out.push({
+            let on = self.config.borrow().drag_image;
+            let cfg = self.config.clone();
+            let hub = self.hub.clone();
+            let mut it = MenuItem::run(
+                "左键拖图",
+                move |_ctx| {
+                    let on = !cfg.borrow().drag_image;
+                    persist_session(&cfg, &hub, |c| c.drag_image = on);
+                },
+                on,
+            );
+            it.checkable = true;
+            it.checked = on;
+            it
+        });
+
+        // ── 幻灯片放映：名字随状态换（放映中读「停止放映」），与 `Btn::PlayPause` 同规矩 ──
+        //
+        // 它不在 `Btn::ALL` 里（浮条上没有这一颗：MDL2 的 PUA 字形是赌局，而浮条几何由
+        // `Btn::ALL` 驱动，多一颗要连动命中与窄窗排布），因此只能作为菜单项存在；
+        // 行为仍走 `exec_action` 那唯一入口——键与菜单同一份代码，不存在"菜单里有、点了没反应"。
+        out.push({
+            let mut it = MenuItem::run(
+                if self.chrome.slideshow_on() {
+                    "停止放映"
+                } else {
+                    "幻灯片放映"
+                },
+                {
+                    let v = self.viewer.clone();
+                    let chrome = self.chrome.clone();
+                    let cfg = self.config.clone();
+                    let hub = self.hub.clone();
+                    move |ctx| {
+                        exec_action(
+                            Some(ctx),
+                            &v,
+                            &chrome,
+                            &cfg,
+                            &hub,
+                            crate::core::hotkey::Action::Slideshow,
+                        );
+                        ctx.mark_dirty();
+                    }
+                },
+                false,
+            );
+            it.shortcut = self
+                .config
+                .borrow()
+                .hotkeys
+                .display(crate::core::hotkey::Action::Slideshow);
+            it
+        });
+
+        // ── 动图/文档播放速度 ▸（m332 建，m335 改名）──
+        // 动图切帧与分页文档切页共用 `viewer::anim_wait` 这一个折算点，所以两者都
+        // 受倍速影响；只有静图 / 单页（没有可推进的延时）才置灰。
+        // ★ 与设置页「看图 → 动图/文档播放速度」写同一份 `Config.anim_speed`，重启后保留；
+        //   改完只重排当前帧之后的时刻，不重解当前帧。
+        out.push({
+            let info = self.viewer.borrow().anim_info();
+            let enabled = info.is_some_and(|a| a.delay_ms > 0);
+            let cur = self.config.borrow().anim_speed;
+            let mut sub = Vec::with_capacity(AnimSpeed::ALL.len());
+            for speed in AnimSpeed::ALL {
+                let cfg = self.config.clone();
+                let hub = self.hub.clone();
+                let checked = cur == speed;
+                sub.push(
+                    MenuItem::run(
+                        speed.label(),
+                        move |ctx| {
+                            persist_session(&cfg, &hub, |c| c.anim_speed = speed);
+                            ctx.mark_dirty();
+                        },
+                        checked,
+                    )
+                    .check(checked),
+                );
+            }
+            let mut it = MenuItem::submenu("动图/文档播放速度", sub);
+            it.enabled = enabled;
+            it
+        });
+
         out
     }
 }
 
-/// 「操作 ▸」的项序与启用态：菜单**恒列** [`Btn::ALL`]，不随窗口宽或播放组显隐删项；
+/// 「画面 ▸」的项序与启用态：菜单**恒列** [`Btn::ALL`]，不随窗口宽或播放组显隐删项；
 /// 只有当前图没有帧/页号时，播放组那三颗变灰（`enabled=false`，框架保证不可点击）。
 ///
 /// ★ 与 [`Chrome::row`] 的分工：浮条按美观裁剪，菜单按"功能永远找得到"列全。
@@ -2541,7 +2656,7 @@ fn ops_row(has_index: bool) -> Vec<(Btn, bool)> {
 /// 让右键菜单**每一级**都留出同一条勾选列，标签左沿才对得齐。
 ///
 /// windui 的 `level_width` 逐级判 `items.iter().any(|it| it.checkable)`：本级有开关项
-/// 才让出 `MENU_CHECK_W + MENU_GAP`（24dp），没有就贴左。于是「操作」「本图」「窗口」
+/// 才让出 `MENU_CHECK_W + MENU_GAP`（24dp），没有就贴左。于是「画面」「本图」「界面」
 /// 「不透明度」这些含开关的级会缩进，而「复制」「插件」这类纯动作列表不会——同一棵菜单里
 /// 文字左沿差一列，看起来就是插件名"没留间隔"。
 /// 补位递归到每一级，包括「外观 ▸ 不透明度 ▸ 档位」这样的三级。
@@ -2566,7 +2681,7 @@ fn align_menu_columns(level: &mut [MenuItem]) {
     first.checkable = true;
 }
 
-/// 活动辅图的缩放按钮（工具栏与右键「操作 ▸」共用）。
+/// 活动辅图的缩放按钮（工具栏与右键「画面 ▸」共用）。
 /// 返回 `true` = 这一颗归辅图，调用方不要再转给主图。
 fn companion_zoom_button(
     b: Btn,
@@ -2604,7 +2719,7 @@ fn companion_zoom_button(
     true
 }
 
-/// 执行一次工具栏按钮的动作：**浮条点击与右键菜单「操作」子菜单共用的唯一入口**。
+/// 执行一次工具栏按钮的动作：**浮条点击与右键菜单「画面」子菜单共用的唯一入口**。
 ///
 /// 以前菜单项各自抄一份行为，加一个按钮要改两处、漏一处就变成"菜单里有这一项，
 /// 点了却没反应"。现在两侧都走这里，加按钮只要动 [`Btn`] 一处。
@@ -2688,7 +2803,10 @@ fn exec_title_btn(
         //   都由系统改尺寸或显隐，重绘自然跟着来），不标这一下，本轮分发结束后画布
         //   没有重绘理由。用户报过"点了不刷新、移开鼠标才变"，指的就是这一档。
         TitleBtn::Topmost => {
-            ctx.toggle_topmost();
+            // m330：与设置页「窗口置顶」写同一份 `stay_on_top`——不再有"只改本窗"的
+            // 第二正本。真正的窗口样式由 runtime 的 `applied_stay` 差分下发（16ms 内）。
+            let on = !cfg.borrow().stay_on_top;
+            persist_session(cfg, hub, |c| c.stay_on_top = on);
             ctx.mark_dirty();
         }
         TitleBtn::Lock => {
@@ -5004,8 +5122,10 @@ fn exec_action(
             true
         }
         Action::Minimal => {
-            let on = !chrome.minimal_mode.get();
+            // m330：与菜单 / 设置页写同一份 `minimal_mode`（旧版这里也只在 chrome 里翻）。
+            let on = !cfg.borrow().minimal_mode;
             chrome.minimal_mode.set(on);
+            persist_session(cfg, hub, |c| c.minimal_mode = on);
             // 不提示：与 `Action::Lock`（锁窗口）同款——状态切换当场可见，
             // 屏幕自己已经说了。锁窗口从来不提示，也从没人抱怨看不见。
             if let Some(c) = ctx {
@@ -5028,10 +5148,12 @@ fn exec_action(
             c.toggle_fullscreen();
             true
         }),
-        Action::Topmost => ctx.is_some_and(|c| {
-            c.toggle_topmost();
+        // m330：与标题栏 📌 / 设置页写同一份 `stay_on_top`；窗口样式由 runtime 差分下发。
+        Action::Topmost => {
+            let on = !cfg.borrow().stay_on_top;
+            persist_session(cfg, hub, |c| c.stay_on_top = on);
             true
-        }),
+        }
         Action::Minimize => ctx.is_some_and(|c| {
             c.minimize();
             true
@@ -5202,7 +5324,7 @@ mod tests {
         }
     }
 
-    /// m262：设置页「外观」卡与右键「外观 ▸」必须是同一条项序。
+    /// m262：设置页「界面」卡与右键「界面 ▸」前六项必须是同一条项序。
     /// 两处各排各的、时间一长必漂；这是源码级接线钉子，改一边就红。
     #[test]
     fn appearance_order_matches_between_settings_and_menu() {
@@ -5210,8 +5332,8 @@ mod tests {
         let page = page
             .split("fn appearance_body")
             .nth(1)
-            .expect("设置页外观卡");
-        assert_order(page, &APPEARANCE_PAGE_KEYS, "设置页外观卡");
+            .expect("设置页界面卡");
+        assert_order(page, &APPEARANCE_PAGE_KEYS, "设置页界面卡");
         let menu = code_lines(production_src());
         let menu = menu
             .split("fn appearance_items")
@@ -5237,25 +5359,47 @@ mod tests {
         assert_order(&old, &APPEARANCE_PAGE_KEYS, "m262 旧序模拟");
     }
 
-    /// m275 / m276 / m287 / m313：顶层**文件块**的项序。m287 把「排序 ▸」从看图区上移到
-    /// 「复制」与「属性」之间 —— 既让「属性」留在块尾（资源管理器里它永远是最后一项），
-    /// 也把"改磁盘上的清单"和"改屏幕上的像素"分成两块；m313 把「系统菜单」插在
-    /// 「打开…」正后方（两条都是"拿这个文件当对象"，内容一个归我们、一个归外壳）。
-    /// 这条钉子钉三件事：系统菜单紧跟打开、排序在文件块里、排序在「复制」之后且在
-    /// 「属性」之前。
-    const FILE_BLOCK_MENU_KEYS: [&str; 5] = [
-        "\"打开…\"",
-        "\"系统菜单\"",
-        "\"复制\"",
-        "\"排序\"",
-        "\"属性…\"",
+    /// m327：顶层 9 项、四块、三条线。项序就是阅读顺序：文件 → 最近 → 排序 →（线）→
+    /// 画面 → 本图 → 插件 →（线）→ 视图 → 主辅视图 →（线）→ 设置。
+    ///
+    /// ★ 「最近 ▸」「排序 ▸」紧跟「文件 ▸」：三者都是"挑下一步看什么"；但它们必须
+    ///   留在顶层——本身是子菜单，收进「文件 ▸」就成了三级，而本地 13 个竞品样本里
+    ///   没有一家右键菜单超过两级。
+    const TOP_MENU_KEYS: [&str; 9] = [
+        "\"文件\"",
+        "self.recent_menu()",
+        "self.sort_menu()",
+        "\"画面\"",
+        "\"本图\"",
+        "\"插件\"",
+        "\"界面\"",
+        "\"主辅视图\"",
+        "\"设置…\"",
     ];
 
-    /// m275 / m287：顶层**状态开关区**的相对位置。排序搬走后这一块剩三项
-    /// （外观 → 幻灯片放映 → 左键拖图），加上块尾的「设置…」共四项要按序出现。
-    /// 排序仍不许混进「外观 ▸」：它不改画面，只改下一张是谁。
-    const VIEW_ORDER_MENU_KEYS: [&str; 4] =
-        ["\"外观\"", "\"幻灯片放映\"", "\"左键拖图\"", "\"设置…\""];
+    /// m327：「文件 ▸」组内顺序：打开 / 系统菜单 →（线）→ 复制×3 →（线）→
+    /// 属性 → 清除本书阅读位置（m333）。
+    /// `复制` 已拍平，不再有自己的子菜单标签；锚点用 `self.copy_items(`。
+    /// 排序已独立成顶层一项，不在本组。
+    const FILE_GROUP_MENU_KEYS: [&str; 5] = [
+        "\"打开…\"",
+        "\"系统菜单\"",
+        "self.copy_items(",
+        "\"属性…\"",
+        "\"清除本书阅读位置\"",
+    ];
+
+    /// m327：「排序 ▸」组内 = 四个维度 →（线）→ 倒序。
+    const SORT_MENU_KEYS: [&str; 3] = ["SortBy::ALL", "MenuItem::separator()", "\"倒序\""];
+
+    /// m327：「画面 ▸」= 线前 10 项（`Btn::ALL`）→（线）→ 拖图 / 放映。
+    /// 前段接的是 `ops_row`；线后两项必须按这个顺序出现。
+    const OPS_TAIL_MENU_KEYS: [&str; 4] = [
+        "ops_row(has_index)",
+        "\"左键拖图\"",
+        "\"停止放映\"",
+        "\"动图/文档播放速度\"",
+    ];
 
     /// m276 / m280：「本图 ▸」组内四项的次序。三个"打开一个窗"的常驻项在前、
     /// 会话开关垫底；改名 / 挪位 / 少一项都会红。
@@ -5270,7 +5414,7 @@ mod tests {
     /// 组内四项按 [`CURRENT_IMAGE_MENU_KEYS`] 递增。正向喂生产源码，负向臂喂旧布局。
     fn assert_current_image_menu(src: &str) {
         let menu = src.split("fn context_menu").nth(1).expect("右键菜单");
-        let top = menu.split("fn appearance_items").next().unwrap_or(menu);
+        let top = menu.split("fn file_items").next().unwrap_or(menu);
         // 只认标签与接线名，不认整串 `MenuItem::submenu("本图", …)`：
         // `cargo fmt` 会把这行按参数折成多行，整串匹配会假红。
         assert!(
@@ -5298,55 +5442,68 @@ mod tests {
     }
 
     #[test]
-    fn sort_sits_in_the_file_block_and_current_image_group_keeps_its_four() {
+    fn top_level_is_nine_items_and_each_group_keeps_its_order() {
         let src = code_lines(production_src());
         let menu = src.split("fn context_menu").nth(1).expect("右键菜单");
-        let top = menu.split("fn appearance_items").next().unwrap_or(menu);
-        assert_order(top, &FILE_BLOCK_MENU_KEYS, "右键菜单文件块");
-        assert_order(top, &VIEW_ORDER_MENU_KEYS, "右键菜单状态开关区");
-        let appearance = src.split("fn appearance_items").nth(1).unwrap_or("");
+        let top = menu.split("fn file_items").next().unwrap_or(menu);
+        assert_order(top, &TOP_MENU_KEYS, "右键菜单顶层");
         assert!(
-            !appearance.contains("MenuItem::submenu(\"排序\""),
-            "「排序 ▸」被挪进「外观 ▸」里了：它不改画面，只改下一张是谁"
+            !top.contains("\"外观\"") && !top.contains("\"操作\""),
+            "m327 起顶层叫「界面」「画面」，旧名不该再出现"
         );
+        assert!(
+            !top.contains("\"左键拖图\"") && !top.contains("\"幻灯片放映\""),
+            "放映与拖图还在顶层，没有收进「画面 ▸」"
+        );
+
+        let group = src.split("fn file_items").nth(1).expect("文件子菜单");
+        let group = group.split("\n    fn ").next().unwrap_or(group);
+        assert_order(group, &FILE_GROUP_MENU_KEYS, "文件 ▸ 组内");
+        assert!(
+            !group.contains("SortBy::ALL"),
+            "排序被摊回「文件 ▸」了：m327 起它是顶层独立一项"
+        );
+
+        let sort = src.split("fn sort_menu").nth(1).expect("排序子菜单");
+        let sort = sort.split("\n    fn ").next().unwrap_or(sort);
+        assert_order(sort, &SORT_MENU_KEYS, "排序 ▸ 组内");
+
+        let ops = src.split("fn ops_items").nth(1).expect("画面子菜单");
+        assert_order(ops, &OPS_TAIL_MENU_KEYS, "画面 ▸ 组内");
+
         assert_current_image_menu(&src);
     }
 
-    /// 负向臂③（m287）：把「排序 ▸」按 m275 的旧位置放回「左键拖图」之后，文件块那条
-    /// 钉子必须当场红 —— 否则这次上移就只是"代码挪了、钉子没跟上"。
-    /// ★ m313 起这份旧布局也要带上「系统菜单」：不然它会先在前一项就红，看着绿、其实
-    ///   没验到"排序位置"这一条（负向臂最容易这么失效）。
+    /// 负向臂①（m327）：把顶层按 m326 的旧布局摊回 14 项，9 项序钉必须当场红——
+    /// 否则这次合并就只是"代码挪了、钉子没跟上"。
     #[test]
-    #[should_panic(expected = "右键菜单文件块 里找不到")]
-    fn file_block_rejects_the_old_sort_position() {
+    #[should_panic(expected = "右键菜单顶层 里找不到")]
+    fn top_level_rejects_the_pre_m327_fourteen_item_layout() {
         let old = [
             "fn context_menu(&self) {",
             "    MenuItem::run(\"打开…\", |_| {}, false);",
+            "    MenuItem::run(\"最近\", |_| {}, false);",
             "    MenuItem::run(\"系统菜单\", |_| {}, false);",
             "    MenuItem::submenu(\"复制\", vec![]);",
+            "    MenuItem::submenu(\"排序\", vec![]);",
             "    MenuItem::run(\"属性…\", |_| {}, false);",
-            "    MenuItem::separator();",
             "    MenuItem::submenu(\"操作\", vec![]);",
             "    MenuItem::submenu(\"本图\", vec![]);",
             "    MenuItem::submenu(\"插件\", vec![]);",
-            "    MenuItem::separator();",
             "    MenuItem::submenu(\"外观\", vec![]);",
             "    MenuItem::run(\"幻灯片放映\", |_| {}, false);",
+            "    MenuItem::submenu(\"主辅视图\", vec![]);",
             "    MenuItem::run(\"左键拖图\", |_| {}, false);",
-            "    MenuItem::submenu(\"排序\", vec![]);",
-            "    MenuItem::separator();",
             "    MenuItem::run(\"设置…\", |_| {}, false);",
             "}",
-            "fn appearance_items(&self) {}",
-            "fn current_image_items(&self) {}",
-            "fn copy_items(&self) {}",
+            "fn file_items(&self) {}",
         ]
         .join("\n");
-        let top = old.split("fn appearance_items").next().unwrap_or(&old);
-        assert_order(top, &FILE_BLOCK_MENU_KEYS, "右键菜单文件块");
+        let top = old.split("fn file_items").next().unwrap_or(&old);
+        assert_order(top, &TOP_MENU_KEYS, "右键菜单顶层");
     }
 
-    /// 负向臂①：模拟 m275 的旧布局——组已经叫「本图」了，但 RAW 参数仍摊在顶层。
+    /// 负向臂②：模拟 m275 的旧布局——组已经叫「本图」了，但 RAW 参数仍摊在顶层。
     /// 专打"顶层不许再出现收编项"这一条，必须当场红。
     #[test]
     #[should_panic(expected = "RAW 参数… 仍是顶层项")]
@@ -5355,9 +5512,9 @@ mod tests {
             "fn context_menu(&self) {",
             "    MenuItem::run(\"RAW 参数…\", |_| {}, false);",
             "    MenuItem::submenu(\"本图\", self.current_image_items(true));",
-            "    MenuItem::submenu(\"外观\", vec![]);",
+            "    MenuItem::submenu(\"界面\", vec![]);",
             "}",
-            "fn appearance_items(&self) {}",
+            "fn file_items(&self) {}",
             "fn current_image_items(&self) {",
             "    \"RAW 参数…\"; \"跳转到…帧/页\"; \"取色器\";",
             "}",
@@ -5367,7 +5524,7 @@ mod tests {
         assert_current_image_menu(&old);
     }
 
-    /// 负向臂②：组内少一项（只剩 RAW 参数 + 取色器）也要红，别让项序钉子
+    /// 负向臂④：组内少一项（只剩 RAW 参数 + 取色器）也要红，别让项序钉子
     /// 变成"只检查前两项"的空壳。
     #[test]
     #[should_panic(expected = "里找不到")]
@@ -5375,9 +5532,9 @@ mod tests {
         let old = [
             "fn context_menu(&self) {",
             "    MenuItem::submenu(\"本图\", self.current_image_items(true));",
-            "    MenuItem::submenu(\"外观\", vec![]);",
+            "    MenuItem::submenu(\"界面\", vec![]);",
             "}",
-            "fn appearance_items(&self) {}",
+            "fn file_items(&self) {}",
             "fn current_image_items(&self) {",
             "    \"RAW 参数…\"; \"取色器\";",
             "}",
@@ -5392,23 +5549,28 @@ mod tests {
     /// ① 窗口卡：[`WINDOW_ROWS`] 既是序也是相邻判据。「启动窗口」与「窗口尺寸」中间
     ///    一旦再插进任何一行（m269 就插过一次「无边框」），"选档 → 填宽高 → 置灰"
     ///    这条读法就断成两截，断言当场红。
-    /// ② 看图卡：[`BROWSE_ROWS`] 的最后一项必须是「幻灯片间隔」——它是卡里唯一的
-    ///    数值行，夹在勾选中间会打断连读。
-    const WINDOW_ROWS: [&str; 6] = [
+    /// ② 画面卡：[`BROWSE_ROWS`] 勾选在前、两个数值行收在末尾
+    ///    （动图/文档播放速度 → 幻灯片间隔），数值行夹在勾选中间会打断连读。
+    /// ③ 系统卡：[`SYSTEM_ROWS`] 只留下载源与文件关联入口（m328 起空格两项在窗口卡）。
+    const WINDOW_ROWS: [&str; 8] = [
         "\"启动窗口\"",
         "\"窗口尺寸 (宽, 高)\"",
         "\"无边框\"",
         "\"窗口置顶\"",
         "\"最小化到托盘\"",
         "\"允许多开\"",
+        "\"空格看图\"",
+        "\"长按空格松手收起\"",
     ];
-    const BROWSE_ROWS: [&str; 5] = [
+    const BROWSE_ROWS: [&str; 6] = [
         "\"适应长图\"",
         "\"左键拖图\"",
-        "\"空格看图\"",
         "\"图片预读\"",
+        "\"动图/文档自动播放\"",
+        "\"动图/文档播放速度\"",
         "\"幻灯片间隔 (秒)\"",
     ];
+    const SYSTEM_ROWS: [&str; 2] = ["\"下载源\"", "\"文件关联\""];
 
     #[test]
     fn options_cards_keep_their_row_order() {
@@ -5419,8 +5581,14 @@ mod tests {
             .and_then(|s| s.split("fn browse_body").next())
             .expect("设置页窗口卡");
         assert_order(window, &WINDOW_ROWS, "设置页窗口卡");
-        let browse = page.split("fn browse_body").nth(1).expect("设置页看图卡");
-        assert_order(browse, &BROWSE_ROWS, "设置页看图卡");
+        let browse = page
+            .split("fn browse_body")
+            .nth(1)
+            .and_then(|s| s.split("fn system_body").next())
+            .expect("设置页画面卡");
+        assert_order(browse, &BROWSE_ROWS, "设置页画面卡");
+        let system = page.split("fn system_body").nth(1).expect("设置页系统卡");
+        assert_order(system, &SYSTEM_ROWS, "设置页系统卡");
     }
 
     /// m273 负向臂：拿 m272 的旧序喂同一个断言，必须报红——那正是"无边框插在尺寸中间"
@@ -5456,7 +5624,7 @@ mod tests {
     }
 
     /// m266：「图片预读」归哪张卡的**唯一断言**。先查它有没有跑回「系统」卡，
-    /// 再查它是不是真在「看图」卡（m273 前叫「看图与操作」）；两条来源的注释必须跟着
+    /// 再查它是不是真在「画面」卡（m273 前叫「看图与操作」）；两条来源的注释必须跟着
     /// 行一起挪。
     fn assert_prefetch_card(src: &str, what: &str) {
         let browse = src
@@ -5474,7 +5642,7 @@ mod tests {
         );
         assert!(
             browse.contains("check_row(\"图片预读\""),
-            "{what}：看图卡里没有「图片预读」"
+            "{what}：画面卡里没有「图片预读」"
         );
         assert!(
             browse.contains("邻图 ±N + 缩略图条可见的那一屏"),
@@ -5505,19 +5673,27 @@ fn system_body(h: &Handles) -> Element {
         assert_prefetch_card(old, "m265 旧版式模拟");
     }
 
-    /// m262：「外观 ▸」内部不许再有分隔线；三态档位必须走共用轴，不许就地硬编码。
+    /// m262 / m327：外观六项自己是一条轴、不画分隔线；「画面 ▸」把浮条十颗与
+    /// 拖图/放映分成两段，中间**只许一条线**。三态档位必须走共用轴，不许就地硬编码。
     #[test]
-    fn appearance_submenu_has_one_axis_and_no_separator() {
+    fn view_and_ops_groups_keep_one_separator_each() {
         let src = production_src();
         let body = src
             .split("fn appearance_items")
             .nth(1)
-            .expect("右键外观子菜单");
+            .expect("右键外观六项");
         let end = body.find("\n    fn ").unwrap_or(body.len());
         let body = &body[..end];
         assert!(
             !body.contains("MenuItem::separator()"),
-            "外观子菜单不许画分隔线（父级已按开关区分过组）"
+            "外观六项内部不许画分隔线（它们本来是一条轴）"
+        );
+        let ops = src.split("fn ops_items").nth(1).expect("右键画面子菜单");
+        let ops = ops.split("fn ops_row").next().unwrap_or(ops);
+        assert_eq!(
+            ops.matches("MenuItem::separator()").count(),
+            1,
+            "「画面 ▸」只许一条线：浮条十颗 ── 拖图/放映"
         );
         assert!(body.contains("settings::FILMSTRIP_POS"), "标签要取共用表");
         assert!(
@@ -5636,7 +5812,7 @@ fn system_body(h: &Handles) -> Element {
         assert_ne!(cache.img.as_ref().unwrap().gen, gen2);
     }
 
-    /// ★ 用户 2026-11-06：右键「操作 ▸」的播放三颗**永远存在**；没有帧/页号时
+    /// ★ 用户 2026-11-06：右键「画面 ▸」的播放三颗**永远存在**；没有帧/页号时
     /// 变灰且不可点，而不是从菜单里消失（浮条才按美观隐藏）。
     #[test]
     fn ops_menu_keeps_anim_buttons_but_disables_them_without_index() {
@@ -6235,6 +6411,88 @@ fn system_body(h: &Handles) -> Element {
         assert!(
             !no_file[1].enabled && !no_file[2].enabled,
             "没打开文件时那两项都该灰着"
+        );
+    }
+
+    /// m327 接线钉子：源码级测试只认标签在不在对应函数里；这条走真实构造函数，
+    /// 钉住“复制三项确实**平铺**在文件组里”，且属性仍在块尾。
+    #[test]
+    fn file_group_flattens_copy_and_keeps_properties_last() {
+        let (canvas, _v) = zoomed_canvas();
+        let items = canvas.file_items(true, true);
+        let labels: Vec<&str> = items
+            .iter()
+            .filter(|it| !it.separator)
+            .map(|it| it.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "打开…",
+                "系统菜单",
+                "复制当前（PNG）",
+                "复制原文件",
+                "复制文件路径",
+                "属性…",
+                "清除本书阅读位置",
+            ],
+            "文件 ▸ 的项序或拍平结果变了"
+        );
+        assert_eq!(
+            items.iter().filter(|it| it.separator).count(),
+            2,
+            "文件 ▸ 两条线：打开层 / 复制"
+        );
+        assert!(items[0].enabled, "“打开…”永远可点");
+        assert!(
+            items
+                .last()
+                .is_some_and(|it| it.label == "清除本书阅读位置"),
+            "清除阅读位置是 m333 新块尾；属性仍紧挨在它前面"
+        );
+        assert!(
+            !labels.contains(&"文件名"),
+            "排序已独立成顶层一项，不许再摊回文件组"
+        );
+    }
+
+    /// m330：设置窗里出现过的开关，任何入口都必须写同一份 ini。
+    /// 极简模式与窗口置顶曾各有“只改 chrome / 只改窗口态”的旁路；这条钉子按
+    /// 写回形状计数，菜单 / 快捷键 / 标题栏少一条就红。
+    #[test]
+    fn settings_backed_toggles_write_config_from_every_entry() {
+        let src = production_src();
+        assert!(
+            src.matches("|c| c.minimal_mode = on").count() >= 2,
+            "极简模式至少要有菜单 + 快捷键两条写回"
+        );
+        assert!(
+            src.matches("|c| c.stay_on_top = on").count() >= 2,
+            "窗口置顶至少要有标题栏 + 快捷键两条写回"
+        );
+    }
+
+    /// m327：排序独立成组 = 四个维度 → 一条线 → 倒序；五项都带勾选列。
+    #[test]
+    fn sort_menu_lists_four_dimensions_then_desc() {
+        let (canvas, _v) = zoomed_canvas();
+        let item = canvas.sort_menu();
+        assert_eq!(item.label, "排序");
+        let sub = &item.submenu;
+        assert_eq!(sub.len(), 6, "4 维 + 分隔线 + 倒序");
+        let labels: Vec<&str> = sub
+            .iter()
+            .filter(|it| !it.separator)
+            .map(|it| it.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["文件名", "大小", "创建日期", "修改日期", "倒序"],
+            "排序 ▸ 的项序变了"
+        );
+        assert!(
+            sub.iter().filter(|it| !it.separator).all(|it| it.checkable),
+            "五项都要留勾选列"
         );
     }
 

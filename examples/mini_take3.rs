@@ -18,7 +18,8 @@ fn main() {
             String::from_utf16_lossy(&buf[..n.max(0) as usize])
         );
     }
-    let got = rupix_lib::platform::shell_selection::foreground_selected_file(&|_: &str| true);
+    let got =
+        rupix_lib::platform::shell_selection::foreground_selected_file(&|_: &std::path::Path| true);
     println!("take = {got:?}");
     std::fs::remove_file(&img).ok();
 }

@@ -220,6 +220,7 @@ fn health_code(h: &Health) -> &'static str {
     match h {
         Health::Ok => "ok",
         Health::AbiMismatch { .. } => "abi-mismatch",
+        Health::LoadSkipped => "load-skipped",
         Health::LoadFailed(_) => "load-failed",
     }
 }

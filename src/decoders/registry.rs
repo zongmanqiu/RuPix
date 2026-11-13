@@ -14,6 +14,8 @@ pub enum Health {
     Ok,
     /// 解码器运行时 abi 与宿主不符。
     AbiMismatch { got: u32 },
+    /// 上次加载时宿主崩溃/硬故障，盘上留有 `<dll>.loading`；本次跳过。
+    LoadSkipped,
     /// 文件/符号缺失、Ffi 调用 panic 等。
     LoadFailed(String),
 }
@@ -24,6 +26,7 @@ impl Health {
         match self {
             Health::Ok => "可用".into(),
             Health::AbiMismatch { got } => format!("版本不匹配（abi={got}）"),
+            Health::LoadSkipped => "上次加载崩溃，已跳过".into(),
             Health::LoadFailed(e) => format!("加载失败（{e}）"),
         }
     }
@@ -364,6 +367,19 @@ pub fn list_decoders() -> Vec<DecoderEntry> {
                 Vec::new(),
                 false,
                 Some(got),
+                Vec::new(),
+            ),
+            Inspect::Skipped => (
+                stem.clone(),
+                format!("{stem}（上次加载崩溃，已跳过）"),
+                "上次加载时宿主崩溃或发生硬故障，本次已按残留标记跳过。清除标记后可重试。"
+                    .to_string(),
+                Vec::new(),
+                Health::LoadSkipped,
+                false,
+                Vec::new(),
+                false,
+                None,
                 Vec::new(),
             ),
             Inspect::Error(e) => (

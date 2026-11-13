@@ -20,12 +20,19 @@ pub(super) enum Fail {
     Unsupported(String),
     /// 损坏 / 过大 / panic——换解码器多半也没用。
     Hard(String),
+    /// 读文件失败（含文件不存在）：换解码器没意义，但分类要看 I/O 原因。
+    Io(std::io::Error),
 }
 
 impl Fail {
-    pub(super) fn into_msg(self) -> String {
+    /// 交给 UI 的结构化判词："不认 / 不支持" → Unsupported；硬失败 → DecodeFailed；
+    /// 读文件失败按 `NotFound` 判 FileMissing，其余 I/O 归 Other。
+    pub(super) fn into_failure(self) -> crate::core::error::ViewFailure {
+        use crate::core::error::ViewFailure;
         match self {
-            Fail::NotClaimed(m) | Fail::Unsupported(m) | Fail::Hard(m) => m,
+            Fail::NotClaimed(m) | Fail::Unsupported(m) => ViewFailure::unsupported(m),
+            Fail::Hard(m) => ViewFailure::decode(m),
+            Fail::Io(e) => ViewFailure::from_io(e),
         }
     }
 
@@ -128,4 +135,42 @@ pub(super) fn preferred_candidate<'a, 'b>(
             && c.extensions.iter().any(|e| e == ext)
             && c.caps & require_caps == require_caps
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::error::FailureKind;
+    use std::io::{Error, ErrorKind};
+
+    /// 解码层三分 → UI 四类：不认/不支持 = Unsupported；硬失败 = DecodeFailed；
+    /// 读文件 NotFound = FileMissing；其余 I/O = Other。原文一个字不丢。
+    #[test]
+    fn fail_categories_map_to_ui_failure_kinds() {
+        let cases = [
+            (
+                Fail::NotClaimed("不认识".to_string()),
+                FailureKind::Unsupported,
+            ),
+            (
+                Fail::Unsupported("缺能力".to_string()),
+                FailureKind::Unsupported,
+            ),
+            (Fail::Hard("已损坏".to_string()), FailureKind::DecodeFailed),
+            (
+                Fail::Io(Error::from(ErrorKind::NotFound)),
+                FailureKind::FileMissing,
+            ),
+            (
+                Fail::Io(Error::from(ErrorKind::PermissionDenied)),
+                FailureKind::Other,
+            ),
+        ];
+        for (fail, want) in cases {
+            let got = fail.into_failure();
+            assert_eq!(got.kind, want, "分类不对：{got:?}");
+        }
+        let got = Fail::Hard("解码器「x」解到一半崩了".to_string()).into_failure();
+        assert_eq!(got.detail, "解码器「x」解到一半崩了", "原文必须保留");
+    }
 }

@@ -10,7 +10,8 @@ fn main() {
         .spawn()
         .ok();
     std::thread::sleep(std::time::Duration::from_millis(1800));
-    let got = rupix_lib::platform::shell_selection::foreground_selected_file(&|_: &str| true);
+    let got =
+        rupix_lib::platform::shell_selection::foreground_selected_file(&|_: &std::path::Path| true);
     println!("no-hook take = {got:?}");
     std::fs::remove_file(&img).ok();
 }

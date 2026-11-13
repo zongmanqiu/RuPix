@@ -49,6 +49,7 @@ use windows::Win32::Graphics::Gdi::{
     HGDIOBJ,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_ADD, VK_APPS, VK_BACK, VK_CONTROL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END,
@@ -72,6 +73,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const MSG_ENABLE: u32 = WM_APP + 20;
 const MSG_SPACE: u32 = WM_APP + 21;
 const MSG_READY: u32 = WM_APP + 22;
+/// 只收起、绝不新开（长按松手那一路用：keyup 与 keydown 之间预览可能已经被 Esc 关掉，
+/// 再走 `on_space` 的 toggle 会把已经收起的预览重新弹出来）。
+const MSG_CLOSE: u32 = WM_APP + 23;
 /// `MSG_ENABLE` 的 wParam 编码。
 const ON: usize = 1;
 const OFF: usize = 0;
@@ -187,6 +191,12 @@ static PREVIEW_HWND: AtomicUsize = AtomicUsize::new(0);
 /// 空格按住标志（长按自重复抑制——QuickLook `_spaceIsDown` 同款：DOWN 接管后置旗，
 /// 连发直到 UP 一律放过，预览不会随按住被反复开关）。
 static SPACE_DOWN: AtomicBool = AtomicBool::new(false);
+/// 长按松手收起的选项镜像（ini 键 `space_hold_close`；UI 线程写、钩子读）。
+static HOLD_CLOSE: AtomicBool = AtomicBool::new(false);
+/// 本次空格 DOWN 的起点（`GetTickCount64` 毫秒；0 = 这次按键不走长按判据）。
+/// 只在这一种情况下非 0：**按下那一刻预览已经开着**且选项开启——这样“按一下开预览”
+/// 那一次按键的 UP 不会被误判成长按（否则按住不放刚打开就会立刻关掉）。
+static HOLD_STARTED_AT: AtomicU64 = AtomicU64::new(0);
 /// 解码世代：连按空格时旧线程的成品作废（一轮就有的设计，原样保留）。
 static GEN: AtomicU64 = AtomicU64::new(0);
 /// 当前预览的文件路径：预览态翻页以它为基准。只在控制线程写，导航 worker 读。
@@ -353,6 +363,17 @@ pub fn set_enabled(on: bool) {
     post_enable(on);
 }
 
+/// 长按松手收起开关的镜像（UI 线程 16ms 轮询调用；同值零动作）。
+/// 关掉时顺手清掉在途的长按起点：下一次 UP 不再按旧时刻裁决。
+pub fn set_hold_close(on: bool) {
+    if HOLD_CLOSE.swap(on, Ordering::Relaxed) == on {
+        return;
+    }
+    if !on {
+        HOLD_STARTED_AT.store(0, Ordering::Relaxed);
+    }
+}
+
 /// 投递开关消息；false 表示控制窗还没建好（启动竞争窗口）。调用方无需补救——
 /// 线程装配时以 `ENABLED` 现值为准，两边最终一致。
 fn post_enable(on: bool) -> bool {
@@ -437,6 +458,20 @@ pub fn engage(
     }
 }
 
+/// 长按松手是否该收起。
+///
+/// 选项 `space_hold_close` 关着时，DOWN 就投递收窗（老行为）。开着时只记下按下的
+/// 时刻，等 UP 再看按了多久：≥ [`HOLD_CLOSE_MS`] 且预览仍开着才收，轻点保持打开。
+/// 这里**只记时间不投递**：用户可能在按住期间用 Esc 或点外部把预览关掉，
+/// keydown 就收会让“本来已经关了”再吃一次关闭（预览不存在时 toggle 甚至会重开）。
+fn hold_close_due(enabled: bool, preview_open: bool, pressed_at: u64, now: u64) -> bool {
+    enabled && preview_open && pressed_at != 0 && now.saturating_sub(pressed_at) >= HOLD_CLOSE_MS
+}
+
+/// 长按判定阈值：用户口径 750 ms。低于它算轻点，保持现有 toggle 的“点一下开、点一下收”
+/// 之外的新语义（开着时轻点 = 不动）。
+pub const HOLD_CLOSE_MS: u64 = 750;
+
 // ───────────────────────── 钩子（微秒级，快进快出） ─────────────────────────
 
 /// 低级键盘钩子回调。运行在本模块线程的输入上下文里；超过 `LowLevelHooksTimeout`
@@ -457,6 +492,15 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         }
         if kb.flags.contains(LLKHF_UP) {
             SPACE_DOWN.store(false, Ordering::Relaxed);
+            let pressed_at = HOLD_STARTED_AT.swap(0, Ordering::Relaxed);
+            if hold_close_due(
+                HOLD_CLOSE.load(Ordering::Relaxed),
+                PREVIEW_HWND.load(Ordering::Acquire) != 0,
+                pressed_at,
+                unsafe { GetTickCount64() },
+            ) {
+                notify_close();
+            }
         } else {
             if SPACE_DOWN.load(Ordering::Relaxed) {
                 // 长按自重复：这串 DOWN 的第一颗已处理过，连发一律放过。
@@ -467,6 +511,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                     return CallNextHookEx(None, code, wparam, lparam);
                 }
                 SPACE_DOWN.store(false, Ordering::Relaxed);
+                HOLD_STARTED_AT.store(0, Ordering::Relaxed);
             }
             if unsafe { modifiers_held() } {
                 // 带修饰的空格不归我们（QuickLook：`Modifiers != None` 跳过；Win 键
@@ -475,11 +520,24 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             }
             match hook_engage() {
                 Intent::Pass => {}
-                Intent::Close | Intent::Open => {
+                Intent::Open => {
                     SPACE_DOWN.store(true, Ordering::Relaxed);
-                    // 意图（收/开）不在钩子里定夺：控制线程按当下的 `PREVIEW_HWND`
-                    // 重新裁决即可——两颗消息之间用户什么都做得出，现场状态才算数。
+                    HOLD_STARTED_AT.store(0, Ordering::Relaxed);
                     notify_space();
+                }
+                Intent::Close => {
+                    SPACE_DOWN.store(true, Ordering::Relaxed);
+                    if HOLD_CLOSE.load(Ordering::Relaxed) {
+                        // 长按松手收起：DOWN 只记起点，UP 才裁决。轻点（<750ms）
+                        // 不动，保持预览打开——这是用户点名的语义。
+                        HOLD_STARTED_AT
+                            .store(unsafe { GetTickCount64() }.max(1), Ordering::Relaxed);
+                    } else {
+                        HOLD_STARTED_AT.store(0, Ordering::Relaxed);
+                        // 老行为：意图（收/开）不在钩子里定夺，控制线程按当下的
+                        // `PREVIEW_HWND` 重新裁决即可——现场状态才算数。
+                        notify_space();
+                    }
                 }
             }
         }
@@ -550,6 +608,22 @@ fn notify_space() {
         let _ = PostMessageW(
             Some(HWND(raw as *mut core::ffi::c_void)),
             MSG_SPACE,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
+}
+
+/// 只投递“收起”——长按松手那一路专用。与 [`notify_space`] 分开的理由见 [`MSG_CLOSE`]。
+fn notify_close() {
+    let raw = CTRL_HWND.load(Ordering::Acquire);
+    if raw == 0 {
+        return;
+    }
+    unsafe {
+        let _ = PostMessageW(
+            Some(HWND(raw as *mut core::ffi::c_void)),
+            MSG_CLOSE,
             WPARAM(0),
             LPARAM(0),
         );
@@ -645,7 +719,7 @@ unsafe fn register_class(
     RegisterClassW(&wc);
 }
 
-/// 控制窗过程。三类自定义消息全在这条线程串行处理——钩子回调刚返回、对输入预算的
+/// 控制窗过程。四类自定义消息全在这条线程串行处理——钩子回调刚返回、对输入预算的
 /// 占用已交还，此处才碰跨进程 COM 与开窗。一轮的判定/投递挂在主窗帧上（收进托盘
 /// 即停摆），这条链与主窗显隐从此再无关系。
 unsafe extern "system" fn ctrl_wnd_proc(
@@ -657,6 +731,7 @@ unsafe extern "system" fn ctrl_wnd_proc(
     match msg {
         MSG_ENABLE => apply_enable(wparam.0 == ON),
         MSG_SPACE => on_space(),
+        MSG_CLOSE => on_close_space(),
         MSG_READY => on_ready_raw(lparam),
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
@@ -669,6 +744,7 @@ unsafe fn apply_enable(on: bool) {
     if on {
         // 重新开钩时先清按住态：关掉期间可能漏掉 UP，不能带着旧旗进来。
         SPACE_DOWN.store(false, Ordering::Relaxed);
+        HOLD_STARTED_AT.store(0, Ordering::Relaxed);
         // 摘钩失败留下的句柄可能已经失效；丢弃它重装，别让 HOOKED 永远粘在 true。
         let stale = HOOK_STALE.swap(false, Ordering::SeqCst);
         let already = HOOK.with(|c| {
@@ -711,6 +787,7 @@ unsafe fn apply_enable(on: bool) {
             }
         }
         SPACE_DOWN.store(false, Ordering::Relaxed);
+        HOLD_STARTED_AT.store(0, Ordering::Relaxed);
         // 作废所有在途解码：否则关掉后重新打开时，旧一代的成品会通过 `on_ready_raw`
         // 的 ENABLED/GEN 双闸，把关闭前选中的图弹出来并抢前台。
         GEN.fetch_add(1, Ordering::SeqCst);
@@ -738,6 +815,17 @@ unsafe fn on_space() {
     dispatch_pick_and_decode();
 }
 
+/// `MSG_CLOSE`：只收不起。长按松手时预览可能已被 Esc / 点外部关掉，走 `on_space`
+/// 的 toggle 会把它重新打开；这里预览不在就什么都不做。
+unsafe fn on_close_space() {
+    if !ENABLED.load(Ordering::SeqCst) {
+        return;
+    }
+    if PREVIEW_HWND.load(Ordering::Acquire) != 0 {
+        close_preview();
+    }
+}
+
 /// 取件 + 解码派发：整段跨进程 COM 与解码都在一次性 worker 里（不占控制线程，
 /// 更不占 UI 线程），成品带世代回投。控制线程只保留窗口状态判定。
 ///
@@ -748,17 +836,19 @@ fn dispatch_pick_and_decode() {
     let gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let ctrl = CTRL_HWND.load(Ordering::SeqCst);
     std::thread::spawn(move || {
-        // 清单口径与主窗一致：内置（SVG/SVGZ）∪ 解码器自述扩展名。判据在 `formats`
-        // 一处，本处只引用。★ 裸像素（`rgb`/`uyvy`/`yuv`…）也在这份清单里：它们能不能
-        // 出图取决于"参数推不推得出"，那是**文件级**事实，下一段按文件长度现场判——
-        // 不在后缀表上预判（否则 `.uyvy` 双击开得开、按空格没反应，用户实测）。
-        let allowed = |ext: &str| crate::core::formats::is_previewable(ext);
+        // 准入判据在 `formats` 一处：已知可预览后缀（内置 SVG ∪ 解码器自述）直接放行；
+        // 空后缀 / 未认领后缀读前 64 字节看魔数（m331：无后缀或错后缀的 PNG/JPEG/GIF/
+        // BMP/WebP 也能空格预览）。★ 裸像素（`rgb`/`uyvy`/`yuv`…）仍走后缀表：它们能不能
+        // 出图取决于"参数推不推得出"，那是**文件级**事实，不在后缀表上预判。
+        let allowed = |p: &std::path::Path| crate::core::formats::is_previewable_path(p);
         let Some(path) = crate::platform::shell_selection::foreground_selected_file(&allowed)
         else {
             // 按了空格却没出窗的两类原因，日志里要能分开：前台不是资源管理器（取不到
             // 选中项）／ 选中项的后缀不在清单里（`allowed` 判否）。否则现场只剩
             // "按了没反应"，与"钩子没挂上"混在一起分不清。
-            log::debug!("spacehook：没取到可预览的选中项（前台非资源管理器，或后缀不在清单内）");
+            log::debug!(
+                "spacehook：没取到可预览的选中项（前台非资源管理器，或后缀未认领且魔数不匹配）"
+            );
             return;
         };
         decode_and_post(path, gen, ctrl);
@@ -1280,6 +1370,32 @@ mod tests {
         );
         SPACE_DOWN.store(false, Ordering::SeqCst);
         assert!(!SPACE_DOWN.load(Ordering::SeqCst), "UP 必须清旗");
+    }
+
+    /// 长按松手判据：选项关闭 / 预览已关 / 没有起点 / 未达阈值 一律不收；
+    /// 只有“开着 + 已经按够 750 ms”才收。
+    #[test]
+    fn hold_close_needs_option_open_preview_and_750ms() {
+        assert!(
+            !hold_close_due(false, true, 1_000, 2_000),
+            "选项关着走老行为"
+        );
+        assert!(
+            !hold_close_due(true, false, 1_000, 2_000),
+            "预览已关不许再收"
+        );
+        assert!(
+            !hold_close_due(true, true, 0, 2_000),
+            "这次按键不是收起候选"
+        );
+        assert!(!hold_close_due(true, true, 1_000, 1_749), "轻点保持打开");
+        assert!(hold_close_due(true, true, 1_000, 1_750), "满 750 ms 收起");
+        assert!(hold_close_due(true, true, 1_000, 9_000), "按住更久照收");
+        // 时钟回绕/脏数据不得下溢成“永远该收”。
+        assert!(
+            !hold_close_due(true, true, 9_000, 1_000),
+            "起点晚于现在不判长按"
+        );
     }
 
     /// 预乘转换：不透明仅换通道顺序；alpha=0 全清；半透明整数预乘；尾数不 panic。

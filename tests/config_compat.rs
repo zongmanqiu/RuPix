@@ -1,7 +1,9 @@
 //! 配置兼容门禁（CurSeen Phase 5）：老配置必须被现行解析器完整直读——
 //! 现行键生效、淘汰键静默忽略、看不懂的值回退默认、绝不 panic。
 
-use rupix_lib::core::config::{Config, DblClick, InitWindow, SourceId, UiTheme, WheelAction};
+use rupix_lib::core::config::{
+    AnimSpeed, Config, DblClick, InitWindow, SourceId, UiTheme, WheelAction,
+};
 use rupix_lib::core::decode::RawParams;
 use rupix_lib::core::gallery::SortBy;
 use rupix_lib::core::hotkey::Hotkeys;
@@ -31,6 +33,7 @@ fn legacy_ini_loads_without_loss() {
         dbl_click: DblClick::Fullscreen,
         // 旧版 fixture 不含 decode_timeout_s（2026-11-04 挂死恢复新增）→ 回默认 20 秒。
         decode_timeout_s: 20,
+        space_hold_close: false,
         // 旧版 fixture 不含 slide_interval 键（m167 新增）→ 回默认 3 秒。
         // 这条正是"加了新设置项也不能读坏老配置"的兼容判据：老 ini 缺键必须安静回默认。
         slide_interval: 3,
@@ -72,6 +75,12 @@ fn legacy_ini_loads_without_loss() {
         // 这正是"加了新设置项也不能读坏老配置"的兼容判据之一。
         decoders_preferred: BTreeMap::new(),
         prefetch: false,
+        // 旧 fixture 不含 anim_speed（m332 新增）→ 回默认 1×。
+        // 老配置升级后动图与分页文档仍按原速播放。
+        anim_speed: AnimSpeed::X1,
+        // 旧 fixture 不含 anim_autoplay（m334 新增）→ 回默认开。
+        // 老配置升级后 GIF / PDF 仍和以前一样自动播。
+        anim_autoplay: true,
         // m281 隐藏键：旧 fixture 不含 ⇒ 回默认 3（老配置升级后深度不变）。
         prefetch_depth: 3,
         close_to_tray: true,

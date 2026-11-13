@@ -56,7 +56,7 @@ impl crate::core::decode::DecodeBackend for Host {
         path: &Path,
         ext: &str,
         region: &crate::core::decode::RegionReq,
-    ) -> Option<Result<Decoded, String>> {
+    ) -> Option<Result<Decoded, crate::core::error::ViewFailure>> {
         Host::try_decode_region(self, path, ext, region)
     }
 
@@ -69,9 +69,12 @@ impl crate::core::decode::DecodeBackend for Host {
         frame_index: u32,
         raw: Option<RawParams>,
         allow_scaled: bool,
-    ) -> Result<Decoded, String> {
+    ) -> Result<Decoded, crate::core::error::ViewFailure> {
+        use crate::core::error::ViewFailure;
         if safe_mode() {
-            return Err("安全模式：解码器已全部禁用（--safe-mode）".into());
+            return Err(ViewFailure::unsupported(
+                "安全模式：解码器已全部禁用（--safe-mode）",
+            ));
         }
         // 裸数据参数：显式走 iv_render_raw。没有参数时先走普通解码——相机 RAW
         // （CR2/CR3/NEF/ARW…）有完整文件头，不能因为同档还支持裸像素就一律拦成
@@ -79,16 +82,19 @@ impl crate::core::decode::DecodeBackend for Host {
         if let Some(p) = raw {
             return self
                 .try_decode_raw(path, ext, p, max_w, max_h)
-                .unwrap_or_else(|| Err(format!("没有解码器支持 .{ext}（解码器缺失或已停用）")));
+                .unwrap_or_else(|| {
+                    Err(ViewFailure::unsupported(format!(
+                        "没有解码器支持 .{ext}（解码器缺失或已停用）"
+                    )))
+                });
         }
         if crate::core::formats::is_raw(ext) {
             return self
                 .try_decode(path, ext, max_w, max_h, frame_index, allow_scaled)
                 .unwrap_or_else(|| {
-                    Err(
-                        "裸数据文件没有尺寸信息：请从「打开…」重新选择该文件以指定宽/高/布局"
-                            .into(),
-                    )
+                    Err(ViewFailure::other(
+                        "裸数据文件没有尺寸信息：请从「打开…」重新选择该文件以指定宽/高/布局",
+                    ))
                 });
         }
         // 位图全部交给解码器。没有解码器认领时给出可行动的提示，而不是一句含混的"打不开"。
@@ -100,9 +106,9 @@ impl crate::core::decode::DecodeBackend for Host {
         //   因此只在**多个解码器认领同一后缀**时才有意义。
         self.try_decode(path, ext, max_w, max_h, frame_index, allow_scaled)
             .unwrap_or_else(|| {
-                Err(format!(
+                Err(ViewFailure::unsupported(format!(
                     "没有解码器支持此文件（扩展名「{ext}」无人认领，且魔数嗅探也无匹配）"
-                ))
+                )))
             })
     }
 }

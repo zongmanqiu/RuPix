@@ -374,6 +374,58 @@ pub(crate) fn previewable_of(ext: &str, declared: &HashSet<String>) -> bool {
     is_builtin_ext(&e) || declared.contains(&e)
 }
 
+/// 空格预览的**魔数准入**：只认五种最常见、且解码器一定接得住的格式。
+///
+/// 调用方给前 ~64 字节即可；本函数纯字节判断，不碰盘。
+/// BMP 的 `"BM"` 太短、纯文本也会命中，所以额外要求 6..10 的 reserved 全零、
+/// 且数据偏移 ≥ 14（正常 BMP 头至少 14 字节）。
+pub(crate) fn sniff_preview_magic(head: &[u8]) -> bool {
+    let has = |p: &[u8]| head.len() >= p.len() && &head[..p.len()] == p;
+    if has(b"\x89PNG\r\n\x1a\n") || has(&[0xFF, 0xD8, 0xFF]) {
+        return true;
+    }
+    if has(b"GIF87a") || has(b"GIF89a") {
+        return true;
+    }
+    if head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+        return true;
+    }
+    if head.len() >= 14 && &head[..2] == b"BM" && head[6..10] == [0, 0, 0, 0] {
+        let offset = u32::from_le_bytes([head[10], head[11], head[12], head[13]]);
+        return offset >= 14;
+    }
+    false
+}
+
+/// 空格预览准入（带路径）：**已知可预览后缀不读盘**；空后缀 / 未认领后缀读前 64 字节，
+/// 按 [`sniff_preview_magic`] 认五种常见图片。
+///
+/// 为什么只在这条闸上做、不动主窗清单：目录浏览按扩展名过滤，给每个未知文件读头
+/// 会把大目录首屏拖慢；空格预览是“用户指了这一个文件”，读 64 字节可以忽略。
+pub fn is_previewable_path(path: &std::path::Path) -> bool {
+    is_previewable_path_of(path, &declared_exts())
+}
+
+pub(crate) fn is_previewable_path_of(path: &std::path::Path, declared: &HashSet<String>) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !ext.is_empty() && previewable_of(&ext, declared) {
+        return true;
+    }
+    let mut head = [0u8; 64];
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    use std::io::Read as _;
+    let Ok(n) = f.read(&mut head) else {
+        return false;
+    };
+    sniff_preview_magic(&head[..n])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,5 +647,81 @@ mod tests {
         assert!(!needs_zoom_rerender("svg"), "内置矢量由宿主按区域重渲");
         assert!(!needs_zoom_rerender("png"), "位图没有重画这回事");
         drop(guard);
+    }
+
+    /// m331：空格预览的魔数准入——五种签名、截断、非图片、BMP 假阳性。
+    #[test]
+    fn preview_magic_covers_five_signatures_and_rejects_junk() {
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+        let jpeg = b"\xFF\xD8\xFF\xE0\0\x10JFIF";
+        let gif87 = b"GIF87a\x01\0\x01\0";
+        let gif89 = b"GIF89a\x01\0\x01\0";
+        let bmp = b"BM\x36\0\0\0\0\0\0\0\x36\0\0\0";
+        let webp = b"RIFF\x24\0\0\0WEBPVP8 ";
+        for (name, head) in [
+            ("png", &png[..]),
+            ("jpeg", &jpeg[..]),
+            ("gif87", &gif87[..]),
+            ("gif89", &gif89[..]),
+            ("bmp", &bmp[..]),
+            ("webp", &webp[..]),
+        ] {
+            assert!(sniff_preview_magic(head), "{name} 应命中");
+        }
+        assert!(!sniff_preview_magic(b"hello world"), "文本不该命中");
+        assert!(!sniff_preview_magic(b"\x89PNG"), "截断的 PNG 不该命中");
+        assert!(
+            !sniff_preview_magic(b"BMW is a car"),
+            "BM 开头不够，reserved 必须全零"
+        );
+        assert!(
+            !sniff_preview_magic(b"RIFF\0\0\0\0WAVE"),
+            "RIFF 但不是 WEBP"
+        );
+    }
+
+    /// m331：已知后缀直接放行（不读盘）；无后缀 / 错后缀读魔数；非图片拒绝。
+    #[test]
+    fn preview_path_admits_magic_only_when_the_suffix_is_unclaimed() {
+        let dir = crate::core::paths::test_scratch_root()
+            .join(format!("m331-preview-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+        let declared: HashSet<String> = ["png".to_string()].into_iter().collect();
+
+        // 后缀在清单里：内容根本不是 PNG 也放行——不读盘是这条闸的性能承诺。
+        let known = dir.join("known.png");
+        std::fs::write(&known, b"not a png at all").unwrap();
+        assert!(
+            is_previewable_path_of(&known, &declared),
+            "已知图片后缀不读盘就该放行"
+        );
+
+        let no_ext = dir.join("noext");
+        std::fs::write(&no_ext, png).unwrap();
+        assert!(
+            is_previewable_path_of(&no_ext, &declared),
+            "无后缀 PNG 要放行"
+        );
+
+        let wrong = dir.join("photo.bin");
+        std::fs::write(&wrong, png).unwrap();
+        assert!(
+            is_previewable_path_of(&wrong, &declared),
+            "错后缀 PNG 要放行"
+        );
+
+        let text = dir.join("notes.txt");
+        std::fs::write(&text, b"hello world").unwrap();
+        assert!(!is_previewable_path_of(&text, &declared), "非图片不许预览");
+
+        let missing = dir.join("gone");
+        assert!(
+            !is_previewable_path_of(&missing, &declared),
+            "读不到文件静默拒绝"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
