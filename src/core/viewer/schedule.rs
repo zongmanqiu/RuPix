@@ -10,9 +10,10 @@ impl Viewer {
     // ── 解码调度 ────────────────────────────────────────────────
 
     pub(super) fn mark_need(&mut self) {
-        if self.need_at.is_none() {
-            self.need_at = Some(Instant::now());
-        }
+        // CORE-22：**尾随**防抖——每次交互都把表拨到"最后一次交互 + 120 ms"。
+        // 旧写法只在第一次置位，连续滚轮/拖窗时每 120 ms 仍会投一档本地派生或
+        // 原图档重解（实测连续缩放 2 s 投了 13 次），手势中途反复换清晰度。
+        self.need_at = Some(Instant::now());
     }
 
     /// 防抖到期后的调度：发起解码，或**本地换档重派生**。由 `App::on_interval` 定期调用。
@@ -28,6 +29,20 @@ impl Viewer {
         // 卡住自报（m71）放在**最前面**：下面每条提前返回都可能让这一帧什么都不做，
         // 而"等太久"恰恰只会发生在这些提前返回成立的时刻（need_at 为空 = 没别的活儿）。
         self.note_stalled_request();
+        // CORE-06：大目录首屏两阶段——每拍收一次后台完整清单。收完这一拍先回去重绘，
+        // 下一拍再处理升级/动画，避免在清单替换的同一帧里又发解码请求。
+        if self.poll_listing() {
+            return true;
+        }
+        // BROWSE-24：缩略图条停手后必须再出一帧。`strip_window` 只由绘制调用，
+        // 而“没人标脏就不合成”——不在这里逼一帧，滚动结束后补图请求永远发不出去。
+        if self.strip_scrolling
+            && self
+                .strip_changed_at
+                .is_some_and(|t| t.elapsed() >= THUMB_SETTLE)
+        {
+            return true;
+        }
         // 等待秒数是时间的函数，必须由这里标脏（见 `wait_shown_secs`）。**跳过一帧**
         // 的 tick_anim / 升级判定不要紧：每秒只发生一次，而卡住时本来就没活儿。
         let secs = self.pending_wait().map(|w| w.as_secs());
@@ -774,19 +789,32 @@ impl Viewer {
     /// 与 [`Self::apply`] 的分工：Frame 决定画布与权威尺寸，Meta 只在 Frame 还没到
     /// 时给 info bar 和「按原始像素开窗」提前一个可用值。返回值 = 是否要重绘。
     pub fn apply_meta(&mut self, ev: MetaEvent) -> bool {
-        // 只接受当前主画面的 seq。预读、缩略图、翻页前的过期请求都无关。
+        // 预读完成的 Meta 也进缓存：技术信息卡按路径读，错过就永远缺
+        // 解码器/位深/ICC 那几行。它**不进** preview_meta，不影响当前图。
         if ev.seq != self.want_seq {
+            self.cache_meta(ev.path, ev.meta);
             return false;
         }
-        // 已经有位图 = 权威尺寸就位，预览不再有意义。
+        // 已经有位图 = 权威尺寸就位，预览不再有意义；但渲染后的第二次 Meta
+        // （解码器/位深/ICC）仍要更新缓存，并让技术信息卡重算一次——否则
+        // “Frame 先到、Meta 后到”会把这几行永久停在“未报告”。
         if self.loaded.is_some() {
+            let current = self.loaded.as_ref().is_some_and(|l| l.path == ev.path);
+            // 动画每一帧都会重新查询并上抛 Meta；内容没变时不许每帧 bump 世代
+            // （技术卡会跟着每帧重算，白白烧 CPU）。
+            let changed = self.meta_cache.get(&ev.path) != Some(&ev.meta);
+            self.cache_meta(ev.path, ev.meta);
+            if current && changed {
+                self.bump_image_gen();
+                return true;
+            }
             return false;
         }
-        self.preview_meta = Some(ev.meta);
+        self.preview_meta = Some(ev.meta.clone());
         // 缓存查询阶段元信息：翻回这张图时不必等 MetaEvent。
         self.cache_meta(ev.path, ev.meta);
-        // 让 `refresh_metadata`（每帧比对 `image_gen`）感知"文件信息"窗的尺寸
-        // 也可以刷新了；canvas 上的 `v.status()` 本来就走每帧重绘，不依赖这个 bump。
+        // 让 `refresh_metadata_if`（每帧比对 `image_gen`）感知属性卡也可以刷新了；
+        // canvas 上的 `v.status()` 本来就走每帧重绘，不依赖这个 bump。
         self.bump_image_gen();
         true
     }

@@ -436,13 +436,14 @@ impl Strip {
         let local = |x: f32, y: f32, w: f32, h: f32| (x, y, w, h);
         let p = panel(at);
         // ★ m302：凡是与别的地相接的边都平（贴底条＝上缘、贴左条＝右缘；左边有
-        //   文件树时再加左缘），只有真正贴窗口外角的那一角还留圆。四角全圆会在
-        //   接缝漏出底下那层底色，看着像空了一块。
+        //   文件树时再加左缘）。贴窗口外缘的角也一并抹平（`square_window=true`）：
+        //   圆角外面会漏出窗口/画布底色，深色底下就是一块黑角。
         fill_panel_open(
             canvas,
             p,
             10.0,
             flat_edges(at.side, at.has_tree),
+            true,
             &Paint::fill(tk::panel_bg()),
             &Paint::fill(tk::panel_edge()),
         );
@@ -458,7 +459,7 @@ impl Strip {
             } else {
                 tk::slot_bg()
             };
-            canvas.fill_round_rect(lx, ly, lw, lh, 4.0, &Paint::fill(bg));
+            canvas.fill_rect(lx, ly, lw, lh, &Paint::fill(bg));
 
             if let Some(img) = thumb(path) {
                 if let Some((dx, dy, dw, dh)) = contain(lx, ly, lw, lh, &img) {
@@ -508,7 +509,7 @@ impl Strip {
                     ly,
                     lw,
                     lh,
-                    4.0,
+                    0.0,
                     2.0,
                     &Paint::fill(tk::overlay_text_active()),
                 );
@@ -913,10 +914,11 @@ mod tests {
             None,
             |_| None::<Rc<RgbaImage>>,
         );
+        assert_eq!(spy.round_fills, 1, "只剩整条底板的圆角填充");
         assert_eq!(
-            spy.round_fills,
-            1 + slots.len(),
-            "多出来的圆角填充就是底色块"
+            spy.cell_fills,
+            slots.len(),
+            "每格背板改直角填充，不允许再漏出窗口底色"
         );
         assert_eq!(spy.badge_strokes, 0, "序号不该再画 1dp 的矩形白边");
         assert_eq!(spy.halos, slots.len() * BADGE_RING.len(), "每格八邻域白字");
@@ -1023,8 +1025,10 @@ mod tests {
         digits: Vec<String>,
         /// 八邻域白字的遍数。
         halos: usize,
-        /// 圆角填充次数：1 块底板 + 每格 1 块背板，多一枚就是底色块回来了。
+        /// 圆角填充次数：只剩整条底板 1 块。
         round_fills: usize,
+        /// 直角格背板填充次数：每格 1 块（不再用圆角，避免四角漏出窗口底色）。
+        cell_fills: usize,
         /// 1dp 的矩形描边次数（m260 那版标签的白边）。
         badge_strokes: usize,
     }
@@ -1038,7 +1042,12 @@ mod tests {
         fn clip_rect(&mut self, _r: Rect) {}
         fn push_layer(&mut self, _opacity: f32) {}
         fn pop_layer(&mut self) {}
-        fn fill_rect(&mut self, _x: f32, _y: f32, _w: f32, _h: f32, _paint: &Paint) {}
+        fn fill_rect(&mut self, _x: f32, _y: f32, w: f32, h: f32, _paint: &Paint) {
+            // 只数格子背板（边线是 1px 宽/高，不会误计）。
+            if w > 8.0 && h > 8.0 {
+                self.cell_fills += 1;
+            }
+        }
         fn fill_round_rect(&mut self, _x: f32, _y: f32, _w: f32, _h: f32, _r: f32, _p: &Paint) {
             self.round_fills += 1;
         }

@@ -18,7 +18,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const MIN_PROTOCOL_VERSION: u32 = 1;
 
 /// 扩展协议**最新版**（运行期）。宿主收 `MIN..=本值`；只增不减。
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 版本区间判定：宿主能跑声明的这个协议版本吗？
 pub fn protocol_ok(protocol: u32) -> bool {
@@ -167,6 +167,7 @@ impl Capability {
                 | Self::SettingsWrite
                 | Self::OpenUrl
                 | Self::OpenFile
+                | Self::UiPanel
         )
     }
 }
@@ -1079,7 +1080,7 @@ mod tests {
         let bad = minimal().replace("\"clipboard.write\"", "\"clipboard.write\", \"telepathy\"");
         assert!(Manifest::parse(&bad).is_err());
 
-        let bad = minimal().replace("\"protocol\": 1", "\"protocol\": 2");
+        let bad = minimal().replace("\"protocol\": 1", "\"protocol\": 3");
         assert!(Manifest::parse(&bad).is_err());
     }
 
@@ -1092,7 +1093,10 @@ mod tests {
         assert!(protocol_ok(PROTOCOL_VERSION));
         assert!(!protocol_ok(MIN_PROTOCOL_VERSION - 1));
         assert!(!protocol_ok(PROTOCOL_VERSION + 1));
-        assert_eq!(protocol_range_text(), format!("v{PROTOCOL_VERSION}"));
+        assert_eq!(
+            protocol_range_text(),
+            format!("v{MIN_PROTOCOL_VERSION}–v{PROTOCOL_VERSION}")
+        );
     }
 
     #[test]
@@ -1208,6 +1212,7 @@ mod tests {
             ClipboardWrite,
             SettingsRead,
             SettingsWrite,
+            UiPanel,
         ] {
             assert!(c.host_provides(), "{} 应该是宿主真开通道的能力", c.as_str());
         }
@@ -1217,7 +1222,6 @@ mod tests {
             FileWrite,
             Network,
             UiWindow,
-            UiPanel,
             ProcessSpawn,
         ] {
             assert!(

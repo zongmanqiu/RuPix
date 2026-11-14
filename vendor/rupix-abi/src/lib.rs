@@ -213,6 +213,17 @@ pub const CAP_VECTOR: u32 = 1 << 5;
 /// 缺席 = 不支持区域渲染：宿主**不会**对它发区域请求（按整幅路线走，行为与今天一致），
 /// **不是错误**。宿主用 `GetProcAddress` 探测符号，符号在不在与这一位互为印证。
 pub const CAP_REGION: u32 = 1 << 6;
+/// **缩略图快路径**（v6 内增量）：`REQ_THUMBNAIL` 置位时，解码器可以用**内嵌预览**
+/// （JPEG 的 EXIF 缩略图、HEIF/AVIF 的 thumbnail item）或其它低分辨率源，而不必整图解。
+///
+/// 与 `CAP_SCALED` 的区别：`CAP_SCALED` 承诺"按 target 原生降采样，首屏/升级两条腿同源"；
+/// `CAP_THUMB` 只服务胶片条那一格，不参与主画面首屏与升级。声明者按自己的格式实现；
+/// 没有内嵌预览的格式照常整解，宿主不因此认为失败。
+///
+/// 缺席 = 宿主不会发 [`REQ_THUMBNAIL`]，按整解走（今天的行为）。
+///
+/// 首位声明者：`common` 的 JPEG 成员（EXIF IFD1 内嵌缩略图，2026-11-13）。
+pub const CAP_THUMB: u32 = 1 << 7;
 
 /// 请求位标志：4 = **这一次请求接受原生降采样**（配套 `CAP_SCALED`）。
 ///
@@ -221,6 +232,13 @@ pub const CAP_REGION: u32 = 1 << 6;
 /// 能力位图只回答「这枚解码器会不会缩放解码」，不回答「这一次要不要」：意图是**每次
 /// 请求**的属性，只能跟在请求里。未置位时解码器一律整解（现役行为，零变化）。
 pub const REQ_ALLOW_SCALED: u32 = 1 << 2;
+
+/// 请求位标志：8 = **这一次是缩略图请求**（配套 `CAP_THUMB`）。
+///
+/// 与 [`REQ_ALLOW_SCALED`] 分开：主画面首屏也允许缩放，但它要的是"同一张图的低分辨率档"；
+/// 缩略图可以接受**内嵌预览**（可能已经是另一张更小的图，方向和 ICC 都可能不同）。
+/// 未声明 `CAP_THUMB` 的解码器会忽略这一位，按整解走。
+pub const REQ_THUMBNAIL: u32 = 1 << 3;
 
 /// 宿主在**解码器没有 `iv_caps` 导出**时的推定规则——纯函数，可测。
 ///
@@ -367,8 +385,8 @@ pub struct IvRenderReq {
     pub target_h: u32,
     /// 宿主给的像素预算上限（0 = 不限）。
     pub budget_bytes: u32,
-    /// 位标志：[`REQ_ALLOW_SCALED`] = 接受原生降采样。1/2（优先速度 / 优先质量）是
-    /// v1 就写进文档的占位，今天宿主恒传 0、无解码器读取。
+    /// 位标志：[`REQ_ALLOW_SCALED`] = 接受原生降采样；[`REQ_THUMBNAIL`] = 这是缩略图请求。
+    /// 1/2（优先速度 / 优先质量）是 v1 就写进文档的占位，今天宿主恒传 0、无解码器读取。
     pub flags: u32,
     /// 要第几帧（0 起）。静态图恒 0，解码器可忽略。
     pub frame_index: u32,
@@ -904,47 +922,129 @@ pub fn exif_orientation(tiff: &[u8]) -> Option<i32> {
     None
 }
 
-/// JPEG：从 SOI 之后扫到第一个 SOS 为止，找带 `Exif\0\0` 前缀的 APP1，把 TIFF 段交给
-/// [`exif_orientation`]。★ **只扫段表、不碰熵编码数据**——微秒级；扫到 SOS/EOS 或段表
-/// 断裂就停，所以畸形文件不会让我们读完整个大文件。
-pub fn jpeg_exif_orientation(data: &[u8]) -> Option<i32> {
+/// 从一段 EXIF / TIFF 结构里取 **IFD1 的 JPEG 缩略图**（`0x0201` + `0x0202`）。
+///
+/// 只认标准布局：IFD0 的 next IFD 指向 IFD1，IFD1 里两个 LONG 单值标签给出偏移与长度，
+/// 偏移相对 TIFF 头。越界 / 类型不对 / 不是 `FF D8…FF D9` 一律 `None`。**不做解码**，
+/// 只返回切片——解不解、够不够大由调用方决定。
+pub fn exif_thumbnail(tiff: &[u8]) -> Option<&[u8]> {
+    let little = match tiff.get(0..2)? {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    let u16_at = |i: usize| -> Option<u16> {
+        let b = tiff.get(i..i + 2)?;
+        Some(if little {
+            u16::from_le_bytes([b[0], b[1]])
+        } else {
+            u16::from_be_bytes([b[0], b[1]])
+        })
+    };
+    let u32_at = |i: usize| -> Option<u32> {
+        let b = tiff.get(i..i + 4)?;
+        Some(if little {
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        } else {
+            u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+        })
+    };
+
+    if u16_at(2)? != 42 {
+        return None;
+    }
+    let ifd0 = u32_at(4)? as usize;
+    // IFD0 的 next IFD 指针在 2 + count*12 之后。count 撒谎时按真实长度夹住读取位置。
+    let count0 = u16_at(ifd0)? as usize;
+    let next_pos = ifd0.checked_add(2)?.checked_add(count0.checked_mul(12)?)?;
+    let ifd1 = u32_at(next_pos)? as usize;
+    if ifd1 == 0 {
+        return None; // 没有 IFD1 = 没有内嵌缩略图
+    }
+
+    // IFD1：只认 LONG 单值的 0x0201/0x0202。目录声称的 count 大于真实字节时按长度夹住，
+    // 最坏扫完真实存在的条目就停（与 `exif_orientation` 同一条上界纪律）。
+    let count1 = u16_at(ifd1)? as usize;
+    let start = ifd1.checked_add(2)?;
+    let room = tiff.len().saturating_sub(start) / 12;
+    let (mut off, mut len) = (None, None);
+    for n in 0..count1.min(room) {
+        let e = start.checked_add(n.checked_mul(12)?)?;
+        if u32_at(e + 4)? != 1 || u16_at(e + 2)? != 4 {
+            continue; // 只认单值 LONG
+        }
+        match u16_at(e)? {
+            0x0201 => off = Some(u32_at(e + 8)? as usize),
+            0x0202 => len = Some(u32_at(e + 8)? as usize),
+            _ => {}
+        }
+    }
+    let (off, len) = (off?, len?);
+    let end = off.checked_add(len)?;
+    if len < 4 || end > tiff.len() {
+        return None;
+    }
+    let bytes = &tiff[off..end];
+    (bytes[0] == 0xFF
+        && bytes[1] == 0xD8
+        && bytes[bytes.len() - 2] == 0xFF
+        && bytes[bytes.len() - 1] == 0xD9)
+        .then_some(bytes)
+}
+/// JPEG：从 SOI 之后扫到第一个 SOS 为止，找带 `Exif\0\0` 前缀的 APP1 段，返回其中的 TIFF 切片。
+///
+/// ★ **只扫段表、不碰熵编码数据**——微秒级；扫到 SOS/EOS 或段表断裂就停，所以畸形文件
+/// 不会让我们读完整个大文件。方向、ICC、缩略图三条读取共用这一趟扫描。
+fn jpeg_exif_tiff(data: &[u8]) -> Option<&[u8]> {
     if data.get(0..2)? != [0xFF, 0xD8] {
         return None;
     }
     let mut i = 2usize;
     // 段表最多走 64 段（真实文件通常 ≤ 8 段；这是给畸形数据的时间上界，不是功能边界）。
     for _ in 0..64 {
-        if data.get(i..i + 2)? != [0xFF, 0xE1] {
-            // 非 APP1：遇到 SOS（0xFFDA）或任何不是 0xFF 开头的东西就结束——
-            // 后面是压缩数据，再往里找只会把字节当长度。
-            if data.get(i) == Some(&0xFF) {
-                let marker = *data.get(i + 1)?;
-                if marker == 0xDA || marker == 0xD9 {
-                    return None;
-                }
-                // 其它带长度的段：跳过它。
-                let len = u16::from_be_bytes([*data.get(i + 2)?, *data.get(i + 3)?]) as usize;
-                if len < 2 {
-                    return None; // 长度 0/1 = 撒谎，不推进（规范 §六 第 10 条）
-                }
-                i += 2 + len;
-                continue;
-            }
+        if data.get(i) != Some(&0xFF) {
+            return None;
+        }
+        let marker = *data.get(i + 1)?;
+        if marker == 0xDA || marker == 0xD9 {
+            return None; // SOS/EOI：后面是压缩数据或文件结束
+        }
+        // 无长度的独立标记：SOI/TEM/RSTn。段表里出现它们说明结构已坏，不猜。
+        if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
             return None;
         }
         let len = u16::from_be_bytes([*data.get(i + 2)?, *data.get(i + 3)?]) as usize;
+        if len < 2 {
+            return None; // 长度 0/1 = 撒谎，不推进（规范 §六 第 10 条）
+        }
         let body_start = i + 4;
         let body_end = body_start.checked_add(len.checked_sub(2)?)?;
         if body_end > data.len() {
             return None;
         }
-        let body = &data[body_start..body_end];
-        if body.starts_with(b"Exif\0\0") {
-            return exif_orientation(&body[6..]);
+        if marker == 0xE1 {
+            let body = &data[body_start..body_end];
+            if body.starts_with(b"Exif\0\0") {
+                return Some(&body[6..]);
+            }
         }
         i = body_end;
     }
     None
+}
+
+/// JPEG：取 EXIF APP1 里的**方向**，语义见 [`exif_orientation`]。
+pub fn jpeg_exif_orientation(data: &[u8]) -> Option<i32> {
+    exif_orientation(jpeg_exif_tiff(data)?)
+}
+
+/// JPEG：取 EXIF APP1 里 **IFD1 的 JPEG 缩略图**（`0x0201` + `0x0202`）。
+///
+/// 只返回切片，不解码；调用方自己决定是否用（常见门槛：缩略图不能太小、能解开头）。
+/// 这是 `CAP_THUMB` 的容器知识：有内嵌预览的相机照片可以只读文件头那一段，
+/// 不必为 240×180 的格子整解一张 20 MB 的 JPEG。
+pub fn jpeg_exif_thumbnail(data: &[u8]) -> Option<&[u8]> {
+    exif_thumbnail(jpeg_exif_tiff(data)?)
 }
 
 /// PNG：逐块走 `IDAT` 之前的块表，找 `eXIf` 数据块（块长驱动、每步严格推进）。
@@ -1150,7 +1250,10 @@ mod tests {
             CAP_FULL | CAP_REGION
         );
         // 向后兼容：老函数的行为一字未变。
-        assert_eq!(caps_from_legacy_v6(true, true, false), caps_from_legacy(true, true));
+        assert_eq!(
+            caps_from_legacy_v6(true, true, false),
+            caps_from_legacy(true, true)
+        );
     }
 
     /// ABI 版本区间：宿主按 `5 ≤ abi ≤ 6` 收载——**v5 的老 DLL 照常加载**。
@@ -1293,6 +1396,102 @@ mod tests {
         v
     }
 
+    fn tiff_with_thumb(
+        little: bool,
+        thumb: &[u8],
+        bad_off: Option<u32>,
+        bad_len: Option<u32>,
+    ) -> Vec<u8> {
+        let mut v = tiff_block(little, &[(ORIENT, SHORT, 1, 6)], None);
+        let next_pos = v.len() - 4;
+        let ifd1 = v.len() as u32;
+        let next = if little {
+            ifd1.to_le_bytes()
+        } else {
+            ifd1.to_be_bytes()
+        };
+        v[next_pos..next_pos + 4].copy_from_slice(&next);
+        let thumb_off = ifd1 as usize + 2 + 2 * 12 + 4;
+        let push16 = |v: &mut Vec<u8>, x: u16| {
+            v.extend(if little {
+                x.to_le_bytes()
+            } else {
+                x.to_be_bytes()
+            })
+        };
+        let push32 = |v: &mut Vec<u8>, x: u32| {
+            v.extend(if little {
+                x.to_le_bytes()
+            } else {
+                x.to_be_bytes()
+            })
+        };
+        push16(&mut v, 2);
+        for (tag, value) in [
+            (0x0201u16, bad_off.unwrap_or(thumb_off as u32)),
+            (0x0202, bad_len.unwrap_or(thumb.len() as u32)),
+        ] {
+            push16(&mut v, tag);
+            push16(&mut v, LONG);
+            push32(&mut v, 1);
+            push32(&mut v, value);
+        }
+        push32(&mut v, 0); // IFD1 没有 next
+        assert_eq!(v.len(), thumb_off);
+        v.extend_from_slice(thumb);
+        v
+    }
+
+    fn jpeg_with_exif(tiff: &[u8]) -> Vec<u8> {
+        let mut body = b"Exif\0\0".to_vec();
+        body.extend_from_slice(tiff);
+        let mut j = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        j.extend(((body.len() + 2) as u16).to_be_bytes());
+        j.extend(&body);
+        j.extend([0xFF, 0xDA, 0x00, 0x02]); // SOS：扫描到此为止
+        j
+    }
+
+    #[test]
+    fn exif_thumbnail_reads_ifd1_in_both_byte_orders() {
+        let thumb = [0xFF, 0xD8, 1, 2, 3, 0xFF, 0xD9];
+        for little in [true, false] {
+            let tiff = tiff_with_thumb(little, &thumb, None, None);
+            assert_eq!(exif_thumbnail(&tiff), Some(&thumb[..]), "little={little}");
+            let j = jpeg_with_exif(&tiff);
+            assert_eq!(jpeg_exif_thumbnail(&j), Some(&thumb[..]), "little={little}");
+            assert_eq!(jpeg_exif_orientation(&j), Some(6), "同一趟扫描仍读方向");
+        }
+    }
+
+    #[test]
+    fn exif_thumbnail_rejects_absent_out_of_bounds_and_non_jpeg() {
+        // IFD0 的 next = 0：没有缩略图。
+        assert_eq!(
+            exif_thumbnail(&tiff_block(true, &[(ORIENT, SHORT, 1, 6)], None)),
+            None
+        );
+        let thumb = [0xFF, 0xD8, 1, 2, 3, 0xFF, 0xD9];
+        // 长度越界 / 偏移越界。
+        assert_eq!(
+            exif_thumbnail(&tiff_with_thumb(true, &thumb, None, Some(999))),
+            None
+        );
+        assert_eq!(
+            exif_thumbnail(&tiff_with_thumb(true, &thumb, Some(9999), None)),
+            None
+        );
+        // 内容不是 JPEG（没有 FFD8…FFD9）。
+        assert_eq!(
+            exif_thumbnail(&tiff_with_thumb(true, &[1, 2, 3, 4], None, None)),
+            None
+        );
+        // JPEG 里没有 EXIF / APP1 是 XMP。
+        assert_eq!(jpeg_exif_thumbnail(&[0xFF, 0xD8, 0xFF, 0xDA, 0, 2]), None);
+        let mut xmp = vec![0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x08];
+        xmp.extend(b"XMP\0\0\0");
+        assert_eq!(jpeg_exif_thumbnail(&xmp), None);
+    }
     const ORIENT: u16 = 0x0112;
     const SHORT: u16 = 3;
     const BYTE: u16 = 1;

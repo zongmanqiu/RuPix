@@ -254,7 +254,7 @@ fn show_box(text: &str, log_path: Option<&std::path::Path>) {
 
 /// 时间戳。不引 chrono（`config` 里同样的取舍），自己换算到秒。
 pub(crate) fn now() -> String {
-    // Unix 秒 → 日历时间的换算算法见 `ui::settings` 的属性页，这里抄那份精益版。
+    // Unix 秒 → 日历时间的换算算法见 `ui::info_panel::properties::format_utc`，这里抄那份精益版。
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

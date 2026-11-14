@@ -1588,3 +1588,46 @@ THICKNESS)` 查询成功 ⇒ `self_outline = false`，边框改由 **DWM** 画�
 `cargo check --all-targets` 0 error · `cargo fmt --check` 无差异 · clippy `-D warnings` 0 ·
 hygiene 第 7 查 `patch_parity: 0` · j13 归档逐字节 ok · j16 正向 + 三条负向通过。
 详见 `docs/待办.md §50`。
+
+## 补丁 030 —— 控件命中扩展 `hit_pad` 与 `Element::raised`
+
+- 编号：030
+- 涉及上游文件：
+  - `wind-ui-rust-0.23.0/src/core.rs`
+    （`Node` 新增 `hit_pad: Insets`；`hit_node` 的包含判定改用扩展后的矩形）
+  - `wind-ui-rust-0.23.0/src/ui/mod.rs`
+    （`Element` 新增 `hit_pad` / `raised` 字段与 `hit_pad` / `hit_pad_edges` / `raised`
+    构建器；`build()` 落进 `Node`。`Node::raised` 本来就有，这里只是把它开放到构建器）
+- 应用侧接线：`ui/window.rs` 的信息面板分隔条
+  `.hit_pad_edges(Insets { left: 8, top: -STRIP_H, right: 8, bottom: 0 }).raised()`；
+  视觉仍是一条 1px 线（`HANDLE_W = 1`）。
+
+### 问题（用户实机，2026-11-14）
+
+信息面板与画布之间的分隔线视觉 1px，命中区也只有 1px。用户原话：
+「这个线的判定太窄了，需要加宽」。线本身不能变粗——面板左缘与画布标题栏
+之间已经被要求只留这一条细线，再铺 6px 槽会重新出现「标题栏左侧缺口」。
+
+### 修复
+
+- `hit_pad` 只放宽**命中矩形**：`measure` / `arrange` / `paint` / `layout_signature`
+  完全不变，视觉零变化。正数向外扩，负数从该侧裁。
+- `Element::raised()` 把节点提升到**同级最上层**：绘制后置、命中优先。分隔条右侧
+  8px 的实际矩形落在面板节点里，不提升的话面板会先接住指针，右侧扩展区等于白扩。
+- 分隔条顶部 `STRIP_H` 那段用 `top: -STRIP_H` 裁掉：画布最右那颗窗口关闭钮紧贴
+  分隔线（`title_btn_rect` 的 Close 右缘 = 画布右缘），不裁会把「点关闭」抢成
+  「拖宽」。面板头的左侧 8px 是标题 padding，不受影响。
+
+### 判据
+
+- `main/src/ui/info_panel/mod.rs` 的
+  `split_handle_hit_pad_reaches_both_sides_of_the_line`：1px 节点、左右各 8px
+  都能命中；扩展区外不归分隔条；标题栏那段不命中分隔条。该测试同时钉住
+  `hit_pad` 与 `raised` 两半，删掉任何一半都会红。
+- 视觉：分隔条静态仍是 1px；悬停 / 拖动时 `SplitHandle` 自己画 2px 强调色。
+- 归档 `patches/` 与 `.3rd` 逐字节由 `j13` 守；章节 ↔ 标记由 hygiene 第 7 查守。
+
+### 门禁行
+
+`cargo test --lib ui::info_panel` 25 passed · `cargo fmt --check` 无差异 ·
+clippy `-D warnings` 0 · hygiene `patch_parity: 0` · j13 归档逐字节 ok。

@@ -1,4 +1,4 @@
-//! 平台层手写最小 EXIF 解析器：属性窗「拍摄信息」段的唯一数据源。
+//! 平台层手写最小 EXIF 解析器：信息面板属性卡「拍摄信息」段的唯一数据源。
 //!
 //! # 为什么手写
 //!
@@ -26,12 +26,12 @@
 //! - 文件读失败 / 无 EXIF 段 / 解析错 → 整个 [`ExifInfo`] 全空，不 panic。
 //! - **工作量对文件长度线性**：条目遍历越界即返回，子 IFD 靠 visited 去重防菱形
 //!   重入爆炸。本函数在 **UI 线程**同步调用，不许存在"输入可达的超长循环"。
-//! - 属性窗按 signal 消费，`.visible_when(!v.is_empty())` 让无 EXIF 文件整段不显示。
+//! - 属性卡按 signal 消费，`.visible_when(!v.is_empty())` 让无 EXIF 文件整段不显示。
 
 use std::collections::HashSet;
 use std::path::Path;
 
-/// 「属性」窗「拍摄信息」段的展示数据，全部预格式化到 String；空 = 无字段。
+/// 属性卡「拍摄信息」段的展示数据，全部预格式化到 String；空 = 无字段。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ExifInfo {
     /// `DateTimeOriginal`，格式 `YYYY-MM-DD HH:MM:SS`。
@@ -48,7 +48,7 @@ pub struct ExifInfo {
     pub gps: String,
     /// `Orientation`（EXIF 274），1..=8；**0 = 文件里没有这个标签**。
     ///
-    /// 属性窗不显示它，但解码器解码路要它：解码器自述的 `orientation` 与这里读的是同一个
+    /// 属性卡不显示它，但解码器解码路要它：解码器自述的 `orientation` 与这里读的是同一个
     /// 274，语义必须一致（0/1 都交宿主处理，见规范），否则竖拍照片会横躺——那是
     /// m48 那族缺陷。（2026-10-25 前这里还挂着"内置 WIC 路要它"的理由，WIC 已删除。）
     pub orientation: u16,
@@ -57,9 +57,9 @@ pub struct ExifInfo {
 /// 从文件路径读 EXIF；任何错误 / 无 EXIF → 全空 [`ExifInfo`]。
 ///
 /// **只读文件头**（K41 那条），**两档**：先读 [`EXIF_HEAD_CAP`]，头里找不到 TIFF 起点
-/// 再补读 [`EXIF_DEEP_CAP`]。本函数在 **UI 线程**同步调用，全仓只有一个调用点——
-/// `ui::settings::metadata` 的属性窗，每换一张图走一次。解码路的朝向走的是解码器回报的
-/// `DecodedInfo::orientation`，**不走这里**。
+/// 再补读 [`EXIF_DEEP_CAP`]。本函数同步读盘，图窗侧只有一个调用点——
+/// `ui::info_panel::properties` 的属性卡，每换一张图走一次；headless 的 `metadata`
+/// 命令也读同一份。解码路的朝向走的是解码器回报的 `DecodedInfo::orientation`，**不走这里**。
 ///
 /// **为什么先 256 KiB**：那个数从来不是"EXIF 会在那儿"，而是"别把 UI 线程冻死"的兜底。
 /// m104 探针（跑在测试二进制里，每档 5 遍取最小、热缓存，8 枚真文件）逐档量过：
@@ -336,7 +336,7 @@ fn walk(
     }
     // 同一 (IFD, 上下文) 只走一次。深度上限防不了**菱形重入**：一个 IFD 的 N 个
     // 条目可以全指向同一个子 IFD，递归次数退化成 N^层数——3 层、N=65535 就是
-    // 2.8e14 次，约 3MB 构造文件即可把属性窗（在 UI 线程上调本函数）永久假死。
+    // 2.8e14 次，约 3MB 构造文件即可把属性卡（在 UI 线程上调本函数）永久假死。
     // key 带 `in_gps` 是因为同一偏移可能被 0x8769 与 0x8825 各引一次，两类上下文
     // 采集的字段不同，不能互相顶掉。
     if !visited.insert((ifd_off, in_gps)) {
@@ -373,7 +373,7 @@ fn walk(
         //
         // 类型不认识 = 这一条不作数，跳过。以前写的是 `type_size(ty).unwrap_or(0)`：
         // size 算成 0 → `inline` 为真 → 从本条自己的 4 字节 value 字段按 `n` 个字节读出去。
-        // `read_ascii` 只保证不越**文件**界，所以它会一路读进邻近条目的字节，属性窗于是
+        // `read_ascii` 只保证不越**文件**界，所以它会一路读进邻近条目的字节，属性卡于是
         // 拿出一句从别处拼出来的"相机型号"（审计第三批：畸形结构要的不是一份猜测）。
         let Some(size) = type_size(ty).and_then(|s| s.checked_mul(n as usize)) else {
             p += 12;
@@ -692,7 +692,7 @@ mod tests {
     /// 未知类型（不在 TIFF 6.0 / EXIF 类型表里的 `ty`）必须**整条跳过**，不是猜着读
     /// （审计第三批）。旧实现写的是 `type_size(ty).unwrap_or(0)`：size 变成 0 → `inline`
     /// 成立 → 从本条 value 字段起按 `n` 个字节往外读，一路读进紧邻的 next-IFD 字节，
-    /// 属性窗于是拿到一句"从别处拼出来的相机型号"。畸形结构的正确答复是"没有这一条"。
+    /// 属性卡于是拿到一句"从别处拼出来的相机型号"。畸形结构的正确答复是"没有这一条"。
     #[test]
     fn unknown_type_entry_is_skipped_not_guessed() {
         let mut t: Vec<u8> = Vec::new();
@@ -1057,7 +1057,7 @@ mod tests {
     /// `MAX_DEPTH` 防的是链式成环，防不了"一个 IFD 的 N 个条目全指向同一个子 IFD"
     /// 的菱形：没有 visited 去重时递归次数是 N^层数。真实构造用 N=65535、三层
     /// （约 3MB 文件）就是 2.8e14 次，而 `read_exif` 在 **UI 线程**同步调用
-    /// → 整个属性窗永久假死，且 catch_unwind / SEH / 三振一层都不沾边。
+    /// → 整个属性卡永久假死，且 catch_unwind / SEH / 三振一层都不沾边。
     #[test]
     fn diamond_sub_ifd_is_walked_once() {
         const N: u32 = 200;
@@ -1247,7 +1247,7 @@ mod tests {
         out
     }
 
-    /// 写进临时目录、跑 `read_exif`、删掉。属性窗那条路就是"给路径读一次"，测试同形。
+    /// 写进临时目录、跑 `read_exif`、删掉。属性卡那条路就是"给路径读一次"，测试同形。
     fn read_exif_of(bytes: &[u8], name: &str) -> ExifInfo {
         let dir = crate::core::paths::test_scratch_root();
         let f = dir.join(name);

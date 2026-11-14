@@ -93,7 +93,7 @@ fn safe_mode_disables_decoders() {
     set_safe_mode(true);
     let mut h = Host::new();
     assert!(
-        h.try_decode(Path::new("x.qoi"), "qoi", 100, 100, 0, false)
+        h.try_decode(Path::new("x.qoi"), "qoi", 100, 100, 0, false, false)
             .is_none(),
         "safe-mode 下不得进入解码器路径"
     );
@@ -109,7 +109,15 @@ fn safe_mode_disables_decoders() {
 fn unknown_ext_returns_none() {
     let mut h = Host::new();
     assert!(h
-        .try_decode(Path::new("x.unknownext"), "unknownext", 10, 10, 0, false)
+        .try_decode(
+            Path::new("x.unknownext"),
+            "unknownext",
+            10,
+            10,
+            0,
+            false,
+            false
+        )
         .is_none());
 }
 

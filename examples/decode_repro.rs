@@ -69,7 +69,7 @@ fn main() {
                         .map(|e| e.to_string_lossy().to_ascii_lowercase())
                         .unwrap_or_default();
                     let r = h
-                        .try_decode(p, &ext, max_w, max_h, 0, allow_scaled)
+                        .try_decode(p, &ext, max_w, max_h, 0, allow_scaled, false)
                         .map(|r| {
                             r.map(|d| {
                                 format!(

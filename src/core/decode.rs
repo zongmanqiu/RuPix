@@ -14,13 +14,17 @@
 //! 解码线程侧 [`decode_loop`] 判 `Main`/`Prefetch` 的 `seq < main_floor` 直接**不发**
 //! 解码（空串 Err 占位 Done）——后者省的是 CPU，前者省的是像素覆盖。这一刀出自
 //! 早期「手感断点清单」的 A1 条目（m07，已随 m47 收编删除；落地数字见 `HISTORY.md` 2026-10-14 段）。
+//! 缩略图另有自己的作废判据：不在当前条上可见窗口里的 `Thumb` 出队即作废（见
+//! `ThumbView`），因为它和主画面的新旧无关，只和"这一格还在不在屏上"有关。
 //!
-//! 取队顺序：**主画面插队**（[`Queue::pop`]）。令牌只作废"还没开始解"的过期请求，
-//! 拦不住"排在前面那张正在解"，所以缩放重解必须能越过队首的缩略图与预读——否则
-//! 用户放大后要等一整排后台解码才拿到清晰图（2026-10-17 大图实测 0.37s → 1.98s）。
+//! 取队顺序：`Main` → `Prefetch` → `Thumb`（[`Queue::pop`]）。令牌只作废"还没开始解"
+//! 的过期请求，拦不住"排在前面那张正在解"，所以缩放重解必须能越过队首的缩略图与
+//! 预读——否则用户放大后要等一整排后台解码才拿到清晰图（2026-10-17 大图实测
+//! 0.37s → 1.98s）。预读排在缩略图之前（BROWSE-24）：用户刚翻过去的那一张比
+//! 条上还没填的格子更值钱，而且预读在途至多一枚，不会饿死缩略图。
 
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -96,14 +100,18 @@ fn scaled_of(req: &Req) -> bool {
 ///
 /// 单线程串行解码下，用户连按方向键会积压过期请求；`Main` 与 `Prefetch` 都参与
 /// 过期判定（seq 小于 `main_floor` 即作废），只有 `Main` 会推 `main_floor`。
-/// `Thumb` 与主画面解耦，不参与取消——胶片条上一屏缩略图不会因主画面翻页而作废。
+/// `Thumb` 与主画面解耦，**但**有自己的取消判据：不在条上可见窗口里的请求出队即作废
+/// （`ThumbView`）——主画面翻页不会整批作废缩略图，用户滚过去的那一格却该停。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReqKind {
     /// 主画面：用户当前看的那张（含 tick 的缩放/平移重解）。推 main_floor。
     Main,
     /// 相邻图预读：允许被新主画面作废，但不推 main_floor。
     Prefetch,
-    /// 缩略图：始终解完。
+    /// 缩略图：只解"条上现在看得见、且还缺图"的那些；滚过去的在出队时作废。
+    ///
+    /// 作废判据是 `ThumbView`，不是 `main_floor`——主画面翻页不该整批作废缩略图，
+    /// 但用户已经滚过去的那一格再解就是纯浪费。
     Thumb,
 }
 
@@ -354,13 +362,52 @@ pub struct Done {
 /// ★ 契约：**查询值仅作预览**，最终以 [`Decoded`]（渲染阶段回填）为准。宿主遇到两者
 /// 不一致时以渲染值覆盖 UI（见 `Viewer::install`）；解码器应保证两阶段一致。
 ///
-/// 只带尺寸：方向已在解码阶段折进 natural，帧数/页数另有权威来源
-/// （动画走 [`Decoded::anim`]，多页尚无消费者）。复制过来只会变成"只写不读"的字段，
-/// 并在缓存被占位值覆盖时埋下假数据。
-#[derive(Debug, Clone, Copy)]
+/// 尺寸之外还带**技术信息卡**要的那批 ABI 字段：解码器 id/版本、位深、像素格式、
+/// 方向、帧/页数、ICC 段长度。这些值在查询阶段（`iv_render(out=NULL)`）就由解码器
+/// 回填，取它们不额外解码；渲染阶段只有 `natural` 会以权威值覆盖缓存。
+///
+/// ★ 契约不变：**查询值仅作预览**，最终像素与 natural 以 [`Decoded`] 为准。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Meta {
     /// 应用 EXIF 方向**后**的自然尺寸。
     pub natural: (u32, u32),
+    /// 实际接住这次解码的解码器（`"jpeg 0.3.4"` / `"resvg（内置）"`）。
+    /// 空串 = 旧解码器/查询路径没报，技术卡显示“未报告”。
+    pub decoder: String,
+    /// 解码器回报的位深（8 / 16 / 32）。0 = 未报告。
+    pub bit_depth: u32,
+    /// ABI 的 `PF_*` 像素格式。
+    pub pixel_format: u32,
+    /// 文件里的原始 EXIF 方向（1 = 正常）。
+    pub orientation: i32,
+    /// 解码器是否已经按方向转好像素（true = 宿主不再转）。
+    pub already_oriented: bool,
+    /// 文件总帧数（0 = 未报告）。
+    pub frame_count: u32,
+    /// 文件总页数（0 = 未报告）。
+    pub page_count: u32,
+    /// 文件自带帧延时（毫秒，0 = 未报告）。
+    pub frame_delay_ms: u32,
+    /// ICC 段字节数（0 = 没有内嵌 profile）。
+    pub icc_len: u32,
+}
+
+impl Default for Meta {
+    fn default() -> Self {
+        Self {
+            natural: (0, 0),
+            decoder: String::new(),
+            bit_depth: 0,
+            pixel_format: 0,
+            // 1 = “正常方向”；0 是“没报”，不能当作 EXIF 的 0。
+            orientation: 1,
+            already_oriented: false,
+            frame_count: 0,
+            page_count: 0,
+            frame_delay_ms: 0,
+            icc_len: 0,
+        }
+    }
 }
 
 /// 一次查询阶段的上抛事件（与 `Done` 并行、各自通道）。
@@ -482,6 +529,13 @@ fn wake_for_main() {
 thread_local! {
     static CURRENT_SEQ: Cell<u64> = const { Cell::new(0) };
     static CURRENT_PATH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    /// 这一笔解码要不要上抛 Meta。缩略图不上抛：条上几十格会把有界缓存冲掉，
+    /// 技术信息卡真正需要的只是主画面与邻图预读。
+    static META_ALLOWED: Cell<bool> = const { Cell::new(true) };
+}
+
+pub(crate) fn set_meta_allowed(allowed: bool) {
+    META_ALLOWED.with(|c| c.set(allowed));
 }
 
 pub(crate) fn set_current_req(seq: u64, path: &Path) {
@@ -499,6 +553,9 @@ pub(crate) fn clear_current_req() {
 /// 给解码器宿主在 `iv_render(out=NULL)` 成功后调用——seq 为 0 意味着调用方是
 /// `probe_decode` 之类的直调路径，没有 UI 在等，硬发反而把过期的 seq 灌进队列。
 pub(crate) fn publish_meta_from_current_req(meta: Meta) {
+    if !META_ALLOWED.with(Cell::get) {
+        return;
+    }
     let seq = CURRENT_SEQ.with(|c| c.get());
     if seq == 0 {
         return;
@@ -507,6 +564,38 @@ pub(crate) fn publish_meta_from_current_req(meta: Meta) {
         return;
     };
     publish_meta(MetaEvent { seq, path, meta });
+}
+
+/// 缩略图"现在还值得解"的路径集：UI 每帧写入条上**可见且缺图**的格子，解码线程
+/// 出队时据此丢弃已经滚过去的请求。
+///
+/// 为什么不复用 `main_floor`：缩略图与主画面解耦，主画面翻页不该整批作废缩略图；
+/// 判据是"这一格还在不在条上"，不是"seq 新不新"。用路径集而不是"窗口代数"，
+/// 是为了让"窗口挪了一格、其中两格仍在屏上"那两格的在途请求继续有效，不重复解。
+#[derive(Default)]
+struct ThumbView {
+    paths: Mutex<HashSet<PathBuf>>,
+}
+
+impl ThumbView {
+    /// 用这一帧的"可见且缺图"集合替换旧集合。内容没变就原地返回，空闲时不产生分配。
+    fn replace(&self, paths: &[&Path]) {
+        let mut guard = self.paths.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.len() == paths.len() && paths.iter().all(|p| guard.contains(*p)) {
+            return;
+        }
+        guard.clear();
+        for p in paths {
+            guard.insert((*p).to_path_buf());
+        }
+    }
+
+    fn wants(&self, path: &Path) -> bool {
+        self.paths
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(path)
+    }
 }
 
 /// 待解队列：一把锁 + 一个条件变量，出队时**主画面插队**。
@@ -521,8 +610,13 @@ pub(crate) fn publish_meta_from_current_req(meta: Meta) {
 ///
 /// # 取法
 ///
-/// 队里有 `Main` → 解它（缩略图与预读往后放）；否则按到达顺序 FIFO。队空则挂在
-/// 条件变量上等，不空转。
+/// 队里有 `Main` → 解它；否则有 `Prefetch` → 解它；否则按到达顺序 FIFO。队空则
+/// 挂在条件变量上等，不空转。
+///
+/// 预读排在缩略图之前是 BROWSE-24 的显式车道：用户刚翻过去的那一张（预读）决定下一次
+/// 翻页有没有零解码命中，而条上还没填的格子只是背景。m99 曾量过"预读插缩略图"的
+/// 命中率，三档节拍下两臂 94–95% 判不出差；这里改的是**出队优先级**，不是预读下注
+/// 范围，且预读在途至多一枚，不会把缩略图饿死。
 ///
 /// 已作废的 `Main`（`seq` 落后于 floor）仍会被选中，但 `decode_loop` 下一行就短路
 /// 成空回复，代价是一次出队——比重解便宜一万倍，不值得再加一层判据。
@@ -556,16 +650,18 @@ impl Queue {
         true
     }
 
-    /// 出队：`Main` 优先，其余按到达顺序。队列关闭且排空后返回 `None`。
+    /// 出队：`Main` → `Prefetch` → `Thumb`。队列关闭且排空后返回 `None`。
     ///
-    /// ★ 预读**不**插缩略图那一档（判废于 m99）：想过"胶片条排在队里的 1–3 枚缩略图会挡
-    ///   住下一次翻页的预读"，三档节拍（150 / 250 / 400 ms）+ 60 张单圈语料都量不出命中率差
-    ///   （两臂 94–95%，见 本仓历史记录）；而代价是确定的——连续翻手中格子填得更慢。
-    ///   无读数的收益不付代价，故留在 FIFO。
+    /// ★ 预读在 BROWSE-24 之后排在缩略图之前（理由见模块头与 `pop` 上方的车道说明）。
+    ///   m99 的旧结论是"预读不插缩略图"，那一条量的是命中率；这里要让的是**出队顺位**，
+    ///   目标是把"用户刚翻过去的那一张"先解出来，缩略图晚一帧填格子不改变可用性。
     fn pop(&self) -> Option<Req> {
         let mut q = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(i) = q.iter().position(|r| r.kind == ReqKind::Main) {
+                return q.remove(i);
+            }
+            if let Some(i) = q.iter().position(|r| r.kind == ReqKind::Prefetch) {
                 return q.remove(i);
             }
             if let Some(r) = q.pop_front() {
@@ -626,6 +722,8 @@ pub struct Decoder {
     /// seq 小于此值即作废（早退发 Err Done），避免过期请求排全量解码队。
     /// UI 线程单侧写（Relaxed 足够——只要求"发送顺序上先落 floor 再发 req"）。
     main_floor: Arc<AtomicU64>,
+    /// 缩略图条当前可见且缺图的路径集（BROWSE-24）。`Thumb` 出队时不在其中即作废。
+    thumb_view: Arc<ThumbView>,
 }
 
 impl Drop for Decoder {
@@ -663,9 +761,19 @@ impl Decoder {
         let main_floor = Arc::new(AtomicU64::new(0));
         let floor_for_thread = main_floor.clone();
         let q_for_thread = queue.clone();
+        let thumb_view = Arc::new(ThumbView::default());
+        let view_for_thread = thumb_view.clone();
         thread::Builder::new()
             .name("sv-decode".into())
-            .spawn(move || decode_loop(q_for_thread, done_tx, floor_for_thread, sink))
+            .spawn(move || {
+                decode_loop(
+                    q_for_thread,
+                    done_tx,
+                    floor_for_thread,
+                    view_for_thread,
+                    sink,
+                )
+            })
             // 红线豁免: 起线程失败 = 系统资源耗尽（OOM 级），没有可降级的第二种活法——
             // 发送端还在只会让请求无限排队、图永远出不来，那才是真的装死；就地失败反而
             // 留下崩溃报告。这是 §八.1 的第三类例外，必须像这样写在违规行上方点名。
@@ -675,12 +783,26 @@ impl Decoder {
             owner: NEXT_OWNER.fetch_add(1, Ordering::Relaxed),
             next_seq: Cell::new(1),
             main_floor,
+            thumb_view,
         }
+    }
+
+    /// UI 每帧告知"缩略图条上现在可见、且还缺图"的路径（BROWSE-24）。
+    ///
+    /// 解码线程出队 `Thumb` 时不在这个集合里 ⇒ 已经滚过去了，直接发空串 Err 早退，
+    /// 不占唯一那条解码线程。传空切片 = 条关掉 / 换目录，所有还没开始的缩略图作废。
+    pub fn set_thumb_view(&self, paths: &[&Path]) {
+        self.thumb_view.replace(paths);
+    }
+
+    /// 条关掉 / 换目录：作废所有还没开始的缩略图请求。
+    pub fn clear_thumb_view(&self) {
+        self.thumb_view.replace(&[]);
     }
 
     /// 发起一次解码，返回它的世代号（用于丢弃过期结果）。
     ///
-    /// 这是**缩略图**用的默认入口（`kind = Thumb`，永不被取消）。
+    /// 这是**缩略图**用的默认入口（`kind = Thumb`；出队时若已滚出可见窗口会早退）。
     /// 主画面/预读走 `request_frame` / `request_raw` / `request_region`，
     /// 它们收 [`ReqKind`] 参数。
     pub fn request(&self, path: &Path, max_w: u32, max_h: u32) -> u64 {
@@ -830,11 +952,19 @@ impl Decoder {
 /// 它的开关是**每次请求的意图**（`allow_scaled`），不是 `max_w/max_h`：主画面也传远小于
 /// 原生的视口尺寸，那里要的是清晰。能力位图（`iv_caps`）只回答"会不会"，这一位回答
 /// "这次要不要"——两者缺一，解码器都不会动手缩放。
+///
+/// 第四条是 2026-11-13 接上的缩略图快路径：只有 `ReqKind::Thumb` 会传 `thumbnail=true`，
+/// 解码器声明 `CAP_THUMB` 时可走内嵌预览（`REQ_THUMBNAIL`，如 JPEG 的 EXIF IFD1），
+/// 与主画面首屏的 `REQ_ALLOW_SCALED` 分开——两条语义不能合成一位。
 pub trait DecodeBackend: Send {
     /// 解一张位图（svg/svgz 不会走到这里：core 自己路由到 [`SvgDecodeFn`]）。
     ///
     /// `allow_scaled` = 这次请求接受**比 target 更小**的原生缩放结果（回填的 `natural`
     /// 随之变小，缩小补齐仍由宿主做）。见 [`ReqKind::wants_scaled`]。
+    ///
+    /// `thumbnail` = 这次请求只服务胶片条那一格。解码器若声明了 `CAP_THUMB`，可以用
+    /// EXIF/容器内嵌预览直接出小图，不必整解；`natural` 在缩略图这条路上没有消费者，
+    /// 调用方不得拿它做「是否已是整图」的升级判定（只有 `Thumb` 会传 `true`）。
     // 参数平铺是刻意的：与 ABI 请求面一一对应，包一层聚合结构只会让每个实现多一次解包。
     #[allow(clippy::too_many_arguments)]
     fn decode(
@@ -846,6 +976,7 @@ pub trait DecodeBackend: Send {
         frame_index: u32,
         raw: Option<RawParams>,
         allow_scaled: bool,
+        thumbnail: bool,
     ) -> Result<Decoded, crate::core::error::ViewFailure>;
 
     /// 本次请求是**后台预取**还是用户正等的那一笔（m237）。
@@ -1237,6 +1368,7 @@ fn decode_loop(
     q: Arc<Queue>,
     done_tx: StdSender<Done>,
     main_floor: Arc<AtomicU64>,
+    thumb_view: Arc<ThumbView>,
     sink: Option<DecodeSink>,
 ) {
     // 本线程的回程（Meta 通道 + 主画面唤醒）。装在线程局部而不是每次调用都查一遍
@@ -1258,12 +1390,15 @@ fn decode_loop(
     while let Some(req) = q.pop() {
         // 过期早退：`Main`/`Prefetch` 类请求的 seq 已被更新的 Main 追过——不再
         // 解像素，直接发一个 Err Done 让 UI 记账清位（`prefetch_seq` / 过期丢弃）。
-        // `Thumb` 不参与（与主画面解耦，缩略图队列不会被翻页作废）。
+        // `Thumb` 的作废判据不同：与主画面解耦，但"条上已经看不见这一格"就该早退
+        // （BROWSE-24：快速滚动时曾经把滚过去的一整排格子全解完，主图只能等）。
         //
         // 判据用 `<` 不是 `<=`：`Main` 请求发送前已 fetch_max 把自己 seq 落进
         // floor，`req.seq == floor` 是当前主画面，必须真解。
-        let cancelled = matches!(req.kind, ReqKind::Main | ReqKind::Prefetch)
-            && req.seq < main_floor.load(Ordering::Relaxed);
+        let cancelled = match req.kind {
+            ReqKind::Main | ReqKind::Prefetch => req.seq < main_floor.load(Ordering::Relaxed),
+            ReqKind::Thumb => !thumb_view.wants(&req.path),
+        };
         // 从这一刻起才算"解码耗时"（在排队的那一段另计）：看门狗日志靠这一位把
         // "堵在队列"和"堵在 FFI"分开，混在一起就只会得出"七个格式同时挂死"。
         crate::core::decode_watchdog::note_picked(req.seq);
@@ -1350,6 +1485,7 @@ fn decode_loop(
 ///   （2026-10-10 删的是**WIC 兜底**，2026-10-20 它以"可被点名的内置库"回归、
 ///   2026-10-25 又整层删掉——三段历史都不改"兜底永远不做"这条底线。）
 fn decode_one(req: &Req) -> Result<Decoded, crate::core::error::ViewFailure> {
+    set_meta_allowed(req.kind != ReqKind::Thumb);
     set_phase(PHASE_OPEN);
     // 排队优先级（m237）：预取让位给用户正等的那一笔——跨窗共用同一枚 DLL 时，
     // "没人等的下一张"不该挡在前面。后端实例是长驻的，所以**每次请求都要设**。
@@ -1409,7 +1545,21 @@ fn decode_route(req: &Req, ext: &str) -> Result<Decoded, crate::core::error::Vie
                         b.id
                     ))
                 })?;
-                return f(&req.path, req.region.as_ref(), req.max_w, req.max_h);
+                let decoded = f(&req.path, req.region.as_ref(), req.max_w, req.max_h)?;
+                // 内置矢量也要让技术信息卡有“解码器 / 位深 / 像素格式”可显示。
+                publish_meta_from_current_req(Meta {
+                    natural: decoded.natural,
+                    decoder: "resvg（内置）".into(),
+                    bit_depth: 8,
+                    pixel_format: crate::core::abi::PF_RGBA8,
+                    orientation: 1,
+                    already_oriented: true,
+                    frame_count: 1,
+                    page_count: 1,
+                    frame_delay_ms: 0,
+                    icc_len: 0,
+                });
+                return Ok(decoded);
             }
             other => {
                 return Err(crate::core::error::ViewFailure::decode(format!(
@@ -1448,6 +1598,7 @@ fn decode_route(req: &Req, ext: &str) -> Result<Decoded, crate::core::error::Vie
             req.frame_index,
             req.raw,
             scaled_of(req),
+            req.kind == ReqKind::Thumb,
         )
     })?
 }
@@ -1576,6 +1727,7 @@ pub(crate) mod tests {
             owner: NEXT_OWNER.fetch_add(1, Ordering::Relaxed),
             next_seq: Cell::new(1),
             main_floor: Arc::new(AtomicU64::new(0)),
+            thumb_view: Arc::new(ThumbView::default()),
         }
     }
 
@@ -1590,6 +1742,18 @@ pub(crate) mod tests {
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .map(|r| (r.path.clone(), r.raw, r.kind, r.max_w, r.max_h))
+            .collect()
+    }
+
+    /// 取走并清空队列里所有还没开始的请求（测试用）。stub decoder 没有 worker，
+    /// 队列不会自己动；要把“滚动中”和“停手后”的新请求分开数，只能每段先清账。
+    pub(crate) fn drain_pending(d: &Decoder) -> Vec<(PathBuf, ReqKind)> {
+        d.queue
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .map(|r| (r.path, r.kind))
             .collect()
     }
 
@@ -1789,18 +1953,16 @@ pub(crate) mod tests {
             Some(&(3, ReqKind::Main)),
             "Main 必须第一个出队：{order:?}"
         );
-        // 插队不许丢请求（这条正是 std mpsc `try_recv` 踩过的那个坑：四条只回来一条），
-        // 也不该顺手打乱其余的到达顺序——缩略图条按序填格。
-        // ★ m99 试过让 `Prefetch` 也插缩略图一档，三档节拍 + 60 张单圈语料量不出命中率差
-        //   （两臂 94–95%），这条期望值因此原样留着（判废见 `Queue::pop` 的注释）。
+        // 插队不许丢请求（这条正是 std mpsc `try_recv` 踩过的那个坑：四条只回来一条）。
+        // BROWSE-24 起 Prefetch 排在 Thumb 之前：用户刚翻过去的那张比条上背景格更值钱。
         assert_eq!(
             &order[1..],
             &[
+                (4, ReqKind::Prefetch),
                 (1, ReqKind::Thumb),
-                (2, ReqKind::Thumb),
-                (4, ReqKind::Prefetch)
+                (2, ReqKind::Thumb)
             ],
-            "其余按 FIFO：{order:?}"
+            "Prefetch 先于 Thumb，同车道 FIFO：{order:?}"
         );
     }
 
@@ -1817,6 +1979,7 @@ pub(crate) mod tests {
             closed_queue([req(50, ReqKind::Main), req(99, ReqKind::Prefetch)]),
             done_tx,
             floor,
+            Arc::new(ThumbView::default()),
             None,
         );
 
@@ -1839,16 +2002,19 @@ pub(crate) mod tests {
     }
 
     /// 边界：`seq == floor` 是当前主画面，**不**取消（用 `<` 不用 `<=`）。
-    /// Thumb 与主画面解耦，任何 seq 都不取消——这条由后续断言间接验证：
-    /// Thumb 会走到 decode_one，返回非空 Err（未装 backend），不是空串。
+    /// Thumb 在可见窗口里也不取消——它会走到 decode_one，返回非空 Err
+    /// （未装 backend），不是空串。
     #[test]
-    fn current_main_and_thumb_are_not_cancelled() {
+    fn current_main_and_visible_thumb_are_not_cancelled() {
         let (done_tx, done_rx) = channel::<Done>();
         let floor = Arc::new(AtomicU64::new(10));
+        let view = Arc::new(ThumbView::default());
+        view.replace(&[Path::new("p11.png")]);
         decode_loop(
             closed_queue([req(10, ReqKind::Main), req(11, ReqKind::Thumb)]),
             done_tx,
             floor,
+            view,
             None,
         );
 
@@ -1861,6 +2027,41 @@ pub(crate) mod tests {
                 "seq={seq} 不该被取消，应走真解码并拿到非空 Err"
             );
         }
+    }
+
+    /// BROWSE-24：缩略图滚出可见窗口之后，出队即作废——它不再占那条唯一的解码线程。
+    #[test]
+    fn thumb_outside_the_visible_view_is_cancelled() {
+        let (done_tx, done_rx) = channel::<Done>();
+        decode_loop(
+            closed_queue([req(21, ReqKind::Thumb)]),
+            done_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(ThumbView::default()),
+            None,
+        );
+        let d = done_rx.recv().expect("应有 Done");
+        assert_eq!(d.seq, 21);
+        assert!(
+            matches!(&d.out, Err(s) if s.detail.is_empty()),
+            "滚过去的缩略图应发空串 Err 早退，实际 {d:?}"
+        );
+    }
+
+    /// 路径集只看内容：同一批路径换顺序不算变化，新窗口挪一格时仍在屏上的那几格保持有效。
+    #[test]
+    fn thumb_view_keeps_paths_that_are_still_visible() {
+        let view = ThumbView::default();
+        view.replace(&[Path::new("a.png"), Path::new("b.png")]);
+        assert!(view.wants(Path::new("a.png")));
+        assert!(view.wants(Path::new("b.png")));
+        assert!(!view.wants(Path::new("c.png")));
+        view.replace(&[Path::new("b.png"), Path::new("c.png")]);
+        assert!(!view.wants(Path::new("a.png")), "滚过去的要失效");
+        assert!(view.wants(Path::new("b.png")), "还在屏上的不许重复解");
+        assert!(view.wants(Path::new("c.png")));
+        view.replace(&[]);
+        assert!(!view.wants(Path::new("b.png")), "条关掉就全作废");
     }
 
     /// 0 字节文件要说真因。过去它落到解码器探测，用户看到「解码器「jpeg」不认识这个
@@ -1916,7 +2117,9 @@ pub(crate) mod tests {
 
         let (done_tx, done_rx) = channel::<Done>();
         let floor = Arc::new(AtomicU64::new(10));
-        // Thumb 11 / Prefetch 12 都**不**作废（12 >= floor），会真走 decode 并回包；
+        let view = Arc::new(ThumbView::default());
+        view.replace(&[Path::new("p11.png")]);
+        // Thumb 11（在可见窗口里）/ Prefetch 12 都**不**作废，会真走 decode 并回包；
         // 只有 Main 10 是当前主画面。
         decode_loop(
             closed_queue([
@@ -1926,6 +2129,7 @@ pub(crate) mod tests {
             ]),
             done_tx,
             floor,
+            view,
             None,
         );
         assert_eq!(

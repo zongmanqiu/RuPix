@@ -13,7 +13,12 @@ impl Viewer {
     /// 把同一句话摆两遍（用户 2026-10-18："错误不要重复，太冗余了，只留中央"）。
     /// 中央那句因此是唯一的错误载体，宽度与让位都由 `ui::canvas` 负责。
     pub fn status(&self) -> String {
-        let base = self.status_base();
+        let mut base = self.status_base();
+        // CORE-06：大目录的首帧只有当前一项，计数暂时是 `1/1`；追加一句，别让用户
+        // 以为这个目录里只有一张图。完整清单到了由 `poll_listing` 标脏重绘。
+        if self.listing.is_some() {
+            base.push_str(" · 目录载入中…");
+        }
         // ★ m304：压缩包层里有认得出但打不开的条目（加密 / 压缩方式不支持）时，
         //   **不许静默少图**。状态格是数量/百分比之外唯一常驻的一行，只追加后缀、
         //   不替换基础信息（用户 2026-11-06：「数量进度和缩放百分比永远不会被替换」）。
@@ -76,7 +81,7 @@ impl Viewer {
                 if self.error.is_some() {
                     pos
                 } else {
-                    match self.preview_meta {
+                    match self.preview_meta.as_ref() {
                         Some(m) => format!("{} · {}×{} · 载入中…", pos, m.natural.0, m.natural.1),
                         None => format!("{} · 载入中…", pos),
                     }
@@ -179,7 +184,7 @@ impl Viewer {
     }
 
     /// 当前图的世代号（每次打开新图 / 翻页 / 当前图解码完成上屏 自增）。
-    /// 属性窗轮询比对它：变了就重算并刷新那扇窗的内容，否则保持不动（不空耗帧）。
+    /// 属性卡轮询比对它：变了就重算并刷新卡片的内容，否则保持不动（不空耗帧）。
     pub fn image_gen(&self) -> u64 {
         self.image_gen
     }

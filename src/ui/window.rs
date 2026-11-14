@@ -1,9 +1,11 @@
 //! 窗口内容树：无边框窗的根元素。
 //!
-//! 菠萝看图式极简布局：没有常驻工具栏与状态栏——画布铺满整窗，翻页箭头、工具栏、
-//! 信息条与顶部标题区**全部由画布绘制**（见 `ui::chrome`）。拖动也一样走画布：
-//! 指针落在顶部标题区里按下时，画布直接调 `start_window_drag`（见 `ui::canvas`），
-//! 标题文字是画出来的，不是控件。窗口按钮（最小化 / 最大化 / 关闭）同理是画布命中区。
+//! 菠萝看图式极简布局：没有常驻工具栏与状态栏——画布与右侧信息面板按 `info.ratio`
+//! 分掉整窗（面板收起时画布才独占）；翻页箭头、工具栏、信息条与顶部标题区
+//! **全部由画布绘制**（见 `ui::chrome`）。拖动也一样走画布：指针落在顶部标题区里
+//! 按下时，画布直接调 `start_window_drag`（见 `ui::canvas`），标题文字是画出来的，
+//! 不是控件。画布上的五颗窗口按钮（置顶 / 锁定 / 最小化 / 最大化 / 关闭）
+//! 同样是画布命中区；面板头部只留「信息」+ 收起面板，不承接窗口键。
 //!
 //! 装配（App 构建、轮询、快捷键）在 `crate::runtime`——本模块只管元素树。
 
@@ -60,14 +62,67 @@ pub(crate) fn build_root(
                 }
             }
         })
-        // 画布铺满整窗：图片、悬浮箭头/工具栏/标题栏都由它绘制。
+        // 画布 + 右侧信息面板：面板的显隐 / 宽度由 `InfoPanel::tick` 每拍回写，
+        // 这里只把两条 `weight_when` 接到会话态上——用户拖抓手、窗宽变化都走同一条。
         .child(
-            Element::col()
+            Element::row()
                 .fill()
-                .widget(
-                    ImageCanvas::new(viewer.clone(), chrome.clone(), config.clone(), hub.clone())
-                        .with_pane_geom(pane_geom),
+                .cross(Align::Stretch)
+                .child(
+                    Element::col()
+                        .fill()
+                        .weight_when({
+                            let c = chrome.clone();
+                            move || c.info.ratio.get()
+                        })
+                        .widget(
+                            ImageCanvas::new(
+                                viewer.clone(),
+                                chrome.clone(),
+                                config.clone(),
+                                hub.clone(),
+                            )
+                            .with_pane_geom(pane_geom),
+                        )
+                        .autofocus(),
                 )
-                .autofocus(),
+                .child(
+                    Element::leaf()
+                        .widget(super::info_panel::PanelSplitHandle::new(chrome.clone()))
+                        .width(super::info_panel::HANDLE_W)
+                        .height_match()
+                        // 视觉 1px，左右各 8px 可抓；顶部标题栏那段裁掉，
+                        // 否则会抢走画布最右那颗关闭钮的点击。
+                        .hit_pad_edges(Insets {
+                            left: super::info_panel::HANDLE_HIT_PAD,
+                            top: -super::chrome::STRIP_H,
+                            right: super::info_panel::HANDLE_HIT_PAD,
+                            bottom: 0,
+                        })
+                        .raised()
+                        .visible_when({
+                            let c = chrome.clone();
+                            move || c.info.panel_visible()
+                        })
+                        .enabled_when({
+                            let c = chrome.clone();
+                            move || !c.locked.get()
+                        }),
+                )
+                .child(
+                    super::info_panel::build(viewer, chrome, config)
+                        .weight_when({
+                            let c = chrome.clone();
+                            move || 1.0 - c.info.ratio.get()
+                        })
+                        .visible_when({
+                            let c = chrome.clone();
+                            move || c.info.panel_visible()
+                        })
+                        .enabled_when({
+                            let c = chrome.clone();
+                            move || !c.locked.get()
+                        }),
+                ),
         )
 }

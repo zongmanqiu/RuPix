@@ -240,7 +240,7 @@ fn note_image_change(last: &RefCell<Option<PathBuf>>, current: &Option<PathBuf>)
 /// - 跳转：`count` / 单位是打开那一刻的，换图后校验的是旧总数；
 /// - RAW 参数：提交会 `viewer.open(旧 path)`，把画面拉回旧文件。
 ///
-/// 它们不像属性窗那样每帧刷新（`refresh_open_metadata`），也不像旋转窗那样可以
+/// 它们不像属性卡那样每帧刷新（`refresh_metadata_if`），也不像旋转窗那样可以
 /// 重绑（正在输的数字属于旧图），所以换图即关——下一次点入口按新图重建。
 /// ★ 辅图版跳转（`goto-companion`）不在此列：它绑的是右栏辅图，辅图可能被钉住不随
 ///   主图翻；主图的 `ctx` 也关不掉它，强行关会在"钉住辅图"时误伤。
@@ -568,6 +568,7 @@ impl WinRt {
             chrome.filmstrip.set(c.filmstrip);
             chrome.filmstrip_left.set(c.filmstrip_left);
             chrome.locked.set(c.locked);
+            chrome.info.init_from(&c);
         }
         // 尺寸档的初值：装配期那份由 `startup_ops` 负责，故这里取配置值，
         // 首帧不会重复下发。
@@ -760,15 +761,90 @@ impl WinRt {
         // 抓手光标按显示器 DPI 复核（脏读一次系统度量，代价可忽略）。
         crate::ui::hand_cursor::refresh_for_dpi();
         // 插件后台调用完成：UI 线程只取结果，不参与启动/等待/终止。
+        // 换图时清掉上一张图的插件输出（同一路径的缩放/旋转不清）。
+        let current_plugin_path = self.viewer.borrow().current_path();
+        self.chrome
+            .info
+            .sync_plugin_scope(current_plugin_path.as_deref());
         for job in crate::extensions::poll() {
             match job.result {
                 Ok(crate::extensions::run::JobOutput::Text {
                     text,
+                    outputs,
                     copied,
                     open_url,
                     open_image,
                 }) => {
-                    crate::ui::plugin_result::show(ctx, &job.id, &job.plugin, &text, copied);
+                    let mut shown_in_panel = false;
+                    let had_outputs = !outputs.is_empty();
+                    if had_outputs {
+                        let same_image = job.target.as_deref() == current_plugin_path.as_deref();
+                        if !same_image {
+                            log::warn!(
+                                "[plugin-panel] id={} verdict=stale（输出对应图片已切换）",
+                                job.id
+                            );
+                            ctx.toast_err("插件输出对应图片已切换，结果未显示");
+                        } else {
+                            match crate::ui::info_panel::plugin_output::card_from_outputs(
+                                &job.id,
+                                &job.plugin,
+                                outputs,
+                            ) {
+                                Ok(card) => {
+                                    if !crate::ui::chrome::borderless() {
+                                        if !self.chrome.info.open.get() {
+                                            self.chrome.info.set_open(true);
+                                            self.chrome.info.persist(&config);
+                                        }
+                                        if self.chrome.info.panel_visible() {
+                                            self.chrome.info.push_plugin_card(card.clone());
+                                            ctx.mark_layout_dirty();
+                                            ctx.mark_dirty();
+                                            if copied {
+                                                ctx.toast_ok("已复制到剪贴板");
+                                            }
+                                            shown_in_panel = true;
+                                        }
+                                    }
+                                    if !shown_in_panel {
+                                        let fallback =
+                                            crate::ui::info_panel::plugin_output::summary_text(
+                                                &card,
+                                            );
+                                        crate::ui::plugin_result::show(
+                                            ctx,
+                                            &job.id,
+                                            &job.plugin,
+                                            if fallback.is_empty() {
+                                                &text
+                                            } else {
+                                                &fallback
+                                            },
+                                            copied,
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "[plugin-panel] id={} verdict=bad-output：{e}",
+                                        job.id
+                                    );
+                                    ctx.toast_err(format!("插件输出无法显示：{e}"));
+                                    crate::ui::plugin_result::show(
+                                        ctx,
+                                        &job.id,
+                                        &job.plugin,
+                                        &text,
+                                        copied,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if !shown_in_panel && !had_outputs {
+                        crate::ui::plugin_result::show(ctx, &job.id, &job.plugin, &text, copied);
+                    }
                     // 打开动作在结果窗弹出之后做：先让用户看见"扫到什么"，
                     // 再让系统窗口跳出来；失败只 toast，不撤掉结果。
                     if let Some(url) = open_url {
@@ -908,8 +984,15 @@ impl WinRt {
         // 空格预览：开关差分（同值零动作）。接管判定/解码/开窗全在哨兵线程。
         crate::platform::spacehook::set_enabled(config.borrow().space_preview);
         crate::platform::spacehook::set_hold_close(config.borrow().space_hold_close);
-        // 属性窗跟随当前图：图片切换 / 解码完成时重算并刷新那扇窗。
-        crate::ui::settings::refresh_open_metadata(&self.viewer);
+        // 信息面板的卡片跟随当前图：图片切换 / 解码完成时重算并刷新。
+        // ★ 门控：面板不可见、或属性/技术卡都没开时连 stat 都不做。
+        let info = &self.chrome.info;
+        let visible = info.panel_visible();
+        let wanted = visible && (info.props_active.get() || info.tech_active.get());
+        crate::ui::info_panel::properties::refresh_metadata_if(&self.viewer, wanted);
+        // 直方图只读像素、不读盘：单独门控，收起卡片时连抽样都不做。
+        let hist_wanted = visible && info.hist_active.get() && info.hist_expanded.get();
+        crate::ui::info_panel::properties::refresh_histogram_if(&self.viewer, hist_wanted);
     }
 
     /// 本窗主图翻页的步长。
@@ -940,6 +1023,9 @@ impl WinRt {
         if self.seen_theme.replace(theme) != theme {
             self.chrome.invalidate_theme_caches();
             ctx.mark_dirty_all();
+            // 信息面板深 / 浅两棵树靠 `visible_when` 切换；换肤也要重排，
+            // 否则上一套的测量结果会留到下一帧。
+            ctx.mark_layout_dirty();
         }
         // `native_window_handle` 只在 UI 线程、事件/定时器分发期间有效；这里正是
         // `WM_TIMER` 的回调里，写下的就是本窗句柄。每拍一次 store 只是一条 relaxed 写。
@@ -1075,6 +1161,24 @@ impl WinRt {
         if apply_session_flags(&self.chrome, &config.borrow()) {
             ctx.mark_dirty();
         }
+        // 锁定兜底（m342 评审）：某个面板控件（分隔条 / 窗口按钮 / 卡片标题 / 滚动条）
+        // 可能正握着指针捕获，而锁定会把它的父链**禁用**——windui 对禁用节点直接丢事件，
+        // 那记 `Up` 永远到不了，捕获就冻结在一个死节点上：此后所有指针事件都投给它，
+        // 连画布上的解锁钮都点不动。这里每拍强制释放一次；重排只在"刚翻成锁定"那一拍做，
+        // 否则每帧白刷整窗。`ctx` 缺失的快捷键路径靠这条兜底。
+        let locked = self.chrome.locked.get();
+        if locked {
+            ctx.release_capture();
+            if !self.chrome.locked_seen.replace(true) {
+                ctx.mark_layout_dirty();
+            }
+        } else {
+            self.chrome.locked_seen.set(false);
+        }
+        // 信息面板会话态：回写内容宽、刷新可见性、消费重排请求，并在"用户拖动"
+        // 与"窗口缩放"之间分流。必须放在 `apply_session_flags` 之后——它刚把无边框 /
+        // 锁定等全局镜像对齐，本拍可见性要读的就是对齐后的值。
+        self.chrome.info.tick(ctx, ctx.bounds().w, &config);
         // 动图/文档播放速度（m332，m335 改名）：配置是唯一真值，`Viewer` 只是投影。差分对齐；
         // 改速只重排下一帧的时刻，不重解当前帧（见 `Viewer::set_anim_speed`）。
         {
@@ -1327,12 +1431,12 @@ impl WinRt {
     /// 关窗裁决。返回 `true` = 放行关闭。
     /// 这扇窗真的要走了：把它名下「每窗一份」的东西清掉（m232）。
     ///
-    /// 现在只有两处：待弹的裸数据参数（`raw_dialog`）与属性窗信号格（`metadata`）。
+    /// 现在只有两处：待弹的裸数据参数（`raw_dialog`）与属性信号格（`properties`）。
     /// 都按 `singleton::window_scope` 分格，所以清理是"摘掉这一格"，不碰别人的。
     fn release_window_scoped(&self) {
         let scope = crate::ui::singleton::window_scope(&self.viewer);
         crate::ui::raw_dialog::forget_window(scope);
-        crate::ui::settings::forget_metadata_window(scope);
+        crate::ui::info_panel::properties::forget_window(scope);
     }
 
     /// 阅读位置节流（m333）：状态变了才置一次 600 ms 计时；书切换时旧书立即落盘。

@@ -25,7 +25,7 @@ thread_local! {
 ///
 /// 用 `Rc<RefCell<Viewer>>` 的堆地址：一扇窗一份 `Rc`，窗口活着期间恒定，而且两扇
 /// 活着的窗不可能共用同一个地址。窗口关闭时 `WinRt::close` 会把以它为键的东西一并
-/// 清掉（`raw_dialog::forget_window`、`settings::forget_metadata_window`），所以地址
+/// 清掉（`raw_dialog::forget_window`、`info_panel::properties::forget_window`），所以地址
 /// 将来被新窗复用时也捡不到上一个窗的遗留。
 pub(crate) fn window_scope(viewer: &Rc<RefCell<crate::core::viewer::Viewer>>) -> usize {
     Rc::as_ptr(viewer) as usize

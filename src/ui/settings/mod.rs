@@ -1,4 +1,4 @@
-//! 设置、关于、属性窗口（参考 CurSeen 控制面板风格）。
+//! 设置、关于窗口（参考 CurSeen 控制面板风格）。
 //!
 //! # 设计规范（对齐 CurSeen）
 //!
@@ -8,7 +8,7 @@
 //! - 无卡片背景、无分组标题、无注释说明
 //! - 滚动条靠右（内容区填满，滚动条紧贴右边框）
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
@@ -24,7 +24,6 @@ use crate::core::config::{
 };
 use crate::core::hotkey::{Action, Hotkey};
 use crate::core::util::fmt_bytes;
-use crate::core::viewer::Viewer;
 use crate::decoders::catalog;
 use crate::decoders::{install, parse_dll_version, Catalog, DecoderEntry, Health, RemoteEntry};
 
@@ -33,7 +32,6 @@ mod decoders;
 mod decoders_tab;
 mod extensions_tab;
 mod exts;
-mod metadata;
 mod options;
 mod rows;
 pub mod shortcuts;
@@ -50,7 +48,6 @@ pub(crate) use decoders_tab::*;
 pub(crate) use extensions_tab::*;
 pub use exts::ExtRow;
 pub(crate) use exts::*;
-pub use metadata::{forget_window as forget_metadata_window, open_metadata, refresh_open_metadata};
 pub(crate) use options::*;
 pub(crate) use rows::{
     action_slot, btn, btn_action, btn_danger, check_row, choice_row, divider, info_row, nav_rail,

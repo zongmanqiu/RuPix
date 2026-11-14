@@ -110,7 +110,7 @@ pub enum Action {
     Minimal,
     /// 棋盘格背景开关。
     Checker,
-    /// 属性窗。
+    /// 属性卡（右侧信息面板）。
     Properties,
     /// 窗口不透明度 +1 档（10%）。
     OpacityUp,

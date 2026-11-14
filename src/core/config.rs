@@ -433,7 +433,7 @@ impl InitWindow {
 /// 看图窗口的配色方案（ini 键 `ui_theme`，2026-11-02 用户口径"只需要两种颜色方案切换"）。
 ///
 /// ★ **只影响看图器主窗口**：浮层胶囊、缩略图条、棋盘格、空窗底、中央提示文字这一批。
-///   设置页 / 属性窗 / 对话框恒为浅底深字那一套，两档主题下长得一模一样——用户明说
+///   设置页 / 对话框恒为浅底深字那一套，两档主题下长得一模一样——用户明说
 ///   "不影响我们的设置页面颜色"。
 /// ★ 存**字符串**而不是数字：`dark` / `light` 手改 ini 时自解释，也不会像
 ///   [`InitWindow`] 那样因为退役值占号而需要两套下标映射。
@@ -620,6 +620,15 @@ pub fn clamp_window_size(w: u32, h: u32) -> (u32, u32) {
         h.clamp(WINDOW_MIN, WINDOW_MAX),
     )
 }
+
+/// 右侧信息面板目标宽的下限（逻辑 px）。再窄的话一行中文标签就折得没法看。
+pub const INFO_PANEL_W_MIN: u32 = 240;
+/// 信息面板目标宽的上限（逻辑 px）。真正的上限是**窗口内容宽的一半**
+/// （[`crate::ui::info_panel::PANEL_MAX_SHARE`]）；这个绝对值只防 ini 写出天文数字，
+/// 4K 窗口半宽 1920、8K 半宽 3840 都留在界内。
+pub const INFO_PANEL_W_MAX: u32 = 4096;
+/// 信息面板目标宽的出厂默认（逻辑 px）。
+pub const INFO_PANEL_W_DEFAULT: u32 = 300;
 
 /// 窗口整体不透明度的可选区间（百分制）。
 ///
@@ -936,6 +945,22 @@ pub struct Config {
     /// id 表在界面层（`ui::settings::Card`）——`core` 不认识界面，只保管这串字符串；
     /// 认不出的 id 在回填时被静默忽略，下一次 `Handles::sync` 按现有卡重新收集时自动消失。
     pub ui_cards_collapsed: Vec<String>,
+    /// 右侧信息面板是否打开（ini 键 `info_panel`）。
+    ///
+    /// 面板默认关、默认是**空面板**：用户点「属性」才加入属性卡。
+    pub info_panel: bool,
+    /// 信息面板目标宽（逻辑 px，夹在 [`INFO_PANEL_W_MIN`]..=[`INFO_PANEL_W_MAX`]）。
+    ///
+    /// 拖面板左缘改的就是它；存的是**目标宽**而不是比例——窗口缩小时面板跟着让位，
+    /// 窗口恢复后仍回到用户选的那个宽度。
+    pub info_panel_width: u32,
+    /// 面板里当前打开的卡片 id（分号分隔，ini 键 `info_cards`）。
+    ///
+    /// 空 = 空面板（默认）。存的是“当前开着哪些卡”，与设置页存收起侧的方向相反，
+    /// 因为面板本来就是“按需加卡”的。
+    pub info_cards: Vec<String>,
+    /// 面板里收起的卡片 id（分号分隔，ini 键 `info_cards_collapsed`）。空 = 全部展开。
+    pub info_cards_collapsed: Vec<String>,
 }
 
 /// 预读深度的**唯一默认值正本**（m281）。Default、from_ini 回落、首启 ini 模板都读它。
@@ -1003,6 +1028,10 @@ impl Default for Config {
             allow_multiple: false,
             decode_timeout_s: 20,
             ui_cards_collapsed: Vec::new(),
+            info_panel: false,
+            info_panel_width: INFO_PANEL_W_DEFAULT,
+            info_cards: Vec::new(),
+            info_cards_collapsed: Vec::new(),
         }
     }
 }
@@ -1255,6 +1284,33 @@ impl Config {
                         .filter(|s| !s.is_empty())
                         .collect()
                 }
+                // 信息面板（2026-11-14）：开关只认 0/1；目标宽解不动回默认、越界夹紧
+                // （与 `window_w` 同一条：手改 ini 写出的天文数字不许变成“半屏面板”）。
+                "info_panel" => set_bool(&mut cfg.info_panel, v, "info_panel"),
+                // 先按 i64 解析再夹：手改 ini 写 `-1` 要**抬到下限** 240（u32 直接解析
+                // 会整串失败、回落 300，反而比下限还宽）；`4294967296` 这类超 u32 的
+                // 天文数字也要落到上限而不是回落默认。乱码才用默认值。
+                "info_panel_width" => {
+                    cfg.info_panel_width = v
+                        .parse::<i64>()
+                        .map(|n| n.clamp(INFO_PANEL_W_MIN as i64, INFO_PANEL_W_MAX as i64) as u32)
+                        .unwrap_or(INFO_PANEL_W_DEFAULT)
+                }
+                // 卡 id 表与 `ui_cards` 同一套写法：分号切分、去空白、丢空串（顺序照原样）。
+                "info_cards" => {
+                    cfg.info_cards = v
+                        .split(';')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                }
+                "info_cards_collapsed" => {
+                    cfg.info_cards_collapsed = v
+                        .split(';')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                }
                 // 快捷键组：整段交给 Hotkeys::from_ini 解析（内部先 default 再覆盖）。
                 "hotkeys" => cfg.hotkeys = crate::core::hotkey::Hotkeys::from_ini(v),
                 // 裸数据「上次使用值」：`宽x高:布局号`（如 `1920x1080:8`）。解析不出
@@ -1333,12 +1389,17 @@ impl Config {
             .raw_last
             .map(|r| format!("{}x{}:{}", r.width, r.height, r.layout))
             .unwrap_or_default();
+        // 写盘也夹一次：解析侧已经夹过，但 `Config` 也可能来自旧版本 / 测试 / 将来
+        // 的写点；手改内存值不该把半屏面板写成一份“下次启动才修”的 ini。
+        let info_panel_width = self
+            .info_panel_width
+            .clamp(INFO_PANEL_W_MIN, INFO_PANEL_W_MAX);
         let body = format!(
             "stay_on_top={}\ndouble_click={}\nslide_interval={}\nanim_speed={}\nanim_autoplay={}\nminimal_mode={}\n\
              checker={}\nfilmstrip={}\nfilmstrip_left={}\nlocked={}\n\
              long_image_fit={}\nwheel_behavior={}\nctrl_wheel={}\nalt_wheel={}\nshift_wheel={}\ninit_window={}\nborderless={}\nwindow_w={}\n\
              window_h={}\nopacity={}\nsort_by={}\nsort_desc={}\n\
-             assoc_exts={}\nassoc_heal={}\ndecoders_disabled={}\nextensions_disabled={}\nextensions_isolated={}\ndecoders_preferred={}\nprefetch={}\nprefetch_depth={}\nclose_to_tray={}\nspace_preview={}\nspace_hold_close={}\ndrag_image={}\nshow_toolbar_buttons={}\nraw_last={}\ndownload_source={}\nui_theme={}\ndecoder_index_gitee={}\ndecoder_index_github={}\nplugin_index_gitee={}\nplugin_index_github={}\nupdate_index_gitee={}\nupdate_index_github={}\nhotkeys={}\nallow_multiple={}\ndecode_timeout_s={}\nui_cards={}\n",
+             assoc_exts={}\nassoc_heal={}\ndecoders_disabled={}\nextensions_disabled={}\nextensions_isolated={}\ndecoders_preferred={}\nprefetch={}\nprefetch_depth={}\nclose_to_tray={}\nspace_preview={}\nspace_hold_close={}\ndrag_image={}\nshow_toolbar_buttons={}\nraw_last={}\ndownload_source={}\nui_theme={}\ndecoder_index_gitee={}\ndecoder_index_github={}\nplugin_index_gitee={}\nplugin_index_github={}\nupdate_index_gitee={}\nupdate_index_github={}\nhotkeys={}\nallow_multiple={}\ndecode_timeout_s={}\nui_cards={}\ninfo_panel={}\ninfo_panel_width={}\ninfo_cards={}\ninfo_cards_collapsed={}\n",
             self.stay_on_top as i32,
             self.dbl_click.index(),
             self.slide_interval,
@@ -1388,6 +1449,10 @@ impl Config {
             self.decode_timeout_s,
             // 分号分隔的卡 id；空串 = 全部展开。
             self.ui_cards_collapsed.join(";"),
+            self.info_panel as i32,
+            info_panel_width,
+            self.info_cards.join(";"),
+            self.info_cards_collapsed.join(";"),
         );
         // 原子写（M2）：写临时文件 → **flush 到盘** → 改名覆盖。
         //
@@ -1686,6 +1751,18 @@ update_index_github={update_github}
 # 单个动作写成 `fit:` = 明确解绑；键名写坏 = 该动作保持出厂默认（不会静默解绑）。动作 id：
 # prev/next/first/last/zoom_in/zoom_out/fit/actual/rotate/flip/pause/filmstrip/fullscreen
 hotkeys={hotkeys}
+
+# 右侧信息面板（1 开 / 0 关；面板默认空，点「属性」才加卡）
+info_panel=0
+
+# 信息面板目标宽（逻辑 px，240..4096；拖面板左缘调整，实际上限为窗口半宽）
+info_panel_width=300
+
+# 信息面板里打开的卡片 id，分号分隔（留空 = 空面板）
+info_cards=
+
+# 信息面板里收起的卡片 id，分号分隔（留空 = 全部展开）
+info_cards_collapsed=
 "
     )
 }
@@ -1701,7 +1778,7 @@ hotkeys={hotkeys}
 ///   ★ 写在 UI 写点处的 `ini 键：<名>` 注释是**给人导航的约定，没有测试读它**（2026-10-24 实测：
 ///   20 个键里 13 个标了，没标的是 `double_click`、`filmstrip`、`locked`、`long_image_fit`、
 ///   `decoders_disabled`、`window_w`、`window_h`）——别把它当成门禁。
-pub const ALL_KEYS: [&str; 48] = [
+pub const ALL_KEYS: [&str; 52] = [
     "stay_on_top",
     "double_click",
     "slide_interval",
@@ -1750,6 +1827,10 @@ pub const ALL_KEYS: [&str; 48] = [
     "allow_multiple",
     "decode_timeout_s",
     "ui_cards",
+    "info_panel",
+    "info_panel_width",
+    "info_cards",
+    "info_cards_collapsed",
 ];
 
 /// 配置专用键：只给高级用户手改 ini，**界面刻意不出现**（2026-10-29 用户口径）。
@@ -2189,6 +2270,81 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    /// 信息面板目标宽：乱码回落默认，越界夹紧（240..=4096）。
+    ///
+    /// 五档都要有可预期结果：手改 ini 写 `10` / `-1` 要抬到下限、写 `9999` /
+    /// `4294967296` 要压到上限、写 `abc` 或留空要回落 300——**绝不 panic**。
+    /// ★ `-1` 与 `4294967296` 是按 i64 解析的直接理由：u32 会把前者整串判失败
+    /// （回落 300，反倒比下限还宽），把后者同样当乱码。
+    #[test]
+    fn info_panel_width_clamps_and_defaults() {
+        for (raw, want) in [
+            ("10", 240u32),
+            ("-1", 240),
+            ("999", 999),
+            ("9999", 4096),
+            ("4294967296", 4096),
+            ("abc", 300),
+            ("", 300),
+        ] {
+            let p = temp_ini("info-panel-width");
+            std::fs::write(&p, format!("info_panel_width={raw}\n")).unwrap();
+            assert_eq!(Config::load_from(&p).info_panel_width, want);
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    /// 写盘也夹一次：内存里被写成 99999 也不许原样落盘。
+    ///
+    /// 不夹的话，下一次启动会读到一份“越界值”，到底是信它还是夹它又得再判一次；
+    /// 写点直接给合规值，盘上就永远只有 240..=4096。
+    #[test]
+    fn info_panel_width_is_clamped_when_saved() {
+        let p = temp_ini("info-panel-width-save");
+        let c = Config {
+            info_panel_width: 99_999,
+            ..Config::default()
+        };
+        c.save_to(&p);
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            text.contains("info_panel_width=4096\n"),
+            "写盘必须夹到上限，实际写的是：{text}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 四个信息面板键必须整组走出磁盘再回来：开关、目标宽、打开的卡、收起的卡。
+    ///
+    /// `save_to` 的写入顺序与 `load_from` 的解析必须一一对应（含分号分隔与顺序）——
+    /// 漏写一排（例如只存 `info_cards` 忘存 `info_cards_collapsed`）这里就红。
+    #[test]
+    fn info_panel_keys_round_trip() {
+        let p = temp_ini("info-panel");
+        let c = Config {
+            info_panel: true,
+            info_panel_width: 420,
+            info_cards: vec!["properties".into(), "future".into()],
+            info_cards_collapsed: vec!["properties".into()],
+            ..Config::default()
+        };
+        c.save_to(&p);
+        let back = Config::load_from(&p);
+        assert!(back.info_panel, "info_panel 没读回");
+        assert_eq!(back.info_panel_width, 420, "info_panel_width 没读回");
+        assert_eq!(
+            back.info_cards,
+            vec!["properties".to_string(), "future".to_string()],
+            "info_cards 没读回"
+        );
+        assert_eq!(
+            back.info_cards_collapsed,
+            vec!["properties".to_string()],
+            "info_cards_collapsed 没读回"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
     /// 默认配置写出来的值一定等于再读一遍读到的值（幂等：反复保存不会把配置漂咸）。
     #[test]
     fn save_then_load_is_idempotent() {
@@ -2412,7 +2568,8 @@ plugin_source=github
              decoders_disabled=abc;def\nextensions_disabled=com.example.ocr\ndecoders_preferred=jpg=jpeg;png=png\nprefetch=0\nanim_speed=8\nanim_autoplay=0\nclose_to_tray=1\nspace_preview=1\ndrag_image=0\nsort_by=3\nsort_desc=1\nraw_last=1x2:3\ndownload_source=github\n\
              decoder_index_gitee=https://a.example/d.json\ndecoder_index_github=https://b.example/d.json\n\
              plugin_index_gitee=https://a.example/p.json\nplugin_index_github=https://b.example/p.json\n\
-             hotkeys=prev:Right\nui_cards=options.appearance;keys.plugins\n",
+             hotkeys=prev:Right\nui_cards=options.appearance;keys.plugins\n\
+             info_panel=1\ninfo_panel_width=9999\ninfo_cards=properties;future\ninfo_cards_collapsed=properties\n",
         )
         .unwrap();
         let c = Config::load_from(&p);
@@ -2494,6 +2651,18 @@ plugin_source=github
             vec!["options.appearance".to_string(), "keys.plugins".to_string()],
             "ui_cards 没有消费方"
         );
+        assert!(c.info_panel, "info_panel 没有消费方");
+        assert_eq!(c.info_panel_width, 4096, "info_panel_width 没有消费方");
+        assert_eq!(
+            c.info_cards,
+            vec!["properties".to_string(), "future".to_string()],
+            "info_cards 没有消费方"
+        );
+        assert_eq!(
+            c.info_cards_collapsed,
+            vec!["properties".to_string()],
+            "info_cards_collapsed 没有消费方"
+        );
         let _ = std::fs::remove_file(&p);
     }
 
@@ -2511,19 +2680,22 @@ plugin_source=github
     ///   页是静默的**（decoders.rs 就这么静默漏过一次）——全集对账由
     ///   `hygiene_scan.py` 第十五查 `settings_include` 守着，本用例只管
     ///   "列进来的文件里有写点"这一半。
+    ///
+    /// ★ 2026-11-14：右侧信息面板的四个键由 `ui/info_panel/` 引用，跟着列进来。
     #[test]
     fn ui_touchpoints_cover_all_keys() {
         let ui = concat!(
             include_str!("../ui/settings/mod.rs"),
             include_str!("../ui/settings/about.rs"),
             include_str!("../ui/settings/exts.rs"),
-            include_str!("../ui/settings/metadata.rs"),
             include_str!("../ui/settings/options.rs"),
             include_str!("../ui/settings/decoders.rs"),
             include_str!("../ui/settings/decoders_tab.rs"),
             include_str!("../ui/settings/extensions_tab.rs"),
             include_str!("../ui/settings/rows.rs"),
             include_str!("../ui/settings/shortcuts.rs"),
+            include_str!("../ui/info_panel/mod.rs"),
+            include_str!("../ui/info_panel/properties.rs"),
             include_str!("../ui/canvas.rs"),
             include_str!("../ui/raw_dialog.rs"),
             // m315：文件关联窗是 `assoc_exts` / `assoc_heal` 的**唯一**写点，必须列进来

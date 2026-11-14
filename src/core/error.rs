@@ -90,6 +90,14 @@ impl ViewFailure {
         Self::new(FailureKind::Other, detail)
     }
 
+    /// 这是"请求已被取消"的哨兵，不是解码失败：空判词 + Other。
+    ///
+    /// 解码线程丢弃过期请求时就用它占位（`other("")`）；缩略图账本据此把格子摘掉，
+    /// 而不是记成 `Failed`——否则滚过去的格子会被永久当成坏图，再也不重试。
+    pub fn is_cancelled(&self) -> bool {
+        self.kind == FailureKind::Other && self.detail.is_empty()
+    }
+
     /// 读文件失败：`NotFound` → FileMissing，其余 → Other；原文带上 OS 判词。
     pub fn from_io(e: std::io::Error) -> Self {
         Self::new(FailureKind::from_io(&e), format!("读不到文件：{e}"))

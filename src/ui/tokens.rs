@@ -21,7 +21,7 @@
 //!
 //! | 组 | 用在哪 | 跟主题走吗 |
 //! |---|---|---|
-//! 浅色组（[`BG`] / [`TEXT`] / [`BORDER`] …） | 设置窗、属性窗、对话框这类**独立窗口** | **不跟**。永远是白底深字——用户 2026-11-02 明说「不影响我们的设置页面颜色，只是影响看图器主窗口」 |
+//! 浅色组（[`BG`] / [`TEXT`] / [`BORDER`] …） | 设置窗、对话框这类**独立窗口** | **不跟**。永远是白底深字——用户 2026-11-02 明说「不影响我们的设置页面颜色，只是影响看图器主窗口」 |
 //! 浮层·跟随主题（[`empty_bg`] / [`pill_bg`] / [`overlay_text`] …） | 压在**我们自己的底**上的东西：空窗底、棋盘格、胶囊、缩略图条与格、浮层文字 | 跟。[`Theme`] 深 / 浅两套表 |
 //! 浮层·恒定（[`STROKE_DARK`] / [`NAV_FILL`] / [`SLIDING_BG`] / [`BTN_DANGER_HOVER`]） | 压在**用户图片的像素**上：双层框线、当前视口高亮、放映进度、危险红 | 不跟。它们的职责是"任意图片上都看得见"，翻成反色会在深色照片上失效 |
 //!
@@ -42,8 +42,8 @@ use windui::geometry::Color;
 // ── 主题：两套浮层配色（2026-11-02 用户口径：「只需要两种颜色方案切换」）──────
 //
 // 只有**浮层**这一组跟主题走。浅色组（`BG` / `TEXT` / `BORDER` …）恒定不变——
-// 用户明说「不影响我们的设置页面颜色，只是影响看图器主窗口」：设置页、属性窗、
-// 对话框永远是白底深字那一套，两套主题下长得一模一样。
+// 用户明说「不影响我们的设置页面颜色，只是影响看图器主窗口」：设置页、对话框
+// 永远是白底深字那一套，两套主题下长得一模一样。
 //
 // 切换是**运行期**的：`set_theme` 写一个 `AtomicU8`，各绘制点在下一帧读到的就是
 // 新值；它返回"是否真的变了"，runtime 拿这个返回值决定要不要重绘。
@@ -166,7 +166,8 @@ pub const CORNER_CONTROL: f32 = 6.0;
 pub const ICON_BTN_W: i32 = 37;
 pub const ICON_BTN_H: i32 = 36;
 
-// ── 浅色系（独立窗口：设置 / 属性 / 对话框）──────────────────────────
+// ── 浅色系（独立窗口：设置 / 对话框）──────────────────────────────
+// 属性卡不是独立窗口：它在信息面板里，深 / 浅两套配色由 `tokens::PanelColors` 提供。
 
 pub const BG: [u8; 3] = [255, 255, 255];
 pub const TEXT: [u8; 3] = [45, 52, 54];
@@ -456,6 +457,76 @@ pub fn overlay_text_active() -> Color {
     to_color(overlay().text_active)
 }
 
+/// 信息面板的一套配色。两套在构建期各取一次，面板树建两份、按主题显隐。
+///
+/// ★ 面板是**浮层**（压在图片旁边那一块），所以跟主题走；但它比胶囊 / 缩略图条
+///   多一层"卡片"：`panel` 是面板底，`header` 是面板标题条（与主窗标题栏同档），
+///   `card` 是卡片外壳 / 标题区，`content` 是卡片正文（与看图窗口同档），`edge` 是卡片描边。
+///   构建期一次取全是刻意的——`Element` 的颜色是建树时定下的值，若在绘制路径上临时读
+///   `overlay()`，换主题就得重建整棵树；建两份、用 `visible_when` 切，切换只标脏。
+#[derive(Clone, Copy)]
+pub struct PanelColors {
+    pub panel: Color,
+    /// 面板头部（与主窗标题栏同一档 `pill_bg`）。
+    pub header: Color,
+    /// 卡片外壳 / 标题区底色。
+    pub card: Color,
+    /// 卡片内容区底色（与看图窗口同一档 `empty_bg`）。
+    pub content: Color,
+    pub text: Color,
+    pub muted: Color,
+    pub edge: Color,
+    /// 直方图的 R / G / B / 亮度四档与轨道底色。
+    pub hist_r: Color,
+    pub hist_g: Color,
+    pub hist_b: Color,
+    pub hist_luma: Color,
+    pub hist_track: Color,
+    /// 直方图网格线（比轨道亮一档，不抢曲线）。
+    pub hist_grid: Color,
+}
+
+impl PanelColors {
+    pub fn dark() -> Self {
+        Self {
+            panel: to_color(DARK_OVERLAY.tree_bg),
+            header: to_color4(DARK_OVERLAY.pill_bg),
+            card: to_color4(DARK_OVERLAY.slot_bg),
+            content: to_color(DARK_OVERLAY.empty_bg),
+            text: to_color(DARK_OVERLAY.text),
+            muted: to_color(DARK_OVERLAY.text_muted),
+            hist_r: to_color4([232, 92, 92, 235]),
+            hist_g: to_color4([96, 204, 132, 235]),
+            hist_b: to_color4([104, 152, 248, 235]),
+            hist_luma: to_color4([226, 226, 230, 225]),
+            hist_track: to_color4([255, 255, 255, 18]),
+            hist_grid: to_color4([255, 255, 255, 34]),
+            // ★ 深色卡描边沿用 `panel_edge`（α=0 = 不画）。这是**已接受**的现状，不是漏项：
+            //   深色底上卡片靠 `slot_bg` 叠层已能与面板分开，再补一道描边反而显重；
+            //   真要单独给卡片一档边线，应新增语义 token，不许在这里写字面值。
+            edge: to_color4(DARK_OVERLAY.panel_edge),
+        }
+    }
+
+    pub fn light() -> Self {
+        Self {
+            panel: to_color(LIGHT_OVERLAY.tree_bg),
+            header: to_color4(LIGHT_OVERLAY.pill_bg),
+            card: to_color4(LIGHT_OVERLAY.slot_bg),
+            content: to_color(LIGHT_OVERLAY.empty_bg),
+            text: to_color(LIGHT_OVERLAY.text),
+            muted: to_color(LIGHT_OVERLAY.text_muted),
+            hist_r: to_color4([196, 58, 58, 235]),
+            hist_g: to_color4([36, 150, 84, 235]),
+            hist_b: to_color4([48, 104, 214, 235]),
+            hist_luma: to_color4([60, 60, 64, 220]),
+            hist_track: to_color4([0, 0, 0, 14]),
+            hist_grid: to_color4([0, 0, 0, 26]),
+            edge: to_color4(LIGHT_OVERLAY.panel_edge),
+        }
+    }
+}
+
 // ── 浮层：恒定不跟主题的那一组 ───────────────────────────────────────
 //
 // 全部压在**用户图片的像素**上。它们的职责是"在任意图片上都看得见"，
@@ -560,6 +631,22 @@ mod tests {
             DARK_OVERLAY.text_active, LIGHT_OVERLAY.text_active,
             "激活绿必须换（浅底上用深绿，否则看不出来）"
         );
+    }
+
+    /// 信息面板那两套配色必须真的分得开：面板树按主题各建一份，颜色若同值，
+    /// 显隐切换就变成"换了个寂寞"。
+    #[test]
+    fn panel_colors_differ_between_themes() {
+        let d = PanelColors::dark();
+        let l = PanelColors::light();
+        assert_ne!(d.panel, l.panel);
+        assert_ne!(d.text, l.text);
+        assert_ne!(d.card, l.card);
+        assert_ne!(d.header, l.header);
+        assert_ne!(d.content, l.content);
+        assert_ne!(d.hist_r, l.hist_r);
+        assert_ne!(d.hist_track, l.hist_track);
+        assert_ne!(d.hist_grid, l.hist_grid);
     }
 
     /// ★ m302：树、条、看图区是三块地，必须两两可分。截图实测过一次「树 = 看图区」

@@ -1,9 +1,15 @@
 //! 缩略图条（filmstrip）的后台解码状态。
 //!
 //! 与主画面共用**同一条**解码线程，所以在途数量有硬上限：一次最多
-//! `MAX_INFLIGHT` 个请求——留着它是为了不让一次翻页把队列灌满陈旧格子，
-//! "正在看的那张"排在缩略图后面这件事已由解码线程的**主画面插队**兜住
-//! （[`crate::core::decode`] 的 `Queue::pop`，2026-10-17 修放大糊图时加）。
+//! `MAX_INFLIGHT` 个请求。BROWSE-24 之前这里还有两个洞：
+//!
+//! - 条一滚，旧窗口的请求**永远不会被取消**——用户已经滚过去的一整排格子照样整解，
+//!   主图要等它们（缩略图对多数解码器是**整图解码后缩到 240×180**，不是只读 500 KB）；
+//! - 每帧都按窗口顺序补图，快速滚动时解码线程被一串"已经看不见的格子"占满。
+//!
+//! 现在：`ensure` 把"当前可见且还缺图"的路径交给解码线程（[`crate::core::decode::Decoder::set_thumb_view`]），
+//! 出队时不在集合里的 `Thumb` 直接作废；滚动中的新请求暂停，停手 `THUMB_SETTLE`
+//! 后再补（`Thumbs::ensure` 的 `allow_new`）。在途上限、LRU、失败记忆一条没改。
 //!
 //! 存的是内存里那份 `RgbaImage`（本模块的 `map`）；跨会话没有磁盘那一层了——
 //! 2026-10-19 撤掉解码缓存，缩略图本来也达不到它的门槛（240×180×4 ≈ 172 KB）。
@@ -12,8 +18,10 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 
 use crate::core::decode::{self, Decoder, Done, RawParams, ReqKind};
+use crate::core::geometry::{downscale, fit_dims};
 use crate::core::pixels::RgbaImage;
 
 /// 缩略图的目标框（设备像素）。
@@ -26,6 +34,12 @@ pub const THUMB_H: u32 = 180;
 
 /// 同时在途的请求上限（理由见模块头）。
 const MAX_INFLIGHT: usize = 3;
+
+/// 条停止滚动后多久才恢复补图。
+///
+/// 比 CORE-22 的 120ms 尾随防抖略长：缩略图是纯背景活，宁可多等半帧，也不要
+/// 在用户刚停手、主图正在换档的那一下挤进去。滚动中一次都不发新请求。
+pub(crate) const THUMB_SETTLE: Duration = Duration::from_millis(150);
 
 /// 内存里最多留多少张（超了按最久未用淘汰）。
 ///
@@ -94,9 +108,12 @@ impl Thumbs {
         n
     }
 
-    /// 为**还没有着落**的路径发起后台解码，受 `MAX_INFLIGHT` 约束。
+    /// 为**当前可见、且还没有着落**的路径发起后台解码，受 `MAX_INFLIGHT` 约束。
     ///
     /// 已有的（含在途与失败的）一律跳过，所以每帧调用也只会在真正缺图时发请求。
+    /// `allow_new = false` 用于"条正在滚动"：只更新解码线程的作废路径集，**一个新请求
+    /// 也不发**；停手后由调用方带着 `true` 再来一次。
+    ///
     /// ★ 收的是 `&[&Path]` 而不是 `&[PathBuf]`（m100）：调用方（`Viewer::strip_window`）
     ///   手里只有清单里那些路径的**引用**，旧签名逼它先克隆一份整屏的 `PathBuf`——
     ///   一帧 12 格就是 12 次分配，而这笔克隆在这条路上没有任何下游需要拥有权。
@@ -106,7 +123,12 @@ impl Thumbs {
     ///   `.bgra/.rgb/.yuv/…` 在条上永远是空的（2026-11-08 用户实报 `noise.bgra`）。
     ///   现在与主画面共用 [`decode::ensure_raw_params`] 的推断 / 会话值，并走
     ///   `request_raw(..., Thumb)`；参数一变就把旧格子作废重发。
-    pub fn ensure(&mut self, decoder: &Decoder, paths: &[&Path]) {
+    pub fn ensure(&mut self, decoder: &Decoder, paths: &[&Path], allow_new: bool) {
+        // 先算出"可见但还缺图"的集合：只把这一批交给解码线程。
+        // 就绪 / 失败的格子不在其中 ⇒ 队列里同路径的旧请求会作废（seed 之后尤其重要）。
+        // `Vec::new()` 而不是 `with_capacity`：空闲时所有格子都已就绪/失败，`missing`
+        // 为空，不该为它分配一块用不上的缓冲。
+        let mut missing: Vec<&Path> = Vec::new();
         for p in paths {
             let headerless = decode::is_headerless_path(p);
             let raw = if headerless {
@@ -119,12 +141,27 @@ impl Thumbs {
                 self.raw_used.insert(p.to_path_buf(), raw);
                 self.forget(p);
             }
-            if self.slots.contains_key(*p) {
-                continue;
+            if !self.slots.contains_key(*p) {
+                missing.push(*p);
             }
+        }
+        decoder.set_thumb_view(&missing);
+        if !allow_new {
+            return;
+        }
+        for p in missing {
             if self.inflight.len() >= MAX_INFLIGHT {
                 break;
             }
+            // 同一轮里 `forget` / 参数变化可能已经改过账；再确认一次，避免重复发。
+            if self.slots.contains_key(p) {
+                continue;
+            }
+            let raw = if decode::is_headerless_path(p) {
+                decode::ensure_raw_params(p)
+            } else {
+                None
+            };
             let seq = match raw {
                 Some(_) => decoder.request_raw(p, THUMB_W, THUMB_H, ReqKind::Thumb),
                 None => decoder.request(p, THUMB_W, THUMB_H),
@@ -132,6 +169,40 @@ impl Thumbs {
             let owned = p.to_path_buf();
             self.inflight.insert(seq, owned.clone());
             self.put(owned, Slot::Pending);
+        }
+    }
+
+    /// 用主画面 / 预读已经解出来的像素**直接种一格**，省掉一次整图解码。
+    ///
+    /// 适用场景：当前图刚上屏（`nav_thumb_rgba` 已有 ≤512 px 的鸟瞰源），或预读回包
+    /// 入缓存——这两条路都已经付过整解的钱，再为 240×180 解一遍纯属重复。
+    /// 目标尺寸按 [`THUMB_W`]×[`THUMB_H`] 等比收，不放大；已有 `Ready` 格子不覆盖
+    /// （同一目标尺寸再种一次不会更清晰）。若这条路径有在途缩略图请求，一并摘掉——
+    /// 晚到的回包会因 `wants(seq) == false` 被丢弃。
+    pub fn seed(&mut self, path: &Path, w: u32, h: u32, rgba: &[u8]) {
+        if matches!(self.slots.get(path), Some((Slot::Ready(_), _))) {
+            return;
+        }
+        if w == 0
+            || h == 0
+            || rgba.len() < (w as usize).saturating_mul(h as usize).saturating_mul(4)
+        {
+            return;
+        }
+        let (tw, th) = fit_dims(w, h, THUMB_W, THUMB_H);
+        let px = if (tw, th) == (w, h) {
+            rgba.to_vec()
+        } else {
+            downscale(rgba, w, h, tw, th)
+        };
+        self.put(
+            path.to_path_buf(),
+            Slot::Ready(Rc::new(RgbaImage::new(tw, th, px))),
+        );
+        self.inflight.retain(|_, p| p != path);
+        if decode::is_headerless_path(path) {
+            self.raw_used
+                .insert(path.to_path_buf(), decode::ensure_raw_params(path));
         }
     }
 
@@ -160,6 +231,12 @@ impl Thumbs {
                 d.bitmap.height,
                 d.bitmap.rgba,
             ))),
+            Err(e) if e.is_cancelled() => {
+                // 滚过去 / 已被 seed 顶掉：不是坏图。把格子整个摘掉，下次可见时
+                // `ensure` 还能重新发；记成 `Failed` 会让它永远空着。
+                self.slots.remove(&path);
+                return false;
+            }
             Err(e) => {
                 log::debug!("缩略图解码失败（此格留空）：{}：{e}", path.display());
                 Slot::Failed
@@ -174,6 +251,12 @@ impl Thumbs {
         self.slots.clear();
         self.inflight.clear();
         self.raw_used.clear();
+    }
+
+    /// 在途请求的 seq（测试用）：`viewer::tests` 据此模拟取消回包。
+    #[cfg(test)]
+    pub(crate) fn inflight_seqs(&self) -> Vec<u64> {
+        self.inflight.keys().copied().collect()
     }
 
     fn put(&mut self, path: PathBuf, slot: Slot) {
@@ -292,7 +375,7 @@ mod tests {
         t.inflight.insert(0, paths[2].clone());
 
         let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
-        t.ensure(&decoder, &refs);
+        t.ensure(&decoder, &refs, true);
         // 前三张被跳过；在途原本 1 个，故再发 2 个就到顶（不是把剩下 7 张全发掉）。
         assert_eq!(t.inflight.len(), MAX_INFLIGHT);
         assert_eq!(t.slots.len(), 5, "3 张手工 + 2 张新请求");
@@ -318,7 +401,7 @@ mod tests {
         let plain = PathBuf::from("thumbs-gate/noise.jpg");
 
         let mut t = Thumbs::new();
-        t.ensure(&d, &[raw_path.as_path(), plain.as_path()]);
+        t.ensure(&d, &[raw_path.as_path(), plain.as_path()], true);
         let reqs = crate::core::decode::tests::pending_reqs(&d);
         assert_eq!(reqs.len(), 2, "两张都该发请求");
         assert_eq!(reqs[0].0, raw_path);
@@ -352,14 +435,14 @@ mod tests {
         };
         decode::set_raw_params(&p, p1);
         let mut t = Thumbs::new();
-        t.ensure(&d, &[p.as_path()]);
+        t.ensure(&d, &[p.as_path()], true);
         let seq1 = *t.inflight.keys().next().expect("第一笔请求");
         assert!(
             t.take(done(seq1, &p, false)),
             "先让它解失败，格子记成 Failed"
         );
 
-        t.ensure(&d, &[p.as_path()]);
+        t.ensure(&d, &[p.as_path()], true);
         assert_eq!(
             crate::core::decode::tests::pending_reqs(&d).len(),
             1,
@@ -367,7 +450,7 @@ mod tests {
         );
 
         decode::set_raw_params(&p, p2);
-        t.ensure(&d, &[p.as_path()]);
+        t.ensure(&d, &[p.as_path()], true);
         let reqs = crate::core::decode::tests::pending_reqs(&d);
         assert_eq!(reqs.len(), 2, "改了参数就该重发一笔");
         assert_eq!(reqs[1].1, Some(p2), "重发要带新参数");
@@ -375,6 +458,75 @@ mod tests {
         let seq2 = *t.inflight.keys().next().expect("第二笔请求");
         assert_ne!(seq1, seq2);
         assert!(matches!(t.slots.get(&p), Some((Slot::Pending, _))));
+    }
+
+    /// BROWSE-24：滚动中只更新可见集合，一个新请求都不发；停手后再发。
+    #[test]
+    fn ensure_can_park_new_requests_without_losing_the_visible_set() {
+        let d = crate::core::decode::tests::stub_decoder();
+        let paths: Vec<PathBuf> = (0..5)
+            .map(|i| PathBuf::from(format!("park{i}.png")))
+            .collect();
+        let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+        let mut t = Thumbs::new();
+        t.ensure(&d, &refs, false);
+        assert!(
+            crate::core::decode::tests::pending_reqs(&d).is_empty(),
+            "滚动中不许补新图"
+        );
+        t.ensure(&d, &refs, true);
+        assert_eq!(
+            crate::core::decode::tests::pending_reqs(&d).len(),
+            MAX_INFLIGHT,
+            "停手后按在途上限补"
+        );
+    }
+
+    /// 取消哨兵（空串 Err）不是失败：格子整个摘掉，下一次可见还能重发。
+    #[test]
+    fn cancelled_done_drops_the_slot_instead_of_failing_it() {
+        let d = crate::core::decode::tests::stub_decoder();
+        let p = PathBuf::from("cancelled.png");
+        let mut t = Thumbs::new();
+        t.ensure(&d, &[p.as_path()], true);
+        let seq = *t.inflight.keys().next().expect("应有一笔在途");
+        let mut done = done(seq, &p, false);
+        done.out = Err(crate::core::error::ViewFailure::other(""));
+        assert!(!t.take(done), "取消不产生新像素，不该要求重绘");
+        assert!(
+            !t.slots.contains_key(&p),
+            "取消不能记成 Failed，否则这张永远不再重试"
+        );
+        t.ensure(&d, &[p.as_path()], true);
+        assert_eq!(
+            crate::core::decode::tests::pending_reqs(&d).len(),
+            2,
+            "摘掉格子后应允许重发"
+        );
+    }
+
+    /// 主画面 / 预读已解出的像素直接种一格：立刻可画，且不再为它发解码请求。
+    #[test]
+    fn seed_makes_the_cell_ready_without_another_decode() {
+        let d = crate::core::decode::tests::stub_decoder();
+        let p = PathBuf::from("seeded.png");
+        let mut t = Thumbs::new();
+        let src = vec![0x40u8; 400 * 300 * 4];
+        t.seed(&p, 400, 300, &src);
+        let img = t.get(&p).expect("种下的格子应当就绪");
+        assert_eq!((img.width, img.height), (240, 180), "等比收到格子框内");
+        t.ensure(&d, &[p.as_path()], true);
+        assert!(
+            crate::core::decode::tests::pending_reqs(&d).is_empty(),
+            "已有就绪格子就不该再解一遍"
+        );
+        // 已在途的那一笔也要失效，晚到的回包不许盖掉种子。
+        let p2 = PathBuf::from("seeded2.png");
+        t.ensure(&d, &[p2.as_path()], true);
+        let seq = *t.inflight.keys().next().expect("应有一笔在途");
+        t.seed(&p2, 240, 180, &vec![0x10u8; 240 * 180 * 4]);
+        assert!(!t.wants(seq), "seed 要摘掉同路径的在途登记");
+        assert!(t.get(&p2).is_some());
     }
 
     /// 超过上限时淘汰**最久未用**的那一格——写入和读到都算「用过」。

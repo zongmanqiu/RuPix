@@ -156,7 +156,7 @@ python build/gate.py run all
 | `dll_serial_probe.ps1` | 两（三）扇窗迎面翻同一批图，`[dll-serial]` 记每笔的 `wait`/`run`；`-CloseMidway` 在解码在飞时关掉一扇，`-HoldSec` 让进程在驱动之后再活 N 秒（跨过看门狗 10 s 首报阈值，才验得了"没有假告警"）。`-Arm idle` = 第二扇窗只开不驱动（**用户真实场景**：一窗翻页、另一窗只是开着并在后台预取）；`-Prefetch 0/1` 开关邻图预读（默认 0 保持 m229/m230 的臂可复跑，要测真实体验必须给 1）；`-Bin` 指定被测二进制做 A/B（旧名 `-Exe` 会被脚本里的 `$exe` 顶掉，PS 变量名不分大小写） |
 | `dll_serial_analyze.py` | 上一条的判据：持锁区间零重叠、等待上界随窗口数缩放、跨解码器重叠是**并行**的正面证据；退出码 0/1/2（2 = 没测到争用 ⇒ 结论不成立） |
 | `raw_dialog_probe.ps1` | 多开时**每扇窗各弹一个**裸数据参数窗（两个无整数几何的 `.bgra` 造夹具，数顶层窗：主窗 + 各自的对话框） |
-| `metadata_probe.ps1` | 同上，验属性窗：ini 里 `hotkeys=props:F2`，`PostMessage` 往每扇窗投 F2，数标题不是主窗标题的窗 |
+| `metadata_probe.ps1` | **历史探针（m232 旧属性窗）**：m342 属性窗退役后不再适用，留档不跑；当初验每扇窗各弹一个属性窗，ini 里 `hotkeys=props:F2` + `PostMessage` 投 F2，数顶层窗 |
 | `decoder_inuse_probe.ps1` | 卸载一个**本会话已加载**的解码器会怎样：私有解码器目录只放 `common`，开着 `.jpg` 时把 DLL 送回收站（外壳真实路径，不是原地改名）⇒ 期望失败；关进程后再试 ⇒ 期望成功。附带一条方法论：原地改名**不是**回收站的替身 |
 | `dir_rescan_probe.ps1` | 多窗盯同一个大目录时**一次文件变动的重扫成本**：造 N 项夹具、开 N 扇窗、加/删一个文件，读 `[dir-rescan]` 数 `scanned`（真读盘）与 `reused`（复用别人的扫描）。判定 `scanned` 恒为 1 才算同批只扫一次 |
 | `tray_wake_probe.ps1` | 点托盘「显示窗口」（等价于再次启动不带参数的 `rupix.exe`）时，多开的窗口是不是**全部**回到前面：开 N 扇，拿一个无关窗口把它们盖住，读 z 序（同一次 `EnumWindows` 里算 index）。`-Bin` 指被测 exe（新旧对照要传两个不同的二进制，**不能**叫 `-Exe`：PS 变量名不分大小写，会被脚本里的 `$exe` 顶掉）；`-Cover 0` 改走"最小化 + 读 IsIconic"的老判据，`-SkipWake 1` 是不唤回的对照臂（证明恢复确实由唤回触发，而不是系统自己还原） |

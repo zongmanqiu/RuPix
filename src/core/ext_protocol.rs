@@ -1,4 +1,4 @@
-//! 扩展进程的请求/响应 JSON 契约（协议 v1）。
+//! 扩展进程的请求/响应 JSON 契约（协议 v2，兼容 v1）。
 //!
 //! 传输层（命名管道）只负责帧边界；本模块负责字段语义与序列化，单测可无头跑。
 //! 图像不塞进 JSON：`ImageRef` 只带共享内存名与尺寸，像素在 `platform::shared_mem`。
@@ -12,9 +12,38 @@
 //! ```json
 //! {"protocol":1,"ok":true,"text":"识别结果"}
 //! ```
+//! 协议 v2 响应可带 `outputs` 块序列（文本 / 表格 / 图片），见 §Ext 文档。
 
 use crate::core::ext::{protocol_ok, protocol_range_text, PROTOCOL_VERSION};
 use crate::core::json::{self, Value};
+
+/// 插件回传的单块输出图上限（解码前 PNG 字节）。
+///
+/// 面板里的图是图表 / 预览，不是整幅照片；4 MB 足够容纳 4K 级 PNG 图表。
+/// 更大的图应走共享内存（后续加法式扩展），不许把 16 MiB 帧塞满。
+pub const MAX_OUTPUT_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// 响应里的一个输出块。
+///
+/// 一次命令运行 = 一张面板卡；卡内按 `outputs` 顺序堆叠文本 / 表格 / 图片。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputBlock {
+    Text {
+        title: Option<String>,
+        text: String,
+    },
+    Table {
+        title: Option<String>,
+        rows: Vec<(String, String)>,
+    },
+    Image {
+        title: Option<String>,
+        /// 目前只接受 `png`（宿主不替插件猜其它格式）。
+        format: String,
+        /// 原始字节的 base64；解析时已验过可解码与大小。
+        base64: String,
+    },
+}
 
 /// 共享内存图像描述。`name` 由宿主生成，扩展只读打开。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,6 +253,8 @@ pub struct Response {
     pub protocol: u32,
     pub ok: bool,
     pub text: Option<String>,
+    /// 协议 v2：一次运行的多块输出。空 = 旧插件，走 `text` / `open_image` 老路。
+    pub outputs: Vec<OutputBlock>,
     pub image: Option<ImageRef>,
     pub error: Option<String>,
     /// 插件要写回宿主的设置（插件声明 `settings.write` 时才会被落盘）。
@@ -240,6 +271,7 @@ impl Response {
             protocol: PROTOCOL_VERSION,
             ok: true,
             text: Some(text.into()),
+            outputs: Vec::new(),
             image: None,
             error: None,
             settings: None,
@@ -253,6 +285,7 @@ impl Response {
             protocol: PROTOCOL_VERSION,
             ok: true,
             text: None,
+            outputs: Vec::new(),
             image: Some(image),
             error: None,
             settings: None,
@@ -266,6 +299,7 @@ impl Response {
             protocol: PROTOCOL_VERSION,
             ok: false,
             text: None,
+            outputs: Vec::new(),
             image: None,
             error: Some(message.into()),
             settings: None,
@@ -282,6 +316,16 @@ impl Response {
         );
         if let Some(text) = &self.text {
             s.push_str(&format!(",\"text\":{}", quote(text)));
+        }
+        if !self.outputs.is_empty() {
+            s.push_str(",\"outputs\":[");
+            for (i, block) in self.outputs.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&output_to_json(block));
+            }
+            s.push(']');
         }
         if let Some(img) = &self.image {
             s.push_str(&format!(",\"image\":{}", img.to_json()));
@@ -310,6 +354,10 @@ impl Response {
             .and_then(Value::as_bool)
             .ok_or("缺少布尔字段 `ok`")?;
         let text = optional_string(&root, "text");
+        let outputs = match root.get("outputs") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(v) => parse_outputs(v)?,
+        };
         let error = optional_string(&root, "error");
         let image = match root.get("image") {
             None | Some(Value::Null) => None,
@@ -337,6 +385,7 @@ impl Response {
             protocol,
             ok,
             text,
+            outputs,
             image,
             error,
             settings,
@@ -344,6 +393,124 @@ impl Response {
             open_image,
         })
     }
+}
+
+fn output_title(title: &Option<String>) -> String {
+    title
+        .as_ref()
+        .map(|t| format!(",\"title\":{}", quote(t)))
+        .unwrap_or_default()
+}
+
+fn output_to_json(block: &OutputBlock) -> String {
+    match block {
+        OutputBlock::Text { title, text } => {
+            format!(
+                "{{\"type\":\"text\"{},\"text\":{}}}",
+                output_title(title),
+                quote(text)
+            )
+        }
+        OutputBlock::Table { title, rows } => {
+            let rows = rows
+                .iter()
+                .map(|(k, v)| format!("[{},{}]", quote(k), quote(v)))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "{{\"type\":\"table\"{},\"rows\":[{}]}}",
+                output_title(title),
+                rows
+            )
+        }
+        OutputBlock::Image {
+            title,
+            format,
+            base64,
+        } => format!(
+            "{{\"type\":\"image\"{},\"format\":{},\"base64\":{}}}",
+            output_title(title),
+            quote(format),
+            quote(base64)
+        ),
+    }
+}
+
+fn parse_outputs(v: &Value) -> Result<Vec<OutputBlock>, String> {
+    let arr = v.as_array().ok_or("outputs 必须是数组")?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, item) in arr.iter().enumerate() {
+        let at = |e: String| format!("outputs[{i}]：{e}");
+        let ty = get_str(item, "type").map_err(|e| at(e.to_string()))?;
+        let title = item
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        match ty.as_str() {
+            "text" => {
+                let text = get_str(item, "text").map_err(|e| at(e.to_string()))?;
+                out.push(OutputBlock::Text { title, text });
+            }
+            "table" => {
+                let rows = item
+                    .get("rows")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| at("rows 必须是数组".into()))?;
+                let mut parsed = Vec::with_capacity(rows.len());
+                for (j, row) in rows.iter().enumerate() {
+                    let pair = row
+                        .as_array()
+                        .ok_or_else(|| at(format!("rows[{j}] 必须是两元数组")))?;
+                    if pair.len() != 2 {
+                        return Err(at(format!("rows[{j}] 必须是 [标签, 值]")));
+                    }
+                    let k = pair[0]
+                        .as_str()
+                        .ok_or_else(|| at(format!("rows[{j}][0] 必须是字符串")))?;
+                    let v = pair[1]
+                        .as_str()
+                        .ok_or_else(|| at(format!("rows[{j}][1] 必须是字符串")))?;
+                    parsed.push((k.to_string(), v.to_string()));
+                }
+                out.push(OutputBlock::Table {
+                    title,
+                    rows: parsed,
+                });
+            }
+            "image" => {
+                let format = get_str(item, "format").map_err(|e| at(e.to_string()))?;
+                if !format.eq_ignore_ascii_case("png") {
+                    return Err(at(format!("不支持的图片格式 {format}（只接受 png）")));
+                }
+                let b64 = item
+                    .get("base64")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| at("image.base64 缺失".into()))?;
+                // 先按 base64 长度粗闸，避免为一个超大载荷先分配一份解码缓冲。
+                if b64.len() > MAX_OUTPUT_IMAGE_BYTES * 4 / 3 + 8 {
+                    return Err(at(format!(
+                        "图片 base64 超过 {} MB",
+                        MAX_OUTPUT_IMAGE_BYTES / 1024 / 1024
+                    )));
+                }
+                let bytes =
+                    crate::core::b64::decode(b64).map_err(|e| at(format!("base64 解不开：{e}")))?;
+                if bytes.len() > MAX_OUTPUT_IMAGE_BYTES {
+                    return Err(at(format!(
+                        "图片超过 {} MB",
+                        MAX_OUTPUT_IMAGE_BYTES / 1024 / 1024
+                    )));
+                }
+                out.push(OutputBlock::Image {
+                    title,
+                    format: "png".into(),
+                    base64: b64.to_string(),
+                });
+            }
+            other => return Err(at(format!("不认识的输出类型 {other}"))),
+        }
+    }
+    Ok(out)
 }
 
 impl ImageRef {
@@ -488,8 +655,35 @@ mod tests {
     }
 
     #[test]
+    fn response_parses_v2_output_blocks() {
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        let text = format!(
+            r#"{{"protocol":2,"ok":true,"outputs":[
+                {{"type":"text","title":"报告","text":"第一行\n第二行"}},
+                {{"type":"table","title":"摘要","rows":[["均值","128"],["中位","130"]]}},
+                {{"type":"image","title":"图","format":"png","base64":"{png}"}}
+            ]}}"#
+        );
+        let r = Response::parse(&text).expect("v2 outputs");
+        assert_eq!(r.outputs.len(), 3);
+        assert!(matches!(
+            &r.outputs[0],
+            OutputBlock::Text { text, .. } if text == "第一行\n第二行"
+        ));
+        assert!(matches!(
+            &r.outputs[1],
+            OutputBlock::Table { rows, .. } if rows == &vec![("均值".into(), "128".into()), ("中位".into(), "130".into())]
+        ));
+        assert!(matches!(&r.outputs[2], OutputBlock::Image { format, .. } if format == "png"));
+        assert_eq!(Response::parse(&r.to_json()).expect("roundtrip"), r);
+
+        let bad = text.replace("\"format\":\"png\"", "\"format\":\"jpeg\"");
+        assert!(Response::parse(&bad).is_err(), "面板图只接受 png");
+    }
+
+    #[test]
     fn rejects_bad_protocol_and_missing_error() {
-        let bad = r#"{"protocol":2,"id":"x","action":"run"}"#;
+        let bad = r#"{"protocol":3,"id":"x","action":"run"}"#;
         assert!(Request::parse(bad).is_err());
 
         let bad = r#"{"protocol":1,"ok":false}"#;

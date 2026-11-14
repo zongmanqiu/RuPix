@@ -39,7 +39,9 @@ pub fn install_format_source() {
 // `Descriptor.caps` 落到目录表，缺席时由 [`caps_of`] 按既有证据推定。
 // **缩放路由已接通（2026-10-18）**：`allow_scaled` 来自请求语义（只有缩略图那一类），
 // 与候选解码器的 `CAP_SCALED` 求与后才落成 `iv_render` 的 `REQ_ALLOW_SCALED` 位。
-// 现役解码器里只有 `jpeg` 声明了它，所以 PNG/TIFF/GIF 的表现与昨天逐字节相同。
+// **缩略图快路径（2026-11-13）**：`thumbnail` 只在 `ReqKind::Thumb` 为真，与
+// `CAP_THUMB` 求与后落成 `REQ_THUMBNAIL`；`common` 0.2.7 的 JPEG 成员用它读 EXIF IFD1。
+// 两条位互不替代：主画面首屏不会带 `REQ_THUMBNAIL`，缩略图也不靠 `CAP_SCALED` 冒充。
 
 impl crate::core::decode::DecodeBackend for Host {
     /// 后台预取标志：只改排队档位，不动解码行为（见 `Host::bg`）。
@@ -69,6 +71,7 @@ impl crate::core::decode::DecodeBackend for Host {
         frame_index: u32,
         raw: Option<RawParams>,
         allow_scaled: bool,
+        thumbnail: bool,
     ) -> Result<Decoded, crate::core::error::ViewFailure> {
         use crate::core::error::ViewFailure;
         if safe_mode() {
@@ -90,7 +93,15 @@ impl crate::core::decode::DecodeBackend for Host {
         }
         if crate::core::formats::is_raw(ext) {
             return self
-                .try_decode(path, ext, max_w, max_h, frame_index, allow_scaled)
+                .try_decode(
+                    path,
+                    ext,
+                    max_w,
+                    max_h,
+                    frame_index,
+                    allow_scaled,
+                    thumbnail,
+                )
                 .unwrap_or_else(|| {
                     Err(ViewFailure::other(
                         "裸数据文件没有尺寸信息：请从「打开…」重新选择该文件以指定宽/高/布局",
@@ -104,11 +115,19 @@ impl crate::core::decode::DecodeBackend for Host {
         //   位图一律由解码器解，宿主自带的位图解码能力为零——便携看图器不调系统解码器，
         //   同一张图在两台机器上必须解出同一个结果（宪章 §5.1）。设置页「首选解码器」
         //   因此只在**多个解码器认领同一后缀**时才有意义。
-        self.try_decode(path, ext, max_w, max_h, frame_index, allow_scaled)
-            .unwrap_or_else(|| {
-                Err(ViewFailure::unsupported(format!(
-                    "没有解码器支持此文件（扩展名「{ext}」无人认领，且魔数嗅探也无匹配）"
-                )))
-            })
+        self.try_decode(
+            path,
+            ext,
+            max_w,
+            max_h,
+            frame_index,
+            allow_scaled,
+            thumbnail,
+        )
+        .unwrap_or_else(|| {
+            Err(ViewFailure::unsupported(format!(
+                "没有解码器支持此文件（扩展名「{ext}」无人认领，且魔数嗅探也无匹配）"
+            )))
+        })
     }
 }

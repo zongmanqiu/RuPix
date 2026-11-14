@@ -87,6 +87,22 @@ pub(super) fn needs_doc_natural(ext: Option<&str>, path: &Path, max_w: u32, max_
     ) && crate::core::formats::is_region_renderable(&e)
 }
 
+/// 这一次请求的 ABI 位：缩放与缩略图是两件事，各自与解码器能力位求与。
+///
+/// 为什么不能合成一位：`REQ_ALLOW_SCALED` 要的是“同一张图的低分辨率档”（首屏/升级
+/// 两条腿同源），`REQ_THUMBNAIL` 允许用内嵌预览（可能是另一张小图）；主画面首屏会
+/// 传 `allow_scaled=true`，绝不能因此被解码器当成缩略图请求。
+fn request_flags(allow_scaled: bool, thumbnail: bool, caps: u32) -> u32 {
+    let mut flags = 0;
+    if allow_scaled && caps & CAP_SCALED != 0 {
+        flags |= REQ_ALLOW_SCALED;
+    }
+    if thumbnail && caps & CAP_THUMB != 0 {
+        flags |= REQ_THUMBNAIL;
+    }
+    flags
+}
+
 impl Host {
     /// 解码器路径的解码入口。`None` = 没有解码器认领这个扩展名（调用方据此报"无法打开"错误）。
     ///
@@ -94,6 +110,7 @@ impl Host {
     /// `index` 是"要第几张"（0 起；静态图解码器可忽略）。**页与帧同值**：
     /// 多帧格式把它当帧号、多页格式把它当页号，见 [`crate::core::pixels::Anim`]。
     /// 宿主只维护这一个号，同一个文件不会既多帧又多页。
+    #[allow(clippy::too_many_arguments)] // 与 ABI 请求面一一对应
     pub fn try_decode(
         &mut self,
         path: &Path,
@@ -102,6 +119,7 @@ impl Host {
         max_h: u32,
         frame_index: u32,
         allow_scaled: bool,
+        thumbnail: bool,
     ) -> Option<Result<Decoded, crate::core::error::ViewFailure>> {
         if safe_mode() {
             return None;
@@ -116,6 +134,7 @@ impl Host {
                 max_h,
                 frame_index,
                 allow_scaled,
+                thumbnail,
             );
             match r {
                 Ok(d) => return Some(Ok(d)),
@@ -136,6 +155,7 @@ impl Host {
                         max_h,
                         frame_index,
                         allow_scaled,
+                        thumbnail,
                         Some(e.into_failure()),
                     );
                 }
@@ -146,7 +166,16 @@ impl Host {
         //    嗅探代价极小（每解码器只读文件头几个字节），且若某解码器嗅探本身有 bug，
         //    由 SEH 隔离 + 三振兜底，不会拖垮进程。
         let ranked = self.sniff_ranked(path, None);
-        self.try_chain(ranked, path, max_w, max_h, frame_index, allow_scaled, None)
+        self.try_chain(
+            ranked,
+            path,
+            max_w,
+            max_h,
+            frame_index,
+            allow_scaled,
+            thumbnail,
+            None,
+        )
     }
 
     /// 兜底解码榜单：对所有已加载解码器（未被关掉/拉黑）逐一 `iv_probe(data, *, NULL)`，
@@ -267,11 +296,21 @@ impl Host {
         max_h: u32,
         frame_index: u32,
         allow_scaled: bool,
+        thumbnail: bool,
         first_verdict: Option<crate::core::error::ViewFailure>,
     ) -> Option<Result<Decoded, crate::core::error::ViewFailure>> {
         let mut first_soft = first_verdict;
         for (_score, key) in ranked {
-            match self.decode_with(&key, path, None, max_w, max_h, frame_index, allow_scaled) {
+            match self.decode_with(
+                &key,
+                path,
+                None,
+                max_w,
+                max_h,
+                frame_index,
+                allow_scaled,
+                thumbnail,
+            ) {
                 Ok(d) => return Some(Ok(d)),
                 Err(e) if !e.worth_sniff() => return Some(Err(e.into_failure())),
                 Err(e) => {
@@ -312,11 +351,21 @@ impl Host {
         max_w: u32,
         max_h: u32,
     ) -> Result<Decoded, crate::core::error::ViewFailure> {
-        let (render_raw, last_error, id) = {
+        let (render_raw, last_error, id, version) = {
             let Some(l) = self.loaded.get(key) else {
                 return Err(crate::core::error::ViewFailure::decode("解码器已卸载"));
             };
-            (l.sym.render_raw, l.sym.last_error, l.desc.id.clone())
+            (
+                l.sym.render_raw,
+                l.sym.last_error,
+                l.desc.id.clone(),
+                l.desc
+                    .metadata
+                    .iter()
+                    .find(|(k, _)| k == "version")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default(),
+            )
         };
         let Some(render_raw) = render_raw else {
             return Err(crate::core::error::ViewFailure::unsupported(format!(
@@ -401,6 +450,24 @@ impl Host {
                 aw, ah,
             )));
         }
+        // 裸数据没有 EXIF 方向，技术信息卡仍要显示解码器/位深/像素格式。
+        let decoder = if version.is_empty() {
+            id.clone()
+        } else {
+            format!("{id} {version}")
+        };
+        crate::core::decode::publish_meta_from_current_req(crate::core::decode::Meta {
+            natural: (aw, ah),
+            decoder,
+            bit_depth: info.bit_depth,
+            pixel_format: info.pixel_format,
+            orientation: 1,
+            already_oriented: true,
+            frame_count: 1,
+            page_count: 1,
+            frame_delay_ms: 0,
+            icc_len: info.icc_len,
+        });
 
         // ② 渲染阶段：宿主按契约分配 `bytes_needed + icc_len`（规范 §十一：ICC 紧跟像素之后）。
         // 两段长度**取查询阶段的值**并在分配前过闸——渲染阶段解码器会覆写 info，之后再读就是拿
@@ -606,9 +673,10 @@ impl Host {
         max_h: u32,
         frame_index: u32,
         allow_scaled: bool,
+        thumbnail: bool,
     ) -> Result<Decoded, Fail> {
         // 拿符号与 id（`Symbols` 是 Copy：拷出来即可，不必长期借用 self.loaded）。
-        let (probe, render, last_error, id, caps) = {
+        let (probe, render, last_error, id, version, caps) = {
             let Some(l) = self.loaded.get(key) else {
                 return Err(Fail::Hard("解码器已卸载".into()));
             };
@@ -617,6 +685,12 @@ impl Host {
                 l.sym.render,
                 l.sym.last_error,
                 l.desc.id.clone(),
+                l.desc
+                    .metadata
+                    .iter()
+                    .find(|(k, _)| k == "version")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default(),
                 l.desc.caps,
             )
         };
@@ -680,14 +754,9 @@ impl Host {
             target_w: max_w,
             target_h: max_h,
             budget_bytes: (MAX_PIXELS * 4) as u32,
-            // 缩放意图（规范 §十三）：只在**这次请求真接受降采样**（`ReqKind::wants_scaled`）
-            // 且**这枚解码器真声明了 `CAP_SCALED`** 时点亮。两个条件缺任何一个都恒 0，
-            // 那条路就是今天逐字节相同的路径——主画面传的是视口尺寸，那儿要的是清晰。
-            flags: if allow_scaled && caps & CAP_SCALED != 0 {
-                REQ_ALLOW_SCALED
-            } else {
-                0
-            },
+            // 缩放/缩略图两个意图分开（见 [`request_flags`]）：主画面首屏只可能点亮
+            // `REQ_ALLOW_SCALED`，胶片条那一格才可能同时带 `REQ_THUMBNAIL`。
+            flags: request_flags(allow_scaled, thumbnail, caps),
             frame_index,
             // v4 的多页选择与 v3 的帧号同值：宿主只维护一个号（见 `Anim`），
             // 解码器各取所需——GIF 看 `frame_index`、PDF/TIFF 看 `page_index`，
@@ -814,8 +883,22 @@ impl Host {
             5..=8 => (n0h, n0w),
             _ => (n0w, n0h),
         };
+        let decoder = if version.is_empty() {
+            id.clone()
+        } else {
+            format!("{id} {version}")
+        };
         crate::core::decode::publish_meta_from_current_req(crate::core::decode::Meta {
             natural: q_natural,
+            decoder,
+            bit_depth: info.bit_depth,
+            pixel_format: info.pixel_format,
+            orientation: info.orientation,
+            already_oriented: info.already_oriented != 0,
+            frame_count: info.frame_count,
+            page_count: info.page_count,
+            frame_delay_ms: info.frame_delay_ms,
+            icc_len: info.icc_len,
         });
 
         // ② 渲染阶段：宿主按契约分配 `bytes_needed + icc_len`（规范 §十一），两段长度取查询值、
@@ -1141,4 +1224,25 @@ pub(super) fn region_roundtrip(
         //   一放大就退化成单页——那正是"翻页按钮翻两下就没了"的来历。
         info,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thumbnail_and_scaled_flags_are_independent() {
+        let thumb = CAP_FULL | CAP_THUMB;
+        let scaled = CAP_FULL | CAP_SCALED;
+        let both = CAP_FULL | CAP_SCALED | CAP_THUMB;
+        assert_eq!(request_flags(true, true, thumb), REQ_THUMBNAIL);
+        assert_eq!(request_flags(true, true, scaled), REQ_ALLOW_SCALED);
+        assert_eq!(
+            request_flags(true, true, both),
+            REQ_ALLOW_SCALED | REQ_THUMBNAIL
+        );
+        // 主画面首屏（thumbnail=false）不许带缩略图位——否则内嵌预览会顶掉首屏。
+        assert_eq!(request_flags(true, false, both), REQ_ALLOW_SCALED);
+        assert_eq!(request_flags(false, false, both), 0);
+    }
 }

@@ -38,9 +38,9 @@ use crate::core::decode::{Decoder, Done, Meta, MetaEvent, RegionReq, ReqKind};
 use crate::core::error::{ViewError, ViewFailure};
 use crate::core::gallery::{Gallery, Jump, SortSpec};
 use crate::core::geometry::{downscale, fit_dims, transformed, RectI};
-use crate::core::pixels::{Anim, Decoded, Region, RgbaImage, MAX_PIXELS};
+use crate::core::pixels::{Anim, Decoded, Histogram, Region, RgbaImage, MAX_PIXELS};
 use crate::core::reading::Memento;
-use crate::core::thumbs::Thumbs;
+use crate::core::thumbs::{Thumbs, THUMB_SETTLE};
 
 /// 缩放倍率上下限（相对**原图**，1.0 = 100%）。
 pub const MIN_ZOOM: f32 = 0.02;
@@ -48,8 +48,9 @@ pub const MAX_ZOOM: f32 = 64.0;
 
 /// 缩放停止后多久才动画面（升级解码或本地重派生）。
 ///
-/// 120ms 是"滚轮已经停了"与"用户还在滚"的分界：更短会在连续滚动时反复触发重活
-/// （升级是一次全图重解，稳态下是一次 150–200 ms 的本地面积采样），更长则停下来后画面糊得太久。
+/// 120ms 是"滚轮已经停了"与"用户还在滚"的分界：**从最后一次交互起算**（尾随防抖），
+/// 更短会在连续滚动时反复触发重活（升级是一次全图重解，稳态下是一次 150–200 ms 的
+/// 本地面积采样），更长则停下来后画面糊得太久。
 const REDECODE_DEBOUNCE: Duration = Duration::from_millis(120);
 /// 旋转/镜像的"当场算"上限：源像素 + 目标像素之和低于它就走同步重建。
 ///
@@ -207,6 +208,23 @@ pub struct Pick {
     pub at: (u32, u32),
 }
 
+/// 当前显示状态：缩放倍率 + 顺时针旋转档（×90°）+ 水平镜像。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DisplayState {
+    pub scale: f32,
+    pub rotation: u8,
+    pub mirrored: bool,
+}
+
+/// 直方图缓存的一格。字段单独命名，避免 `RefCell<Option<(…五元组…)>>` 撞 clippy。
+pub(super) struct HistCache {
+    pub(super) path: PathBuf,
+    pub(super) key: usize,
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) hist: Histogram,
+}
+
 /// 当前已上屏的一张图。
 pub struct Loaded {
     pub path: PathBuf,
@@ -288,6 +306,16 @@ impl Prefetched {
     }
 }
 
+/// 大目录首屏两阶段的在途完整清单。
+pub(super) struct ListingJob {
+    /// 发起时的世代号；与 `Viewer::listing_gen` 不等即作废。
+    gen: u64,
+    /// 用户点开的那一张（清单对齐锚点，也是"还是不是同一张"的判据）。
+    path: PathBuf,
+    /// 后台线程回包；`Err` 时保留单项临时清单，不把已经上屏的图打掉。
+    rx: std::sync::mpsc::Receiver<Result<Gallery, ViewError>>,
+}
+
 pub struct Viewer {
     /// 清单排序口径的**变更代数**（m275）。
     ///
@@ -314,6 +342,12 @@ pub struct Viewer {
     /// 命中时 [`Self::navigate`] 直接从缓存取回填进 [`Self::preview_meta`]。
     /// `install` 落地后用渲染阶段的权威值覆盖缓存（契约：查询值仅预览）。
     pub(super) meta_cache: std::collections::HashMap<PathBuf, crate::core::decode::Meta>,
+
+    /// 直方图缓存：键 = `(路径, base_rgba 指针, 解码宽, 解码高)`。
+    ///
+    /// 直方图卡只在展开时读它；用 `RefCell` 是因为 `paint` / 属性刷新都只有 `&Viewer`。
+    /// 指针 + 尺寸已能区分“换图 / 换解码档”；同一份像素旋转/镜像不改变分布，不必重算。
+    pub(super) hist_cache: RefCell<Option<HistCache>>,
 
     /// 预读在途请求的世代号（同一时刻至多一个，见 [`Self::request_prefetch`]）。
     ///
@@ -362,6 +396,29 @@ pub struct Viewer {
 
     /// 底部缩略图条的解码账本（在途请求 + 内存缓存）。见 [`Thumbs`]。
     pub(super) thumbs: Thumbs,
+
+    /// 缩略图条上一帧的窗口起点（`strip_window` 第一格的序号）。`None` = 换目录 / 还没画过。
+    ///
+    /// 只用来判"条是不是在动"：起点变了就是滚动（或快速翻页把当前图带走了）。
+    pub(super) strip_first_seen: Option<usize>,
+    /// 窗口起点最后一次变化的时刻（尾随停手判据，`THUMB_SETTLE`）。
+    pub(super) strip_changed_at: Option<Instant>,
+    /// 大目录首屏两阶段：在途完整清单的世代号（每次换目录 / 取消 +1）。
+    pub(super) listing_gen: u64,
+    /// 在途完整清单任务；`Some` = 状态栏报「目录载入中…」，`tick` 每拍收一次。
+    pub(super) listing: Option<ListingJob>,
+
+    /// 条还在滚动 / 快速翻页的尾随窗口里：为真时**不补**新缩略图。
+    ///
+    /// 这是 BROWSE-24 的"burst 停车"：滚动中每一帧的窗口都不同，按帧补图只会把
+    /// 唯一那条解码线程灌满"用户已经滚过去"的格子。停手 150 ms 后由 `tick` 逼一
+    /// 帧重绘，`strip_window` 才恢复补图。
+    pub(super) strip_scrolling: bool,
+    /// 这一次停车是**用户自己滚条**（`anchor = Some`），不是翻页把窗口带着走。
+    ///
+    /// 只有自己滚条时才连预读一起停：滚过的格子用户马上就不看了，预读它们纯浪费；
+    /// 翻页带窗时预读恰恰是下一次翻页的零解码来源，不能一起停（那会把快翻命中率打掉）。
+    pub(super) strip_user_scroll: bool,
 
     pub(super) fit: bool,
     pub(super) zoom: f32,
@@ -485,7 +542,7 @@ pub struct Viewer {
     pub(super) drag: Option<Drag>,
 
     /// 当前图的世代号（每次打开新图 / 翻页 / 当前图解码完成上屏 自增）。
-    /// 属性窗据此判断"当前图是否已变"——变了就重算并刷新那扇窗的内容，
+    /// 属性卡据此判断"当前图是否已变"——变了就重算并刷新卡片的内容，
     /// 不必每帧轮询。与 `want_seq`（解码请求序号）无关，这是给 UI 看的"版本戳"。
     pub(super) image_gen: u64,
 }

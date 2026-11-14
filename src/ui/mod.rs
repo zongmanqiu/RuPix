@@ -62,6 +62,7 @@ pub mod filmstrip;
 pub mod goto_dialog;
 /// 抓手光标（松手 / 抓手）的 SVG 光栅化与切换。
 pub mod hand_cursor;
+pub mod info_panel;
 pub mod pin;
 pub mod plugin_result;
 pub mod plugin_settings;
@@ -145,15 +146,19 @@ fn open_rect(r: Rect, radius: f32, flat: FlatEdges) -> (f32, f32, f32, f32) {
 ///
 /// `rect` 是**视口绝对坐标**（与 `filmstrip::panel` / `tree::panel` 的命中同一套），
 /// 裁剪也用它——不许在绘制点再换算一次坐标系。
+///
+/// `square_window`：贴窗口外缘的那几个角也一并抹平。圆角外面会露出窗口/画布的底色，
+/// 深色底下就是一块黑角；文件树与缩略图条贴窗口边时传 `true`。
 pub(crate) fn fill_panel_open(
     canvas: &mut dyn Canvas,
     rect: Rect,
     radius: f32,
     flat: FlatEdges,
+    square_window: bool,
     paint: &Paint,
     edge: &Paint,
 ) {
-    let (x, y, w, h) = open_rect(rect, radius, flat);
+    let (x, y, w, h) = panel_fill_rect(rect, radius, flat, square_window);
     canvas.save();
     canvas.clip_rect(rect);
     canvas.fill_round_rect(x, y, w, h, radius, paint);
@@ -161,6 +166,26 @@ pub(crate) fn fill_panel_open(
     // 线画在**面板内缘**：越出去就压到看图区、或者压到隔壁那块地上了。
     for line in edge_lines(rect, flat).into_iter().flatten() {
         canvas.fill_rect(line.0, line.1, line.2, line.3, edge);
+    }
+}
+
+/// 面板背板的填充矩形。`square_window` 时四边各外扩一个圆角半径，再由
+/// [`fill_panel_open`] 裁回原矩形——四个角因此全平，不再漏出底下的窗口色。
+fn panel_fill_rect(
+    rect: Rect,
+    radius: f32,
+    flat: FlatEdges,
+    square_window: bool,
+) -> (f32, f32, f32, f32) {
+    if square_window {
+        (
+            rect.x as f32 - radius,
+            rect.y as f32 - radius,
+            rect.w as f32 + 2.0 * radius,
+            rect.h as f32 + 2.0 * radius,
+        )
+    } else {
+        open_rect(rect, radius, flat)
     }
 }
 
@@ -180,6 +205,19 @@ fn edge_lines(rect: Rect, flat: FlatEdges) -> [Option<(f32, f32, f32, f32)>; 2] 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `square_window` 时四个圆角全部外扩到裁剪区外：贴窗口外缘的角也直，
+    /// 圆角外面不会再漏出窗口/画布底色。
+    #[test]
+    fn square_window_expands_all_four_corners_outside_the_clip() {
+        let r = Rect::new(20, 30, 184, 600);
+        let (x, y, w, h) = panel_fill_rect(r, 10.0, FlatEdges::new(false, true, false), true);
+        assert_eq!((x, y, w, h), (10.0, 20.0, 204.0, 620.0));
+        assert_eq!(
+            panel_fill_rect(r, 10.0, FlatEdges::new(false, true, false), false),
+            open_rect(r, 10.0, FlatEdges::new(false, true, false))
+        );
+    }
 
     /// 每个方向的外扩只动自己那根轴，多条相接边可以叠加；没点名的边不许顺手动。
     #[test]

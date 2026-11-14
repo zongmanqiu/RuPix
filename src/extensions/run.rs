@@ -107,6 +107,8 @@ pub enum JobOutput {
     /// 命令型：文本结果（进结果窗）。
     Text {
         text: String,
+        /// 协议 v2 的多块输出；空 = 旧插件，走文本结果窗。
+        outputs: Vec<crate::core::ext_protocol::OutputBlock>,
         /// 插件声明了 `clipboard.write` → 宿主已把文本写进系统剪贴板。
         /// UI 靠它把"复制"按钮换成"已复制"，不让用户对着空按钮猜。
         copied: bool,
@@ -412,12 +414,13 @@ pub fn start_command(
     let job = register(&ext.manifest.id)?;
     let name = ext.manifest.name.clone();
     let id = ext.manifest.id.clone();
+    let target = image_path.clone();
     let cleanup_job = job.clone();
     let cleanup_id = id.clone();
     std::thread::Builder::new()
         .spawn(move || {
             let result = run_command(&ext, image_path, selection, image, &job);
-            finish(&id, name, &job, None, result);
+            finish(&id, name, &job, target, result);
         })
         .map_err(|e| {
             deregister(&cleanup_id, &cleanup_job);
@@ -723,6 +726,7 @@ fn run_command(
     };
     Ok(JobOutput::Text {
         text,
+        outputs: resp.outputs,
         copied,
         open_url,
         open_image,

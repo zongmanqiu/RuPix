@@ -2,7 +2,7 @@
 //! 现行键生效、淘汰键静默忽略、看不懂的值回退默认、绝不 panic。
 
 use rupix_lib::core::config::{
-    AnimSpeed, Config, DblClick, InitWindow, SourceId, UiTheme, WheelAction,
+    AnimSpeed, Config, DblClick, InitWindow, SourceId, UiTheme, WheelAction, INFO_PANEL_W_DEFAULT,
 };
 use rupix_lib::core::decode::RawParams;
 use rupix_lib::core::gallery::SortBy;
@@ -119,6 +119,12 @@ fn legacy_ini_loads_without_loss() {
         // 与 `drag_image` 那条相反方向的判据：这张表里"缺键"表示**没有收起的卡**，
         // 所以老配置升级后不该突然看到一页折叠起来的卡片。
         ui_cards_collapsed: Vec::new(),
+        // 旧 fixture 不含信息面板四键（2026-11-14 新增）⇒ 回默认：面板关、宽 300、无卡。
+        // 面板是“按需加卡”的，缺键绝不能读出开着的面板或半空的高度。
+        info_panel: false,
+        info_panel_width: INFO_PANEL_W_DEFAULT,
+        info_cards: Vec::new(),
+        info_cards_collapsed: Vec::new(),
         // 旧 fixture 不含排序两键（m275 新增）→ 回默认「文件名升序」。
         // 老配置升级后清单次序必须和升级前一模一样，不能因为多了个维度就重排。
         sort_by: SortBy::Name,

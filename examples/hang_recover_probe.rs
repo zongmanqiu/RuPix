@@ -40,6 +40,7 @@ impl DecodeBackend for HangBackend {
         _frame_index: u32,
         _raw: Option<decode::RawParams>,
         _allow_scaled: bool,
+        _thumbnail: bool,
     ) -> Result<Decoded, rupix_lib::core::error::ViewFailure> {
         let n = CALLS.fetch_add(1, Ordering::SeqCst);
         if n == 0 {

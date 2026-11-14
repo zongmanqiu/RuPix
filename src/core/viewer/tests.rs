@@ -1444,6 +1444,76 @@ fn navigator_bitmap_is_a_thumbnail_and_survives_zoom() {
     assert_ne!(nav.gen, before.unwrap(), "朝向变了就该是新的一份");
 }
 
+/// CORE-22：`mark_need` 必须是尾随防抖——每次交互都把 120 ms 表拨到"最后一次"
+/// 之后，而不是只在第一次置位。连续交互时 `need_at` 必须不断后移。
+#[test]
+fn mark_need_is_trailing_not_leading() {
+    let (tx, _rx) = std::sync::mpsc::channel::<Done>();
+    let mut v = Viewer::new(
+        Rc::new(Decoder::spawn_with(tx)),
+        Rc::new(RefCell::new(Config::default())),
+    );
+    v.mark_need();
+    let first = v.need_at.expect("第一次交互要起表");
+    std::thread::sleep(Duration::from_millis(2));
+    v.mark_need();
+    let second = v.need_at.expect("第二次交互仍要有表");
+    assert!(
+        second > first,
+        "第二次交互必须把表往后拨；不后移就是旧的前沿防抖"
+    );
+}
+
+/// CORE-22 开工闸：连续缩放 2 s，量“手势中途投了几次派生档”。
+///
+/// 只做测量，不进默认测试集：用 `cargo test --release core22_measure -- --ignored --nocapture` 跑。
+/// 当前实现 `need_at` 是**前沿**防抖（第一次交互起表，120 ms 后无论是否还在滚都发）；
+/// 尾随防抖应让连续手势中的投递数为 0，停手后才投 1 次。
+#[test]
+#[ignore = "manual CORE-22 measurement"]
+fn core22_measure_continuous_zoom_posts() {
+    use crate::core::pixels::{Anim, Bitmap, Decoded};
+    let (_dir, [pa, _pb, _pc]) = bitmap_gallery_dir();
+    let mut v = viewer_in_dir(&pa);
+    v.on_viewport(0.0, 0.0, 800.0, 600.0, 1.0);
+    let frame = Decoded {
+        natural: (1600, 1200),
+        region: None,
+        anim: Anim::STATIC,
+        bitmap: Bitmap {
+            width: 1600,
+            height: 1200,
+            rgba: vec![0x40u8; 1600 * 1200 * 4],
+        },
+    };
+    assert!(v.install(pa.clone(), frame));
+    let before = v.levels.as_ref().map(|l| l.counts().posted).unwrap_or(0);
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        let z = v.scale() * 1.005;
+        v.zoom_at_center(z);
+        let _ = v.tick();
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    let during = v.levels.as_ref().map(|l| l.counts().posted).unwrap_or(0) - before;
+    // 停手后再等过 120 ms 的尾随窗口，并让 tick 真正发一次。
+    std::thread::sleep(Duration::from_millis(150));
+    let _ = v.tick();
+    std::thread::sleep(Duration::from_millis(150));
+    let mut settled = false;
+    for _ in 0..50 {
+        if v.poll_levels() {
+            settled = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let after = v.levels.as_ref().map(|l| l.counts().posted).unwrap_or(0) - before;
+    eprintln!(
+        "CORE22 zoom: posted_during={during} posted_total={after} landed_after_stop={settled}"
+    );
+}
+
 /// 等派生线程送回一档（最多 5 s），返回是否真的落地了一次。
 fn wait_levels(v: &mut Viewer) -> bool {
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -2101,7 +2171,13 @@ fn rescanning_a_renamed_sibling_notifies_the_ui() {
 fn meta_cache_is_bounded() {
     let mut v = viewer_with_image();
     for i in 0..(META_CACHE_MAX + 10) {
-        v.cache_meta(PathBuf::from(format!("{i}.png")), Meta { natural: (1, 1) });
+        v.cache_meta(
+            PathBuf::from(format!("{i}.png")),
+            Meta {
+                natural: (1, 1),
+                ..Default::default()
+            },
+        );
     }
     assert!(
         v.meta_cache.len() <= META_CACHE_MAX,
@@ -2916,6 +2992,244 @@ fn the_strip_window_indices_and_the_borrowed_paths_are_the_same_pictures() {
     );
 }
 
+// ── BROWSE-24 · 缩略图分层调度 ─────────────────────────────
+
+/// 条滚动中不发新缩略图；停手后 `tick` 逼一帧，只补最终窗口。
+#[test]
+fn strip_burst_parks_new_thumbnails_until_it_settles() {
+    let (dir, paths) = gallery_many("browse24-burst", 40);
+    let decoder = Rc::new(crate::core::decode::tests::stub_decoder());
+    let mut v = Viewer::new(
+        Rc::clone(&decoder),
+        Rc::new(RefCell::new(Config::default())),
+    );
+    v.open(&paths[0]);
+    v.on_viewport(0.0, 0.0, 800.0, 600.0, 1.0);
+    // `open` / `on_viewport` 会排主画面请求；本用例只数缩略图。
+    let _ = crate::core::decode::tests::drain_pending(&decoder);
+
+    // 第一屏：不在滚动中，按在途上限补 3 张。
+    v.strip_window(5, Some(0));
+    let first = crate::core::decode::tests::drain_pending(&decoder);
+    let first_thumbs: Vec<&PathBuf> = first
+        .iter()
+        .filter(|(_, k)| *k == ReqKind::Thumb)
+        .map(|(p, _)| p)
+        .collect();
+    assert_eq!(first_thumbs.len(), 3, "第一屏应补 3 张：{first:?}");
+    assert!(first_thumbs.iter().all(|p| paths[..5].contains(p)));
+    assert!(
+        !first_thumbs.iter().any(|p| **p == paths[0]),
+        "主画面正在解当前图，这一格不该再排一遍缩略图：{first_thumbs:?}"
+    );
+
+    // 连续滚动：每次换一屏，10 ms 一次。期间不许再补新图。
+    for a in [5usize, 10, 15, 20, 25] {
+        v.strip_window(5, Some(a));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(v.strip_user_scroll, "用户滚条应连预读一起停");
+    let during = crate::core::decode::tests::drain_pending(&decoder);
+    assert!(
+        during.iter().all(|(_, k)| *k != ReqKind::Thumb),
+        "滚动中不许补新缩略图：{during:?}"
+    );
+
+    // 模拟解码线程把旧窗口的 3 笔在途请求作废（stub 没有 worker，不会自己出队）。
+    for seq in v.thumbs.inflight_seqs() {
+        assert!(!v.apply(Done {
+            seq,
+            path: PathBuf::new(),
+            out: Err(ViewFailure::other("")),
+        }));
+    }
+    assert!(v.thumbs.inflight_seqs().is_empty());
+
+    // 还没停够 150 ms：即使再画一帧也不发。
+    v.strip_window(5, Some(25));
+    assert!(
+        crate::core::decode::tests::drain_pending(&decoder)
+            .iter()
+            .all(|(_, k)| *k != ReqKind::Thumb),
+        "停手窗口内也不发"
+    );
+
+    // 停手：`tick` 必须逼一帧；再画条，只补最终窗口（25..30）。
+    std::thread::sleep(THUMB_SETTLE + Duration::from_millis(20));
+    assert!(
+        v.tick(),
+        "停手后 tick 必须要求重绘，否则补图请求永远发不出去"
+    );
+    v.strip_window(5, Some(25));
+    let after: Vec<PathBuf> = crate::core::decode::tests::drain_pending(&decoder)
+        .into_iter()
+        .filter(|(_, k)| *k == ReqKind::Thumb)
+        .map(|(p, _)| p)
+        .collect();
+    assert_eq!(after.len(), 3, "停手后只补当前屏：{after:?}");
+    assert!(
+        after.iter().all(|p| paths[25..30].contains(p)),
+        "只补最终窗口，不许补滚过去的格子：{after:?}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// 翻页把条窗口带着走：缩略图停车，但预读**不**停（下一次翻页还要它）。
+#[test]
+fn page_flip_parks_thumbnails_but_keeps_prefetch() {
+    let (dir, paths) = gallery_many("browse24-flip", 30);
+    let decoder = Rc::new(crate::core::decode::tests::stub_decoder());
+    let mut v = Viewer::new(
+        Rc::clone(&decoder),
+        Rc::new(RefCell::new(Config::default())),
+    );
+    v.open(&paths[0]);
+    v.on_viewport(0.0, 0.0, 800.0, 600.0, 1.0);
+    let _ = crate::core::decode::tests::drain_pending(&decoder);
+    v.strip_window(5, None);
+    let _ = crate::core::decode::tests::drain_pending(&decoder);
+    // 第一屏的预读在 stub 里不会回包，手工清掉在途位才能观察下一次。
+    v.prefetch_seq = None;
+    v.prefetched.clear();
+    // 跳到窗口外，才能让“翻页带窗”真的改变起点；只翻一格时条窗口不动，本来就不该停。
+    assert!(v.goto(10));
+    v.prefetch_seq = None;
+    v.strip_window(5, None);
+    assert!(v.strip_scrolling, "翻页带窗也要停缩略图");
+    assert!(!v.strip_user_scroll, "这不是用户滚条，预读不该停");
+    v.request_prefetch();
+    let pending = crate::core::decode::tests::drain_pending(&decoder);
+    assert!(
+        pending.iter().any(|(_, k)| *k == ReqKind::Prefetch),
+        "翻页停车期间预读仍应可发：{pending:?}"
+    );
+    assert!(
+        pending.iter().all(|(_, k)| *k != ReqKind::Thumb),
+        "缩略图仍要停车：{pending:?}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// 当前图刚上屏时用主图像素种一格，条上那格不再整解第二遍。
+#[test]
+fn current_image_thumb_is_seeded_from_the_main_bitmap() {
+    use crate::core::pixels::Bitmap;
+    let (dir, paths) = gallery_many("browse24-seed", 8);
+    let decoder = Rc::new(crate::core::decode::tests::stub_decoder());
+    let mut v = Viewer::new(
+        Rc::clone(&decoder),
+        Rc::new(RefCell::new(Config::default())),
+    );
+    v.open(&paths[3]);
+    v.on_viewport(0.0, 0.0, 400.0, 300.0, 1.0);
+    let _ = crate::core::decode::tests::drain_pending(&decoder);
+    let seq = v.want_seq;
+    assert!(v.apply(Done {
+        seq,
+        path: paths[3].clone(),
+        out: Ok(Decoded {
+            natural: (800, 600),
+            region: None,
+            anim: Anim::STATIC,
+            bitmap: Bitmap {
+                width: 800,
+                height: 600,
+                rgba: vec![0x40; 800 * 600 * 4],
+            },
+        }),
+    }));
+    assert!(
+        v.thumb(&paths[3]).is_some(),
+        "上屏后应顺手种好当前格的缩略图"
+    );
+    let _ = crate::core::decode::tests::drain_pending(&decoder);
+    let (first, n) = v.strip_window(5, None);
+    assert!(first <= 3 && 3 < first + n, "当前图应在窗口里");
+    let pending = crate::core::decode::tests::drain_pending(&decoder);
+    assert!(
+        pending
+            .iter()
+            .all(|(p, k)| !(*k == ReqKind::Thumb && *p == paths[3])),
+        "当前图已有缩略图，不许再整解一遍：{pending:?}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// CORE-06：大目录首帧只装当前一张，完整清单在后台补齐；当前项不跳、状态有提示。
+#[test]
+fn large_directory_opens_with_one_item_then_fills_in_the_background() {
+    let (dir, paths) = gallery_many("core06-large", 5000);
+    let decoder = Rc::new(crate::core::decode::tests::stub_decoder());
+    let mut v = Viewer::new(
+        Rc::clone(&decoder),
+        Rc::new(RefCell::new(Config::default())),
+    );
+    v.open(&paths[2500]);
+    assert_eq!(v.gallery_len(), 1, "首帧应是单项临时清单");
+    assert!(v.listing.is_some(), "大目录应启动后台清单");
+    assert!(
+        v.status().contains("目录载入中…"),
+        "首帧状态要说明清单还在建：{}",
+        v.status()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while v.gallery_len() == 1 && Instant::now() < deadline {
+        let _ = v.tick();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(v.gallery_len(), 5000, "后台清单应补齐");
+    assert_eq!(
+        v.current_path().as_deref(),
+        Some(paths[2500].as_path()),
+        "完整清单到达后当前项不许跳"
+    );
+    assert!(v.listing.is_none());
+    assert!(
+        !v.status().contains("目录载入中…"),
+        "清单到齐后提示要消失：{}",
+        v.status()
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// 小目录不付线程成本：仍在 `open` 当下就得到完整清单，状态不出现「目录载入中」。
+#[test]
+fn small_directory_keeps_the_synchronous_listing() {
+    let (dir, paths) = gallery_many("core06-small", 10);
+    let decoder = Rc::new(crate::core::decode::tests::stub_decoder());
+    let mut v = Viewer::new(
+        Rc::clone(&decoder),
+        Rc::new(RefCell::new(Config::default())),
+    );
+    v.open(&paths[3]);
+    assert_eq!(v.gallery_len(), 10, "小目录仍同步建完整清单");
+    assert!(v.listing.is_none());
+    assert_eq!(v.current_path().as_deref(), Some(paths[3].as_path()));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+/// 大目录清单在途时打开另一个目录：旧世代作废，绝不把旧目录的清单串进来。
+#[test]
+fn opening_another_directory_discards_the_in_flight_listing() {
+    let (dir_a, pa) = gallery_many("core06-a", 5000);
+    let (dir_b, pb) = gallery_many("core06-b", 5);
+    let decoder = Rc::new(crate::core::decode::tests::stub_decoder());
+    let mut v = Viewer::new(
+        Rc::clone(&decoder),
+        Rc::new(RefCell::new(Config::default())),
+    );
+    v.open(&pa[2500]);
+    assert_eq!(v.gallery_len(), 1, "A 应先出单项首帧");
+    assert!(v.listing.is_some());
+    v.open(&pb[2]);
+    assert_eq!(v.gallery_len(), 5, "B 是小目录，同步得到完整清单");
+    assert!(v.listing.is_none(), "换目录必须取消 A 的在途清单");
+    std::thread::sleep(Duration::from_millis(80));
+    let _ = v.tick();
+    assert_eq!(v.gallery_len(), 5, "A 的晚到清单不许顶掉 B");
+    assert_eq!(v.current_path().as_deref(), Some(pb[2].as_path()));
+    std::fs::remove_dir_all(dir_a).unwrap();
+    std::fs::remove_dir_all(dir_b).unwrap();
+}
 // ── S3 · 查询阶段 Meta ─────────────────────────────────────
 
 use crate::core::decode::Meta;
@@ -2924,8 +3238,97 @@ fn meta_event(seq: u64, path: &str, natural: (u32, u32)) -> MetaEvent {
     MetaEvent {
         seq,
         path: std::path::PathBuf::from(path),
-        meta: Meta { natural },
+        meta: Meta {
+            natural,
+            ..Default::default()
+        },
     }
+}
+
+/// 预读 Meta 不进预览，但必须进缓存：技术信息卡按路径读，丢了就永远缺
+/// 解码器 / 位深 / ICC 那几行。
+#[test]
+fn apply_meta_caches_prefetch_meta_without_touching_preview() {
+    let (tx, _rx) = std::sync::mpsc::channel::<Done>();
+    let mut v = Viewer::new(
+        Rc::new(Decoder::spawn_with(tx)),
+        Rc::new(RefCell::new(Config::default())),
+    );
+    v.want_seq = 7;
+    let mut ev = meta_event(8, "next.png", (4000, 3000));
+    ev.meta.decoder = "jpeg 0.3.4".into();
+    ev.meta.bit_depth = 8;
+    assert!(!v.apply_meta(ev), "预读 Meta 不该触发重绘/预览");
+    assert!(v.preview_meta.is_none(), "预读 Meta 不进当前图预览");
+    let cached = v
+        .meta_cache
+        .get(std::path::Path::new("next.png"))
+        .expect("预读 Meta 要进缓存");
+    assert_eq!(cached.decoder, "jpeg 0.3.4");
+    assert_eq!(cached.bit_depth, 8);
+}
+
+/// install 只覆盖 natural，查询阶段带回来的解码器/位深不能丢。
+#[test]
+fn install_keeps_query_meta_fields_when_updating_natural() {
+    use crate::core::abi::PF_RGBA8;
+
+    let (tx, _rx) = std::sync::mpsc::channel::<Done>();
+    let mut v = Viewer::new(
+        Rc::new(Decoder::spawn_with(tx)),
+        Rc::new(RefCell::new(Config::default())),
+    );
+    let path = std::path::PathBuf::from("tech.png");
+    v.cache_meta(
+        path.clone(),
+        Meta {
+            natural: (1, 1),
+            decoder: "jpeg 0.3.4".into(),
+            bit_depth: 8,
+            pixel_format: PF_RGBA8,
+            icc_len: 4096,
+            ..Default::default()
+        },
+    );
+    assert!(v.install(path.clone(), decoded_sized(2, 2)));
+    let cached = v.meta_cache.get(&path).expect("install 后缓存必须还在");
+    assert_eq!(cached.natural, (2, 2), "natural 以渲染值为准");
+    assert_eq!(cached.decoder, "jpeg 0.3.4", "技术字段不许被覆盖掉");
+    assert_eq!(cached.bit_depth, 8);
+    assert_eq!(cached.icc_len, 4096);
+}
+
+/// 晚到的 Meta 只有**值真变了**才 bump 世代：动画每帧都查询一次，内容相同
+/// 还每帧重算技术卡就是白烧 CPU。
+#[test]
+fn late_meta_bumps_only_when_values_change() {
+    let (tx, _rx) = std::sync::mpsc::channel::<Done>();
+    let mut v = Viewer::new(
+        Rc::new(Decoder::spawn_with(tx)),
+        Rc::new(RefCell::new(Config::default())),
+    );
+    let path = std::path::PathBuf::from("late.png");
+    v.cache_meta(
+        path.clone(),
+        Meta {
+            natural: (2, 2),
+            decoder: "jpeg".into(),
+            ..Default::default()
+        },
+    );
+    assert!(v.install(path.clone(), decoded_sized(2, 2)));
+    v.want_seq = 1;
+    let gen = v.image_gen();
+
+    let mut same = meta_event(1, "late.png", (2, 2));
+    same.meta.decoder = "jpeg".into();
+    assert!(!v.apply_meta(same), "同值 Meta 不该触发重绘");
+    assert_eq!(v.image_gen(), gen, "同值 Meta 不许推世代");
+
+    let mut changed = meta_event(1, "late.png", (2, 2));
+    changed.meta.decoder = "jpeg 0.3.4".into();
+    assert!(v.apply_meta(changed), "值变了要让技术卡重算");
+    assert!(v.image_gen() > gen);
 }
 
 /// `apply_meta` 只认同 `want_seq`、且 `loaded` 为空——预览的窗口期只在

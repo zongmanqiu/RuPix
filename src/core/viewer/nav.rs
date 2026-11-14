@@ -34,6 +34,7 @@ impl Viewer {
             prefetch_seq: None,
             prefetch_stopped: false,
             meta_cache: std::collections::HashMap::new(),
+            hist_cache: std::cell::RefCell::new(None),
             prefetched: Vec::new(),
             prefetch_strip: None,
             last_dir: 0,
@@ -71,6 +72,12 @@ impl Viewer {
             archive_skipped: 0,
             note: None,
             thumbs: Thumbs::new(),
+            listing_gen: 0,
+            listing: None,
+            strip_first_seen: None,
+            strip_changed_at: None,
+            strip_scrolling: false,
+            strip_user_scroll: false,
             drag: None,
             image_gen: 0,
         }
@@ -159,6 +166,136 @@ impl Viewer {
         self.open_at(&layer.dir, layer.from_archive, layer.skipped, book);
     }
 
+    /// 取消在途完整清单：结果晚到也会因世代号不符被丢弃。
+    fn cancel_listing(&mut self) {
+        self.listing = None;
+        self.listing_gen = self.listing_gen.wrapping_add(1);
+    }
+
+    /// 大目录首屏：先装单项临时清单并立刻解码，完整清单放后台。
+    ///
+    /// 只用于“从文件打开的普通目录”——目录打开、压缩包层、空层仍走同步路径，
+    /// 免得把“一次只显示一层”的语义搅进来。
+    fn start_async_listing(&mut self, path: &Path, book: BookId, saved: Option<Memento>) -> bool {
+        log::debug!(
+            "[open] 大目录首帧：先装单项清单，后台枚举 {}",
+            path.display()
+        );
+        self.error = None;
+        self.gallery = Some(Gallery::single(path, self.sort()));
+        self.book_key = Some(book.key);
+        self.book_archive = book.archive;
+        self.book_opened = book.opened;
+        // 文件键的阅读记忆只属于这一张：与同步路径同一条 `memento_matches` 判据。
+        self.pending_restore = saved.filter(|m| self.memento_matches(m, path, book.archive));
+        self.note = None;
+        self.prefetch_seq = None;
+        self.prefetched.clear();
+        self.prefetch_strip = None;
+        self.clear_thumbs();
+        self.anim_next_at = None;
+        self.anim_due_at = None;
+        self.reset_view();
+        if let Some(m) = self.meta_cache.get(path) {
+            self.preview_meta = Some(m.clone());
+        }
+        // 与同步 `Ok(g)` 分支同一条顺序：清单就位 → 请求解码 → 标脏。
+        self.request_decode();
+        self.bump_image_gen();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let gen = self.listing_gen;
+        let p = path.to_path_buf();
+        let sort = self.sort();
+        let spawned = std::thread::Builder::new()
+            .name("sv-listing".into())
+            .spawn(move || {
+                // 失败也回包：`Gallery::from_file` 的 IO / NoImages 判词要由 UI 侧决定
+                // 是“保留当前图”还是“打开失败”，线程里不打印、不 panic。
+                let _ = tx.send(Gallery::from_file(&p, sort));
+            });
+        if spawned.is_err() {
+            // 线程起不来不是“打不开”：保留单项清单，退回同步补全。
+            log::warn!("目录清单线程起不来，回退同步枚举：{}", path.display());
+            match Gallery::from_file(path, sort) {
+                Ok(g) => {
+                    let _ = self.install_full_listing(path.to_path_buf(), g);
+                }
+                Err(e) => log::warn!("目录清单读取失败（保留当前图）：{e}"),
+            }
+            return true;
+        }
+        self.listing = Some(ListingJob {
+            gen,
+            path: path.to_path_buf(),
+            rx,
+        });
+        true
+    }
+
+    /// `tick` 每拍收一次后台清单。返回是否已替换清单（需要重绘）。
+    pub(super) fn poll_listing(&mut self) -> bool {
+        let Some(job) = self.listing.take() else {
+            return false;
+        };
+        match job.rx.try_recv() {
+            Ok(Ok(g)) => {
+                if job.gen != self.listing_gen {
+                    return true;
+                }
+                let _ = self.install_full_listing(job.path, g);
+                // 不论装没装（当前项已变时作废），状态栏的「目录载入中…」都该消失。
+                true
+            }
+            Ok(Err(e)) => {
+                if job.gen != self.listing_gen {
+                    return true;
+                }
+                log::warn!("目录清单读取失败（保留当前图）：{e}");
+                self.note = Some(("目录清单读取失败，只显示当前图片", Instant::now()));
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.listing = Some(job);
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                log::warn!("目录清单线程已退出（保留当前图）");
+                true
+            }
+        }
+    }
+
+    /// 把完整清单原地换上去：当前图、已上屏像素、阅读记忆都保持不动。
+    fn install_full_listing(&mut self, path: PathBuf, mut g: Gallery) -> bool {
+        let same = self
+            .gallery
+            .as_ref()
+            .and_then(|g| g.current())
+            .is_some_and(|p| p == &path);
+        if !same {
+            return false;
+        }
+        // 先排序再对齐：用户在枚举期间改过排序口径时，文件集仍是这一批，重排即可。
+        if g.sort() != self.sort() {
+            g.set_sort(self.sort());
+        }
+        let Some(idx) = g.slot_for(&path) else {
+            return false;
+        };
+        self.gallery = Some(g);
+        if let Some(g) = self.gallery.as_mut() {
+            g.jump_to(idx);
+        }
+        // 条从“一格”变成“一屏”：这不是用户滚动，立刻按新窗口补可见格。
+        self.strip_first_seen = None;
+        self.strip_changed_at = None;
+        self.strip_scrolling = false;
+        self.strip_user_scroll = false;
+        self.request_prefetch();
+        true
+    }
+
     /// 返回是否真的建立了清单（用于「最近打开」记录；空层也算打开成功）。
     fn open_at(&mut self, path: &Path, allow_empty: bool, skipped: usize, book: BookId) -> bool {
         let t0 = Instant::now();
@@ -168,6 +305,15 @@ impl Viewer {
         self.archive_skipped = skipped;
         // 新开一张 = 换目录或换图，翻页方向无从推测。
         self.last_dir = 0;
+        // CORE-06：同一张文件**重复打开**时保留它在途的完整清单；换目录 / 换图才作废。
+        // 否则用户在清单到之前又点了一次这张图，会把唯一的后台任务取消掉。
+        let pending_same = self
+            .listing
+            .as_ref()
+            .is_some_and(|j| j.path.as_path() == path);
+        if !pending_same {
+            self.cancel_listing();
+        }
         // ★ m101：**同一目录里再开一张不是换目录**。清单里认得它，就只换当前项。
         //   旧写法无条件 `Gallery::from_file` + 清 `prefetched` + 清 `thumbs`，于是
         //   资源管理器里连双击每张都要：整条胶片条重解（实测 6 张目录 = 每开一张
@@ -201,6 +347,27 @@ impl Viewer {
             }
             self.navigate();
             return true;
+        }
+        // 旧清单不可复用；走到这儿也说明在途清单（若有）已无意义。
+        self.cancel_listing();
+        // CORE-06：只对“从文件打开的普通目录”做两阶段；目录打开 / 压缩包层仍同步，
+        // 免得把“一次只显示一层”和空层语义搅进来。
+        if !path.is_dir() && !allow_empty {
+            let dir = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let t = Instant::now();
+            let entries = crate::core::gallery::dir_entry_count_at_least(
+                dir,
+                crate::core::gallery::LISTING_ASYNC_MIN,
+            );
+            // 两个判据：项数已经够大，或只数了一小段就超过 2 ms（网络盘 / 冷盘）。
+            if entries >= crate::core::gallery::LISTING_ASYNC_MIN
+                || t.elapsed() >= Duration::from_millis(2)
+            {
+                return self.start_async_listing(path, book, saved);
+            }
         }
         let built = if allow_empty && path.is_dir() {
             Gallery::from_dir(path, self.sort(), true)
@@ -240,7 +407,7 @@ impl Viewer {
                 self.prefetched.clear();
                 self.prefetch_strip = None;
                 // 缩略图同理：旧目录那批再也看不见，别占着内存。
-                self.thumbs.clear();
+                self.clear_thumbs();
                 self.anim_next_at = None;
                 // m75：时间线随闸一起作废，下一帧重新起表（不续旧账）。
                 self.anim_due_at = None;
@@ -265,7 +432,7 @@ impl Viewer {
                 if let Some(g) = self.gallery.as_ref() {
                     if let Some(p) = g.current() {
                         if let Some(m) = self.meta_cache.get(p) {
-                            self.preview_meta = Some(*m);
+                            self.preview_meta = Some(m.clone());
                         }
                     }
                 }
@@ -403,7 +570,7 @@ impl Viewer {
         moved
     }
 
-    /// 当前图"版本"自增：属性窗轮询比对这个值，变了才重算刷新。
+    /// 当前图"版本"自增：属性卡轮询比对这个值，变了才重算刷新。
     pub(super) fn bump_image_gen(&mut self) {
         self.image_gen = self.image_gen.wrapping_add(1);
     }
@@ -435,7 +602,7 @@ impl Viewer {
         if let Some(g) = self.gallery.as_ref() {
             if let Some(p) = g.current() {
                 if let Some(m) = self.meta_cache.get(p) {
-                    self.preview_meta = Some(*m);
+                    self.preview_meta = Some(m.clone());
                 }
             }
         }
@@ -495,6 +662,10 @@ impl Viewer {
     /// 去抖不在这一层做——runtime 的 16ms 轮询负责（一次 tick 只调一次，把一整波
     /// 拷贝合并成一次 `read_dir`）。
     pub fn rescan_dir(&mut self) -> bool {
+        // 首屏两阶段正在后台枚举同一目录：让它跑完，别叠第二趟同步扫描。
+        if self.listing.is_some() {
+            return false;
+        }
         let Some(g) = self.gallery.as_ref() else {
             return false;
         };
@@ -509,6 +680,10 @@ impl Viewer {
     /// 一批既有用例直接调它来验"删掉文件后清单跟着变"。缓存只在**明确知道这是同一批事件**
     /// 的这条路上生效，两条路互不污染（`rescan_never_serves_a_stale_batch` 钉着这一点）。
     pub fn rescan_dir_shared(&mut self) -> bool {
+        // 同 [`Self::rescan_dir`]：首屏清单在途时不再叠一趟。
+        if self.listing.is_some() {
+            return false;
+        }
         let Some(g) = self.gallery.as_ref() else {
             return false;
         };
@@ -682,6 +857,19 @@ impl Viewer {
         self.report_failure(ViewFailure::other(msg));
     }
 
+    /// 缩略图账清空：缓存、解码线程的可见集合、条的滚动态一起复位。
+    ///
+    /// `thumbs.clear()` 只管本地格子；不一起清解码线程那份可见集合，换目录后
+    /// 队列里同名的旧请求还会被当成"还看得见"，白解一遍。
+    fn clear_thumbs(&mut self) {
+        self.thumbs.clear();
+        self.decoder.clear_thumb_view();
+        self.strip_first_seen = None;
+        self.strip_changed_at = None;
+        self.strip_scrolling = false;
+        self.strip_user_scroll = false;
+    }
+
     /// [`Self::fail`] 与 [`Self::clear`] 的共同主体：把"当前这张图"的一切账清干净。
     ///
     /// 两处唯一的差别由调用方补（一个落错误文本、一个不落），所以清账逻辑只写一遍——
@@ -689,12 +877,14 @@ impl Viewer {
     /// `gallery`（旧标题与 `n/n`）、`prefetched`（预读缓存几十 MB）、`thumbs`（缩略图条）、
     /// 在途 `want_seq`（晚到的回包会把旧图重新上屏）。
     pub(super) fn drop_current(&mut self) {
+        // 关窗 / 打开失败 / 清空：在途完整清单的结果已经没人要了。
+        self.cancel_listing();
         self.gallery = None;
         self.loaded = None;
         self.prefetched.clear();
         self.prefetch_seq = None;
         self.prefetch_strip = None;
-        self.thumbs.clear();
+        self.clear_thumbs();
         // 复位视图（它会把 error 清成 None）——错误文本由调用方按需补。
         self.reset_view();
         self.anim_next_at = None;

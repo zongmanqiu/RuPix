@@ -200,12 +200,14 @@ pub fn paint(
     }
     // ★ m302：树是**第三块地**，既不是看图区底色也不是缩略图条底色。上一版取了
     //   看图区的 `empty_bg`，真机截图里树与画面同为 #F6F6F8，整块面板等于没画。
-    // ★ 右缘与缩略图条 / 看图区相接 ⇒ 直角；只有贴窗口外角的左侧两角留圆。
+    // ★ 右缘与缩略图条 / 看图区相接 ⇒ 直角；贴窗口外缘的角也一并抹平
+    //   （`square_window=true`），避免圆角外面漏出窗口底色。
     fill_panel_open(
         canvas,
         panel,
         10.0,
         FlatEdges::new(false, true, false),
+        true,
         &Paint::fill(tk::tree_bg()),
         &Paint::fill(tk::panel_edge()),
     );

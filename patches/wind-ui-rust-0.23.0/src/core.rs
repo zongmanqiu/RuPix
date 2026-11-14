@@ -431,6 +431,13 @@ pub struct Node {
     pub max_height: i32,
     pub padding: Insets,
     pub margin: Insets,
+    /// **命中扩展**（逻辑 px，可为负）：命中测试时按四边扩 / 裁矩形，视觉与布局不变。
+    ///
+    /// 给「视觉 1px、可抓 16px」这类细交互点用；负数表示从该侧裁掉。默认全 0。
+    /// 只影响 [`Tree::hit_test`]，不影响 measure / arrange / paint；扩展区里若没有
+    /// 子节点可命中，由本节点自己按 [`Widget::hit_opaque`] 落定。
+    // ★ RuPix 补丁 030
+    pub hit_pad: Insets,
     /// 自身对齐覆盖：None=继承容器交叉轴对齐；Some(a)=显式覆盖。
     ///
     /// 在 `Layout::Frame`（stack）里它同时管两个轴——`Align::End` 就是右下角。要把
@@ -2880,7 +2887,15 @@ impl Tree {
             n.bounds.w,
             n.bounds.h,
         );
-        if !abs.contains(p) {
+        // ★ RuPix 补丁 030 —— 命中扩展只放宽「本节点是否被点中」，不改变布局 / 绘制；
+        //   子节点下探仍用真实 `abs`，扩展区里没有子节点时由本节点自己落定。
+        let hit = Rect::new(
+            abs.x - n.hit_pad.left,
+            abs.y - n.hit_pad.top,
+            (abs.w + n.hit_pad.left + n.hit_pad.right).max(0),
+            (abs.h + n.hit_pad.top + n.hit_pad.bottom).max(0),
+        );
+        if !hit.contains(p) {
             return None;
         }
         // 滚动条区域优先命中滚动容器自身（用于拖动滚动条，而非下方内容）。

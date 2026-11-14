@@ -29,7 +29,33 @@ impl Viewer {
         self.loaded
             .as_ref()
             .map(|l| l.natural)
-            .or_else(|| self.preview_meta.map(|m| m.natural))
+            .or_else(|| self.preview_meta.as_ref().map(|m| m.natural))
+    }
+
+    /// 当前解码档尺寸（**未旋转基准**）。技术信息卡用它对比原图尺寸。
+    pub fn decoded_dims(&self) -> Option<(u32, u32)> {
+        self.loaded.as_ref().map(|l| l.decoded)
+    }
+
+    /// 当前显示状态（缩放 / 旋转 / 镜像）。无图时 `None`。
+    pub fn display_state(&self) -> Option<DisplayState> {
+        self.loaded.as_ref().map(|_| DisplayState {
+            scale: self.scale(),
+            rotation: self.rot,
+            mirrored: self.flip,
+        })
+    }
+
+    /// 当前图的查询/渲染元信息（技术信息卡的数据源）。
+    ///
+    /// 查询阶段 Meta 先到、渲染阶段 natural 后覆盖；`meta_cache` 同时缓存预读图的
+    /// Meta（`apply_meta` 对非当前 seq 只入缓存，不当预览用）。
+    pub fn render_meta(&self) -> Option<Meta> {
+        let path = self.current_path()?;
+        self.meta_cache
+            .get(&path)
+            .cloned()
+            .or_else(|| self.preview_meta.clone())
     }
 
     /// 有上一张可翻（决定左侧箭头画不画）。翻页永远循环，多张即恒有。
@@ -59,6 +85,10 @@ impl Viewer {
     /// `cap` 是要显示的格数（由 UI 按视口宽度算）。窗口以当前图为中心；翻到末尾时不再
     /// 居中（否则右边会空出半排格子）。
     ///
+    /// BROWSE-24：窗口起点一变就进入"滚动中"，这一帧只更新解码线程的可见集合（让滚过去
+    /// 的在途请求作废），**不发新请求**；停手 `THUMB_SETTLE` 后 `tick` 会逼一帧重绘，
+    /// 这里再按最终窗口补图。
+    ///
     /// ★ m100：这里不再交出 `Vec<(usize, PathBuf)>`。旧签名每帧克隆 2×格数 个 `PathBuf`
     ///   （一份给返回值、一份给 `ensure`），而格子要的只是"第几格是哪张图"——清单里本来就存着，
     ///   按引用给出去就够了。旧/新两臂留在 `examples/frame_cost_probe.rs` 的 D2 里长期可跑。
@@ -67,31 +97,90 @@ impl Viewer {
     ///
     /// 路径请用 [`Self::strip_path`] 按索引取（借用的有效区就是这次调用之后、下一次改动之前）。
     pub fn strip_window(&mut self, cap: usize, anchor: Option<usize>) -> (usize, usize) {
-        let Some(g) = self.gallery.as_ref() else {
-            return (0, 0);
+        // 先把几何读完再放开 `gallery` 的借用：`note_strip_window` 要 `&mut self`。
+        let (len, cur_0based) = match self.gallery.as_ref() {
+            Some(g) => (g.len(), g.position().saturating_sub(1)),
+            None => return (0, 0),
         };
-        let len = g.len();
         if len == 0 {
             return (0, 0);
         }
         let n = cap.clamp(1, len);
-        // g.position() 是 1-based，strip_window_first 期望 0-based，需减 1
-        let cur_0based = g.position().saturating_sub(1);
-        // `None` = 没滚过，跟着当前图居中；`Some` = 用户滚过，条就停在他滚到的地方
+        // 缩略图条是独立滚动的列表：`None` = 跟着当前图居中；`Some` = 停在他滚到的地方
         // （m260：**不再**把当前图拽回视野，见 `strip_window_anchored`）。
         let first = match anchor {
             None => strip_window_first(len, cur_0based, n),
             Some(a) => strip_window_anchored(len, n, a),
         };
+        let (scrolling, just_settled) = self.note_strip_window(first, anchor);
+        let main_in_flight = self.main_sent_at.get().is_some();
+        // 再借清单取这一屏的路径：上面那次 `&mut self` 已经结束，借用不重叠。
+        let Some(g) = self.gallery.as_ref() else {
+            return (0, 0);
+        };
         let refs: Vec<&Path> = (first..first + n)
             .filter_map(|i| g.peek(i).map(PathBuf::as_path))
+            // 当前图的主画面正在解：这一格马上会由 `install` 用主图像素种出来，
+            // 现在再排一笔缩略图就是同一张整解两遍。主画面失败时 `main_sent_at`
+            // 会清掉，下一帧这里不再过滤，缩略图照常补。
+            .filter(|p| !(main_in_flight && g.current().is_some_and(|c| c == *p)))
             .collect();
         let n = refs.len();
-        self.thumbs.ensure(&self.decoder, &refs);
+        self.thumbs.ensure(&self.decoder, &refs, !scrolling);
         // m265：这一屏同时也是「图片预读」的下注范围。条滚到哪儿，预读跟到哪儿；
         // 点格子能切到的图就全在这一屏里，不需要按当前索引去猜。
+        // 滚动中 `request_prefetch` 会早退（见 `prefetch.rs`）；停手那一刻补发一次。
         self.set_prefetch_strip(first, n);
+        if just_settled {
+            self.request_prefetch();
+        }
         (first, n)
+    }
+
+    /// 记下这一帧的条窗口起点，返回 `(是否还在滚动, 是否刚刚停手)`。
+    ///
+    /// 尾随判据：起点每次变都把 150 ms 表拨到此刻；表走完才算停手。窗口起点不变
+    /// **不代表**没在滚（内容可能因目录重排而变），但那种情况下发缩略图也不亏——
+    /// 真正要拦的是"每帧都换一屏"的连续拖动。
+    fn note_strip_window(&mut self, first: usize, anchor: Option<usize>) -> (bool, bool) {
+        let now = Instant::now();
+        match self.strip_first_seen {
+            None => {
+                self.strip_first_seen = Some(first);
+                self.strip_changed_at = Some(now);
+                self.strip_scrolling = false;
+                self.strip_user_scroll = false;
+            }
+            Some(prev) if prev != first => {
+                self.strip_first_seen = Some(first);
+                self.strip_changed_at = Some(now);
+                self.strip_scrolling = true;
+                // `anchor = Some` 才是用户自己滚条；`None` 是翻页把窗口带着走。
+                self.strip_user_scroll = anchor.is_some();
+            }
+            Some(_) => {
+                if self.strip_scrolling
+                    && self
+                        .strip_changed_at
+                        .is_some_and(|t| now.duration_since(t) >= THUMB_SETTLE)
+                {
+                    self.strip_scrolling = false;
+                    self.strip_user_scroll = false;
+                    return (false, true);
+                }
+            }
+        }
+        (self.strip_scrolling, false)
+    }
+
+    /// 条关掉：作废所有还没开始的缩略图请求，并退出"滚动中"。缓存**不清**——
+    /// 用户再打开条时同一目录还能直接命中。
+    pub fn strip_hidden(&mut self) {
+        self.decoder.clear_thumb_view();
+        self.strip_first_seen = None;
+        self.strip_changed_at = None;
+        self.strip_scrolling = false;
+        self.strip_user_scroll = false;
     }
 
     /// 清单里第 `idx` 张的路径（**按引用**，与 [`Self::strip_window`] 配对使用）。
@@ -113,7 +202,7 @@ impl Viewer {
         moved
     }
 
-    /// 动画元信息（供属性窗口展示）：未动画返回 None，否则 (总帧数, 每帧时长ms)。
+    /// 动画元信息（供属性卡展示）：未动画返回 None，否则 (总帧数, 每帧时长ms)。
     /// 帧数可能为 0（GIF 惰性数帧，解码到 EOF 才回填），调用方据此显示"帧数未知"。
     pub fn anim_summary(&self) -> Option<(u32, u32)> {
         let a = self.loaded.as_ref()?.anim;

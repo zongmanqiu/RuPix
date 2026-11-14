@@ -292,7 +292,7 @@ fn cmd_list(dir: &Path) -> Result<String, (i32, String)> {
     Ok(s)
 }
 
-/// `metadata`：**不解码**。文件大小 / 修改时间 / 后缀 + 属性窗那六行 EXIF。
+/// `metadata`：**不解码**。文件大小 / 修改时间 / 后缀 + 属性卡那六行 EXIF。
 /// 尺寸与帧数在 `render` / `thumbnail` 的回答里——看元数据不该付一次整解的代价。
 fn cmd_metadata(path: &Path) -> Result<String, (i32, String)> {
     let m = std::fs::metadata(path).map_err(|e| (EXIT_FAIL, format!("读文件失败：{e}")))?;

@@ -456,21 +456,39 @@ use rupix_lib::core::decode::Meta;
 #[inline(never)]
 fn install_now(m: &mut HashMap<PathBuf, Meta>, path: &Path, natural: (u32, u32)) {
     let cache_path = path.to_path_buf();
-    m.insert(cache_path, Meta { natural });
+    m.insert(
+        cache_path,
+        Meta {
+            natural,
+            ..Default::default()
+        },
+    );
 }
 
 /// 门闸：值没变就不写（房规同 `ui::settings` 的 `put_b` / `Handles::refresh_labels`）。
 #[inline(never)]
 fn install_gated(m: &mut HashMap<PathBuf, Meta>, path: &Path, natural: (u32, u32)) {
     if m.get(path).map(|x| x.natural) != Some(natural) {
-        m.insert(path.to_path_buf(), Meta { natural });
+        m.insert(
+            path.to_path_buf(),
+            Meta {
+                natural,
+                ..Default::default()
+            },
+        );
     }
 }
 
 /// 一臂的起手账本：缓存里已经有这张图（动画跑到第 N 帧时的常态）。
 fn cache_seeded(path: &Path, natural: (u32, u32)) -> HashMap<PathBuf, Meta> {
     let mut m = HashMap::new();
-    m.insert(path.to_path_buf(), Meta { natural });
+    m.insert(
+        path.to_path_buf(),
+        Meta {
+            natural,
+            ..Default::default()
+        },
+    );
     m
 }
 

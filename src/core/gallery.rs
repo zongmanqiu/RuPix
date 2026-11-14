@@ -156,6 +156,25 @@ impl Gallery {
         })
     }
 
+    /// 只含一张图的临时清单：大目录两阶段的**首帧**用。
+    ///
+    /// 起点的 `dir` 与 [`Self::from_file`] 同口径（父目录 / 当前目录），这样条的滚动、
+    /// 预读方向、状态计数都还能按"这是一张图"正常走；完整清单到了再由
+    /// `Viewer::poll_listing` 原地替换。
+    pub fn single(file: &Path, sort: SortSpec) -> Self {
+        let dir = file
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+        Self {
+            dir,
+            files: vec![file.to_path_buf()],
+            index: 0,
+            sort,
+        }
+    }
+
     /// 建一个「目录清单」。`allow_empty` 为真时，空目录也返回一个「有清单、零项」的对象。
     ///
     /// 只有压缩包的**层**用得上：那一层的子目录 / 子包才是可进入项，画面空着是正常态
@@ -391,6 +410,31 @@ struct Found {
     /// 创建 / 修改时刻（UNIX 纪元起的纳秒；读不到或早于 1970 记 `None`，升序时排末位）。
     created: Option<u64>,
     modified: Option<u64>,
+}
+
+/// 目录项数达到它才把完整清单放后台（大目录首屏两阶段）。
+///
+/// 4096 是实测出来的门槛：本机 3000 项整段约 3.4–3.8 ms，线程启动成本约 1–2 ms，
+/// 1000 项目录走后台反而让 `open` 慢约 2 ms（探针实测）。本地几千项同步更快；
+/// 上万项或网络盘才值得与解码重叠。慢盘另由 `nav.rs` 的“数到一半已超过 2 ms”兜住。
+pub(crate) const LISTING_ASYNC_MIN: usize = 4096;
+
+/// 只数到 `limit` 为止的目录项数：判断"是不是大目录"用，不为判断再枚举一整遍。
+///
+/// 读不到目录返回 0 ⇒ 调用方走同步 [`Gallery::from_file`]，让原有的错误路径
+/// （`NoImages` / IO 判词）原样发生，不在首屏阶段把失败吞掉。
+pub(crate) fn dir_entry_count_at_least(dir: &Path, limit: usize) -> usize {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut n = 0;
+    for _ in rd {
+        n += 1;
+        if n >= limit {
+            break;
+        }
+    }
+    n
 }
 
 /// 一次枚举的临时产物，只在 [`listing`] 里活一趟。

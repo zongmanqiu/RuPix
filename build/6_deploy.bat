@@ -6,10 +6,10 @@ REM deploy.py does the work (it is source, shipped in this directory):
 REM   * copy .temp\target\release\rupix.exe -> .build\rupix.exe
 REM     (atomic .new/.old swap: the exe may be RUNNING, and a mapped image
 REM      handle refuses plain overwrite - the classic "cannot copy" trap)
-REM   * MD5 + size cross-check: proves the deployed exe is the one just built
+REM   * size + mtime cross-check: proves the deployed exe is the one just built
 REM     (the exe is NOT reproducible - the PE header carries a build timestamp -
-REM      so MD5 only proves "this is the file from this build", not code identity
-REM      across builds)
+REM      so size+mtime only proves "this is the file from this build", not code
+REM      identity across builds; no hash is published or checked)
 REM   * inventory of .build\decoders\*.dll with an ABI/version sanity check
 REM   * copy RuPix-Decoder\decoders.json -> .build\docs\decoders.json (the host reads
 REM     this local catalogue when the decoders page opens; refresh updates it)

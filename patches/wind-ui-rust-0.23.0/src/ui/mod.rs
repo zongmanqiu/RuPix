@@ -679,6 +679,12 @@ pub struct Element {
     max_height: Option<i32>,
     padding: Insets,
     margin: Insets,
+    /// 命中扩展（见 [`crate::core::Node::hit_pad`]）。正=向外扩，负=从该侧裁。
+    // ★ RuPix 补丁 030
+    hit_pad: Insets,
+    /// 同级绘制 / 命中提升（见 [`crate::core::Node::raised`]）。
+    // ★ RuPix 补丁 030
+    raised: bool,
     align: Option<Align>,
     /// 纵轴对齐覆盖（仅 stack），见 [`Element::align_xy`]。
     align_v: Option<Align>,
@@ -726,6 +732,8 @@ impl Element {
             max_height: None,
             padding: Insets::default(),
             margin: Insets::default(),
+            hit_pad: Insets::default(),
+            raised: false,
             align: None,
             align_v: None,
             weight: None,
@@ -4161,6 +4169,32 @@ impl Element {
         self
     }
 
+    /// **命中扩展**（逻辑 px，可为负）：只扩 / 裁命中矩形，不影响布局与绘制。
+    ///
+    /// 与 `margin` 的区别：margin 会改变兄弟排布，本方法不会——视觉位置与占位完全
+    /// 不变，只有指针判定变宽。给「1px 细线也要好抓」这类场合用。
+    // ★ RuPix 补丁 030
+    pub fn hit_pad(mut self, px: i32) -> Self {
+        self.hit_pad = Insets::all(px);
+        self
+    }
+
+    /// 同 [`Self::hit_pad`]，四边分别给（负数从该侧裁掉）。
+    // ★ RuPix 补丁 030
+    pub fn hit_pad_edges(mut self, pad: Insets) -> Self {
+        self.hit_pad = pad;
+        self
+    }
+
+    /// 把本节点提升到**同级最上层**：后绘制、命中优先测试。
+    ///
+    /// 只在本节点的兄弟之间生效；跨出祖先的裁剪 / 浮层仍要 `popup`。
+    // ★ RuPix 补丁 030
+    pub fn raised(mut self) -> Self {
+        self.raised = true;
+        self
+    }
+
     // ---- 对齐/布局参数 ----
     pub fn align(mut self, a: Align) -> Self {
         self.align = Some(a);
@@ -4419,6 +4453,8 @@ impl Element {
             max_height: self.max_height.unwrap_or(0),
             padding: self.padding,
             margin: self.margin,
+            hit_pad: self.hit_pad,
+            raised: self.raised,
             align: self.align,
             align_v: self.align_v,
             layout: self.layout,
@@ -4446,7 +4482,6 @@ impl Element {
             over_scroll: 0,
             prev_visible: Cell::new(true),
             offset: Point::new(0, 0),
-            raised: false,
             overlay: self.overlay,
         };
         let id = tree.insert(node);

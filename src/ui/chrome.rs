@@ -46,6 +46,7 @@ use crate::core::hotkey::Hotkeys;
 // 用模块别名而不是逐个 import：跟随主题那一组是**函数**（运行期切主题），
 // 名字又短又常见（`text` / `empty_bg`），逐个引入容易和局部变量撞名。
 use super::companion::{CompanionSource, LinkMode, Pane};
+use super::info_panel::InfoPanel;
 use super::tokens as tk;
 
 /// 顶部拖动条高度（逻辑 dp）：画布据此判定"指针落在顶条里"以发起窗口拖动，
@@ -132,7 +133,7 @@ fn wipe_width(step: u32) -> f32 {
 
 /// 工具栏图标的字体。Win10/11 系统自带的图标字形字体（PUA 码位），
 /// 与菠萝看图的工具栏一样用"纯图标 + 悬停提示"的极简形式。
-const ICON_FONT: &str = "Segoe MDL2 Assets";
+pub const ICON_FONT: &str = "Segoe MDL2 Assets";
 
 /// 工具栏上的一个按钮。
 ///
@@ -193,8 +194,8 @@ pub enum Btn {
 
 /// 标题栏窗口按钮。
 ///
-/// `ALL` 是**右→左序**（下标越大越靠左）：布局、命中、绘制三处都以它为
-/// 唯一真源，加按钮只改这一行。
+/// `ALL` 是**右→左序**（下标越大越靠左），也是布局、命中、绘制三处的唯一真源：
+/// 加按钮只改这一行。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TitleBtn {
     Minimize,
@@ -215,6 +216,14 @@ impl TitleBtn {
         TitleBtn::Lock,
         TitleBtn::Topmost,
     ];
+
+    /// 画布这一帧该画哪几颗标题钮（右→左序）。
+    ///
+    /// ★ 面板头部只承担「信息 + 关闭面板」，不再放窗口三键；窗口五颗钮始终
+    ///   连在一起留在画布顶条。参数保留是为了让命中/绘制/几何的调用形状不变。
+    pub fn shown(_panel_visible: bool) -> &'static [TitleBtn] {
+        &Self::ALL
+    }
 
     /// 按钮字形。`maximized` 只影响最大化钮：非最大化画方框（ChromeMaximize），
     /// 最大化时画还原图标（ChromeRestore）——用户靠字形切换才能一眼读出窗口状态
@@ -400,6 +409,10 @@ pub struct Chrome {
     /// 锁定后整窗交互封锁，只留锁住按钮解锁——语义与拦截地图见
     /// `docs/superpowers/specs/2026-10-12-titlebar-topmost-lock-design.md`。
     pub locked: Cell<bool>,
+    /// 上一拍是否处于锁定态。**只给 `runtime::window_tick` 的捕获兜底用**：
+    /// 锁定那一刻要 `release_capture()` 并重排一次，之后每拍保持释放；
+    /// 置位只在"锁定翻成真"的那一拍做一次，免得每拍都白重排整窗。
+    pub locked_seen: Cell<bool>,
     /// 当前图**有没有帧/页号**（`Anim::has_index()`）。由 canvas 每帧回写，**决定浮条上
     /// 有没有播放组那三颗**（[`Chrome::row`]）；「操作▸」菜单读同一份。
     ///
@@ -529,6 +542,8 @@ pub struct Chrome {
     /// 文本测量与截断的记账（见 [`TextMemo`]）。浮条每帧都要为同一串字量好几遍，
     /// 而字与宽只在翻页 / 改倍率 / 改窗宽 / 换 DPI 时才变。
     text: RefCell<TextMemo>,
+    /// 右侧信息面板的会话态（m342）；面板树见 `ui::info_panel`，已接进 `ui::window` 根布局。
+    pub info: InfoPanel,
 }
 
 /// 一帧里同一串文本会被量很多遍：状态格定宽量一次、标题截断量一次、提示条再量一次，
@@ -610,6 +625,7 @@ impl Chrome {
             strip_fit_request: Cell::new(false),
             strip_resize: Cell::new(None),
             locked: Cell::new(false),
+            locked_seen: Cell::new(false),
             anim: Cell::new(false),
             index_pair: Cell::new(false),
             paused: Cell::new(false),
@@ -653,6 +669,7 @@ impl Chrome {
             save_notice: RefCell::new(None),
             pins: RefCell::new(None),
             text: RefCell::new(TextMemo::default()),
+            info: InfoPanel::new(),
         })
     }
 
@@ -1424,12 +1441,26 @@ impl Chrome {
     }
 
     /// 标题栏按钮矩形（视口右上角）。
-    fn title_btn_rect(tb: TitleBtn, view: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+    ///
+    /// 锚点是 [`TitleBtn::ALL`] 的第 0 颗（最右）：× ▢ _ 🔒 📌，五颗始终连在一起。
+    fn title_btn_rect(
+        tb: TitleBtn,
+        view: (f32, f32, f32, f32),
+        panel_visible: bool,
+    ) -> (f32, f32, f32, f32) {
+        // 只对 `ALL` 里的按钮有几何：调试构建里把误用喊出来，发布构建仍保持不 panic。
+        debug_assert!(
+            TitleBtn::shown(panel_visible).contains(&tb),
+            "title_btn_rect 只认 TitleBtn::ALL 里的按钮：{tb:?} 不在表里"
+        );
         let (_, _, vw, _) = view;
         const BTN_W: f32 = 40.0;
         const BTN_H: f32 = STRIP_H as f32;
-        let i = TitleBtn::ALL.iter().position(|&x| x == tb).unwrap_or(0) as f32;
-        let x = vw - (i + 1.0) * (BTN_W + 0.0);
+        let i = TitleBtn::shown(panel_visible)
+            .iter()
+            .position(|&x| x == tb)
+            .unwrap_or(0) as f32;
+        let x = vw - (i + 1.0) * BTN_W;
         (x, 0.0, BTN_W, BTN_H)
     }
 
@@ -1453,8 +1484,10 @@ impl Chrome {
         let pos = (pos.0 - view.0, pos.1 - view.1);
         // 锁定：整窗只认锁住按钮（解锁唯一入口）——其余命中一律 None，
         // 拖窗/工具栏/箭头自然全断（用户拍板 2026-10-12，spec §5）。
+        // Lock 在满组里始终在场，故面板开合不影响这条分支的几何。
+        let panel_visible = self.info.panel_visible();
         if self.locked.get() {
-            let (x, y, w, h) = Self::title_btn_rect(TitleBtn::Lock, view);
+            let (x, y, w, h) = Self::title_btn_rect(TitleBtn::Lock, view, panel_visible);
             return if pos.0 >= x && pos.0 < x + w && pos.1 >= y && pos.1 < y + h {
                 Some(Press::TitleBtn(TitleBtn::Lock))
             } else {
@@ -1490,8 +1523,9 @@ impl Chrome {
             }
         }
         // 标题栏按钮最后测（最右上角，按 Windows 标准顺序从右向左）。
-        for &tb in TitleBtn::ALL.iter().rev() {
-            let (x, y, w, h) = Self::title_btn_rect(tb, view);
+        // 只用 `ALL` 这一份：五颗始终在画布顶条，面板头部不再重复窗口键。
+        for &tb in TitleBtn::shown(panel_visible).iter().rev() {
+            let (x, y, w, h) = Self::title_btn_rect(tb, view, panel_visible);
             if pos.0 >= x && pos.0 < x + w && pos.1 >= y && pos.1 < y + h {
                 return Some(Press::TitleBtn(tb));
             }
@@ -1538,9 +1572,6 @@ pub const ARROW_ZONE: f32 = 16.0 + ARROW_R * 2.0 + 8.0;
 
 /// 标题栏左内边距（文件名从这里起）。
 const TITLE_PAD: f32 = 12.0;
-/// 标题栏右侧让给窗口按钮的宽：5 × 40 = 200，再加 8 留白 = 208。
-/// （旧写法把 `vw - 220` 这个魔数直接写在绘制处，等价于 `TITLE_PAD + 208`。）
-const TITLE_BTN_RESERVE: f32 = 208.0;
 
 /// 信息条这一帧落在哪儿（判据见 [`info_place`]）。
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
@@ -1635,12 +1666,13 @@ fn clip_text(canvas: &mut dyn Canvas, text: &str, ts: &TextStyle, avail_w: f32) 
     format!("{kept}{ELL}")
 }
 
-/// 顶条（自绘标题栏 + 5 颗窗口按钮）这一帧画不画。**m238**。
+/// 顶条（自绘标题栏 + 画布上的标题钮）这一帧画不画。**m238**。
 ///
 /// ★ 全屏时**默认不画**——用户口径「全屏不该还留着标题栏」。但顶缘悬停仍能把它
 ///   唤出：与极简模式共用同一份 `hover_title`，而那位由 `in_title_strip` 的几何
-///   独立算出，不看这一帧画没画，所以不会「收了就唤不回」。全屏下 5 颗窗口按钮
-///   （置顶 / 锁定 / 最小化 / 最大化 / 关闭）因此仍然可达。
+///   独立算出，不看这一帧画没画，所以不会「收了就唤不回」。满组 5 颗钮
+///   （置顶 / 锁定 / 最小化 / 最大化 / 关闭）因此仍然可达；面板头部只留
+///   「信息 + 关闭面板」，窗口五颗钮始终连在画布顶条。
 /// ★ 非全屏的判据一字未动：传统模式常驻，极简模式只靠悬停。
 fn title_visible(fullscreen_on: bool, minimal_mode: bool, hover_title: bool) -> bool {
     if fullscreen_on {
@@ -1735,7 +1767,10 @@ pub fn paint(
     let info_ts = TextStyle::new(13.0);
     let buttons = toolbar_buttons(); // m245：隐藏后信息独占浮条并水平居中
     let place = info_place(vw, buttons);
-    let title_room = vw - TITLE_BTN_RESERVE - TITLE_PAD;
+    // 标题右侧让给画布上的窗口按钮：每颗 40 + 8 呼吸。满组 5 颗 ⇒ 208。
+    let panel_visible = chrome.info.panel_visible();
+    let shown_btns = TitleBtn::shown(panel_visible);
+    let title_room = vw - (shown_btns.len() as f32 * 40.0 + 8.0) - TITLE_PAD;
     // 每帧先清零再按需回写：hover / tick_hide 读到的永远是这帧**实际画出来**的那块
     // （没画 = 零矩形 = 不可悬停）。
     chrome.info_rect.set((0.0, 0.0, 0.0, 0.0));
@@ -1774,9 +1809,9 @@ pub fn paint(
         // 标题栏背景
         canvas.fill_rect(vx, vy, vw, STRIP_H as f32, &Paint::fill(tk::pill_bg()));
         let title_ts = TextStyle::new(13.0);
-        // 标题文本：左对齐，右侧让出 5 颗窗口按钮。**必须截断**：直绘的 `draw_text`
-        // 不截断，长文件名会折行画到图片上，第二行压在画面中央（`clip_text` 的注释里
-        // 记着取证）。状态已经搬进浮条，这里不再为它让宽。
+        // 标题文本：左对齐，右侧让出画布上的五颗窗口按钮。**必须截断**：直绘的
+        // `draw_text` 不截断，长文件名会折行画到图片上，第二行压在画面中央
+        // （`clip_text` 的注释里记着取证）。状态已经搬进浮条，这里不再为它让宽。
         let shown = chrome.clip(canvas, title, &title_ts, title_room);
         canvas.draw_text(
             &shown,
@@ -1790,10 +1825,10 @@ pub fn paint(
             Align::Start,
             &title_ts,
         );
-        // 窗口按钮（📌 🔒 最小化 最大化 ×），按 Windows 标准顺序从右向左绘制
+        // 窗口按钮（📌 🔒 最小化 最大化 ×），按 Windows 标准顺序从右向左绘制。
         let locked = chrome.locked.get();
-        for &tb in TitleBtn::ALL.iter().rev() {
-            let (bx, by, bw, bh) = Chrome::title_btn_rect(tb, view);
+        for &tb in shown_btns.iter().rev() {
+            let (bx, by, bw, bh) = Chrome::title_btn_rect(tb, view, panel_visible);
             let (lx, ly, lw, lh) = local(bx, by, bw, bh);
             let hovered = chrome.hover_title_btn.get() == Some(tb);
             let pressed = chrome.pressed_title_btn.get() == Some(tb);
@@ -2348,7 +2383,7 @@ mod tests {
     fn every_title_button_lies_inside_the_title_strip_for_both_viewports() {
         for view in [(0.0, 0.0, 900.0, 600.0), (112.0, 0.0, 788.0, 600.0)] {
             for tb in TitleBtn::ALL {
-                let (x, y, w, h) = Chrome::title_btn_rect(tb, view);
+                let (x, y, w, h) = Chrome::title_btn_rect(tb, view, false);
                 // 矩形是视口的相对坐标，判据吃的是窗口绝对坐标 ⇒ 搬一次。
                 let center = (view.0 + x + w / 2.0, view.1 + y + h / 2.0);
                 assert!(
@@ -2561,7 +2596,7 @@ mod tests {
         let view = (112.0, 0.0, 800.0, 600.0);
         let chrome = Chrome::new(true);
         for tb in TitleBtn::ALL {
-            let rel = Chrome::title_btn_rect(tb, view);
+            let rel = Chrome::title_btn_rect(tb, view, false);
             let (ax, ay, aw, ah) = to_canvas(view, rel);
             assert_eq!(
                 chrome.hit((ax + aw / 2.0, ay + ah / 2.0), view),
@@ -2659,7 +2694,7 @@ mod tests {
         let view = (0.0, 0.0, 800.0, 600.0);
         let chrome = Chrome::new(true);
         for tb in TitleBtn::ALL {
-            let (x, y, w, h) = Chrome::title_btn_rect(tb, view);
+            let (x, y, w, h) = Chrome::title_btn_rect(tb, view, false);
             let hit = chrome.hit((x + w / 2.0, y + h / 2.0), view);
             assert_eq!(hit, Some(Press::TitleBtn(tb)), "{tb:?} 命中不了自己");
         }
@@ -2671,11 +2706,11 @@ mod tests {
     fn title_buttons_are_right_anchored_without_overlap() {
         let view = (0.0, 0.0, 800.0, 600.0);
         let vw = view.2;
-        let (cx, _, cw, _) = Chrome::title_btn_rect(TitleBtn::Close, view);
+        let (cx, _, cw, _) = Chrome::title_btn_rect(TitleBtn::Close, view, false);
         assert!((cx + cw - vw).abs() < f32::EPSILON, "关闭钮该贴右缘");
         for pair in TitleBtn::ALL.windows(2) {
-            let (rx, _, _rw, _) = Chrome::title_btn_rect(pair[0], view); // 更靠右
-            let (lx, _, lw, _) = Chrome::title_btn_rect(pair[1], view); // 更靠左
+            let (rx, _, _rw, _) = Chrome::title_btn_rect(pair[0], view, false); // 更靠右
+            let (lx, _, lw, _) = Chrome::title_btn_rect(pair[1], view, false); // 更靠左
             assert!(
                 lx + lw <= rx + f32::EPSILON,
                 "{:?}/{:?} 矩形重叠",
@@ -2726,7 +2761,7 @@ mod tests {
         let chrome = Chrome::new(true);
         chrome.locked.set(true);
         for tb in TitleBtn::ALL {
-            let (x, y, w, h) = Chrome::title_btn_rect(tb, view);
+            let (x, y, w, h) = Chrome::title_btn_rect(tb, view, false);
             let want = (tb == TitleBtn::Lock).then_some(Press::TitleBtn(TitleBtn::Lock));
             assert_eq!(
                 chrome.hit((x + w / 2.0, y + h / 2.0), view),

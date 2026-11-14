@@ -109,6 +109,11 @@ impl Viewer {
         if self.prefetch_stopped || self.prefetch_seq.is_some() {
             return;
         }
+        // BROWSE-24：只有**用户自己滚条**时才连预读一起停。此刻下注的
+        // "下一张"很可能在用户停手前就被下一页顶掉；等 `strip_window` 停手补发。
+        if self.strip_user_scroll {
+            return;
+        }
         // 用户关掉了「图片预读」（ini `prefetch=0`）：一台安静的机器也是需求。
         // 关的是**发起**这一侧——已在途的那一枚照常回来、已缓存的那些照常命中，
         // 不做任何"顺手清空"，免得改一个开关把用户正看着的东西抖一下。
@@ -215,6 +220,10 @@ impl Viewer {
     /// ★ `len() > 1` 这个前置条件不能省：单份就超预算时若也淘汰，缓存会被清空、
     /// 预读从此再也进不来——那条闸就成了"关掉预读"而不是"限制预读"。
     pub(super) fn cache_prefetch(&mut self, path: PathBuf, img: Decoded) -> bool {
+        // BROWSE-24：预读已经付过整解的钱，顺手种一格缩略图；用户点条上这一格时
+        // 不用再把同一张图整解一遍。种不下（已有 Ready）就跳过。
+        self.thumbs
+            .seed(&path, img.bitmap.width, img.bitmap.height, &img.bitmap.rgba);
         self.prefetched.retain(|e| e.path != path);
         self.prefetched.push(Prefetched { path, img });
         let mut evicted = false;
@@ -392,12 +401,17 @@ impl Viewer {
         //   ⇒ `tick_anim` 永不触发 ⇒ PDF 放大/平移后自动切页停止。
         //   排表逻辑移到下面 `anim` 变量计算之后执行。
         // ★ 这里**不 stat 文件**（m98）。曾经有一份 `file_size` 在这里每次装档 `fs::metadata`
-        //   一次，字段文档还写着"状态栏与属性窗口展示用"——实读：全仓**零读者**，属性窗自己
-        //   按路径 stat 它那一份（`ui::settings::metadata`）。而装档不只发生在换图：同一张的
+        //   一次，字段文档还写着"状态栏与属性卡展示用"——实读：全仓**零读者**，属性卡自己
+        //   按路径 stat 它那一份（`ui::info_panel::properties`）。而装档不只发生在换图：同一张的
         //   原图档升级、SVG 切片重渲、动画每一帧都进来一次，等于在 UI 线程上白付一串
         //   `GetFileAttributesW`（本地 µs 级）。
         // 缓存路径：`path` 即将被 move 进 Loaded，先 clone 一份留作缓存键。
         let cache_path = path.clone();
+        // BROWSE-24：主图已经解得，条上当前这一格不必再整解一遍。鸟瞰源 ≤512 px，
+        // 收到 240×180 的格子框内几乎不要钱；同一帧重复装档时 `seed` 会自己跳过。
+        if let Some((rgba, tw, th)) = nav_thumb_rgba.as_ref() {
+            self.thumbs.seed(&cache_path, *tw, *th, rgba);
+        }
         // 装新图 = 世代号自增：在途的旧档位派生回包从此一律作废（晚到的旧像素盖在
         // 新图上就是"闪回上一张"）。`inflight` 一并清掉，免得旧指纹挡住新图的第一次投递。
         self.epoch += 1;
@@ -509,8 +523,14 @@ impl Viewer {
         if overlay.is_none() {
             self.apply_edited_overlay(&cache_path);
         }
-        // 用渲染阶段的权威值覆盖缓存：natural 尺寸以 Decoded 为准。
-        self.cache_meta(cache_path, Meta { natural });
+        // 用渲染阶段的权威值覆盖缓存：只改 natural，查询阶段带回来的技术字段保留。
+        let mut meta = self
+            .meta_cache
+            .get(&cache_path)
+            .cloned()
+            .unwrap_or_default();
+        meta.natural = natural;
+        self.cache_meta(cache_path, meta);
         self.error = None;
         self.clamp_pan();
         true
