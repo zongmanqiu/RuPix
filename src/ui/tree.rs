@@ -32,7 +32,6 @@ const INDENT: i32 = 13;
 /// 图标边长与图标后的空隙。
 const ICON: f32 = 11.0;
 const ICON_GAP: i32 = 6;
-const FONT: f32 = 12.0;
 
 /// 树在 `vw` 宽的内容区里该多宽。
 ///
@@ -213,7 +212,7 @@ pub fn paint(
     );
 
     let cap = capacity(panel.h, notice);
-    let ts = TextStyle::new(FONT);
+    let ts = TextStyle::new(super::tokens::SIZE_BODY);
     let text = tk::overlay_text();
 
     for (i, node) in nodes.iter().enumerate().skip(first).take(cap) {
@@ -267,7 +266,7 @@ pub fn paint(
         let mut right_pad = PAD;
         let count = node.images.to_string();
         let count_w = if node.images > 0 {
-            let ts_small = TextStyle::new(FONT - 1.0);
+            let ts_small = TextStyle::new(super::tokens::SIZE_BODY);
             let m = canvas.measure_text(&count, &ts_small);
             let w = m.w;
             canvas.draw_text(
@@ -289,7 +288,7 @@ pub fn paint(
         if avail <= 4.0 {
             continue;
         }
-        let label = clip(&node.label, avail, FONT);
+        let label = clip(&node.label, avail, super::tokens::SIZE_BODY);
         let color = if node.images > 0 || node.depth == 0 {
             text
         } else {
@@ -333,11 +332,11 @@ pub fn paint(
 fn paint_notice(canvas: &mut dyn Canvas, panel: Rect) {
     let r = notice_rect(panel);
     canvas.draw_text(
-        &clip(NOTICE_TEXT, r.w as f32, FONT),
+        &clip(NOTICE_TEXT, r.w as f32, super::tokens::SIZE_BODY),
         r,
         tk::overlay_text_muted(),
         Align::Start,
-        &TextStyle::new(FONT),
+        &TextStyle::new(super::tokens::SIZE_BODY),
     );
 }
 

@@ -34,7 +34,6 @@ impl Viewer {
             prefetch_seq: None,
             prefetch_stopped: false,
             meta_cache: std::collections::HashMap::new(),
-            hist_cache: std::cell::RefCell::new(None),
             prefetched: Vec::new(),
             prefetch_strip: None,
             last_dir: 0,

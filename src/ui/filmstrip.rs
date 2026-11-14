@@ -123,13 +123,12 @@ const SCROLL_MIN: f32 = 24.0;
 /// 3dp 让 16dp 热区上下各探出 5dp 时刚好不啃到格子（格子从 `p.y + 14` 起）。
 const SCROLL_TOP_GAP: f32 = 3.0;
 
-/// 序号：字号与**描边**厚度（m260）。
+/// 序号：描边厚度（m260）。
 ///
 /// 用户 2026-11-08 的口径是"数字有描边、一黑一白"，**不是**一块有底色的标签：
 /// 「数字有线条包裹，不是一整个矩形区域都是其它颜色背景」。所以这里只画字——
-/// 黑字 + 八邻域各偏 1px 的白字，读起来就是 1px 白描边。
-const BADGE_FONT: f32 = 10.0;
-/// 描边厚度（逻辑 px）。1px 用户点名要的。
+/// 黑字 + 八邻域各偏 1px 的白字，读起来就是 1px 白描边；字号走全窗唯一的
+/// [`super::tokens::SIZE_BODY`]，不再单独降档。
 const BADGE_EDGE: f32 = 1.0;
 /// 八邻域偏移：先按这八个位移各画一遍白字，再正中压一遍黑字。
 const BADGE_RING: [(i32, i32); 8] = [
@@ -523,7 +522,7 @@ impl Strip {
             // 浅色缩略图上黑字自己就够，深色缩略图上靠这圈白边把字形勾出来，
             // 而且一格像素都不被底衬吃掉。
             let label = (idx + 1).to_string();
-            let ts = TextStyle::new(BADGE_FONT);
+            let ts = TextStyle::new(super::tokens::SIZE_BODY);
             let m = canvas.measure_text(&label, &ts);
             if let Some(b) = badge_rect(r, m.w as f32, m.h as f32) {
                 for (dx, dy) in BADGE_RING {

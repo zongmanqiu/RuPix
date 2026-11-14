@@ -169,6 +169,10 @@ fn run_editor_probe(dir: &Path) -> Result<(), String> {
         enabled: true,
         blocked: false,
         isolated: false,
+        command_id: None,
+        display_name: String::new(),
+        package_name: String::new(),
+        run_key: String::new(),
     };
 
     // 4×2 探针图：每像素首字节 = 序号；反相结果可逐字节断言，不靠肉眼。
@@ -358,6 +362,10 @@ fn run_settings_probe(dir: &Path) -> Result<(), String> {
         enabled: true,
         blocked: false,
         isolated: false,
+        command_id: None,
+        display_name: String::new(),
+        package_name: String::new(),
+        run_key: String::new(),
     };
     let store = settings_store(&base.manifest.id)?;
     let _ = std::fs::remove_file(&store);
@@ -548,6 +556,10 @@ fn run_sampled_probe(dir: &Path, image: &Path) -> Result<(), String> {
         enabled: true,
         blocked: false,
         isolated: false,
+        command_id: None,
+        display_name: String::new(),
+        package_name: String::new(),
+        run_key: String::new(),
     };
     rupix_lib::install_decode_stack();
 
@@ -613,6 +625,10 @@ fn run_channels_probe(dir: &Path) -> Result<(), String> {
         enabled: true,
         blocked: false,
         isolated: false,
+        command_id: None,
+        display_name: String::new(),
+        package_name: String::new(),
+        run_key: String::new(),
     };
     let mut fails: Vec<String> = Vec::new();
 
@@ -816,6 +832,10 @@ fn main() -> Result<(), String> {
         enabled: true,
         blocked: false,
         isolated: false,
+        command_id: None,
+        display_name: String::new(),
+        package_name: String::new(),
+        run_key: String::new(),
     };
     let name = ext.manifest.name.clone();
     let id = ext.manifest.id.clone();

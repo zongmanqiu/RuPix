@@ -164,24 +164,25 @@ static SVG_FONTDB: std::sync::OnceLock<std::sync::Arc<resvg::usvg::fontdb::Datab
 
 #[cfg(feature = "svg-text")]
 fn svg_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
-    SVG_FONTDB.get_or_init(|| {
-        let mut db = resvg::usvg::fontdb::Database::new();
-        // ★ RuPix 补丁 023 —— 优先回放持久索引；指纹不符（装/卸字体、文件变动）
-        // 才付整轮扫描，并把新索引写回。
-        let cache_path = SVG_FONT_CACHE_PATH.get().cloned().flatten();
-        let replayed = cache_path
-            .as_deref()
-            .map(|p| svg_font_cache_load(&mut db, p).is_some())
-            .unwrap_or(false);
-        if !replayed {
-            db.load_system_fonts();
-            if let Some(p) = cache_path.as_deref() {
-                svg_font_cache_store(&db, p);
+    SVG_FONTDB
+        .get_or_init(|| {
+            let mut db = resvg::usvg::fontdb::Database::new();
+            // ★ RuPix 补丁 023 —— 优先回放持久索引；指纹不符（装/卸字体、文件变动）
+            // 才付整轮扫描，并把新索引写回。
+            let cache_path = SVG_FONT_CACHE_PATH.get().cloned().flatten();
+            let replayed = cache_path
+                .as_deref()
+                .map(|p| svg_font_cache_load(&mut db, p).is_some())
+                .unwrap_or(false);
+            if !replayed {
+                db.load_system_fonts();
+                if let Some(p) = cache_path.as_deref() {
+                    svg_font_cache_store(&db, p);
+                }
             }
-        }
-        std::sync::Arc::new(db)
-    })
-    .clone()
+            std::sync::Arc::new(db)
+        })
+        .clone()
 }
 
 /// ★ RuPix 补丁 023 —— 字体库是否已初始化（含回放缓存成功的那次）。
@@ -249,12 +250,12 @@ fn svg_font_cache_load(db: &mut resvg::usvg::fontdb::Database, path: &Path) -> O
             self.take(2).map(|b| u16::from_le_bytes([b[0], b[1]]))
         }
         fn u32(&mut self) -> Option<u32> {
-            self.take(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            self.take(4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         }
         fn u64(&mut self) -> Option<u64> {
-            self.take(8).map(|b| {
-                u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-            })
+            self.take(8)
+                .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
         }
         fn s(&mut self) -> Option<String> {
             let n = usize::from(self.u16()?);
@@ -306,7 +307,16 @@ fn svg_font_cache_load(db: &mut resvg::usvg::fontdb::Database, path: &Path) -> O
             1 => true,
             _ => return None,
         };
-        faces.push((file, index, families, post_script_name, style, weight, stretch, monospaced));
+        faces.push((
+            file,
+            index,
+            families,
+            post_script_name,
+            style,
+            weight,
+            stretch,
+            monospaced,
+        ));
     }
 
     // 指纹区：每个唯一字体文件逐一核对（大小 + 修改时刻），一项不符整份作废。
@@ -422,7 +432,10 @@ fn svg_font_cache_store(db: &resvg::usvg::fontdb::Database, path: &Path) {
             Ok(m) => m,
             Err(_) => return, // 扫描与落盘之间文件被移走：宁可不用缓存
         };
-        let (secs, nanos) = match m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        let (secs, nanos) = match m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         {
             Some(d) => (d.as_secs(), d.subsec_nanos()),
             None => (0, 0),
@@ -457,7 +470,8 @@ fn svg_font_cache_store(db: &resvg::usvg::fontdb::Database, path: &Path) {
 #[cfg(all(feature = "svg", feature = "svg-text"))]
 fn svg_may_have_text(bytes: &[u8]) -> bool {
     fn has(hay: &[u8], needle: &[u8]) -> bool {
-        hay.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+        hay.windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
     }
     // gzip 魔数：resvg 内部透明解压，这里无从判断内容。
     bytes.starts_with(&[0x1f, 0x8b]) || has(bytes, b"<text") || has(bytes, b":text")
@@ -560,6 +574,7 @@ fn svg_tree_cached(bytes: &[u8]) -> Result<std::sync::Arc<resvg::usvg::Tree>, Im
     use std::hash::{Hash, Hasher};
     use std::sync::{Arc, Mutex};
 
+    #[allow(clippy::type_complexity)]
     static CACHE: Mutex<Option<HashMap<(u64, usize), Arc<resvg::usvg::Tree>>>> = Mutex::new(None);
     static CAP: usize = 8;
 
@@ -571,6 +586,8 @@ fn svg_tree_cached(bytes: &[u8]) -> Result<std::sync::Arc<resvg::usvg::Tree>, Im
             return Ok(t.clone());
         }
     }
+    // svg-text 关着时 `opt` 不被改动，clippy 会挑 needless_mut：精确豁免到该形态。
+    #[cfg_attr(not(feature = "svg-text"), allow(unused_mut))]
     let mut opt = resvg::usvg::Options::default();
     // ★ RuPix 补丁 017 —— 无文字的文档不碰字体库（`Options::default()` 里那份空库
     // 足够解析纯图形 SVG）；带文字的照旧共享全局那一份。
@@ -1317,7 +1334,10 @@ mod tests {
             // `<text` 后跟非空白非 `>` 不是 text 元素（textPath / textArea）。
             assert_eq!(svg_strip_text_nodes(b"<svg><textPath/></svg>"), None);
             // 命名空间前缀不认（usvg 也不渲染它）。
-            assert_eq!(svg_strip_text_nodes(b"<svg><sv:text>a</sv:text></svg>"), None);
+            assert_eq!(
+                svg_strip_text_nodes(b"<svg><sv:text>a</sv:text></svg>"),
+                None
+            );
             // 没有文字 → None。
             assert_eq!(svg_strip_text_nodes(b"<svg><rect/></svg>"), None);
             // 收尾丢了 → None（保守）。
@@ -1365,8 +1385,7 @@ mod tests {
             let mut scanned = resvg::usvg::fontdb::Database::new();
             scanned.load_system_fonts();
 
-            let dir = std::env::temp_dir()
-                .join(format!("windui-fontcache-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("windui-fontcache-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&dir);
             let path = dir.join("fonts.bin");
 
@@ -1374,7 +1393,10 @@ mod tests {
             assert!(path.exists(), "缓存必须真实落盘");
 
             let mut replayed = resvg::usvg::fontdb::Database::new();
-            assert!(svg_font_cache_load(&mut replayed, &path).is_some(), "指纹吻合必须回放成功");
+            assert!(
+                svg_font_cache_load(&mut replayed, &path).is_some(),
+                "指纹吻合必须回放成功"
+            );
 
             let names = |db: &resvg::usvg::fontdb::Database| -> BTreeSet<String> {
                 db.faces()
@@ -1384,7 +1406,11 @@ mod tests {
             let ps = |db: &resvg::usvg::fontdb::Database| -> BTreeSet<String> {
                 db.faces().map(|f| f.post_script_name.clone()).collect()
             };
-            assert_eq!(scanned.faces().count(), replayed.faces().count(), "面数必须一致");
+            assert_eq!(
+                scanned.faces().count(),
+                replayed.faces().count(),
+                "面数必须一致"
+            );
             assert_eq!(names(&scanned), names(&replayed), "家族名集合必须一致");
             assert_eq!(ps(&scanned), ps(&replayed), "PostScript 名集合必须一致");
 
@@ -1417,7 +1443,10 @@ mod tests {
             assert!(svg_font_cache_load(&mut ok, &probe_path).is_some());
             std::fs::write(&copy, b"tampered").unwrap();
             let mut stale = resvg::usvg::fontdb::Database::new();
-            assert!(svg_font_cache_load(&mut stale, &probe_path).is_none(), "指纹不符必须拒绝");
+            assert!(
+                svg_font_cache_load(&mut stale, &probe_path).is_none(),
+                "指纹不符必须拒绝"
+            );
             assert_eq!(stale.faces().count(), 0, "拒绝时不得放进任何面");
 
             // 损坏字节：解析失败 = 拒绝，不是半信半疑。

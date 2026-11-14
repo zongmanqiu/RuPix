@@ -1304,3 +1304,51 @@ fn j18_rejects_missing_and_truncated_features() {
     let same: std::collections::BTreeSet<String> = cargo.clone();
     assert!(feature_set_diff(&cargo, &same).is_empty(), "相等集合不该报");
 }
+
+/// ⑳ 排版正本 ↔ 令牌同步（2026-11-14）：`docs/排版规范.md` 必须登记
+/// `src/ui/tokens.rs` 里的每一个排版令牌，且字号/字重的值与文档表格一致。
+///
+/// 为什么值得一条门禁：字体统一的价值全在“只有一个口子”。令牌改名或改值而文档
+/// 不跟，下一个人就按旧文档抄一个数——那正是本轮返工的起点。`literal_font`
+/// 管的是“代码里不许写字面量”，这条管的是“登记表不许漂”。
+#[test]
+fn j20_typography_doc_lists_every_token() {
+    let tokens = read(&main_dir().join("src/ui/tokens.rs"));
+    let doc = read(&main_dir().join("docs/排版规范.md"));
+
+    const TOKENS: [&str; 6] = [
+        "FAMILY_UI",
+        "SIZE_BODY",
+        "FAMILY_ICON",
+        "SIZE_ICON",
+        "SIZE_DISPLAY",
+        "WEIGHT_EMPHASIS",
+    ];
+    for name in TOKENS {
+        assert!(
+            tokens.contains(&format!("pub const {name}")),
+            "src/ui/tokens.rs 缺排版令牌 {name}"
+        );
+        assert!(
+            doc.contains(name),
+            "docs/排版规范.md 没登记排版令牌 {name}——新元素会按旧文档抄数字"
+        );
+    }
+
+    // 值同样要对：文档表格里写的是 `13` / `16` / `22` / `600`。
+    for (name, value) in [
+        ("SIZE_BODY", "13"),
+        ("SIZE_ICON", "16"),
+        ("SIZE_DISPLAY", "22"),
+        ("WEIGHT_EMPHASIS", "600"),
+    ] {
+        let line = doc
+            .lines()
+            .find(|l| l.contains(&format!("`{name}`")))
+            .unwrap_or_else(|| panic!("docs/排版规范.md 的表格里找不到 {name} 那一行"));
+        assert!(
+            line.contains(&format!("`{value}`")),
+            "docs/排版规范.md 里 {name} 的值与 tokens.rs 不一致（应含 `{value}`）：{line}"
+        );
+    }
+}

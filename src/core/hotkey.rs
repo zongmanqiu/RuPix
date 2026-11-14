@@ -110,7 +110,7 @@ pub enum Action {
     Minimal,
     /// 棋盘格背景开关。
     Checker,
-    /// 属性卡（右侧信息面板）。
+    /// 「图片信息」卡（右侧信息面板；旧名「属性」）。
     Properties,
     /// 窗口不透明度 +1 档（10%）。
     OpacityUp,
@@ -306,7 +306,7 @@ impl Action {
             Action::CopyPath => "复制文件路径",
             Action::Minimal => "极简模式",
             Action::Checker => "棋盘格背景",
-            Action::Properties => "属性",
+            Action::Properties => "图片信息",
             Action::OpacityUp => "不透明度 +",
             Action::OpacityDown => "不透明度 −",
             Action::Settings => "设置",

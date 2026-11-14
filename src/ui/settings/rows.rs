@@ -19,7 +19,7 @@ pub fn option_row_inset(label: &str, control: Element, inset: i32) -> Element {
     Element::row()
         .child(
             Element::label(label)
-                .font_size(FONT_MD)
+                .font_size(SIZE_BODY)
                 .fg(to_color(TEXT_SECONDARY))
                 .width(COL1_W),
         )
@@ -48,7 +48,7 @@ pub fn check_row(label: &str, sig: Signal<bool>) -> Element {
 /// 版本格：与「可下载」列表同一宽度、同一右对齐方式。
 pub fn version_cell(version: &str) -> Element {
     Element::label(format!("v{version}"))
-        .font_size(FONT_MD)
+        .font_size(SIZE_BODY)
         .fg(to_color(TEXT_SECONDARY))
         .width(VERSION_COL_W)
         .text_align(Align::End)
@@ -94,7 +94,7 @@ pub fn slider_row(label: &str, sig: Signal<f32>, text_sig: Signal<String>) -> El
             .child(Element::leaf().width(8))
             .child(
                 Element::label_signal(text_sig)
-                    .font_size(FONT_MD)
+                    .font_size(SIZE_BODY)
                     .fg(to_color(TEXT_SECONDARY))
                     .width(INPUT_W),
             )
@@ -109,7 +109,7 @@ pub fn slider_row(label: &str, sig: Signal<f32>, text_sig: Signal<String>) -> El
 /// 输入框同层级——这里只显式钉死字号与圆角，避免各调用点写法漂移。
 pub fn btn(label: impl Into<TextContent>) -> Element {
     Element::button(label)
-        .font_size(FONT_MD)
+        .font_size(SIZE_BODY)
         .corner(CORNER_CONTROL)
 }
 
@@ -194,14 +194,14 @@ pub fn section_card(name: &str, expanded: Signal<bool>, body: Element) -> Elemen
             "\u{25B6}".to_string()
         }
     }))
-    .font_size(FONT_MD)
+    .font_size(SIZE_BODY)
     .fg(to_color(TEXT_SECONDARY))
     .align(Align::Center);
     Element::col()
         .width_match()
         .child(
             Element::row()
-                .child(Element::label(name).font_size(FONT_MD).fg(to_color(TEXT)))
+                .child(Element::label(name).font_size(SIZE_BODY).fg(to_color(TEXT)))
                 .child(Element::flex_spacer())
                 .child(Element::stack().child(chevron).width(28).height(28))
                 .cross(Align::Center)
@@ -238,13 +238,13 @@ pub fn info_row(label: &'static str, value: String) -> Element {
         .padding_xy(0, 6)
         .child(
             Element::label(label)
-                .font_size(FONT_MD)
+                .font_size(SIZE_BODY)
                 .fg(to_color(TEXT_SECONDARY))
                 .width(92),
         )
         .child(
             Element::label(value)
-                .font_size(FONT_MD)
+                .font_size(SIZE_BODY)
                 .fg(to_color(TEXT))
                 .weight(1.0),
         )
@@ -282,7 +282,7 @@ pub fn nav_rail(tab: Signal<usize>, on_switch: OnSwitch) -> Element {
                 )
                 .child(
                     Element::label(*label)
-                        .font_size(FONT_MD)
+                        .font_size(SIZE_BODY)
                         .fg(to_color(TEXT))
                         .padding_xy(14, 0),
                 )

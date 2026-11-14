@@ -26,7 +26,7 @@ pub fn hotkey_box(
     Element::stack()
         .child(
             Element::label_signal(text)
-                .font_size(FONT_MD)
+                .font_size(SIZE_BODY)
                 .fg(to_color(TEXT))
                 // 框内文字居中：stack（Layout::Frame）按子元素自己的 align 摆放，
                 // 缺省 Start 会顶在左上角——这层与下面 stack 自己那个 align 各管一层。
@@ -52,7 +52,7 @@ fn readonly_hotkey_box(text: &str) -> Element {
     Element::stack()
         .child(
             Element::label(text)
-                .font_size(FONT_MD)
+                .font_size(SIZE_BODY)
                 .fg(to_color(TEXT))
                 .align(Align::Center),
         )

@@ -1631,3 +1631,63 @@ hygiene 第 7 查 `patch_parity: 0` · j13 归档逐字节 ok · j16 正向 + �
 
 `cargo test --lib ui::info_panel` 25 passed · `cargo fmt --check` 无差异 ·
 clippy `-D warnings` 0 · hygiene `patch_parity: 0` · j13 归档逐字节 ok。
+
+## 补丁 031 —— 指针焦点不再被重排归一化清掉（纯文本富文本可接物理键）
+
+- 编号：031
+- 涉及上游文件：
+  - `wind-ui-rust-0.23.0/src/app/focus.rs`
+    （`refresh_focus` 的焦点归一化：只在焦点节点**真正失效**时才抹成 `None`，
+    不再因「不在 Tab 焦点环里」就抹）
+- 应用侧接线：无（纯框架修复；受益方是 `ui/info_panel/mod.rs` 的
+  `value_doc` 富文本值行与一切「指针聚焦但不进 Tab 环」的控件）。
+
+### 问题（用户实机，2026-11-15）
+
+信息面板里划选富文本值行后，物理 Ctrl+C / Ctrl+A 完全无效，而右键菜单
+「复制」（SendKey 路径）却正常。`RUST_LOG=trace` 实锤：拖选时焦点确实落到
+富文本节点（`focus set #142 pointer=true`），但下一次重排后按键日志变成
+`on_key focus=Some(#2) -> consumed=false`——焦点被悄悄挪回了画布（#2，带
+`.autofocus()` 的兜底节点），物理键全部落到它身上无人消费。
+
+### 根因
+
+`refresh_focus` 在每次布局后归一化焦点：「当前焦点不在 `focusable_order()`
+里 → 抹成 `None`」。但 `Widget::focusable` 只管 **Tab 遍历**：纯文本
+RichText（无可折叠 Section，见 `rich.rs` 的 `focusable()`）与
+`.focusable(false)` 的控件不进环，却能在指针按下时合法持有焦点。于是：
+
+1. 用户拖选 → 指针路径把焦点给富文本（`apply_dispatch_effects`）；
+2. 选区高亮触发局部重绘 → 重排 → `refresh_focus` 归一化把这份「不在环里」
+   的合法焦点抹成 `None`；
+3. `honor_autofocus` 兜底把焦点安给带 `.autofocus()` 的画布节点；
+4. 此后物理 Ctrl+C / Ctrl+A 全落到画布上——`dispatch_key` 静默未消费；
+   而右键菜单走 `activate_menu_item` → `dispatch_key(key, Some(target))`，
+   直发弹菜单时记录的目标节点，不经过焦点，所以不受影响。
+
+菜单能复制、键盘不能，两条路径的差异正是「节点」。
+
+### 修复
+
+归一化条件从「不在环里」收紧为「**节点真失效**」：已从树上消失（重排重建
+换了 id，`Tree::get` 不命中）或连自身带父链被禁用（`node_enabled` 不命中，
+键也到不了它）。注意不能用 `node_enabled` 单独判活——它对死节点
+`None => break` 会**返回 true**，必须与 `get` 命中合取。
+
+### 判据
+
+- 真机（`RUST_LOG=trace`）：拖选 + 物理 ^c → `focus set #142 pointer=true`，
+  一秒后（经历重排）`on_key ev=Other(67) focus=Some(#142) alive=true ->
+  consumed=true`，剪贴板 = 选中文本；^a + ^c → 整行全选复制；画布方向键
+  翻页无回归。
+- `windui` 全套测试 debug profile：1105 passed / 0 failed（92 doctests 亦过；
+  release 下 3 个 `debug_assert` 型 should_panic 失败为既有特性，与补丁无关）。
+- 归档 `patches/` 与 `.3rd` 逐字节由 `j13` 守；章节 ↔ 标记由 hygiene 第 7 查守。
+
+### 门禁行
+
+`cargo test`（debug）1105 passed / 0 failed · `cargo fmt --check` 无差异 ·
+clippy `-D warnings` 0（1.97.0；顺带修平了它新揪出的 4 处既有告警：
+`skia.rs`/`win32\mod.rs` 两处已退役的 `chunks_exact_to_as_chunks` allow、
+`image.rs` 的 `type_complexity` 与 cfg 条件下的 `unused_mut`、
+`dyn_list.rs` 的 doc 缩进，均已重新归档）· j13 归档逐字节 ok。

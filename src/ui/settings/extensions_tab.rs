@@ -308,7 +308,7 @@ fn installed_body(config: &Rc<RefCell<Config>>, ui: PluginUi) -> Element {
                 .padding_xy(16, 0)
                 .child(
                     Element::label_signal(ui.installed_count)
-                        .font_size(FONT_MD)
+                        .font_size(SIZE_BODY)
                         .fg(to_color(TEXT_ACCENT))
                         .weight(1.0)
                         .max_lines(1)
@@ -326,7 +326,7 @@ fn installed_body(config: &Rc<RefCell<Config>>, ui: PluginUi) -> Element {
                 .padding_xy(16, 0)
                 .child(
                     Element::label("（没有匹配的插件）")
-                        .font_size(FONT_MD)
+                        .font_size(SIZE_BODY)
                         .fg(to_color(TEXT_SECONDARY)),
                 )
                 .visible_when(move || {
@@ -342,7 +342,7 @@ fn installed_body(config: &Rc<RefCell<Config>>, ui: PluginUi) -> Element {
                 .padding_xy(16, 0)
                 .child(
                     Element::label("（没有已安装插件）")
-                        .font_size(FONT_MD)
+                        .font_size(SIZE_BODY)
                         .fg(to_color(TEXT_SECONDARY)),
                 )
                 .visible_when(move || ui.installed.get().is_empty()),
@@ -390,7 +390,7 @@ fn available_body(config: &Rc<RefCell<Config>>, ui: PluginUi) -> Element {
                 .padding_xy(16, 0)
                 .child(
                     Element::label_signal(ui.status)
-                        .font_size(FONT_MD)
+                        .font_size(SIZE_BODY)
                         .fg(to_color(TEXT_ACCENT))
                         .weight(1.0)
                         .max_lines(1)
@@ -407,7 +407,7 @@ fn available_body(config: &Rc<RefCell<Config>>, ui: PluginUi) -> Element {
                 .padding_xy(16, 0)
                 .child(
                     Element::label("（没有匹配的插件）")
-                        .font_size(FONT_MD)
+                        .font_size(SIZE_BODY)
                         .fg(to_color(TEXT_SECONDARY)),
                 )
                 .visible_when(move || {
@@ -422,7 +422,7 @@ fn available_body(config: &Rc<RefCell<Config>>, ui: PluginUi) -> Element {
                 .padding_xy(16, 0)
                 .child(
                     Element::label("（没有可下载插件）")
-                        .font_size(FONT_MD)
+                        .font_size(SIZE_BODY)
                         .fg(to_color(TEXT_SECONDARY)),
                 )
                 .visible_when(move || ui.available.get().is_empty()),
@@ -463,7 +463,7 @@ fn info_btn() -> Element {
 /// 矮 4 px（2026-11-05 用户报障）。图标在框里居中（windui 按钮居中画）。
 fn gear_btn() -> Element {
     btn("\u{E713}")
-        .font_family("Segoe MDL2 Assets")
+        .font_family(FAMILY_ICON)
         .width(ICON_BTN_W)
         .height(ICON_BTN_H)
 }
@@ -766,7 +766,7 @@ fn available_row(entry: AvailablePlugin, ui: PluginUi) -> Element {
         .padding_xy(16, 0)
         .child(
             Element::label(entry.name.clone())
-                .font_size(FONT_MD)
+                .font_size(SIZE_BODY)
                 .weight(1.0)
                 .max_lines(1)
                 .truncate(Truncate::End),
@@ -818,7 +818,7 @@ fn row_shell(name: &str, version: &str, info: Element, control: Element) -> Elem
         .padding_xy(16, 0)
         .child(
             Element::label(name)
-                .font_size(FONT_MD)
+                .font_size(SIZE_BODY)
                 .weight(1.0)
                 .max_lines(1)
                 .truncate(Truncate::End),
@@ -1016,7 +1016,7 @@ mod tests {
     /// （14×14）、「!」是正文字形（5×18）——不钉死就长成 46×32 vs 37×36。
     ///
     /// 这里用**真实 DirectWrite** 量：①「!」的自然盒子必须等于钉死的 `ICON_BTN_W/H`
-    /// （FONT_MD 或界面字体变了就红，提示重订）；②两颗按钮排出来的实际盒子必须一致。
+    /// （SIZE_BODY 或界面字体变了就红，提示重订）；②两颗按钮排出来的实际盒子必须一致。
     #[test]
     fn info_row_icon_buttons_share_one_box() {
         use tiny_skia::Pixmap;
@@ -1031,13 +1031,13 @@ mod tests {
             let mut eng = DWriteEngine::new();
             eng.set_scale(1.0);
             let mut cx = SkiaCanvas::with_text(&mut pm, &mut eng, 1.0);
-            let s = cx.measure_text("!", &TextStyle::new(FONT_MD));
+            let s = cx.measure_text("!", &TextStyle::new(SIZE_BODY));
             (s.w, s.h)
         };
         assert_eq!(
             (bw + 32, bh + 18),
             (ICON_BTN_W, ICON_BTN_H),
-            "「!」的自然盒子变了（{bw}×{bh}）：FONT_MD 或界面字体改了，ICON_BTN_W/H 要跟着重订"
+            "「!」的自然盒子变了（{bw}×{bh}）：SIZE_BODY 或界面字体改了，ICON_BTN_W/H 要跟着重订"
         );
 
         // ② 两颗按钮排一次，比实际盒子。

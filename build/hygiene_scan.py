@@ -115,9 +115,18 @@ r"""
    = 幽灵条目（cargo 编译也会红，静态提前报，与 patch_parity 同风格）。解析不出 M4 用例、
    条目集为空、磁盘目录为空一律报「本查失明」——静默通过比报错更危险。
 
+十六查 `literal_font`（2026-11-14，用户口径「看图窗口所有字体字号全部统一」）：
+`main/src/ui/**/*.rs` 里不许出现字面字体 / 字号 / 字重，唯一例外是 `ui/tokens.rs`
+（定义处）。命中 `.font_size(13` / `TextStyle::new(12` / `font_family("…")` /
+`font_weight(600)` 都算。起因是同一个界面里各模块各抄一个数：标题栏 13、状态 13、
+浮条提示 12、缩略图序号 10、文件树 12、面板小节 11/12——用户看到的是「字体不一样」。
+字体族、字号、字重收进 `ui/tokens.rs` 后，本查把“新元素直接调参数”钉成硬门禁；
+例外（图标字形、展示性大标题）必须先在 `docs/排版规范.md` 登记再起名。
+
 分类计数：违规按 `abs_path` / `debug_macro` / `marker` / `boundary_doc` / `panic_source` /
 `config_last_mile` / `patch_parity` / `control_char` / `ps1_ascii` / `literal_color` /
-`ui_super_path` / `secret` / `single_window_key` / `footer_buttons` / `settings_include` 十五档分别报数（见 [`CATEGORIES`]）。**判定门限仍是「总数 = 0」**——分类只为趋势可见（哪一类在动），
+`ui_super_path` / `secret` / `single_window_key` / `footer_buttons` / `settings_include` /
+`literal_font` 十六档分别报数（见 [`CATEGORIES`]）。**判定门限仍是「总数 = 0」**——分类只为趋势可见（哪一类在动），
 不引入基线冻结；RuPix 违规历史 = 0，加基线等于给满分项目开小抄通道。
 退出码：0 = 「违规 0 处」；1 = 有违规。
 
@@ -150,6 +159,13 @@ MARKER = re.compile(r"\b(?:TODO|FIXME|XXX)\s*[:(]")
 # 第 10 查：ui 层的**字面色值**。命中形如 `Color::rgb(` / `Color::rgba(` 的直接构造，
 # 放行 `to_color(OVERLAY_X)` 这类令牌引用（它们不带 `Color::` 前缀）。
 LITERAL_COLOR = re.compile(r"Color::(?:rgba|rgb)\s*\(")
+# 第 16 查：ui 层的**字面字体 / 字号 / 字重**。命中 `.font_size(13` / `TextStyle::new(12` /
+# `font_family("…")` / `font_weight(600)`；放行 `tokens::SIZE_BODY` 这类令牌引用。
+# 字体与字号只有一个来源（`ui/tokens.rs`），否则“统一”就只是自觉。
+LITERAL_FONT = re.compile(
+    r"(?:\.font_size\s*\(\s*\d|TextStyle::new\s*\(\s*\d|\.font_weight\s*\(\s*\d"
+    r"|font_family\s*\(\s*(?:Some\s*\(\s*)?\"|family:\s*Some\s*\(\s*\")"
+)
 # 第 11 查：ui 层内跨模块引用。平铺模块之间直接写 `crate::ui::<兄弟>::` 会让依赖长成网，
 # 一律经父模块（`use super::{Chrome, Hub}` / `super::<模块>::名字`）——中枢在 src/ui/mod.rs。
 UI_SIBLING_PATH = re.compile(r"crate::ui::")
@@ -236,7 +252,8 @@ CFG_FIELD = re.compile(r"\bcfg\.([a-z_][a-z0-9_]*)")
 # 与上面"九查"顺序一一对应；新增分类请**尾追**（头插会打乱旧日志三段布局）。
 CATEGORIES = ("abs_path", "debug_macro", "marker", "boundary_doc", "panic_source", "config_last_mile",
               "patch_parity", "control_char", "ps1_ascii", "literal_color",
-              "ui_super_path", "secret", "single_window_key", "footer_buttons", "settings_include")
+              "ui_super_path", "secret", "single_window_key", "footer_buttons", "settings_include",
+              "literal_font")
 
 
 def is_comment(line: str) -> bool:
@@ -508,6 +525,40 @@ def detect_non_ascii_ps1(root_dir):
             )
     if scanned == 0:
         return ["ps1_ascii: 域内一个 .ps1 都没扫到（目录形状变了，本查失明）"]
+    return bad
+
+
+def detect_literal_fonts(src_dir):
+    """第 16 查：`src/ui/**/*.rs` 不许写字面字体/字号/字重，唯一例外是 `ui/tokens.rs`。
+
+    2026-11-14 用户口径：「看图窗口所有字体字号全部统一；小标题可以加粗，特殊用途
+    可以更大，但必须记录；口子不能随便开。」——字体只是一个反复踩到的表面，
+    根因是每个新元素都自己抄一个数。把取值收进 [`tokens`] 后，本查把“不许再抄”
+    钉成硬门禁；例外必须先在 `docs/排版规范.md` 登记，再在 tokens.rs 起名。
+    """
+    bad, scanned = [], 0
+    for p in sorted((src_dir / "ui").rglob("*.rs")):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(src_dir.parent).as_posix()
+        if rel.endswith("ui/tokens.rs"):
+            continue  # 令牌文件自身就是字体/字号/字重的定义处
+        scanned += 1
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+        in_test = bool(TEST_ONLY.search(rel))
+        for i, line in enumerate(lines, 1):
+            if CFG_TEST.match(line):
+                in_test = True
+            if in_test or is_comment(line):
+                continue
+            if LITERAL_FONT.search(line):
+                bad.append(
+                    f"literal_font: {rel}:{i} ui 层出现字面字体/字号/字重 -- {line.strip()[:80]}"
+                    "（一律用 ui/tokens.rs 的 FAMILY_UI / SIZE_BODY / SIZE_ICON /"
+                    " WEIGHT_EMPHASIS；确有新档位先登记 docs/排版规范.md 再起名）"
+                )
+    if scanned == 0:
+        return ["literal_font: 域内一个 ui/*.rs 都没扫到（目录形状变了，本查失明）"]
     return bad
 
 
@@ -923,6 +974,30 @@ def selftest() -> int:
         "literal_color 不该误报令牌引用（改色只改一处正是靠这层间接）",
     )
 
+    # literal_font（第十六查：ui 层字体/字号/字重单一来源）
+    expect(LITERAL_FONT.search(".font_size(13.0)") is not None, "literal_font 应命中字面字号")
+    expect(
+        LITERAL_FONT.search("let ts = TextStyle::new(10.0);") is not None,
+        "literal_font 应命中 TextStyle::new(字面值)",
+    )
+    expect(
+        LITERAL_FONT.search('.font_family("Segoe MDL2 Assets")') is not None,
+        "literal_font 应命中字面字体族",
+    )
+    expect(
+        LITERAL_FONT.search('.font_family(Some("Microsoft YaHei"))') is not None,
+        "literal_font 应命中 Some(字面字体族)",
+    )
+    expect(LITERAL_FONT.search(".font_weight(600)") is not None, "literal_font 应命中字面字重")
+    expect(
+        LITERAL_FONT.search(".font_size(SIZE_BODY)") is None,
+        "literal_font 不该误报令牌引用（改字号只改一处正是靠这层间接）",
+    )
+    expect(
+        LITERAL_FONT.search("TextStyle::new(super::tokens::SIZE_ICON)") is None,
+        "literal_font 不该误报 TextStyle 的令牌引用",
+    )
+
     # debug_macro
     expect(DEBUG_MACRO.search('println!("x");') is not None, "debug_macro 应命中 println!")
     expect(DEBUG_MACRO.search("// println! 是调试宏") is None or True, "注释行由上层 comment 判定豁免，不测这里")
@@ -1211,6 +1286,10 @@ def main():
     # settings_include：M4 清单 = 磁盘 settings/*.rs 全集（见模块头十五查与 detect_settings_include）。
     for msg in detect_settings_include(SRC):
         violations.append(("settings_include", msg))
+
+    # literal_font：ui 层字体/字号/字重单一来源（见模块头十六查与 detect_literal_fonts）。
+    for msg in detect_literal_fonts(SRC):
+        violations.append(("literal_font", msg))
 
     by_cat = {c: 0 for c in CATEGORIES}
     for cat, _ in violations:

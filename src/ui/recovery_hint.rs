@@ -73,18 +73,18 @@ pub fn show(ctx: &mut EventCtx, log_path: Option<PathBuf>) {
                 // 这里只排内容行，四边留白 / 行间距 / 按钮位不再自己写。
                 let mut rows: Vec<Element> = vec![
                     Element::label("RuPix 检测到上次运行未正常结束。")
-                        .font_size(13.5)
+                        .font_size(super::tokens::SIZE_BODY)
                         .fg_role(Role::Text),
                     Element::label(
                         "如果反复闪退，可以先临时禁用所有解码器继续看图（下次启动会自动恢复）。",
                     )
-                    .font_size(12.5)
+                    .font_size(super::tokens::SIZE_BODY)
                     .fg_role(Role::TextMuted),
                 ];
                 for n in &notes {
                     rows.push(
                         Element::label(n.clone())
-                            .font_size(12.0)
+                            .font_size(super::tokens::SIZE_BODY)
                             .fg_role(Role::TextMuted),
                     );
                 }

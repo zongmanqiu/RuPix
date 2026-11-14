@@ -162,13 +162,13 @@ fn card_element(card: PluginCard, chrome: Rc<chrome::Chrome>, colors: PanelColor
         .on_click(toggle)
         .child(
             Element::label(if card.expanded { "▾" } else { "▸" })
-                .font_size(12.0)
+                .font_size(super::super::tokens::SIZE_BODY)
                 .fg(colors.text),
         )
         .child(
             Element::label(card.title)
-                .font_size(13.0)
-                .font_weight(600)
+                .font_size(super::super::tokens::SIZE_BODY)
+                .font_weight(super::super::tokens::WEIGHT_EMPHASIS)
                 .fg(colors.text)
                 .max_lines(1)
                 .truncate(Truncate::End),
@@ -184,7 +184,7 @@ fn card_element(card: PluginCard, chrome: Rc<chrome::Chrome>, colors: PanelColor
         .child(
             Element::icon_button("✕")
                 .size(22, 22)
-                .font_size(11.0)
+                .font_size(super::super::tokens::SIZE_BODY)
                 .fg(colors.muted)
                 .tooltip("关闭插件输出")
                 .on_click(close),
@@ -202,20 +202,60 @@ fn card_element(card: PluginCard, chrome: Rc<chrome::Chrome>, colors: PanelColor
         for block in card.blocks {
             body = body.child(block_element(block, table_label_w, colors));
         }
-        let copy = move || {
-            let text = summary_text(&card_for_copy);
-            vec![MenuItem::run(
-                "复制全部文本",
-                move |ctx: &mut EventCtx| match crate::platform::clipboard::copy_text(&text) {
-                    Ok(()) => ctx.toast_ok("已复制到剪贴板"),
-                    Err(e) => ctx.toast_err(format!("复制失败：{e}")),
-                },
-                false,
-            )]
-        };
-        body.on_context_menu(copy)
+        body
     } else {
         Element::col().width_match()
+    };
+
+    // 整卡的右键菜单：图片复制与全文复制都在这里，右键落在标题、空白或图片上都找得到。
+    // 值文本自带富文本的「复制」菜单，会先吃掉自己的那一击；这里兜住其余区域。
+    #[allow(clippy::type_complexity)]
+    let images: Vec<(Option<String>, u32, u32, Arc<Vec<u8>>)> = card_for_copy
+        .blocks
+        .iter()
+        .filter_map(|b| match b {
+            PluginBlock::Image {
+                title,
+                width,
+                height,
+                rgba,
+            } => Some((title.clone(), *width, *height, rgba.clone())),
+            _ => None,
+        })
+        .collect();
+    let copy = move || {
+        let mut items = Vec::with_capacity(images.len() + 1);
+        let many = images.len() > 1;
+        for (i, (title, width, height, rgba)) in images.iter().enumerate() {
+            let label = if many {
+                format!(
+                    "复制图片：{}",
+                    title.clone().unwrap_or_else(|| format!("输出 {}", i + 1))
+                )
+            } else {
+                "复制图片".to_string()
+            };
+            let (w, h, px) = (*width, *height, rgba.clone());
+            items.push(MenuItem::run(
+                label,
+                move |ctx: &mut EventCtx| match crate::platform::clipboard::copy_png(w, h, &px[..])
+                {
+                    Ok(()) => ctx.toast_ok("图片已复制到剪贴板"),
+                    Err(e) => ctx.toast_err(format!("复制图片失败：{e}")),
+                },
+                false,
+            ));
+        }
+        let text = summary_text(&card_for_copy);
+        items.push(MenuItem::run(
+            "复制全部文本",
+            move |ctx: &mut EventCtx| match crate::platform::clipboard::copy_text(&text) {
+                Ok(()) => ctx.toast_ok("已复制到剪贴板"),
+                Err(e) => ctx.toast_err(format!("复制失败：{e}")),
+            },
+            false,
+        ));
+        items
     };
 
     Element::col()
@@ -227,22 +267,7 @@ fn card_element(card: PluginCard, chrome: Rc<chrome::Chrome>, colors: PanelColor
         .spacing(6)
         .child(head)
         .child(body)
-}
-
-/// 文本块高度估算：面板宽不定，按每行约 48 个半角单位折行，钳在 60–320 px。
-///
-/// 估多了只是底部留白；估少了是文本输入框内部滚动——两者都比在面板里
-/// 直接铺一条三千像素的长条好。
-fn text_block_height(text: &str) -> i32 {
-    let mut lines = 0i32;
-    for line in text.lines() {
-        let width: i32 = line
-            .chars()
-            .map(|c| if (c as u32) >= 0x2E80 { 2 } else { 1 })
-            .sum();
-        lines += (width / 48).max(1);
-    }
-    (lines * 17 + 10).clamp(60, 320)
+        .on_context_menu(copy)
 }
 
 fn block_element(block: PluginBlock, table_label_w: i32, colors: PanelColors) -> Element {
@@ -252,20 +277,9 @@ fn block_element(block: PluginBlock, table_label_w: i32, colors: PanelColors) ->
             if let Some(t) = title {
                 col = col.child(block_title(t, colors));
             }
-            // 只读多行输入框：鼠标拖选 / Ctrl+A / Ctrl+C / 右键「复制」都能用。
-            let h = text_block_height(&text);
-            let sig = signal(text);
-            col.child(
-                Element::text_input(sig, "")
-                    .multiline()
-                    .wrap(true)
-                    .read_only()
-                    .frameless_input()
-                    .font_size(12.0)
-                    .fg(colors.text)
-                    .width_match()
-                    .height(h),
-            )
+            // 富文本：拖选 / 双击选词 / Ctrl+A / Ctrl+C / 右键「复制」都能用；
+            // 高度随内容，不再用一个会内部滚动的定高输入框。
+            col.child(super::value_text(&text, colors.text))
         }
         PluginBlock::Table { title, rows } => {
             let mut col = Element::col().width_match().spacing(2);
@@ -316,8 +330,8 @@ fn block_element(block: PluginBlock, table_label_w: i32, colors: PanelColors) ->
 
 fn block_title(text: String, colors: PanelColors) -> Element {
     Element::label(text)
-        .font_size(12.0)
-        .font_weight(600)
+        .font_size(super::super::tokens::SIZE_BODY)
+        .font_weight(super::super::tokens::WEIGHT_EMPHASIS)
         .fg(colors.text)
         .max_lines(2)
 }
@@ -350,8 +364,7 @@ fn table_row(label: String, value: String, label_w: i32, colors: PanelColors) ->
         .child(
             Element::label(label)
                 .width(label_w)
-                .font_size(13.0)
-                .font_family(super::PANEL_FONT)
+                .font_size(super::super::tokens::SIZE_BODY)
                 // 行头与值同色同字号：浅灰行头在浅背景上会因对比度显得更小，
                 // 放大后像“两列字不一样高”（2026-11-14 用户反馈）。列位本身已能区分。
                 .fg(colors.text),
@@ -364,14 +377,8 @@ fn table_row(label: String, value: String, label_w: i32, colors: PanelColors) ->
                 .weight(1.0)
                 // 字号放容器上：label 直接挂 font_size 在 weight/width_match 路径会被
                 // 父级样式盖掉（2026-11-14 真机复现，22 px 实测不生效）。
-                .font_size(13.0)
-                .child(
-                    Element::label(value)
-                        .width_match()
-                        .font_size(13.0)
-                        .font_family(super::PANEL_FONT)
-                        .fg(colors.text),
-                ),
+                .font_size(super::super::tokens::SIZE_BODY)
+                .child(super::value_text(&value, colors.text)),
         )
 }
 

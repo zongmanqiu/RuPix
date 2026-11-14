@@ -131,9 +131,7 @@ fn wipe_width(step: u32) -> f32 {
     (step.min(SLIDE_STEPS) as f32 / SLIDE_STEPS as f32) * (ARROW_R * 2.0)
 }
 
-/// 工具栏图标的字体。Win10/11 系统自带的图标字形字体（PUA 码位），
-/// 与菠萝看图的工具栏一样用"纯图标 + 悬停提示"的极简形式。
-pub const ICON_FONT: &str = "Segoe MDL2 Assets";
+// 工具栏图标的字体令牌在 `tokens::FAMILY_ICON`（全 ui 层唯一来源）。
 
 /// 工具栏上的一个按钮。
 ///
@@ -228,6 +226,9 @@ impl TitleBtn {
     /// 按钮字形。`maximized` 只影响最大化钮：非最大化画方框（ChromeMaximize），
     /// 最大化时画还原图标（ChromeRestore）——用户靠字形切换才能一眼读出窗口状态
     /// （windui `WindowState` 文档点名的用法）。
+    ///
+    /// ★ 2026-11-14 字体统一：锁钮从 emoji 码位（U+1F512/1F513，要另引
+    ///   Segoe UI Symbol）改成 MDL2 自带的 Lock / Unlock——图标字体只留一枚。
     fn glyph(self, locked: bool, maximized: bool) -> &'static str {
         match self {
             TitleBtn::Minimize => "\u{E921}",              // ChromeMinimize
@@ -235,18 +236,8 @@ impl TitleBtn {
             TitleBtn::Maximize => "\u{E922}",              // ChromeMaximize
             TitleBtn::Close => "\u{E8BB}",                 // ChromeClose
             TitleBtn::Topmost => "\u{1F4CC}", // 📌 状态用颜色表达（paint 读 topmost_on）
-            TitleBtn::Lock if locked => "\u{1F512}", // 🔒
-            TitleBtn::Lock => "\u{1F513}",    // 🔓
-        }
-    }
-
-    /// 标题按钮字形所在字体：emoji 区码位 MDL2 没有，锁住走 Segoe UI Symbol
-    /// （CurSeen 已验证该字体下字形单色、不回退彩色 emoji）。置顶钮不走字形
-    /// ——图钉是图元手绘（见 [`crate::ui::pin::render_pins`]），无需字体。
-    fn font_family(self) -> Option<&'static str> {
-        match self {
-            TitleBtn::Lock => Some("Segoe UI Symbol"),
-            _ => None,
+            TitleBtn::Lock if locked => "\u{E72E}", // Lock
+            TitleBtn::Lock => "\u{E785}",     // Unlock
         }
     }
 }
@@ -1732,11 +1723,11 @@ pub fn paint(
     // 视口**相对**坐标 → 画布坐标。下面所有几何（title_btn_rect / btn_rect /
     // arrow_center / pill / above）都是相对视口原点的，这里统一搬一次。
     let local = |x: f32, y: f32, w: f32, h: f32| to_canvas(view, (x, y, w, h));
-    let small = TextStyle::new(12.0);
+    let small = TextStyle::new(super::tokens::SIZE_BODY);
     // 图标字形：指定图标字体族，PUA 码位才会落在这个字体里（默认字体是方块）。
     let icon_ts = TextStyle {
-        family: Some(ICON_FONT),
-        ..TextStyle::new(17.0)
+        family: Some(super::tokens::FAMILY_ICON),
+        ..TextStyle::new(super::tokens::SIZE_ICON)
     };
     // 计算各元素是否显示
     // m269/m271：无边框形态把**所有** chrome 都收掉——顶条、底部浮条（按钮与信息一起）、
@@ -1764,7 +1755,7 @@ pub fn paint(
     // **档位**只看视口宽（[`info_place`]，按满格判），**格宽**跟着这一帧的文本伸缩
     // （用户 2026-10-18 复看：定宽在信息右侧留下一大片空白）。两者分开，纵向就不会跳。
     // 量宽与绘制用**同一份 style**（旧写法量 12 号、画 13 号，胶囊比字窄一圈）。
-    let info_ts = TextStyle::new(13.0);
+    let info_ts = TextStyle::new(super::tokens::SIZE_BODY);
     let buttons = toolbar_buttons(); // m245：隐藏后信息独占浮条并水平居中
     let place = info_place(vw, buttons);
     // 标题右侧让给画布上的窗口按钮：每颗 40 + 8 呼吸。满组 5 颗 ⇒ 208。
@@ -1808,7 +1799,7 @@ pub fn paint(
     if show_title {
         // 标题栏背景
         canvas.fill_rect(vx, vy, vw, STRIP_H as f32, &Paint::fill(tk::pill_bg()));
-        let title_ts = TextStyle::new(13.0);
+        let title_ts = TextStyle::new(super::tokens::SIZE_BODY);
         // 标题文本：左对齐，右侧让出画布上的五颗窗口按钮。**必须截断**：直绘的
         // `draw_text` 不截断，长文件名会折行画到图片上，第二行压在画面中央
         // （`clip_text` 的注释里记着取证）。状态已经搬进浮条，这里不再为它让宽。
@@ -1877,15 +1868,14 @@ pub fn paint(
                 }
                 continue;
             }
-            let family = tb.font_family().unwrap_or(ICON_FONT);
             canvas.draw_text(
                 tb.glyph(locked, maximized_on),
                 Rect::new(tx as i32, ty as i32, tw as i32, th as i32),
                 fg,
                 Align::Center,
                 &TextStyle {
-                    family: Some(family),
-                    ..TextStyle::new(14.0)
+                    family: Some(super::tokens::FAMILY_ICON),
+                    ..TextStyle::new(super::tokens::SIZE_ICON)
                 },
             );
         }
@@ -1947,7 +1937,7 @@ pub fn paint(
             }
         }
         // 字形**永远最后画** ⇒ 进度层遮不到箭头（用户特别点了这一条）。
-        let ts = TextStyle::new(22.0);
+        let ts = TextStyle::new(super::tokens::SIZE_DISPLAY);
         canvas.draw_text(
             glyph,
             Rect::new((x) as i32, (y) as i32, w as i32, h as i32),
@@ -2288,7 +2278,7 @@ mod tests {
         let mut eng = DWriteEngine::new();
         eng.set_scale(1.0);
         let mut cx = SkiaCanvas::with_text(&mut pm, &mut eng, 1.0);
-        let ts = TextStyle::new(13.0);
+        let ts = TextStyle::new(super::super::tokens::SIZE_BODY);
         for worst in [
             "1234/1234 · 100% (1234/1234)",
             "1234/1234 · 4000×3000 · 载入中…",
@@ -2720,8 +2710,8 @@ mod tests {
         }
     }
 
-    /// 字形与字体：锁字形随锁定态切换、走 Segoe UI Symbol；最大化字形随
-    /// 窗口状态在方框/还原间切换；置顶不走字形
+    /// 字形与字体：所有标题钮都走同一枚图标字体（MDL2）；锁字形随锁定态切换，
+    /// 最大化字形随窗口状态在方框/还原间切换；置顶不走字形
     /// （📌 字形离屏 GDI 预渲染成位图，姿态 + 颜色即状态，见 `ui::pin`）。
     #[test]
     fn title_button_glyphs_and_fonts_reflect_state() {
@@ -2729,8 +2719,8 @@ mod tests {
             assert!(!tb.glyph(false, false).is_empty(), "{tb:?} 缺未锁字形");
             assert!(!tb.glyph(true, true).is_empty(), "{tb:?} 缺锁定字形");
         }
-        assert_eq!(TitleBtn::Lock.glyph(false, false), "\u{1F513}"); // 🔓
-        assert_eq!(TitleBtn::Lock.glyph(true, false), "\u{1F512}"); // 🔒
+        assert_eq!(TitleBtn::Lock.glyph(false, false), "\u{E785}"); // Unlock
+        assert_eq!(TitleBtn::Lock.glyph(true, false), "\u{E72E}"); // Lock
         assert_eq!(
             TitleBtn::Topmost.glyph(false, false),
             TitleBtn::Topmost.glyph(true, true)
@@ -2738,19 +2728,9 @@ mod tests {
         // 最大化钮：常规=方框，最大化=还原图标（两态必须真的不同）。
         assert_eq!(TitleBtn::Maximize.glyph(false, false), "\u{E922}");
         assert_eq!(TitleBtn::Maximize.glyph(false, true), "\u{E923}");
-        assert_eq!(
-            TitleBtn::Lock.font_family(),
-            Some("Segoe UI Symbol"),
-            "Lock 应走 Symbol 字体"
-        );
-        for tb in [
-            TitleBtn::Topmost,
-            TitleBtn::Minimize,
-            TitleBtn::Maximize,
-            TitleBtn::Close,
-        ] {
-            assert_eq!(tb.font_family(), None, "{tb:?} 不走 Symbol 字体");
-        }
+        // 字体统一：所有标题钮字形都走同一枚图标字体（MDL2），锁钮不再另引 Symbol。
+        assert_eq!(TitleBtn::Lock.glyph(false, false), "\u{E785}");
+        assert_eq!(TitleBtn::Lock.glyph(true, false), "\u{E72E}");
     }
 
     /// 锁定禁用矩阵（移植 CurSeen `lock_disables_everything_but_add_and_lock`）：
@@ -3485,7 +3465,7 @@ mod tests {
     fn the_text_memo_returns_the_same_string_as_recomputing() {
         let chrome = Chrome::new(false);
         let mut spy = MeasureCount::new();
-        let ts = TextStyle::new(13.0);
+        let ts = TextStyle::new(super::super::tokens::SIZE_BODY);
         let long = "1234567890".repeat(12);
         let direct = clip_text(&mut spy, &long, &ts, 90.0);
         let a = chrome.clip(&mut spy, &long, &ts, 90.0);
@@ -3508,7 +3488,7 @@ mod tests {
     fn the_text_memo_key_includes_dpi() {
         let chrome = Chrome::new(false);
         let mut one = MeasureCount::new();
-        let ts = TextStyle::new(13.0);
+        let ts = TextStyle::new(super::super::tokens::SIZE_BODY);
         let text = "3/9 · 100%";
         let w1 = chrome.measure_w(&mut one, text, &ts);
         // 同一 DPI：第二次必须走账（一次都不排）。

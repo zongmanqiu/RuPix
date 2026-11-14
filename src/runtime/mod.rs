@@ -985,14 +985,11 @@ impl WinRt {
         crate::platform::spacehook::set_enabled(config.borrow().space_preview);
         crate::platform::spacehook::set_hold_close(config.borrow().space_hold_close);
         // 信息面板的卡片跟随当前图：图片切换 / 解码完成时重算并刷新。
-        // ★ 门控：面板不可见、或属性/技术卡都没开时连 stat 都不做。
+        // ★ 门控：面板不可见、或「图片信息」卡没开时连 stat 都不做。
         let info = &self.chrome.info;
         let visible = info.panel_visible();
-        let wanted = visible && (info.props_active.get() || info.tech_active.get());
+        let wanted = visible && info.info_active.get();
         crate::ui::info_panel::properties::refresh_metadata_if(&self.viewer, wanted);
-        // 直方图只读像素、不读盘：单独门控，收起卡片时连抽样都不做。
-        let hist_wanted = visible && info.hist_active.get() && info.hist_expanded.get();
-        crate::ui::info_panel::properties::refresh_histogram_if(&self.viewer, hist_wanted);
     }
 
     /// 本窗主图翻页的步长。
@@ -1607,6 +1604,13 @@ pub fn run(initial: Option<PathBuf>) {
     // 所以不能等用户勾上「关闭到托盘」才装。
     let mut app = App::resident(TITLE)
         .icon(crate::ui::brand::app_icon())
+        // 字体统一（2026-11-14 用户口径）：框架自绘的菜单 / tooltip / toast 与
+        // 所有没显式设 family 的文本都走同一枚界面字体。字号不在这里（windui 的
+        // 默认 14 只影响我们没设 size 的元素；应用内元素一律显式用 `tokens::SIZE_BODY`）。
+        .theme(windui::theme::Theme {
+            font_family: Some(crate::ui::tokens::FAMILY_UI.to_string()),
+            ..Default::default()
+        })
         .tray(crate::ui::tray::build(
             to_tray,
             config.clone(),

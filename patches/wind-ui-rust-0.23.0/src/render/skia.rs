@@ -314,7 +314,6 @@ impl<'a> SkiaCanvas<'a> {
     // 用 chunks_exact_mut 而非 as_chunks_mut：后者要 Rust 1.88，而本 crate 已发布到
     // crates.io 且未声明 rust-version，换过去会让老工具链的下游直接编译失败。两者
     // 生成的代码等价。
-    #[allow(clippy::chunks_exact_to_as_chunks)]
     #[allow(clippy::too_many_arguments)]
     fn fast_fill_rect(
         &mut self,

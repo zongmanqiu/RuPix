@@ -17,7 +17,7 @@ use windui::core::EventCtx;
 use windui::prelude::*;
 
 use super::dialog_footer::{action, shell};
-use super::tokens::{to_color, BG, FONT_MD, TEXT};
+use super::tokens::{to_color, BG, SIZE_BODY, TEXT};
 use crate::core::update::{self, Plan};
 
 /// 窗宽 / 窗高（逻辑像素），与 CurSeen 说明窗同尺寸。
@@ -54,7 +54,7 @@ pub fn open(ctx: &mut EventCtx, plan: &Plan) {
 /// 窗内容：标题行 + 文本区 + 底栏。工厂形态（`Window::content` 会被重复调用）。
 fn content(latest: &str, notes: &str, plan: Plan) -> Element {
     let title = Element::label(format!("发现新版本 {latest}"))
-        .font_size(FONT_MD)
+        .font_size(SIZE_BODY)
         .fg(to_color(TEXT));
 
     let body = Element::text_input(signal(notes.to_string()), "")
@@ -64,7 +64,7 @@ fn content(latest: &str, notes: &str, plan: Plan) -> Element {
         .frameless_input()
         // 视图起点钉在 0：否则光标（默认在末尾）会把可视区滚到最后几行。
         .select_range(0, 0)
-        .font_size(FONT_MD)
+        .font_size(SIZE_BODY)
         .padding_xy(PAD_X, 6)
         .weight(1.0)
         .width_match();

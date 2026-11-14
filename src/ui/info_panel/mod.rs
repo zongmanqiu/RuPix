@@ -15,12 +15,13 @@ use std::rc::Rc;
 
 use windui::core::{EventCtx, Widget};
 use windui::event::CursorShape;
-use windui::geometry::{Rect, Size};
+use windui::geometry::{Color, Rect, Size};
 use windui::prelude::*;
-use windui::render::{Canvas, Paint};
+use windui::render::Canvas;
 use windui::signal::{signal, Signal};
 use windui::style::Style;
-use windui::text::{TextEngine, TextStyle};
+use windui::text::TextEngine;
+use windui::ui::rich::{Para, RichDoc, SpanStyle};
 use windui::ui::split::{SplitHandle, SplitOpts};
 
 use self::properties::MetaSignals;
@@ -28,7 +29,6 @@ use super::chrome;
 use super::singleton;
 use super::tokens::{self, PanelColors};
 use crate::core::config::{self, Config, INFO_PANEL_W_DEFAULT, INFO_PANEL_W_MAX, INFO_PANEL_W_MIN};
-use crate::core::pixels::Histogram;
 
 pub mod plugin_output;
 pub mod properties;
@@ -65,70 +65,63 @@ pub const HANDLE_W: i32 = 1;
 /// ★ 扩展只作用于命中（windui 补丁 030 的 `hit_pad`），不参与 `usable_w` 的换算。
 pub const HANDLE_HIT_PAD: i32 = 8;
 
-/// 属性卡 id（文件身份 + EXIF）。
-pub const CARD_PROPERTIES: &str = "properties";
-/// 技术信息卡 id（解码器 / 位深 / 像素格式 / ICC / 方向 / 显示状态）。
-pub const CARD_TECHNICAL: &str = "technical";
-/// 直方图卡 id（RGB + 亮度 + 裁切比例）。
-pub const CARD_HISTOGRAM: &str = "histogram";
+/// 「图片信息」卡 id：文件 / 图像 / 拍摄 / 技术四节合一（2026-11-14 合并属性与技术信息）。
+pub const CARD_INFO: &str = "info";
+/// 旧属性卡 id：仅用于配置兼容（读到即视为 `info`），不再写入。
+pub const CARD_PROPERTIES_LEGACY: &str = "properties";
+/// 旧技术信息卡 id：仅用于配置兼容。
+pub const CARD_TECHNICAL_LEGACY: &str = "technical";
 
 /// 信息面板里的一张卡。
 ///
-/// `ALL` 同时是**菜单顺序**与**持久化顺序**的唯一真源：加一张卡只改这里与
-/// `build_one` 的装配，不再到处抄一份字符串列表。
+/// ★ 2026-11-14 用户裁定：内置直方图退役——`levels`（色阶分析）插件给得更细。
+///   这里只留「图片信息」；`ALL` 仍是菜单顺序与持久化顺序的唯一真源。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Card {
-    Properties,
-    Technical,
-    Histogram,
+    Info,
 }
 
 impl Card {
-    pub const ALL: [Card; 3] = [Card::Properties, Card::Technical, Card::Histogram];
+    pub const ALL: [Card; 1] = [Card::Info];
 
     /// ini 里的卡片 id（`info_cards` / `info_cards_collapsed` 共用）。
     pub fn id(self) -> &'static str {
         match self {
-            Card::Properties => CARD_PROPERTIES,
-            Card::Technical => CARD_TECHNICAL,
-            Card::Histogram => CARD_HISTOGRAM,
+            Card::Info => CARD_INFO,
         }
     }
 
     /// 卡片标题与菜单项文案。
     pub fn label(self) -> &'static str {
+        "图片信息"
+    }
+
+    /// 这一条 `info_cards` 配置是否打开本卡。
+    ///
+    /// 兼容旧 `properties` / `technical`；旧 `histogram`（已退役）不在任何卡的
+    /// 匹配表里，读到时静默忽略。
+    pub fn matches_id(self, id: &str) -> bool {
         match self {
-            Card::Properties => "属性",
-            Card::Technical => "技术信息",
-            Card::Histogram => "直方图",
+            Card::Info => {
+                id == CARD_INFO || id == CARD_PROPERTIES_LEGACY || id == CARD_TECHNICAL_LEGACY
+            }
         }
     }
 
     /// 这张卡在不在面板里。
     pub fn active(self, info: &InfoPanel) -> Signal<bool> {
         match self {
-            Card::Properties => info.props_active,
-            Card::Technical => info.tech_active,
-            Card::Histogram => info.hist_active,
+            Card::Info => info.info_active,
         }
     }
 
     /// 这张卡展不展开。
     pub fn expanded(self, info: &InfoPanel) -> Signal<bool> {
         match self {
-            Card::Properties => info.props_expanded,
-            Card::Technical => info.tech_expanded,
-            Card::Histogram => info.hist_expanded,
+            Card::Info => info.info_expanded,
         }
     }
 }
-
-/// 面板正文统一字体族。
-///
-/// ★ 中文与数字必须是同一字体：不指定时数字走 Segoe UI、中文回退微软雅黑，
-///   两种字体的 ascent/descent 不同，同一个矩形内垂直居中后两列基线会差 1px；
-///   放大看就是“右边比左边低一点”（2026-11-14 用户截图实测）。
-pub const PANEL_FONT: &str = "Microsoft YaHei";
 
 /// 卡片标题行高：比设置页 `CARD_HEADER_H`（36）矮一档，面板本来就窄，
 /// "属性"两个字的标题条再占 36 + 上下 padding 会显得空。
@@ -172,16 +165,10 @@ pub struct InfoPanel {
     pub was_visible: Cell<bool>,
     /// 没有 `EventCtx` 的写点（菜单、快捷键、持久化）借它请求下一拍重排。
     pub layout_dirty: Cell<bool>,
-    /// 属性卡是否在面板里（对应 `info_cards`）。
-    pub props_active: Signal<bool>,
-    /// 属性卡是否展开（对应 `info_cards_collapsed` 的反面）。
-    pub props_expanded: Signal<bool>,
-    /// 技术信息卡是否在面板里。
-    pub tech_active: Signal<bool>,
-    pub tech_expanded: Signal<bool>,
-    /// 直方图卡是否在面板里。
-    pub hist_active: Signal<bool>,
-    pub hist_expanded: Signal<bool>,
+    /// 「图片信息」卡是否在面板里（对应 `info_cards`；兼容旧 `properties`/`technical`）。
+    pub info_active: Signal<bool>,
+    /// 「图片信息」卡是否展开（对应 `info_cards_collapsed` 的反面）。
+    pub info_expanded: Signal<bool>,
     /// 插件输出卡（会话级；换图清空，不落配置）。
     pub plugin_cards: Signal<Vec<plugin_output::PluginCard>>,
     /// 上一张图的路径：路径变化时清掉插件输出，避免上一张图的报告冒充当前图。
@@ -209,12 +196,8 @@ impl InfoPanel {
             last_ratio: Cell::new(0.72),
             was_visible: Cell::new(false),
             layout_dirty: Cell::new(false),
-            props_active: signal(false),
-            props_expanded: signal(true),
-            tech_active: signal(false),
-            tech_expanded: signal(true),
-            hist_active: signal(false),
-            hist_expanded: signal(true),
+            info_active: signal(false),
+            info_expanded: signal(true),
             plugin_cards: signal(Vec::new()),
             plugin_scope: RefCell::new(None),
         }
@@ -228,8 +211,11 @@ impl InfoPanel {
             .clamp(INFO_PANEL_W_MIN, INFO_PANEL_W_MAX) as i32;
         self.width.set(w);
         for card in Card::ALL {
-            let active = cfg.info_cards.iter().any(|id| id == card.id());
-            let collapsed = cfg.info_cards_collapsed.iter().any(|id| id == card.id());
+            let active = cfg.info_cards.iter().any(|id| card.matches_id(id));
+            let collapsed = cfg
+                .info_cards_collapsed
+                .iter()
+                .any(|id| card.matches_id(id));
             card.active(self).set(active);
             // 收起是"展开"的反面。★ 卡没开时 `expanded` 一律为假（不是"一律展开"）：
             // 没有卡，展开态没有对象；下次入口会把两者一起置真，加回来就是展开的。
@@ -388,17 +374,17 @@ impl InfoPanel {
 
     /// 面板里加入属性卡并展开（「属性」菜单项 / 快捷键的落点）。
     pub fn open_properties(&self) -> bool {
-        self.open_card(Card::Properties)
+        self.open_card(Card::Info)
     }
 
     /// 把属性卡从面板里拿掉。
     pub fn close_properties(&self) -> bool {
-        self.close_card(Card::Properties)
+        self.close_card(Card::Info)
     }
 
     /// 折叠 / 展开属性卡。
     pub fn toggle_properties(&self) -> bool {
-        self.toggle_card(Card::Properties)
+        self.toggle_card(Card::Info)
     }
 
     /// 把会话态写回配置（**不写盘**：交给 `config::mark_dirty` 的 5 秒防抖）。
@@ -594,14 +580,14 @@ pub fn build(
 
 /// 用一套配色建一扇窗的面板树。`build` 只负责建两份主题副本，布局全在这里。
 ///
-/// `colors` 是**唯一**取色入口：本函数（含 [`property_card`] / [`info_row`]）不读
+/// `colors` 是**唯一**取色入口：本函数（含 [`info_card`] / [`info_row`]）不读
 /// `tk::*()`，否则主题切换那一帧会有一半控件停在旧色上。
 ///
 /// 结构：`col[ 标题条(固定 STRIP_H) , scroll(weight 1)[ 空态提示 / 三张卡 ] ]`。
 /// 标题条是**面板自己的标题**，不承担窗口标题栏职责：窗口五颗钮仍在画布顶条，
 /// 面板头部只留「信息」和收起面板的 `<`。
 ///
-/// 三张卡共用同一套卡片外壳（[`card_shell`]）：属性 / 技术信息 / 直方图，
+/// 内置卡共用同一套卡片外壳（[`card_shell`]）：目前只有「图片信息」一张，
 /// 各自可折叠、可关闭、状态进 `info_cards`。
 pub fn build_one(
     chrome: &Rc<chrome::Chrome>,
@@ -628,7 +614,7 @@ pub fn build_one(
         .bg(colors.header)
         .child(
             Element::label("信息")
-                .font_size(13.0)
+                .font_size(super::tokens::SIZE_BODY)
                 .fg(colors.text)
                 .padding_xy(10, 0)
                 .weight(1.0)
@@ -636,20 +622,20 @@ pub fn build_one(
                 .truncate(Truncate::End),
         )
         .child(
-            // 收起用 MDL2 的 ChevronLeft（与主窗标题栏同一套图标字体 / 14px）。
+            // 收起用 MDL2 的 ChevronLeft（与主窗标题栏同一套图标字体 / 统一图标尺寸）。
             Element::icon_button("\u{E76B}")
                 .size(40, 40)
-                .font_family(chrome::ICON_FONT)
-                .font_size(14.0)
+                .font_family(super::tokens::FAMILY_ICON)
+                .font_size(super::tokens::SIZE_ICON)
                 .fg(colors.text)
                 .tooltip("收起信息面板")
                 .on_click(close_panel),
         );
 
-    // 没有卡片时的空态：只写一句提示，不占位。`props_active` 为假时才显示，
+    // 没有卡片时的空态：只写一句提示，不占位。`info_active` 为假时才显示，
     // 与卡片互斥——两者若同时可见，用户会以为卡片下面还挂着一张空卡。
-    let empty = Element::label("右键「属性」或「本图」添加输出")
-        .font_size(12.0)
+    let empty = Element::label("右键「本图 ▸ 图片信息」或插件输出")
+        .font_size(super::tokens::SIZE_BODY)
         .fg(colors.muted)
         .padding(12)
         .visible_when({
@@ -657,9 +643,7 @@ pub fn build_one(
             move || !chrome.info.any_active()
         });
     let plugin_cards = plugin_output::cards_element(chrome, colors);
-    let properties = property_card(chrome, config, sig, colors);
-    let technical = technical_card(chrome, config, sig, colors);
-    let histogram = histogram_card(chrome, config, sig, colors);
+    let info = info_card(chrome, config, sig, colors);
     // ★ `weight(1.0)` 而不是 `fill()`：`fill()` 在列里会把主轴也撑成“内容高”，
     //   面板就跟着卡片长高 / 缩矮；这里要的是**吃掉标题条剩下的高度**，_内部_再滚。
     let body = Element::scroll()
@@ -682,9 +666,7 @@ pub fn build_one(
                 .spacing(8)
                 .child(plugin_cards)
                 .child(empty)
-                .child(properties)
-                .child(technical)
-                .child(histogram),
+                .child(info),
         );
 
     Element::col()
@@ -725,8 +707,11 @@ fn copy_info_menu(
     }
 }
 
-/// 属性卡：文件身份 + 拍摄信息。
-fn property_card(
+/// 「图片信息」卡：文件 / 图像 / 拍摄 / 技术四节合一。
+///
+/// 2026-11-14 用户口径：图片**本来就有的信息**（文件属性、EXIF、解码器/格式/像素）
+/// 用原生入口，不再拆「属性」「技术信息」两张卡；需要额外分析的归插件。
+fn info_card(
     chrome: &Rc<chrome::Chrome>,
     config: &Rc<RefCell<Config>>,
     sig: &MetaSignals,
@@ -734,49 +719,94 @@ fn property_card(
 ) -> Element {
     let has_image = sig.has_image;
 
-    // 无图只留一句“没有打开图片”；有图时这行隐藏、属性行整块出现。
+    // 无图只留一句“没有打开图片”；有图时这行隐藏、四节整块出现。
     let no_image = Element::label("没有打开图片")
-        .font_size(13.0)
+        .font_size(super::tokens::SIZE_BODY)
         .fg(colors.muted)
         .visible_when(move || !has_image.get());
 
-    let rows = Element::col()
+    let section = |title: &'static str, rows: Element| {
+        Element::col()
+            .width_match()
+            .spacing(2)
+            .child(
+                Element::label(title)
+                    .font_size(super::tokens::SIZE_BODY)
+                    .font_weight(super::tokens::WEIGHT_EMPHASIS)
+                    .fg(colors.text)
+                    .padding_edges(Insets {
+                        top: 4,
+                        ..Default::default()
+                    }),
+            )
+            .child(rows)
+    };
+
+    let file_rows = Element::col()
         .width_match()
         .spacing(2)
-        .child(info_row("文件名", sig.filename, 2, colors))
-        .child(info_row("类型", sig.kind, 2, colors))
-        .child(info_row("位置", sig.location, 3, colors))
-        .child(info_row("大小", sig.size, 1, colors))
-        .child(info_row("修改时间", sig.mtime, 1, colors))
-        .child(info_row("图像尺寸", sig.dims, 1, colors))
-        .child({
-            let s = sig.anim;
-            info_row("动画", s, 2, colors).visible_when(move || !s.get().is_empty())
-        })
+        .child(info_row("文件名", sig.filename, colors))
+        .child(info_row("类型", sig.kind, colors))
+        .child(info_row("位置", sig.location, colors))
+        .child(info_row("大小", sig.size, colors))
+        .child(info_row("修改时间", sig.mtime, colors));
+
+    let shot_rows = Element::col()
+        .width_match()
+        .spacing(2)
         .child({
             let s = sig.capture_time;
-            info_row("拍摄时间", s, 1, colors).visible_when(move || !s.get().is_empty())
+            info_row("拍摄时间", s, colors).visible_when(move || !s.get().is_empty())
         })
         .child({
             let s = sig.camera;
-            info_row("相机", s, 2, colors).visible_when(move || !s.get().is_empty())
+            info_row("相机", s, colors).visible_when(move || !s.get().is_empty())
         })
         .child({
             let s = sig.lens;
-            info_row("镜头", s, 2, colors).visible_when(move || !s.get().is_empty())
+            info_row("镜头", s, colors).visible_when(move || !s.get().is_empty())
         })
         .child({
             let s = sig.exposure;
-            info_row("曝光", s, 2, colors).visible_when(move || !s.get().is_empty())
+            info_row("曝光", s, colors).visible_when(move || !s.get().is_empty())
         })
         .child({
             let s = sig.focal;
-            info_row("焦距", s, 1, colors).visible_when(move || !s.get().is_empty())
+            info_row("焦距", s, colors).visible_when(move || !s.get().is_empty())
         })
         .child({
             let s = sig.gps;
-            info_row("GPS", s, 2, colors).visible_when(move || !s.get().is_empty())
-        })
+            info_row("GPS", s, colors).visible_when(move || !s.get().is_empty())
+        });
+
+    let tech_rows = Element::col()
+        .width_match()
+        .spacing(2)
+        .child(info_row("解码器", sig.tech_decoder, colors))
+        .child(info_row("格式", sig.tech_format, colors))
+        .child(info_row("像素", sig.tech_pixels, colors))
+        .child(info_row("像素格式", sig.tech_color, colors))
+        .child(info_row("色彩配置", sig.tech_icc, colors))
+        .child(info_row("方向", sig.tech_orientation, colors))
+        .child(optional_row("显示", sig.tech_view, colors))
+        .child(optional_row("帧/页", sig.tech_frames, colors));
+
+    // 拍摄节：六个 EXIF 信号全空时整节（含标题）隐藏，不留一个空标题。
+    let shot_any = {
+        let s = sig.clone();
+        move || {
+            [s.capture_time, s.camera, s.lens, s.exposure, s.focal, s.gps]
+                .iter()
+                .any(|sig| !sig.get().is_empty())
+        }
+    };
+
+    let sections = Element::col()
+        .width_match()
+        .spacing(6)
+        .child(section("文件", file_rows))
+        .child(section("拍摄", shot_rows).visible_when(shot_any))
+        .child(section("技术", tech_rows))
         .visible_when(move || has_image.get());
 
     let body = Element::col()
@@ -786,58 +816,21 @@ fn property_card(
         .padding(8)
         .spacing(6)
         .child(no_image)
-        .child(rows)
+        .child(sections)
         .on_context_menu(copy_info_menu(
-            "属性",
+            "图片信息",
             vec![
                 ("文件名", sig.filename),
                 ("类型", sig.kind),
                 ("位置", sig.location),
                 ("大小", sig.size),
                 ("修改时间", sig.mtime),
-                ("图像尺寸", sig.dims),
-                ("动画", sig.anim),
                 ("拍摄时间", sig.capture_time),
                 ("相机", sig.camera),
                 ("镜头", sig.lens),
                 ("曝光", sig.exposure),
                 ("焦距", sig.focal),
                 ("GPS", sig.gps),
-            ],
-        ));
-
-    simple_card(Card::Properties, chrome, config, colors, body)
-}
-
-/// 技术信息卡：解码器 / 位深 / 像素格式 / ICC / 方向 / 当前显示状态。
-fn technical_card(
-    chrome: &Rc<chrome::Chrome>,
-    config: &Rc<RefCell<Config>>,
-    sig: &MetaSignals,
-    colors: PanelColors,
-) -> Element {
-    let frames = sig.tech_frames;
-    let rows = Element::col()
-        .width_match()
-        .spacing(2)
-        .child(info_row("解码器", sig.tech_decoder, 2, colors))
-        .child(info_row("格式", sig.tech_format, 1, colors))
-        .child(info_row("像素", sig.tech_pixels, 2, colors))
-        .child(info_row("像素格式", sig.tech_color, 2, colors))
-        .child(info_row("色彩配置", sig.tech_icc, 2, colors))
-        .child(info_row("方向", sig.tech_orientation, 1, colors))
-        .child(optional_row("显示", sig.tech_view, 2, colors))
-        .child(optional_row("帧/页", frames, 1, colors));
-    let body = Element::col()
-        .width_match()
-        .bg(colors.content)
-        .corner(6.0)
-        .padding(8)
-        .spacing(6)
-        .child(rows)
-        .on_context_menu(copy_info_menu(
-            "技术信息",
-            vec![
                 ("解码器", sig.tech_decoder),
                 ("格式", sig.tech_format),
                 ("像素", sig.tech_pixels),
@@ -848,50 +841,11 @@ fn technical_card(
                 ("帧/页", sig.tech_frames),
             ],
         ));
-    simple_card(Card::Technical, chrome, config, colors, body)
+
+    simple_card(Card::Info, chrome, config, colors, body)
 }
 
-/// 直方图卡：RGB + 亮度四条，底部一行裁切统计。
-fn histogram_card(
-    chrome: &Rc<chrome::Chrome>,
-    config: &Rc<RefCell<Config>>,
-    sig: &MetaSignals,
-    colors: PanelColors,
-) -> Element {
-    let summary = sig.hist_summary;
-    let copy = move || {
-        let body = format!("直方图\n{}", summary.get());
-        vec![MenuItem::run(
-            "复制直方图数据",
-            move |ctx: &mut EventCtx| match crate::platform::clipboard::copy_text(&body) {
-                Ok(()) => ctx.toast_ok("已复制到剪贴板"),
-                Err(e) => ctx.toast_err(format!("复制失败：{e}")),
-            },
-            false,
-        )]
-    };
-    let body = Element::col()
-        .width_match()
-        .bg(colors.content)
-        .corner(6.0)
-        .padding(8)
-        .spacing(6)
-        .child(
-            Element::leaf()
-                .widget(HistogramView::new(sig.histogram, colors))
-                .width_match(),
-        )
-        .child(
-            Element::label_signal(sig.hist_summary)
-                .font_size(11.0)
-                .fg(colors.muted)
-                .max_lines(4),
-        )
-        .on_context_menu(copy);
-    simple_card(Card::Histogram, chrome, config, colors, body)
-}
-
-/// 三张卡共用的外壳：标题行（箭头 + 标题，点击折叠） + 关闭按钮 + 正文。
+/// 内置卡外壳：标题行（箭头 + 标题，点击折叠） + 关闭按钮 + 正文。
 fn simple_card(
     card: Card,
     chrome: &Rc<chrome::Chrome>,
@@ -943,20 +897,20 @@ fn card_shell(
         .on_click(on_toggle)
         .child(
             Element::label("▾")
-                .font_size(12.0)
+                .font_size(super::tokens::SIZE_BODY)
                 .fg(colors.text)
                 .visible_signal(expanded),
         )
         .child(
             Element::label("▸")
-                .font_size(12.0)
+                .font_size(super::tokens::SIZE_BODY)
                 .fg(colors.text)
                 .visible_when(move || !expanded.get()),
         )
         .child(
             Element::label(card.label())
-                .font_size(13.0)
-                .font_weight(600)
+                .font_size(super::tokens::SIZE_BODY)
+                .font_weight(super::tokens::WEIGHT_EMPHASIS)
                 .fg(colors.text)
                 .max_lines(1),
         );
@@ -970,7 +924,7 @@ fn card_shell(
         .child(
             Element::icon_button("✕")
                 .size(22, 22)
-                .font_size(11.0)
+                .font_size(super::tokens::SIZE_BODY)
                 .fg(colors.muted)
                 .tooltip(format!("关闭{}卡", card.label()))
                 .on_click(on_close),
@@ -989,261 +943,46 @@ fn card_shell(
 }
 
 /// 空值整行隐藏（技术卡里“帧/页 / 显示”这类可选行）。
-fn optional_row(
-    label: &'static str,
-    value: Signal<String>,
-    max_lines: usize,
-    colors: PanelColors,
-) -> Element {
-    info_row(label, value, max_lines, colors).visible_when(move || !value.get().is_empty())
+fn optional_row(label: &'static str, value: Signal<String>, colors: PanelColors) -> Element {
+    let shown = value;
+    info_row(label, value, colors).visible_when(move || !shown.get().is_empty())
 }
 
-/// 直方图画布：四条平滑曲线叠在同一绘图区，共用纵轴（满格 = 全局峰值）。
+/// 富文本文档：一段可划选、可复制的纯文本。
 ///
-/// ★ 高度跟着宽度按 16:9 长（[`hist_height`]）：面板从 240 拉到半屏后，图不是
-///   一条窄缝，而是能看清峰值与溢出的曲线图。
-struct HistogramView {
-    data: Signal<Histogram>,
-    colors: PanelColors,
-}
-
-impl HistogramView {
-    fn new(data: Signal<Histogram>, colors: PanelColors) -> Self {
-        Self { data, colors }
+/// ★ 面板里所有**值**都走这里，而不是 `Element::label`：label 只能看，富文本控件
+///   自带拖选 / 双击选词 / Ctrl+C / 右键「复制 / 复制全部」——2026-11-14 用户
+///   报「文字没办法鼠标选择后再复制」，根因是值都画成了 label。
+fn value_doc(text: &str, color: Color) -> RichDoc {
+    // weight 不写：富文本默认就是常规 400，显式写会逼着 tokens.rs 多开一个令牌口子。
+    let mut doc = RichDoc::new().style(
+        "v",
+        SpanStyle::new().size(super::tokens::SIZE_BODY).fg(color),
+    );
+    let mut any = false;
+    for line in text.lines() {
+        doc = doc.para(Para::new().styled("v", line.to_string()));
+        any = true;
     }
-}
-
-/// 直方图高度：宽度 × 9/16，夹在 160..=480。
-fn hist_height(width: i32) -> i32 {
-    (width.max(160) * 9 / 16).clamp(160, 480)
-}
-
-/// 绘图区：左 4 / 右 40（纵轴百分比）/ 上 20（图例）/ 下 18（横轴刻度）。
-fn hist_plot_rect(bounds: Rect) -> Rect {
-    Rect::new(
-        bounds.x + 4,
-        bounds.y + 20,
-        (bounds.w - 44).max(24),
-        (bounds.h - 38).max(24),
-    )
-}
-
-impl Widget for HistogramView {
-    fn measure(&self, avail: Size, _style: &Style, _text: &mut dyn TextEngine) -> Size {
-        Size::new(avail.w.max(1), hist_height(avail.w))
+    if !any {
+        doc = doc.para(Para::new().styled("v", ""));
     }
-
-    fn paint(
-        &self,
-        bounds: Rect,
-        _content: Rect,
-        _focused: bool,
-        _enabled: bool,
-        canvas: &mut dyn Canvas,
-        _style: &Style,
-    ) {
-        let hist = self.data.get();
-        let plot = hist_plot_rect(bounds);
-        let ts = TextStyle::new(10.0);
-        let muted = self.colors.muted;
-
-        canvas.fill_rect(
-            plot.x as f32,
-            plot.y as f32,
-            plot.w as f32,
-            plot.h as f32,
-            &Paint::fill(self.colors.hist_track),
-        );
-        // 5 横 + 5 纵，与 levels 插件同一套刻度：0/64/128/192/255。
-        for k in 0..=4 {
-            let y = plot.y + plot.h * k / 4;
-            canvas.fill_rect(
-                plot.x as f32,
-                y as f32,
-                plot.w as f32,
-                1.0,
-                &Paint::fill(self.colors.hist_grid),
-            );
-            let x = plot.x + plot.w * k / 4;
-            canvas.fill_rect(
-                x as f32,
-                plot.y as f32,
-                1.0,
-                plot.h as f32,
-                &Paint::fill(self.colors.hist_grid),
-            );
-        }
-
-        if hist.count == 0 {
-            canvas.draw_text(
-                "没有可统计的像素",
-                Rect::new(plot.x, plot.y + plot.h / 2 - 7, plot.w, 14),
-                muted,
-                Align::Center,
-                &ts,
-            );
-            return;
-        }
-
-        // 端点（纯黑/纯白）常常是黑边、透明垫或裁切溢出；拿全局峰值当纵轴会被
-        // 一根 0 档高柱压扁整张图。曲线按“去掉 0/255 后的最高档”缩放，端点尖峰
-        // 允许截顶；精确的阴影/高光比例仍在摘要里照实写。
-        let peak = visual_peak(&hist) as f32;
-        let step = (plot.w / 140).max(1);
-        for (bins, color) in [
-            (&hist.r, self.colors.hist_r),
-            (&hist.g, self.colors.hist_g),
-            (&hist.b, self.colors.hist_b),
-            (&hist.luma, self.colors.hist_luma),
-        ] {
-            // 端点不参与平滑/曲线：否则一根 0 档高柱会糊成一段贴顶的斜坡。
-            let mut curve_bins = *bins;
-            curve_bins[0] = 0;
-            curve_bins[255] = 0;
-            let smooth = smooth_bins(&curve_bins);
-            let mut pts = Vec::with_capacity((plot.w / step + 2) as usize);
-            let mut x = 0;
-            while x <= plot.w {
-                let t = x as f32 / plot.w.max(1) as f32 * 255.0;
-                let v = sample_smooth(&smooth, t);
-                let dh = ((v / peak) * plot.h as f32).round().min(plot.h as f32) as i32;
-                let y = plot.y + plot.h - dh;
-                pts.push((x as f32 + plot.x as f32, y as f32));
-                x += step;
-            }
-            canvas.draw_polyline(&pts, 1.5, &Paint::fill(color));
-
-            // 端点尖峰超过纵轴时画一根贴边竖线（截顶标记），精确比例见摘要。
-            for (edge, x) in [(0usize, plot.x + 1), (255, plot.x + plot.w - 2)] {
-                if bins[edge] as f32 > peak {
-                    canvas.draw_line(
-                        x as f32,
-                        plot.y as f32,
-                        x as f32,
-                        (plot.y + plot.h) as f32,
-                        1.5,
-                        &Paint::fill(color),
-                    );
-                }
-            }
-        }
-
-        // 图例：短色条 + 字母，与曲线颜色一一对应。
-        let mut lx = bounds.x + 4;
-        for (label, color) in [
-            ("R", self.colors.hist_r),
-            ("G", self.colors.hist_g),
-            ("B", self.colors.hist_b),
-            ("L", self.colors.hist_luma),
-        ] {
-            canvas.fill_rect(
-                lx as f32,
-                (bounds.y + 7) as f32,
-                9.0,
-                2.0,
-                &Paint::fill(color),
-            );
-            canvas.draw_text(
-                label,
-                Rect::new(lx + 12, bounds.y, 18, 15),
-                muted,
-                Align::Start,
-                &ts,
-            );
-            lx += 34;
-        }
-
-        // 纵轴：右侧标占全图有效像素的百分比，顶线 = 峰值箱占比。
-        let max_pct = peak as f64 / hist.count as f64 * 100.0;
-        for k in 0..=4 {
-            let y = plot.y + plot.h - plot.h * k / 4;
-            canvas.draw_text(
-                &format!("{:.1}%", max_pct * k as f64 / 4.0),
-                Rect::new(plot.x + plot.w + 3, y - 7, 37, 14),
-                muted,
-                Align::Start,
-                &ts,
-            );
-        }
-
-        // 横轴：0/64/128/192/255，5 档刻度。
-        for (k, s) in [(0, "0"), (1, "64"), (2, "128"), (3, "192"), (4, "255")] {
-            let x = plot.x + plot.w * k / 4;
-            canvas.draw_text(
-                s,
-                Rect::new(x - 16, plot.y + plot.h + 2, 32, 14),
-                muted,
-                Align::Center,
-                &ts,
-            );
-        }
-    }
+    doc
 }
 
-/// 曲线纵轴的峰值：忽略 0 / 255 两个端点的最高档。
-///
-/// 端点是“裁切溢出”的归集档：黑边、透明垫或过曝会把一根柱顶到 20%+，
-/// 而照片主体常常不到 1%。按端点峰值缩放等于把其余曲线压成一条平线。
-/// 端点本身仍会画（截顶），精确比例由摘要给出。全图只有端点时退回全局峰值。
-fn visual_peak(hist: &Histogram) -> u32 {
-    let mut best = 0;
-    for bins in [&hist.r, &hist.g, &hist.b, &hist.luma] {
-        for &c in &bins[1..255] {
-            best = best.max(c);
-        }
-    }
-    if best == 0 {
-        hist.global_peak().max(1)
-    } else {
-        best
-    }
+/// 静态值的可选中版本（插件表格用）。
+pub(super) fn value_text(text: &str, color: Color) -> Element {
+    Element::rich(value_doc(text, color)).width_match()
 }
 
-/// 5 抽头高斯平滑：256 档原始箱直接画会全是锯齿；平滑只用于曲线，
-/// 裁切百分比仍按原始箱算。
-fn smooth_bins(bins: &[u32; 256]) -> [f32; 256] {
-    const W: [f32; 5] = [1.0, 4.0, 6.0, 4.0, 1.0];
-    let mut out = [0.0f32; 256];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let mut acc = 0.0;
-        let mut wsum = 0.0;
-        for (k, &wk) in W.iter().enumerate() {
-            let j = (i as isize + k as isize - 2).clamp(0, 255) as usize;
-            acc += bins[j] as f32 * wk;
-            wsum += wk;
-        }
-        *slot = acc / wsum;
-    }
-    out
+/// 信号值的可选中版本（图片信息卡用）。
+fn value_text_signal(value: Signal<String>, color: Color) -> Element {
+    let doc = value.map(move |s| value_doc(s, color));
+    Element::rich_signal(doc).width_match()
 }
 
-/// 在平滑后的 256 档上线性取样；两端夹紧，越界不会 panic。
-fn sample_smooth(smoothed: &[f32; 256], t: f32) -> f32 {
-    let t = t.clamp(0.0, 255.0);
-    let i = t.floor() as usize;
-    let f = t - i as f32;
-    let a = smoothed[i];
-    let b = smoothed[(i + 1).min(255)];
-    a + (b - a) * f
-}
-
-/// 一行「标签 + 值」。`max_lines == 1` 时单行截断（大小 / 时间这类定长值），
-/// 文件名、路径、EXIF 文本允许多行——中文路径折行比截断更好认。
-fn info_row(
-    label: &'static str,
-    value: Signal<String>,
-    max_lines: usize,
-    colors: PanelColors,
-) -> Element {
-    let text = Element::label_signal(value)
-        .font_size(13.0)
-        .fg(colors.text)
-        .width_match();
-    let text = if max_lines == 1 {
-        text.max_lines(1).truncate(Truncate::End)
-    } else {
-        text.max_lines(max_lines)
-    };
+/// 一行「标签 + 值」。值可划选复制；长路径自动折行（富文本自己量高度）。
+fn info_row(label: &'static str, value: Signal<String>, colors: PanelColors) -> Element {
     Element::row()
         .width_match()
         // 行头与内容顶部对齐（2026-11-14 用户口径）：多行值时行头贴第一行。
@@ -1252,17 +991,15 @@ fn info_row(
         .child(
             Element::label(label)
                 .width(60)
-                .font_size(13.0)
-                .font_family(PANEL_FONT)
+                .font_size(super::tokens::SIZE_BODY)
                 // 同 table_row：行头与值同色，避免浅灰在浅背景上显得字号更小。
                 .fg(colors.text),
         )
-        // ★ 同 table_row：字号放容器上，否则 label 的 `.font_size` 会被父级样式盖掉。
         .child(
             Element::col()
                 .weight(1.0)
-                .font_size(13.0)
-                .child(text.font_family(PANEL_FONT)),
+                .font_size(super::tokens::SIZE_BODY)
+                .child(value_text_signal(value, colors.text)),
         )
 }
 
@@ -1403,17 +1140,14 @@ mod tests {
         assert!(!info.panel_visible());
         assert!(info.open_properties());
         assert!(info.open.get());
-        assert!(info.props_active.get());
-        assert!(info.props_expanded.get());
+        assert!(info.info_active.get());
+        assert!(info.info_expanded.get());
         info.persist(&cfg);
         assert!(cfg.borrow().info_panel);
-        assert_eq!(cfg.borrow().info_cards, vec!["properties".to_string()]);
+        assert_eq!(cfg.borrow().info_cards, vec!["info".to_string()]);
         assert!(info.toggle_properties());
         info.persist(&cfg);
-        assert_eq!(
-            cfg.borrow().info_cards_collapsed,
-            vec!["properties".to_string()]
-        );
+        assert_eq!(cfg.borrow().info_cards_collapsed, vec!["info".to_string()]);
         assert!(info.close_properties());
         info.persist(&cfg);
         assert!(cfg.borrow().info_cards.is_empty());
@@ -1431,10 +1165,10 @@ mod tests {
         assert!(!chrome.info.open.get());
         open_properties(None, &chrome, &cfg);
         assert!(chrome.info.open.get());
-        assert!(chrome.info.props_active.get());
-        assert!(chrome.info.props_expanded.get());
+        assert!(chrome.info.info_active.get());
+        assert!(chrome.info.info_expanded.get());
         assert!(cfg.borrow().info_panel);
-        assert_eq!(cfg.borrow().info_cards, vec!["properties".to_string()]);
+        assert_eq!(cfg.borrow().info_cards, vec!["info".to_string()]);
     }
 
     /// 无边框形态不打开面板、也不改配置：那形态下没有标题条可拖，面板开了只能进不能出。
@@ -1483,16 +1217,16 @@ mod tests {
         let cfg = crate::core::config::Config {
             info_panel: true,
             info_panel_width: 420,
-            info_cards: vec!["properties".into()],
-            info_cards_collapsed: vec!["properties".into()],
+            info_cards: vec!["info".into()],
+            info_cards_collapsed: vec!["info".into()],
             ..crate::core::config::Config::default()
         };
         let info = InfoPanel::new();
         info.init_from(&cfg);
         assert!(info.open.get());
         assert_eq!(info.width.get(), 420);
-        assert!(info.props_active.get());
-        assert!(!info.props_expanded.get());
+        assert!(info.info_active.get());
+        assert!(!info.info_expanded.get());
     }
 
     /// 借一棵一次性控件树把 `InfoPanel::tick` 跑一拍：`tick` 要 `&mut EventCtx`，
@@ -1631,92 +1365,60 @@ mod tests {
         properties::forget_window(9_997);
     }
 
-    /// 直方图必须随面板变宽而长高：窄面板保底 160，半屏后到 420 封顶。
-    #[test]
-    fn histogram_height_grows_with_width() {
-        assert_eq!(hist_height(100), 160, "窄面板保底");
-        assert_eq!(hist_height(200), 160);
-        assert!(
-            hist_height(400) > hist_height(200),
-            "宽度增加，高度要跟着长"
-        );
-        assert_eq!(hist_height(2000), 480, "超高面板封顶，免得太矮或太高");
-    }
-
-    /// 端点尖峰不参与曲线纵轴：黑边 100、照片内部最高 5，纵轴应取 5。
-    #[test]
-    fn visual_peak_ignores_endpoint_spikes() {
-        let mut h = Histogram {
-            count: 195,
-            ..Default::default()
-        };
-        h.r[0] = 100;
-        h.r[255] = 90;
-        h.r[128] = 5;
-        assert_eq!(visual_peak(&h), 5);
-        // 全图只有端点时退回全局峰值，不能除零/画成空图。
-        let mut only_edges = Histogram {
-            count: 10,
-            ..Default::default()
-        };
-        only_edges.r[0] = 10;
-        assert_eq!(visual_peak(&only_edges), 10);
-    }
-
-    /// 平滑与取样两端夹紧；尖峰不会被平滑抹没。
-    #[test]
-    fn smooth_sampling_stays_in_bounds_and_keeps_peak() {
-        let mut bins = [0u32; 256];
-        bins[128] = 1000;
-        let s = smooth_bins(&bins);
-        assert!(s[128] > 0.0, "尖峰仍在");
-        assert!(s[128] > s[0]);
-        assert_eq!(sample_smooth(&s, 0.0), s[0]);
-        assert_eq!(sample_smooth(&s, 255.0), s[255]);
-        assert!(sample_smooth(&s, -10.0).is_finite());
-        assert!(sample_smooth(&s, 999.0).is_finite());
-    }
-
     /// 卡片 id / 文案是菜单与 ini 的共同真源，顺序也不能漂。
     #[test]
     fn card_ids_and_labels_are_stable() {
-        assert_eq!(
-            Card::ALL.map(|c| c.id()),
-            [CARD_PROPERTIES, CARD_TECHNICAL, CARD_HISTOGRAM]
-        );
-        assert_eq!(Card::ALL.map(|c| c.label()), ["属性", "技术信息", "直方图"]);
+        assert_eq!(Card::ALL.map(|c| c.id()), [CARD_INFO]);
+        assert_eq!(Card::ALL.map(|c| c.label()), ["图片信息"]);
     }
 
-    /// 三张卡的开关 / 折叠必须能完整落进 `info_cards` 再读回来。
+    /// 卡片的开关 / 折叠必须能完整落进 `info_cards` 再读回来。
     #[test]
     fn card_activation_and_collapse_round_trip_through_config() {
         let info = InfoPanel::new();
-        info.open_card(Card::Technical);
-        info.open_card(Card::Histogram);
-        info.toggle_card(Card::Histogram);
+        info.open_card(Card::Info);
+        info.toggle_card(Card::Info);
 
         let cfg = Rc::new(RefCell::new(Config::default()));
         info.persist(&cfg);
-        assert_eq!(
-            cfg.borrow().info_cards,
-            vec![CARD_TECHNICAL.to_string(), CARD_HISTOGRAM.to_string()]
-        );
+        assert_eq!(cfg.borrow().info_cards, vec![CARD_INFO.to_string()]);
         assert_eq!(
             cfg.borrow().info_cards_collapsed,
-            vec![CARD_HISTOGRAM.to_string()]
+            vec![CARD_INFO.to_string()]
         );
 
         let restored = InfoPanel::new();
         restored.init_from(&cfg.borrow());
-        assert!(restored.tech_active.get());
-        assert!(restored.hist_active.get());
-        assert!(restored.tech_expanded.get());
-        assert!(!restored.hist_expanded.get());
+        assert!(restored.info_active.get());
+        assert!(!restored.info_expanded.get());
     }
 
-    /// 技术信息 / 直方图卡也要真的把面板内容撑高；折叠直方图后要变矮。
+    /// 旧 `histogram` 卡 id 已退役：读到它既不能让任何卡亮起，也不能把配置写回去。
     #[test]
-    fn technical_and_histogram_cards_add_height() {
+    fn retired_histogram_id_is_ignored() {
+        let cfg = Config {
+            info_cards: vec!["histogram".into(), "info".into()],
+            info_cards_collapsed: vec!["histogram".into()],
+            ..Config::default()
+        };
+
+        let cfg = Rc::new(RefCell::new(cfg));
+        let info = InfoPanel::new();
+        info.init_from(&cfg.borrow());
+        assert!(info.info_active.get(), "同一条配置里的 info 仍要生效");
+        assert!(info.info_expanded.get(), "histogram 的折叠态不许串到 info");
+
+        info.persist(&cfg);
+        assert_eq!(cfg.borrow().info_cards, vec![CARD_INFO.to_string()]);
+        assert!(
+            cfg.borrow().info_cards_collapsed.is_empty(),
+            "退役 id 不许再写回配置"
+        );
+    }
+
+    /// 「图片信息」卡要真的把面板内容撑高；折叠后要变矮。
+    #[test]
+    fn info_card_adds_height_and_collapses() {
         use windui::core::{NodeId, Tree};
         use windui::text::NullTextEngine;
 
@@ -1740,20 +1442,15 @@ mod tests {
         let scroll = find_scroll(&tree, root).expect("面板里要有 scroll");
         let h_empty = tree.get(scroll).unwrap().content_h;
 
-        chrome.info.open_card(Card::Technical);
+        chrome.info.open_card(Card::Info);
         tree.layout_root(size, &mut NullTextEngine);
-        let h_tech = tree.get(scroll).unwrap().content_h;
-        assert!(h_tech > h_empty, "技术信息卡应撑高内容");
+        let h_open = tree.get(scroll).unwrap().content_h;
+        assert!(h_open > h_empty, "图片信息卡应撑高内容");
 
-        chrome.info.open_card(Card::Histogram);
-        tree.layout_root(size, &mut NullTextEngine);
-        let h_hist = tree.get(scroll).unwrap().content_h;
-        assert!(h_hist > h_tech, "直方图卡应再撑高一段");
-
-        chrome.info.toggle_card(Card::Histogram);
+        chrome.info.toggle_card(Card::Info);
         tree.layout_root(size, &mut NullTextEngine);
         let h_collapsed = tree.get(scroll).unwrap().content_h;
-        assert!(h_collapsed < h_hist, "折叠直方图后内容应变矮");
+        assert!(h_collapsed < h_open, "折叠图片信息卡后内容应变矮");
         properties::forget_window(9_998);
     }
 
@@ -1994,16 +1691,16 @@ mod tests {
         let scroll = find_scroll(&tree, root).expect("面板里要有 scroll");
         let h_empty = tree.get(scroll).unwrap().content_h;
 
-        chrome.info.props_active.set(true);
-        chrome.info.props_expanded.set(true);
+        chrome.info.info_active.set(true);
+        chrome.info.info_expanded.set(true);
         tree.layout_root(size, &mut NullTextEngine);
         let h_expanded = tree.get(scroll).unwrap().content_h;
 
-        chrome.info.props_expanded.set(false);
+        chrome.info.info_expanded.set(false);
         tree.layout_root(size, &mut NullTextEngine);
         let h_collapsed = tree.get(scroll).unwrap().content_h;
 
-        chrome.info.props_active.set(false);
+        chrome.info.info_active.set(false);
         tree.layout_root(size, &mut NullTextEngine);
         let h_closed = tree.get(scroll).unwrap().content_h;
 

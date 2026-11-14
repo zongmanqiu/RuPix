@@ -273,7 +273,7 @@ pub fn ext_row(r: &ExtRow) -> Element {
     Element::row()
         .child(
             Element::label(&r.ext)
-                .font_size(FONT_MD)
+                .font_size(SIZE_BODY)
                 .fg(to_color(TEXT_SECONDARY))
                 .width(COL1_W),
         )

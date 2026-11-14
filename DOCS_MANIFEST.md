@@ -27,6 +27,7 @@
 | `docs/踩坑记录/踩坑记录-2.md` … `-7.md` | 同上（各册头部写明"新坑追加到最后一册"）。**只有第 1 册收总索引** | 同上；`docs_consistency` 的 j3/j4 扫全部 md，册名不影响判据 |
 | `docs/Rust 软件工程设计总纲.md` | **工程方法论宪章**（此前未登记，2026-10-19 补上）。只在"新的编译期约束被采纳 / 某条裁决被推翻"时更新顶部那张《采纳状态》表；正文方法论按需查阅，不追改。**只保留本仓采纳后的方法论**，不复制外部全文 | 自检 + `cargo test --release --test docs_consistency`（j3/j4/j5：点名的 `.rs` 存在、现行文档无考古串、行数上限） |
 | `docs/界面版式规范.md` | **版式正本**（2026-11-06 建）：对话框四边留白 / 行间距 / 按钮位 / 按钮文案与顺序变化时；新开一扇自绘对话框、新加一颗底栏按钮的规则也写在这里。**改版式先改它、再改代码**，两边不一致当场二选一 | `ui/dialog_footer.rs` 三条几何判据（340/480/640 三种窗宽量右缘 = 窗宽−16、下缘 = 窗高−16、间距 = 8）+ `python build/hygiene_scan.py`（第十四查 `footer_buttons`）+ 自检 |
+| `docs/排版规范.md` | **字体/字号/字重正本**（2026-11-14 建）：换字体、换字号、加字重、新增字号档位时；新元素取排版参数的规则也写在这里。例外（图标字形 / 展示性大标题）必须先在 §3 登记 | `src/ui/tokens.rs` 的 `FAMILY_UI` / `SIZE_BODY` / `FAMILY_ICON` / `SIZE_ICON` / `WEIGHT_EMPHASIS` + `python build/hygiene_scan.py`（第十六查 `literal_font`）+ 自检 |
 | `docs/扩展体系.md` | 扩展 manifest / 能力 / 目录约定 / 分层 / 安全底线变化时；未落地项随 P0.1b 更新 | `cargo test --release --lib core::ext -- --test-threads=1` + `python build/layering_scan.py` + 自检 |
 | `docs/架构总览.md` | 五层分层、§三关键类型（`DecodeBackend` / `Fail` / `ImageCache` 等）、§五解码路由与清单规则（**只写动态并集，不登记具体 DLL**）、§七性能红线、§八改动影响面任一变化；「明确不做」清单（§九）变化 | `python build/layering_scan.py` + `hygiene_scan.py` 均 `violations: 0` |
 | `docs/解码器开发规范.md`（**宿主侧 ABI 对接说明**，自包含） | 宿主看到的 ABI 版本、导出、结构体、错误码、缓冲所有权、能力路由变化时更新；契约结构体以 `vendor/rupix-abi` 为准 | 宿主 `cargo test --release --lib core::abi -- --test-threads=1` 全绿 + `cargo test --release --test docs_consistency -- --test-threads=1` |

@@ -43,36 +43,6 @@ impl Viewer {
         self.loaded.as_ref().map(|l| &l.image)
     }
 
-    /// 当前解码档的直方图（RGB + 亮度）。
-    ///
-    /// 统计的是**解码器交上来的那份像素**（`base_rgba`，未旋转/镜像），不是派生后的
-    /// 上屏档：旋转不改变分布，派生只重采样。大图按 `plugin_sample_step` 等距抽样，
-    /// 保持纯黑/纯白的计数不被面积平均抹平。
-    pub fn histogram(&self) -> Option<Histogram> {
-        let l = self.loaded.as_ref()?;
-        let (w, h) = l.decoded;
-        if w == 0 || h == 0 {
-            return None;
-        }
-        let path = l.path.clone();
-        let key = std::sync::Arc::as_ptr(&l.base_rgba) as usize;
-        if let Some(c) = self.hist_cache.borrow().as_ref() {
-            if c.path == path && c.key == key && c.width == w && c.height == h {
-                return Some(c.hist);
-            }
-        }
-        let step = crate::core::pixels::plugin_sample_step(w, h, 0);
-        let hist = crate::core::pixels::histogram_rgba(&l.base_rgba[..], w, h, step);
-        *self.hist_cache.borrow_mut() = Some(HistCache {
-            path,
-            key,
-            width: w,
-            height: h,
-            hist,
-        });
-        Some(hist)
-    }
-
     /// 当前位图（整图或 SVG 可视区域切片）在视口中的目标矩形（逻辑坐标）。
     ///
     /// 整图位图与 [`Self::dst_rect`] 相同；切片则把"图像坐标 → 显示坐标"正向映射

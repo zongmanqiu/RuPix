@@ -1086,7 +1086,10 @@ impl SkiaBackend {
             let mut tgt = crate::render::PixmapTarget { pixmap };
             handler.render(&mut tgt, size);
         }
-        let drawn = match (self.fresh || self.transparent_bg, handler.last_frame_damage()) {
+        let drawn = match (
+            self.fresh || self.transparent_bg,
+            handler.last_frame_damage(),
+        ) {
             (false, Some(d)) => Some(d.intersect(&Rect::new(0, 0, self.buf_w, self.buf_h))),
             _ => None,
         };
@@ -4854,7 +4857,6 @@ mod live_windows_tests {
     /// 重点从"翻了几次"转成了"搬没搬对、搬没搬多"。
     // 用 chunks_exact 而非 as_chunks：后者要 Rust 1.88，而本 crate 已发布到 crates.io
     // 且未声明 rust-version（同 `render/skia.rs` 的 `fast_fill_rect`）。
-    #[allow(clippy::chunks_exact_to_as_chunks)]
     #[test]
     fn partial_frame_uploads_only_the_damage_rect() {
         const W: i32 = 8;

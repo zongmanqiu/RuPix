@@ -411,16 +411,17 @@ pub fn start_command(
         had_image,
         image.as_ref(),
     );
-    let job = register(&ext.manifest.id)?;
-    let name = ext.manifest.name.clone();
-    let id = ext.manifest.id.clone();
+    let job = register(&ext.run_key)?;
+    let name = ext.display_name.clone();
+    let id = ext.run_key.clone();
+    let package_id = ext.manifest.id.clone();
     let target = image_path.clone();
     let cleanup_job = job.clone();
     let cleanup_id = id.clone();
     std::thread::Builder::new()
         .spawn(move || {
             let result = run_command(&ext, image_path, selection, image, &job);
-            finish(&id, name, &job, target, result);
+            finish(&id, &package_id, name, &job, target, result);
         })
         .map_err(|e| {
             deregister(&cleanup_id, &cleanup_job);
@@ -452,9 +453,10 @@ pub fn start_editor(ext: Extension, image: ForPlugin) -> Result<(), String> {
             EDITOR_MAX_PIXELS / 1_000_000
         ));
     }
-    let job = register(&ext.manifest.id)?;
-    let name = ext.manifest.name.clone();
-    let id = ext.manifest.id.clone();
+    let job = register(&ext.run_key)?;
+    let name = ext.display_name.clone();
+    let id = ext.run_key.clone();
+    let package_id = ext.manifest.id.clone();
     let cleanup_job = job.clone();
     let cleanup_id = id.clone();
     std::thread::Builder::new()
@@ -462,7 +464,7 @@ pub fn start_editor(ext: Extension, image: ForPlugin) -> Result<(), String> {
             // `finish` 要报的是"哪张图的编辑落地了"，路径先摘出来（`image` 整个进 `run_editor`）。
             let target = image.path.clone();
             let result = run_editor(&ext, image, &job);
-            finish(&id, name, &job, Some(target), result);
+            finish(&id, &package_id, name, &job, Some(target), result);
         })
         .map_err(|e| {
             deregister(&cleanup_id, &cleanup_job);
@@ -481,15 +483,16 @@ pub fn start_settings(ext: Extension) -> Result<(), String> {
         return Err(format!("插件 {} 没有提供设置界面", ext.manifest.name));
     }
     gate(&ext, false)?;
-    let job = register(&ext.manifest.id)?;
-    let name = ext.manifest.name.clone();
-    let id = ext.manifest.id.clone();
+    let job = register(&ext.run_key)?;
+    let name = ext.display_name.clone();
+    let id = ext.run_key.clone();
+    let package_id = ext.manifest.id.clone();
     let cleanup_job = job.clone();
     let cleanup_id = id.clone();
     std::thread::Builder::new()
         .spawn(move || {
             let result = run_settings(&ext, &job);
-            finish(&id, name, &job, None, result);
+            finish(&id, &package_id, name, &job, None, result);
         })
         .map_err(|e| {
             deregister(&cleanup_id, &cleanup_job);
@@ -502,6 +505,7 @@ pub fn start_settings(ext: Extension) -> Result<(), String> {
 /// 菜单应已回到「运行」；隔离提示出现时，运行标记必须已摘）。
 fn finish(
     id: &str,
+    package_id: &str,
     name: String,
     job: &Arc<JobHandle>,
     target: Option<PathBuf>,
@@ -509,13 +513,17 @@ fn finish(
 ) {
     deregister(id, job);
     let counts = result.as_ref().err().map(|f| f.strike).unwrap_or(false);
-    let isolated_now = record_outcome(id, result.is_ok(), cancelled(job), counts);
+    // 三振按**包 id** 记：同一包任一命令连续失败都是包坏了，整包隔离。
+    let isolated_now = record_outcome(package_id, result.is_ok(), cancelled(job), counts);
     if isolated_now {
-        log::warn!("插件 {id} 连续失败 {} 次，已推入隔离队列", STRIKE_LIMIT);
+        log::warn!(
+            "插件 {package_id} 连续失败 {} 次，已推入隔离队列",
+            STRIKE_LIMIT
+        );
     }
     if let Err(f) = &result {
         log::warn!(
-            "插件 {id} 调用失败（{}）：{}",
+            "插件 {package_id} 调用失败（{}）：{}",
             if f.strike {
                 "计入隔离"
             } else {
@@ -620,7 +628,7 @@ fn attach_settings(ext: &Extension, req: &mut Request) {
     if !ext.manifest.has_capability(Capability::SettingsRead) {
         return;
     }
-    let stored = super::settings::load(&ext.manifest.id);
+    let stored = super::settings::load_for(ext);
     if !stored.is_empty() {
         req.settings = Some(stored);
     }
@@ -639,7 +647,7 @@ fn persist_settings(ext: &Extension, resp: &Response) {
     if incoming.is_empty() {
         return;
     }
-    match super::settings::merge_into(&ext.manifest.id, incoming) {
+    match super::settings::merge_into_for(ext, incoming) {
         Ok(_) => log::info!("插件 {} 写回设置 {} 项", ext.manifest.id, incoming.len()),
         Err(e) => log::warn!("插件 {} 的设置没能存下：{e}", ext.manifest.id),
     }
@@ -652,7 +660,7 @@ fn run_command(
     image: Option<Outgoing>,
     job: &JobHandle,
 ) -> Result<JobOutput, Failure> {
-    let mut req = Request::new(ext.manifest.id.clone(), "run", ext.manifest.protocol);
+    let mut req = Request::new(ext.run_key.clone(), "run", ext.manifest.protocol);
     // WinRT StorageFile 只接受绝对路径；相对路径按**宿主**当前目录解析（不是插件目录）。
     req.image_path = image_path.map(|p| {
         std::path::absolute(&p)
@@ -738,7 +746,7 @@ fn run_command(
 /// 交互形态与编辑型一致：**不设响应超时**——用户在插件的设置窗口里待多久都行，
 /// 取消走插件菜单。回传的设置照旧合并落盘（`persist_settings`）。
 fn run_settings(ext: &Extension, job: &JobHandle) -> Result<JobOutput, Failure> {
-    let mut req = Request::new(ext.manifest.id.clone(), "settings", ext.manifest.protocol);
+    let mut req = Request::new(ext.run_key.clone(), "settings", ext.manifest.protocol);
     attach_settings(ext, &mut req);
     let resp = run_action(ext, req, true, job)?;
     if resp.settings.is_some() {
@@ -757,7 +765,7 @@ fn run_action(
     interactive: bool,
     job: &JobHandle,
 ) -> Result<Response, Failure> {
-    let pname = pipe_name(&ext.manifest.id);
+    let pname = pipe_name(&ext.run_key);
     let pid = spawn_plugin(ext, &pname, job)?;
     let mut conn = accept_plugin(&pname, pid, job)?;
     if cancelled(job) {
@@ -877,7 +885,7 @@ fn run_editor(ext: &Extension, image: ForPlugin, job: &JobHandle) -> Result<JobO
         return Err("已取消".into());
     }
 
-    let pname = pipe_name(&ext.manifest.id);
+    let pname = pipe_name(&ext.run_key);
     let pid = spawn_plugin(ext, &pname, job)?;
     let mut conn = accept_plugin(&pname, pid, job)?;
     if cancelled(job) {
@@ -885,7 +893,7 @@ fn run_editor(ext: &Extension, image: ForPlugin, job: &JobHandle) -> Result<JobO
         return Err("已取消".into());
     }
 
-    let mut req = Request::new(ext.manifest.id.clone(), "run", ext.manifest.protocol);
+    let mut req = Request::new(ext.run_key.clone(), "run", ext.manifest.protocol);
     // 只给共享内存引用，不给文件路径：编辑插件没声明 file.read（能力最小化），
     // 也不需要——它编辑的就是送进来的这一档像素。
     req.image = Some(reference);
@@ -1040,6 +1048,10 @@ mod tests {
             enabled: true,
             blocked: false,
             isolated: false,
+            command_id: None,
+            display_name: String::new(),
+            package_name: String::new(),
+            run_key: String::new(),
         };
         let err = start_settings(ext).expect_err("没有设置窗口的插件必须被拒");
         assert!(err.contains("没有提供设置界面"), "错误应说清原因：{err}");
@@ -1066,6 +1078,10 @@ mod tests {
                 enabled: true,
                 blocked: false,
                 isolated: false,
+                command_id: None,
+                display_name: String::new(),
+                package_name: String::new(),
+                run_key: String::new(),
             }
         };
         let err = start_command(mk("editor"), None, None, None).expect_err("编辑型不能走命令入口");
@@ -1177,7 +1193,14 @@ mod tests {
         let old = register(id).expect("old task");
         assert!(cancel(id));
         let new = register(id).expect("cancel permits immediate restart");
-        finish(id, "old".into(), &old, None, Err("cancelled".into()));
+        finish(
+            id,
+            "test.package",
+            "old".into(),
+            &old,
+            None,
+            Err("cancelled".into()),
+        );
         let remains = lock(running())
             .get(id)
             .is_some_and(|job| Arc::ptr_eq(job, &new));

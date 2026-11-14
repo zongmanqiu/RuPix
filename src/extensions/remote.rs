@@ -269,11 +269,17 @@ mod tests {
                 run_ui: false,
                 preview: None,
                 presets: Vec::new(),
+                commands: Vec::new(),
+                command_id: None,
             },
             dir: PathBuf::new(),
             enabled: true,
             blocked: false,
             isolated: false,
+            command_id: None,
+            display_name: String::new(),
+            package_name: String::new(),
+            run_key: String::new(),
         }
     }
 

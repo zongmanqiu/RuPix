@@ -549,7 +549,7 @@ fn open(ctx: &mut EventCtx, ext: &Extension, config: &Rc<RefCell<Config>>, mode:
         return;
     }
     // 初值：参数窗读当前显示状态（每张图都从原图起步），设置窗才读落盘那一份。
-    let stored = crate::extensions::settings::load(&id);
+    let stored = crate::extensions::settings::load_for(ext);
     let seeds: Vec<(String, String)> = match (&mode, &live_keys) {
         (Mode::Run(o), Some(_)) => {
             let cur = o.state.tint.get().filter(|t| t.path == o.path);
@@ -616,6 +616,7 @@ fn open(ctx: &mut EventCtx, ext: &Extension, config: &Rc<RefCell<Config>>, mode:
     let bound_save = bounds.clone();
     let stored_save = stored.clone();
     let id_save = id.clone();
+    let ext_save = ext.clone();
     let cfg_save = config.clone();
     let launch = match &mode {
         Mode::Run(o) => o.on_apply.clone(),
@@ -640,7 +641,7 @@ fn open(ctx: &mut EventCtx, ext: &Extension, config: &Rc<RefCell<Config>>, mode:
                 None => items.push((spec.key.clone(), v)),
             }
         }
-        if let Err(e) = crate::extensions::settings::save(&id_save, &items) {
+        if let Err(e) = crate::extensions::settings::merge_into_for(&ext_save, &items) {
             ctx.toast_err(format!("保存设置失败：{e}"));
             return;
         }
@@ -655,7 +656,11 @@ fn open(ctx: &mut EventCtx, ext: &Extension, config: &Rc<RefCell<Config>>, mode:
             .map(|(_, b)| b.value())
         {
             if let Some(hk) = Hotkey::from_spec(&spec) {
-                crate::extensions::vacate_hotkey(&mut cfg_save.borrow_mut(), &hk, Some(&id_save));
+                crate::extensions::vacate_hotkey(
+                    &mut cfg_save.borrow_mut(),
+                    &hk,
+                    Some(&ext_save.run_key),
+                );
             }
         }
         // 快捷键页那张「插件快捷键」卡显示的是同一个文件 —— 当场把它拉到新值，
@@ -664,7 +669,7 @@ fn open(ctx: &mut EventCtx, ext: &Extension, config: &Rc<RefCell<Config>>, mode:
             &crate::core::config::Config::load(),
             None,
         );
-        log::info!("插件「{id_save}」设置已保存");
+        log::info!("插件「{}」设置已保存", ext_save.display_name);
         // 命令型 run_ui：按「应用」= 值落盘后起进程。声明式实时变换的编辑型
         // 已经在拖动时上屏，参数窗不再有"应用"这一颗。
         // ★ 失败时不关窗、也不在将关的窗口上弹成功 toast——2026-11-06 用户报「秒退」，
@@ -752,8 +757,8 @@ fn open(ctx: &mut EventCtx, ext: &Extension, config: &Rc<RefCell<Config>>, mode:
     let (old_key, win_key) = super::singleton::recycle(&format!("plugin-settings:{id}"));
     let title = match &mode {
         // 设置窗与参数窗同名会让人以为是同一扇：加个尾巴区分（参数窗就是插件名）。
-        Mode::Settings => format!("{} 设置", ext.manifest.name),
-        Mode::Run(_) => ext.manifest.name.clone(),
+        Mode::Settings => format!("{} 设置", ext.display_name),
+        Mode::Run(_) => ext.display_name.clone(),
     };
     ctx.close_window(old_key);
     ctx.open_window(
@@ -1185,6 +1190,10 @@ mod tests {
             enabled: true,
             blocked: false,
             isolated: false,
+            command_id: None,
+            display_name: String::new(),
+            package_name: String::new(),
+            run_key: String::new(),
         }
     }
 

@@ -3394,9 +3394,7 @@ impl AppHandler for UiHost {
         };
         target.begin_damage(None, bg);
         if let Some(pixmap) = target.as_pixmap() {
-            pixmap.fill(tiny_skia::Color::from_rgba8(
-                bg.r, bg.g, bg.b, bg.a,
-            ));
+            pixmap.fill(tiny_skia::Color::from_rgba8(bg.r, bg.g, bg.b, bg.a));
         }
         self.last_present = None;
         self.prepare_full_frame(logical, laid_out, now_ms);

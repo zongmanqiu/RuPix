@@ -27,6 +27,9 @@ pub use run::{
 };
 
 /// 一枚已发现的扩展。
+///
+/// schema 2 的一个插件包会展开成多个 `Extension`（每个命令一条），
+/// 共享 `dir` / 包 id / 启停与隔离状态，各带自己的 kind/entry/settings/hotkey。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extension {
     pub manifest: Manifest,
@@ -37,6 +40,14 @@ pub struct Extension {
     pub blocked: bool,
     /// 三振隔离中（连续 3 次运行期失败，自动写入；设置页可解除）。
     pub isolated: bool,
+    /// schema 2 展开后的命令 id；单命令包为 None。
+    pub command_id: Option<String>,
+    /// 菜单 / 设置窗显示名：单命令 = 包名；多命令 = "包名 · 命令名"。
+    pub display_name: String,
+    /// 包名（菜单分组标题）。
+    pub package_name: String,
+    /// 运行 / 面板卡 / 热键的唯一键：单命令 = id，多命令 = "id:command"。
+    pub run_key: String,
 }
 
 /// 扫描默认已安装目录（exe 同级 `plugins/`），停用表与隔离表取自配置。
@@ -92,38 +103,33 @@ pub fn discover_in(root: &Path, disabled: &[String], isolated: &[String]) -> Vec
                         == std::cmp::Ordering::Less;
                 // 三振隔离：连续失败的插件照列但入口关闭，设置页可解除。
                 let is_isolated = isolated.iter().any(|id| id == &manifest.id);
-                out.push(Extension {
+                out.extend(expand_manifest(
                     manifest,
                     dir,
                     enabled,
                     blocked,
-                    isolated: is_isolated,
-                });
+                    is_isolated,
+                ));
             }
             Err(e) => log::warn!("跳过扩展 {}：{e}", dir.display()),
         }
     }
-    // 先按 (id, 目录) 排：同 id 内部也就确定了，不跟着 `read_dir` 的顺序漂。
-    out.sort_by(|a, b| {
-        a.manifest
-            .id
-            .cmp(&b.manifest.id)
-            .then_with(|| a.dir.cmp(&b.dir))
-    });
-    // **同 id 只留一版**（2026-10-29 m162，插件 id 改成裸短名的配套判据）：
+    // 先按 (run_key, 目录) 排：同键内部也就确定了，不跟着 `read_dir` 的顺序漂。
+    out.sort_by(|a, b| a.run_key.cmp(&b.run_key).then_with(|| a.dir.cmp(&b.dir)));
+    // **同 run_key 只留一版**（2026-10-29 m162，插件 id 改成裸短名的配套判据）：
     // 与解码器 `refresh_catalog` 同一句话——版本高者赢，版本相同取目录字典序第一份。
-    // 这不是"防撞名保险"：两枚同 id 时旧代码会并排两行、停用表一次命中两枚、热键注册两次，
+    // 这不是"防撞名保险"：两枚同键时旧代码会并排两行、停用表一次命中两枚、热键注册两次，
     // 那是未定义状态；列表必须有唯一答案。落选的那份**不进列表**，日志点名两份路径与版本。
     let mut kept: Vec<Extension> = Vec::with_capacity(out.len());
     for e in out {
         if let Some(prev) = kept.last_mut() {
-            if prev.manifest.id == e.manifest.id {
+            if prev.run_key == e.run_key {
                 let take_new = remote::version_cmp(&e.manifest.version, &prev.manifest.version)
                     == std::cmp::Ordering::Greater;
                 let (win, lose) = if take_new { (&e, &*prev) } else { (&*prev, &e) };
                 log::warn!(
-                    "插件 id「{}」有两份：只列 {}（版本 {}），不列 {}（版本 {}）",
-                    e.manifest.id,
+                    "插件「{}」有两份：只列 {}（版本 {}），不列 {}（版本 {}）",
+                    e.run_key,
                     win.dir.display(),
                     win.manifest.version,
                     lose.dir.display(),
@@ -138,6 +144,66 @@ pub fn discover_in(root: &Path, disabled: &[String], isolated: &[String]) -> Vec
         kept.push(e);
     }
     kept
+}
+
+/// 把一份清单展开成运行时条目：schema 1 一条；schema 2 每个命令一条。
+///
+/// 展开后的单命令 `manifest` 仍保留包级字段（id/version/protocol/min_host/
+/// platforms），命令字段被替换成该命令自己的一套；`run_key` 用作运行状态、
+/// 面板卡与热键表的主键。
+fn expand_manifest(
+    manifest: Manifest,
+    dir: PathBuf,
+    enabled: bool,
+    blocked: bool,
+    isolated: bool,
+) -> Vec<Extension> {
+    if manifest.commands.is_empty() {
+        return vec![Extension {
+            run_key: manifest.id.clone(),
+            display_name: manifest.name.clone(),
+            package_name: manifest.name.clone(),
+            command_id: None,
+            manifest,
+            dir,
+            enabled,
+            blocked,
+            isolated,
+        }];
+    }
+    let package_id = manifest.id.clone();
+    let package_name = manifest.name.clone();
+    manifest
+        .commands
+        .iter()
+        .map(|cmd| {
+            let mut m = manifest.clone();
+            m.command_id = Some(cmd.id.clone());
+            m.kind = cmd.kind;
+            m.entry = cmd.entry.clone();
+            m.args = cmd.args.clone();
+            m.capabilities = cmd.capabilities.clone();
+            m.settings_ui = cmd.settings_ui;
+            m.settings = cmd.settings.clone();
+            m.run_ui = cmd.run_ui;
+            m.preview = cmd.preview.clone();
+            m.presets = cmd.presets.clone();
+            m.timeout_ms = cmd.timeout_ms;
+            m.hotkey = cmd.hotkey;
+            Extension {
+                run_key: format!("{package_id}:{}", cmd.id),
+                // 菜单 / 设置窗只显示命令名：包名已在 manifest 里，不要在每个入口前重复。
+                display_name: cmd.name.clone(),
+                package_name: package_name.clone(),
+                command_id: Some(cmd.id.clone()),
+                manifest: m,
+                dir: dir.clone(),
+                enabled,
+                blocked,
+                isolated,
+            }
+        })
+        .collect()
 }
 
 /// 某个扩展是否在启停表里。
@@ -245,14 +311,14 @@ pub fn plugin_hotkey_items(
         else {
             continue;
         };
-        let raw = settings::load(&ext.manifest.id)
+        let raw = settings::load_for(&ext)
             .into_iter()
             .find(|(k, _)| k == &spec.key)
             .map(|(_, v)| v)
             .unwrap_or_else(|| spec.default.clone());
         out.push((
-            ext.manifest.id.clone(),
-            ext.manifest.name.clone(),
+            ext.run_key.clone(),
+            ext.display_name.clone(),
             spec.key.clone(),
             raw,
         ));
@@ -364,7 +430,7 @@ fn effective_hotkey(ext: &Extension) -> Option<crate::core::hotkey::Hotkey> {
         .iter()
         .find(|s| s.kind == crate::core::ext::SettingKind::Hotkey)
     {
-        let raw = settings::load(&ext.manifest.id)
+        let raw = settings::load_for(ext)
             .into_iter()
             .find(|(k, _)| k == &spec.key)
             .map(|(_, v)| v)
@@ -426,8 +492,8 @@ fn build_hotkey_table(list: &[Extension], builtins: &Hotkeys) -> DynamicHotkeys 
             continue;
         }
         table.push(PluginHotkey {
-            plugin_id: ext.manifest.id.clone(),
-            plugin_name: ext.manifest.name.clone(),
+            plugin_id: ext.run_key.clone(),
+            plugin_name: ext.display_name.clone(),
             key,
         });
     }
@@ -448,7 +514,7 @@ pub fn run_by_hotkey(
         return Err("没有插件认领这把键".into());
     };
     let list = installed_cached(config);
-    let Some(ext) = list.iter().find(|e| e.manifest.id == entry.plugin_id) else {
+    let Some(ext) = list.iter().find(|e| e.run_key == entry.plugin_id) else {
         return Err(format!("插件「{}」已不在安装目录里", entry.plugin_name));
     };
     // 能力最小化：没声明 image.read 的插件连路径都不发。
@@ -1060,6 +1126,10 @@ mod tests {
             enabled: true,
             blocked: false,
             isolated: false,
+            command_id: None,
+            display_name: String::new(),
+            package_name: String::new(),
+            run_key: String::new(),
         }];
         let mut p = AvailablePlugin {
             id: "com.example.d".into(),
@@ -1113,7 +1183,37 @@ mod tests {
             enabled: true,
             blocked: false,
             isolated: false,
+            command_id: None,
+            display_name: id.to_string(),
+            package_name: id.to_string(),
+            run_key: id.to_string(),
         }
+    }
+
+    /// schema 2 的一个包要展开成多条运行条目，run_key / 显示名 / 命令字段各归各。
+    #[test]
+    fn schema2_manifest_expands_into_one_extension_per_command() {
+        let text = r#"{
+            "schema": 2, "id": "analyze", "name": "图片分析",
+            "version": "1.0.0", "protocol": 2, "min_host": "0.4.0",
+            "platforms": ["windows-x64"],
+            "commands": [
+                {"id": "checkup", "name": "体检", "kind": "command",
+                 "entry": "checkup.exe", "capabilities": ["image.read"]},
+                {"id": "channels", "name": "调色", "kind": "editor",
+                 "entry": "channels.exe", "capabilities": ["image.read", "image.write"]}
+            ]
+        }"#;
+        let m = Manifest::parse(text).expect("schema 2");
+        let list = expand_manifest(m, PathBuf::from("plugins/analyze"), true, false, false);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].run_key, "analyze:checkup");
+        assert_eq!(list[0].command_id.as_deref(), Some("checkup"));
+        assert_eq!(list[0].display_name, "体检");
+        assert_eq!(list[0].manifest.kind, Kind::Command);
+        assert_eq!(list[1].run_key, "analyze:channels");
+        assert_eq!(list[1].manifest.kind, Kind::Editor);
+        assert!(list[1].manifest.has_capability(Capability::ImageWrite));
     }
 
     /// 动态热键的裁决：内置优先、插件间先来先得、不可用的插件不进表。

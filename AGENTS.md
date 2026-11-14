@@ -90,6 +90,8 @@ python build\hygiene_scan.py      # 硬编路径 / 调试残留 / TODO 真标记
                                   # 自绘对话框按钮只走 btn / dialog_footer::action（第十四查 footer_buttons，2026-11-06）/
                                   # M4 的 include_str! 清单 = 磁盘 settings/*.rs 全集（第十五查 settings_include，
                                   #   E3 下沉——漏列方向 M4 用例自己永远查不到，decoders.rs 曾静默漏过）/
+                                  # ui 层字体/字号/字重只认 `ui/tokens.rs`（第十六查 literal_font，
+                                  #   2026-11-14 用户口径：全窗统一微软雅黑 13px，例外先登记 docs/排版规范.md）/
                                   # 无密钥/无隐私（私钥块 / 访问令牌 / URL 内嵌凭据 / 口令字面量 / 私人邮箱 / 含真名的本机路径）；
                                   # violations: 0 才算过。★ 写 `.ps1` 注释一律英文；解码器仓同款判据在
                                   # 解码器仓库的 `check_docs.py`
@@ -289,6 +291,15 @@ cost=…ms bitmap=…`、`[decode-req] kind=… tier=… verdict=…`、`[close]
   `Element::button(` 只许出现在 `btn` 的实现里——**hygiene 第 14 查 `footer_buttons` 守着**。
 - 对话框内容行用 `option_row_inset(..., 0)`：设置页的「页 16 + 行 16 = 32」**不适用**于对话框，
   照抄会让标签与底栏按钮错开 16（2026-11-06 用户点名「按钮布局不一样」的实际形状）。
+
+### 字体与字号铁律：一个字体、一个字号（2026-11-14，硬性）
+
+- **正本 = [`docs/排版规范.md`](docs/排版规范.md)**。换字体 / 字号先改那份文档，
+  再改 `src/ui/tokens.rs`；例外（图标字形 / 展示性大标题）必须先登记。
+- 全部正文 = `FAMILY_UI`（微软雅黑）+ `SIZE_BODY`（13px）；层级只靠 `WEIGHT_EMPHASIS`
+  （600）加粗表达。图标字形用 `FAMILY_ICON` + `SIZE_ICON`，只画图标、不画正文。
+- `src/ui/**` 不许写字面字体 / 字号 / 字重（`ui/tokens.rs` 除外）——
+  **hygiene 第十六查 `literal_font` 守着**；`docs_consistency::j20` 钉住正本与令牌表同步。
 
 ### 术语铁律：解码器 vs 解码库 vs 扩展名（2026-10-29 收口，三词各归其位）
 

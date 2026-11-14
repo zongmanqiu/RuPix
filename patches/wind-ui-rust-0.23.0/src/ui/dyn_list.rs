@@ -115,8 +115,7 @@ impl<T: Clone + 'static> Widget for DynList<T> {
 /// 症状极具迷惑性：
 /// - `Layout::Scroll` 仍在 → `measure_scroll`/`arrange_scroll` 照常跑，`content_h`、
 ///   `view_h`、`max_scroll` 全都算对，滚动条也**画得出来**；
-/// - 但事件侧无人接手 → `scroll_y` 永远是 0。
-/// 即"滚动条看得见、拖不动、滚轮也不滚"。
+/// - 但事件侧无人接手 → `scroll_y` 永远是 0。即“滚动条看得见、拖不动、滚轮也不滚”。
 ///
 /// # 为什么不能在 DynList 里直接转发
 /// `DynList` 同样被 `host_signal`（普通 `col` 容器）复用，那个场景没有可滚容器，

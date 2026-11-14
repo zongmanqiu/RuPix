@@ -38,7 +38,7 @@ use crate::core::decode::{Decoder, Done, Meta, MetaEvent, RegionReq, ReqKind};
 use crate::core::error::{ViewError, ViewFailure};
 use crate::core::gallery::{Gallery, Jump, SortSpec};
 use crate::core::geometry::{downscale, fit_dims, transformed, RectI};
-use crate::core::pixels::{Anim, Decoded, Histogram, Region, RgbaImage, MAX_PIXELS};
+use crate::core::pixels::{Anim, Decoded, Region, RgbaImage, MAX_PIXELS};
 use crate::core::reading::Memento;
 use crate::core::thumbs::{Thumbs, THUMB_SETTLE};
 
@@ -216,15 +216,6 @@ pub struct DisplayState {
     pub mirrored: bool,
 }
 
-/// 直方图缓存的一格。字段单独命名，避免 `RefCell<Option<(…五元组…)>>` 撞 clippy。
-pub(super) struct HistCache {
-    pub(super) path: PathBuf,
-    pub(super) key: usize,
-    pub(super) width: u32,
-    pub(super) height: u32,
-    pub(super) hist: Histogram,
-}
-
 /// 当前已上屏的一张图。
 pub struct Loaded {
     pub path: PathBuf,
@@ -342,12 +333,6 @@ pub struct Viewer {
     /// 命中时 [`Self::navigate`] 直接从缓存取回填进 [`Self::preview_meta`]。
     /// `install` 落地后用渲染阶段的权威值覆盖缓存（契约：查询值仅预览）。
     pub(super) meta_cache: std::collections::HashMap<PathBuf, crate::core::decode::Meta>,
-
-    /// 直方图缓存：键 = `(路径, base_rgba 指针, 解码宽, 解码高)`。
-    ///
-    /// 直方图卡只在展开时读它；用 `RefCell` 是因为 `paint` / 属性刷新都只有 `&Viewer`。
-    /// 指针 + 尺寸已能区分“换图 / 换解码档”；同一份像素旋转/镜像不改变分布，不必重算。
-    pub(super) hist_cache: RefCell<Option<HistCache>>,
 
     /// 预读在途请求的世代号（同一时刻至多一个，见 [`Self::request_prefetch`]）。
     ///

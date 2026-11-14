@@ -116,6 +116,42 @@ fn load_from(path: &Path, plugin_id: &str) -> Settings {
     }
 }
 
+/// schema 2 命令前缀：`<command_id>.`；单命令包无前缀。
+fn key_prefix(ext: &super::Extension) -> Option<String> {
+    ext.command_id.as_ref().map(|c| format!("{c}."))
+}
+
+/// 读某个扩展（含 schema 2 命令）的设置视图：多命令包只返回本命令前缀下的键，
+/// 且键名已拆回原名（插件不需要知道前缀）。
+pub fn load_for(ext: &super::Extension) -> Settings {
+    let all = load(&ext.manifest.id);
+    let Some(prefix) = key_prefix(ext) else {
+        return all;
+    };
+    all.into_iter()
+        .filter_map(|(k, v)| k.strip_prefix(&prefix).map(|rest| (rest.to_string(), v)))
+        .collect()
+}
+
+/// 合并写某个扩展（含 schema 2 命令）的设置：先给键加命令前缀，再走整体合并。
+///
+/// ★ 不能直接 `save`：同一个 `settings.json` 里还住着同包其他命令的键，
+///   整体覆盖会把它们清掉。
+pub fn merge_into_for(ext: &super::Extension, incoming: &Settings) -> Result<Settings, String> {
+    let Some(prefix) = key_prefix(ext) else {
+        return merge_into(&ext.manifest.id, incoming);
+    };
+    let prefixed: Settings = incoming
+        .iter()
+        .map(|(k, v)| (format!("{prefix}{k}"), v.clone()))
+        .collect();
+    let merged = merge_into(&ext.manifest.id, &prefixed)?;
+    Ok(merged
+        .into_iter()
+        .filter_map(|(k, v)| k.strip_prefix(&prefix).map(|rest| (rest.to_string(), v)))
+        .collect())
+}
+
 /// 写插件的设置区（整体覆盖）。失败只返回 Err，由调用方决定降级。
 pub fn save(plugin_id: &str, items: &Settings) -> Result<(), String> {
     let Some(path) = settings_path(plugin_id) else {

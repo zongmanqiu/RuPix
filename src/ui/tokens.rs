@@ -101,7 +101,33 @@ pub fn set_theme(t: Theme) -> bool {
 
 // ── 排版 ──────────────────────────────────────────────────────────────
 
-pub const FONT_MD: f32 = 14.0;
+// ── 排版：字体 / 字号 / 字重（2026-11-14 用户口径）────────────────────
+//
+// ★ **看图窗口所有文字统一同一字族、同一字号**；小标题只许加粗，特殊用途只许更大，
+//   而且必须登记在 `docs/排版规范.md`；新元素一律用这里的令牌，不许写字面量——
+//   hygiene 第 16 查 `literal_font` 会拦。
+
+/// 界面唯一正文字族：标题栏、浮条、状态、信息面板、文件树、缩略图序号、设置页…
+/// 都由它渲染（windui 的菜单 / tooltip / toast 也经 `Theme::font_family` 兜到它）。
+pub const FAMILY_UI: &str = "Microsoft YaHei";
+
+/// 图标字形专用字族。**只画图标（PUA 码位），不画面上的任何正文**。
+/// 图标字体是唯一允许的第二字族，登记见 `docs/排版规范.md` §3。
+pub const FAMILY_ICON: &str = "Segoe MDL2 Assets";
+
+/// 正文唯一字号：看图窗口与设置窗所有文本共用它。
+pub const SIZE_BODY: f32 = 13.0;
+
+/// 图标字形的统一光学尺寸。图标不是文字，字号只决定字形大小。
+pub const SIZE_ICON: f32 = 16.0;
+
+/// 登记在案的「更大一档」（`docs/排版规范.md` §3）：
+/// 关于页品牌名、画布左右翻页箭头。新增用途必须先登记。
+pub const SIZE_DISPLAY: f32 = 22.0;
+
+/// 强调字重（卡片名 / 小节标题 / 选中项）：**只加粗，不换字体、不换颜色**。
+/// 常规字重就是框架默认的 400，不另设令牌（没人显式写“不加粗”）。
+pub const WEIGHT_EMPHASIS: u16 = 600;
 /// 内容行高（设置页每一行的固定高度）。
 pub const ROW_H: i32 = 40;
 /// 两列版式的标签列宽（右侧控件列与它同一条左缘）。
@@ -162,9 +188,9 @@ pub const CORNER_CONTROL: f32 = 6.0;
 ///
 ///   钉成「!」那颗的尺寸后，图标在框里居中（windui 按钮的文字/图标都是居中画的），
 ///   两颗按钮在任何机器上都严格同款。数字来自真实 DirectWrite 量测，
-///   回归测试 `info_row_icon_buttons_share_one_box` 盯着它（FONT_MD 或界面字体变了会红）。
+///   回归测试 `info_row_icon_buttons_share_one_box` 盯着它（SIZE_BODY 或界面字体变了会红）。
 pub const ICON_BTN_W: i32 = 37;
-pub const ICON_BTN_H: i32 = 36;
+pub const ICON_BTN_H: i32 = 35;
 
 // ── 浅色系（独立窗口：设置 / 对话框）──────────────────────────────
 // 属性卡不是独立窗口：它在信息面板里，深 / 浅两套配色由 `tokens::PanelColors` 提供。
@@ -476,14 +502,6 @@ pub struct PanelColors {
     pub text: Color,
     pub muted: Color,
     pub edge: Color,
-    /// 直方图的 R / G / B / 亮度四档与轨道底色。
-    pub hist_r: Color,
-    pub hist_g: Color,
-    pub hist_b: Color,
-    pub hist_luma: Color,
-    pub hist_track: Color,
-    /// 直方图网格线（比轨道亮一档，不抢曲线）。
-    pub hist_grid: Color,
 }
 
 impl PanelColors {
@@ -495,12 +513,6 @@ impl PanelColors {
             content: to_color(DARK_OVERLAY.empty_bg),
             text: to_color(DARK_OVERLAY.text),
             muted: to_color(DARK_OVERLAY.text_muted),
-            hist_r: to_color4([232, 92, 92, 235]),
-            hist_g: to_color4([96, 204, 132, 235]),
-            hist_b: to_color4([104, 152, 248, 235]),
-            hist_luma: to_color4([226, 226, 230, 225]),
-            hist_track: to_color4([255, 255, 255, 18]),
-            hist_grid: to_color4([255, 255, 255, 34]),
             // ★ 深色卡描边沿用 `panel_edge`（α=0 = 不画）。这是**已接受**的现状，不是漏项：
             //   深色底上卡片靠 `slot_bg` 叠层已能与面板分开，再补一道描边反而显重；
             //   真要单独给卡片一档边线，应新增语义 token，不许在这里写字面值。
@@ -516,12 +528,6 @@ impl PanelColors {
             content: to_color(LIGHT_OVERLAY.empty_bg),
             text: to_color(LIGHT_OVERLAY.text),
             muted: to_color(LIGHT_OVERLAY.text_muted),
-            hist_r: to_color4([196, 58, 58, 235]),
-            hist_g: to_color4([36, 150, 84, 235]),
-            hist_b: to_color4([48, 104, 214, 235]),
-            hist_luma: to_color4([60, 60, 64, 220]),
-            hist_track: to_color4([0, 0, 0, 14]),
-            hist_grid: to_color4([0, 0, 0, 26]),
             edge: to_color4(LIGHT_OVERLAY.panel_edge),
         }
     }
@@ -644,9 +650,6 @@ mod tests {
         assert_ne!(d.card, l.card);
         assert_ne!(d.header, l.header);
         assert_ne!(d.content, l.content);
-        assert_ne!(d.hist_r, l.hist_r);
-        assert_ne!(d.hist_track, l.hist_track);
-        assert_ne!(d.hist_grid, l.hist_grid);
     }
 
     /// ★ m302：树、条、看图区是三块地，必须两两可分。截图实测过一次「树 = 看图区」

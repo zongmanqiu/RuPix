@@ -42,17 +42,17 @@ pub fn about_page(h: &Handles) -> Element {
                 .child(
                     Element::row()
                         .spacing(8)
-                        .child(Element::label("RuPix").font_size(22.0))
+                        .child(Element::label("RuPix").font_size(SIZE_DISPLAY))
                         .child(
                             Element::label(env!("CARGO_PKG_VERSION"))
-                                .font_size(13.0)
+                                .font_size(SIZE_BODY)
                                 .fg(to_color(TEXT_SECONDARY)),
                         )
                         .cross(Align::End),
                 )
                 .child(
                     Element::label("小巧极速的 Windows 看图器")
-                        .font_size(FONT_MD)
+                        .font_size(SIZE_BODY)
                         .fg(to_color(TEXT_SECONDARY)),
                 ),
         )
@@ -64,19 +64,19 @@ pub fn about_page(h: &Handles) -> Element {
         .spacing(6)
         .child(
             Element::label("仓库：")
-                .font_size(FONT_MD)
+                .font_size(SIZE_BODY)
                 .fg(to_color(TEXT_SECONDARY)),
         )
-        .child(Element::link("Gitee").url(HOMEPAGE).font_size(FONT_MD))
+        .child(Element::link("Gitee").url(HOMEPAGE).font_size(SIZE_BODY))
         .child(
             Element::label("|")
-                .font_size(FONT_MD)
+                .font_size(SIZE_BODY)
                 .fg(to_color(TEXT_SECONDARY)),
         )
         .child(
             Element::link("GitHub")
                 .url(GITHUB_MIRROR)
-                .font_size(FONT_MD),
+                .font_size(SIZE_BODY),
         )
         .cross(Align::Center);
 
@@ -85,12 +85,12 @@ pub fn about_page(h: &Handles) -> Element {
         .child(header)
         .child(
             Element::label("Copyright © 2026 邱宗满")
-                .font_size(FONT_MD)
+                .font_size(SIZE_BODY)
                 .fg(to_color(TEXT_SECONDARY)),
         )
         .child(
             Element::label("许可证：AGPL-3.0")
-                .font_size(FONT_MD)
+                .font_size(SIZE_BODY)
                 .fg(to_color(TEXT_SECONDARY)),
         )
         .child(repo_row)
@@ -100,7 +100,7 @@ pub fn about_page(h: &Handles) -> Element {
 
     let qr = |bytes: &'static [u8], caption: &str| {
         Element::col()
-            .child(Element::label(caption).font_size(FONT_MD))
+            .child(Element::label(caption).font_size(SIZE_BODY))
             .child(
                 Element::image_svg(bytes, None)
                     .width(DONATE_QR_SIZE)
@@ -115,7 +115,11 @@ pub fn about_page(h: &Handles) -> Element {
 
     let donate_card = Element::col()
         .spacing(8)
-        .child(Element::label("赞助").font_size(FONT_MD).font_weight(600))
+        .child(
+            Element::label("赞助")
+                .font_size(SIZE_BODY)
+                .font_weight(WEIGHT_EMPHASIS),
+        )
         .child(
             Element::row()
                 .child(qr(DONATE_WECHAT_SVG, "微信"))
@@ -153,15 +157,15 @@ pub fn about_page(h: &Handles) -> Element {
         let name = if *s == 0 { "Gitee" } else { "GitHub" };
         format!("更新源：{name}")
     }))
-    .font_size(FONT_MD)
+    .font_size(SIZE_BODY)
     .fg(to_color(TEXT_SECONDARY));
 
     let update_card = Element::col()
         .spacing(8)
         .child(
             Element::label("版本更新")
-                .font_size(FONT_MD)
-                .font_weight(600),
+                .font_size(SIZE_BODY)
+                .font_weight(WEIGHT_EMPHASIS),
         )
         .child(
             Element::row()
@@ -174,7 +178,7 @@ pub fn about_page(h: &Handles) -> Element {
         )
         .child(
             Element::label_signal(up.status)
-                .font_size(FONT_MD)
+                .font_size(SIZE_BODY)
                 .fg(to_color(TEXT_SECONDARY)),
         )
         .padding(card_pad)

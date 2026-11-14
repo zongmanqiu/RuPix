@@ -114,7 +114,7 @@ pub fn installed_body(h: &Handles, config: Rc<RefCell<Config>>) -> Element {
                 .padding_xy(16, 0)
                 .child(
                     Element::label_signal(h.decoder_count)
-                        .font_size(FONT_MD)
+                        .font_size(SIZE_BODY)
                         .fg(to_color(TEXT_ACCENT))
                         .weight(1.0)
                         .max_lines(1)
@@ -135,7 +135,7 @@ pub fn installed_body(h: &Handles, config: Rc<RefCell<Config>>) -> Element {
                 .padding_xy(16, 0)
                 .child(
                     Element::label("（没有匹配的解码器）")
-                        .font_size(FONT_MD)
+                        .font_size(SIZE_BODY)
                         .fg(to_color(TEXT_SECONDARY)),
                 )
                 .visible_when({
@@ -246,7 +246,7 @@ pub fn decoder_row(
         .padding_xy(16, 0)
         .child(
             Element::label(e.display_name)
-                .font_size(FONT_MD)
+                .font_size(SIZE_BODY)
                 .weight(1.0)
                 // 单行省略：名字过长截断，别把版本/「!」/开关挤出右缘。
                 .max_lines(1)
@@ -257,7 +257,7 @@ pub fn decoder_row(
         // 灰的后缀串：最多一行、尾部截断，别把「!」与开关挤出右缘。
         row = row.child(
             Element::label(text)
-                .font_size(FONT_MD)
+                .font_size(SIZE_BODY)
                 .fg(to_color(TEXT_SECONDARY))
                 .width(160)
                 .max_lines(1)
@@ -452,7 +452,7 @@ pub fn open_decoder_info(
                             .padding_xy(0, 8)
                             .child(
                                 Element::label("上次加载时宿主崩溃，本次已跳过。")
-                                    .font_size(FONT_MD)
+                                    .font_size(SIZE_BODY)
                                     .fg(to_color(TEXT_SECONDARY))
                                     .weight(1.0),
                             )

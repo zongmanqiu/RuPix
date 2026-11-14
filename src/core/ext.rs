@@ -11,6 +11,9 @@ use crate::core::json::{self, Value};
 /// manifest 结构版本（安装期）。与运行期协议版本分开。
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// schema 2：一个插件包多个命令（`commands` 数组）。
+pub const COMMANDS_SCHEMA_VERSION: u32 = 2;
+
 /// 扩展协议**下界**（运行期）。旧插件兼容的地板，**永不抬**。
 ///
 /// ★ 与解码器 ABI 同一条立约：宿主升级后，已安装的旧插件不需要重新编译/重装。
@@ -612,6 +615,43 @@ fn normalize_default(
     }
 }
 
+/// schema 2：一个插件包里的一个命令。
+///
+/// 字段与 schema 1 的单命令清单同义、同校验；一个包可以有多个命令，
+/// 共享顶层 id/version/protocol/min_host/platforms，命令自己的
+/// kind/entry/capabilities/settings/hotkey 各自独立。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandSpec {
+    pub id: String,
+    pub name: String,
+    pub kind: Kind,
+    pub entry: String,
+    pub args: Vec<String>,
+    pub capabilities: Vec<Capability>,
+    pub settings_ui: bool,
+    pub settings: Vec<SettingSpec>,
+    pub run_ui: bool,
+    pub preview: Option<PreviewSpec>,
+    pub presets: Vec<PresetSpec>,
+    pub timeout_ms: Option<u64>,
+    pub hotkey: Option<Hotkey>,
+}
+
+/// 单命令字段的解析结果（schema 1 顶层 / schema 2 的 command 共用）。
+struct CommandFields {
+    kind: Kind,
+    entry: String,
+    args: Vec<String>,
+    capabilities: Vec<Capability>,
+    settings_ui: bool,
+    settings: Vec<SettingSpec>,
+    run_ui: bool,
+    preview: Option<PreviewSpec>,
+    presets: Vec<PresetSpec>,
+    timeout_ms: Option<u64>,
+    hotkey: Option<Hotkey>,
+}
+
 /// 一个扩展的 `manifest.json`。字段名与扩展开发文档一一对应。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
@@ -674,6 +714,112 @@ pub struct Manifest {
     pub preview: Option<PreviewSpec>,
     /// 声明式滤镜预设（可选，加法式）：取值 → 六条滑块的数值组。
     pub presets: Vec<PresetSpec>,
+    /// schema 2 的命令列表；schema 1 为空（视为单命令包）。
+    pub commands: Vec<CommandSpec>,
+    /// 展开后的命令 id（单命令包为 None）。由 `extensions::discover` 填写。
+    pub command_id: Option<String>,
+}
+
+/// 解析一个「单命令」的字段集：schema 1 取顶层，schema 2 取 `commands[i]`。
+fn parse_command_fields(root: &Value) -> Result<CommandFields, String> {
+    let kind_s = get_str(root, "kind")?;
+    let kind = Kind::parse(&kind_s)
+        .ok_or_else(|| format!("kind=\"{kind_s}\" 不认识（command/editor/panel）"))?;
+
+    let entry = get_str(root, "entry")?;
+    validate_entry(&entry, kind)?;
+
+    let args = get_str_array(root, "args")?;
+    let capabilities = get_capabilities(root)?;
+
+    // 响应超时：可选；超过上限 = 坏清单（而不是"照办"）——
+    // 桌面软件没有"等半小时"这种设计，插件也不能替宿主决定它等多久。
+    let timeout_ms = match root.get("timeout_ms") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .ok_or_else(|| "timeout_ms 必须是非负整数（毫秒）".to_string())?;
+            if n == 0 {
+                return Err("timeout_ms 必须大于 0".into());
+            }
+            if n > MAX_TIMEOUT_MS {
+                return Err(format!(
+                    "timeout_ms={n} 超过上限 {MAX_TIMEOUT_MS}（30 分钟）"
+                ));
+            }
+            Some(n)
+        }
+    };
+
+    // 动态热键：可选。给了但写不成宿主认得的键串 = 坏清单（不是"照办"——
+    // 一条永远按不出来的热键等于没写，还会让用户以为插件坏了）。
+    let hotkey = match root.get("hotkey") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| "hotkey 必须是字符串（键串）".to_string())?;
+            let hk =
+                Hotkey::from_spec(s).ok_or_else(|| format!("hotkey=\"{s}\" 不是宿主认得的键串"))?;
+            Some(hk)
+        }
+    };
+
+    // 设置窗口：可选布尔。只给了 `settings_ui` 却没给写权限 = 改了存不下来，
+    // 属于坏清单（不是"降级成只读"——用户改完发现没保存比没有入口更糟）。
+    let settings_ui = match root.get("settings_ui") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err("settings_ui 必须是布尔值".into()),
+    };
+    if settings_ui && !capabilities.contains(&Capability::SettingsWrite) {
+        return Err("settings_ui=true 必须同时声明 settings.write".into());
+    }
+
+    // 声明式设置：可选。给了它就必须能读能写（宿主既要读旧值来填控件，也要存新值）。
+    // 与 `settings_ui` 同时出现 = 坏清单：一个说"宿主画"、一个说"插件画"，得挑一个。
+    let settings = parse_settings(root)?;
+    if !settings.is_empty() {
+        if !capabilities.contains(&Capability::SettingsRead)
+            || !capabilities.contains(&Capability::SettingsWrite)
+        {
+            return Err("声明了 settings 就必须同时声明 settings.read 与 settings.write".into());
+        }
+        if settings_ui {
+            return Err("settings（宿主渲染）与 settings_ui（插件自画）只能二选一".into());
+        }
+    }
+    if settings.iter().any(|s| s.kind == SettingKind::Hotkey) && hotkey.is_some() {
+        return Err("settings 里已有 type=hotkey 的项，就别再写 manifest.hotkey".into());
+    }
+
+    // 运行时参数窗：可选布尔。声明了却没有 settings = 没有窗可弹，
+    // 属于坏清单（不是静默降级成一点即跑）。
+    let run_ui = match root.get("run_ui") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err("run_ui 必须是布尔值".into()),
+    };
+    if run_ui && settings.is_empty() {
+        return Err("run_ui=true 必须同时声明 settings（否则没有参数窗可弹）".into());
+    }
+    let preview = parse_preview(root, &settings)?;
+    let presets = parse_presets(root, &settings, preview.as_ref())?;
+
+    Ok(CommandFields {
+        kind,
+        entry,
+        args,
+        capabilities,
+        settings_ui,
+        settings,
+        run_ui,
+        preview,
+        presets,
+        timeout_ms,
+        hotkey,
+    })
 }
 
 impl Manifest {
@@ -691,8 +837,10 @@ impl Manifest {
         let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let root = json::parse(text).map_err(|e| format!("JSON 解析失败：{e}"))?;
         let schema = get_u32(&root, "schema")?;
-        if schema != SCHEMA_VERSION {
-            return Err(format!("schema={schema}，宿主只支持 {SCHEMA_VERSION}"));
+        if schema != SCHEMA_VERSION && schema != COMMANDS_SCHEMA_VERSION {
+            return Err(format!(
+                "schema={schema}，宿主只支持 {SCHEMA_VERSION} 或 {COMMANDS_SCHEMA_VERSION}"
+            ));
         }
 
         let id = get_str(&root, "id")?;
@@ -717,15 +865,6 @@ impl Manifest {
         let min_host = get_str(&root, "min_host")?;
         validate_version(&min_host, "min_host")?;
 
-        let kind_s = get_str(&root, "kind")?;
-        let kind = Kind::parse(&kind_s)
-            .ok_or_else(|| format!("kind=\"{kind_s}\" 不认识（command/editor/panel）"))?;
-
-        let entry = get_str(&root, "entry")?;
-        validate_entry(&entry, kind)?;
-
-        let args = get_str_array(&root, "args")?;
-        let capabilities = get_capabilities(&root)?;
         let platforms = get_str_array(&root, "platforms")?;
         if platforms.is_empty() {
             return Err("platforms 不能为空".into());
@@ -734,83 +873,87 @@ impl Manifest {
             return Err("platforms 必须包含 windows-x64".into());
         }
 
-        // 响应超时：可选；超过上限 = 坏清单（而不是"照办"）——
-        // 桌面软件没有"等半小时"这种设计，插件也不能替宿主决定它等多久。
-        let timeout_ms = match root.get("timeout_ms") {
-            None | Some(Value::Null) => None,
-            Some(v) => {
-                let n = v
-                    .as_u64()
-                    .ok_or_else(|| "timeout_ms 必须是非负整数（毫秒）".to_string())?;
-                if n == 0 {
-                    return Err("timeout_ms 必须大于 0".into());
-                }
-                if n > MAX_TIMEOUT_MS {
-                    return Err(format!(
-                        "timeout_ms={n} 超过上限 {MAX_TIMEOUT_MS}（30 分钟）"
-                    ));
-                }
-                Some(n)
-            }
-        };
-
-        // 动态热键：可选。给了但写不成宿主认得的键串 = 坏清单（不是"照办"——
-        // 一条永远按不出来的热键等于没写，还会让用户以为插件坏了）。
-        let hotkey = match root.get("hotkey") {
-            None | Some(Value::Null) => None,
-            Some(v) => {
-                let s = v
-                    .as_str()
-                    .ok_or_else(|| "hotkey 必须是字符串（键串）".to_string())?;
-                let hk = Hotkey::from_spec(s)
-                    .ok_or_else(|| format!("hotkey=\"{s}\" 不是宿主认得的键串"))?;
-                Some(hk)
-            }
-        };
-
-        // 设置窗口：可选布尔。只给了 `settings_ui` 却没给写权限 = 改了存不下来，
-        // 属于坏清单（不是"降级成只读"——用户改完发现没保存比没有入口更糟）。
-        let settings_ui = match root.get("settings_ui") {
-            None | Some(Value::Null) => false,
-            Some(Value::Bool(b)) => *b,
-            Some(_) => return Err("settings_ui 必须是布尔值".into()),
-        };
-        if settings_ui && !capabilities.contains(&Capability::SettingsWrite) {
-            return Err("settings_ui=true 必须同时声明 settings.write".into());
+        if schema == SCHEMA_VERSION {
+            let f = parse_command_fields(&root)?;
+            return Ok(Self {
+                schema,
+                id,
+                name,
+                version,
+                protocol,
+                min_host,
+                kind: f.kind,
+                entry: f.entry,
+                args: f.args,
+                capabilities: f.capabilities,
+                platforms,
+                settings_ui: f.settings_ui,
+                settings: f.settings,
+                run_ui: f.run_ui,
+                preview: f.preview,
+                presets: f.presets,
+                description: optional_str(&root, "description"),
+                author: optional_str(&root, "author"),
+                license: optional_str(&root, "license"),
+                released: optional_str(&root, "released"),
+                timeout_ms: f.timeout_ms,
+                hotkey: f.hotkey,
+                commands: Vec::new(),
+                command_id: None,
+            });
+        }
+        if schema != COMMANDS_SCHEMA_VERSION {
+            return Err(format!(
+                "schema={schema}，宿主只支持 {SCHEMA_VERSION} 或 {COMMANDS_SCHEMA_VERSION}"
+            ));
         }
 
-        // 声明式设置：可选。给了它就必须能读能写（宿主既要读旧值来填控件，也要存新值）。
-        // 与 `settings_ui` 同时出现 = 坏清单：一个说"宿主画"、一个说"插件画"，得挑一个。
-        let settings = parse_settings(&root)?;
-        if !settings.is_empty() {
-            if !capabilities.contains(&Capability::SettingsRead)
-                || !capabilities.contains(&Capability::SettingsWrite)
-            {
-                return Err(
-                    "声明了 settings 就必须同时声明 settings.read 与 settings.write".into(),
-                );
+        // schema 2：一个包多个命令。顶层只留共享字段，命令各自一套。
+        let arr = root
+            .get("commands")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "schema=2 必须有 commands 数组".to_string())?;
+        if arr.is_empty() {
+            return Err("commands 不能为空".into());
+        }
+        let mut commands: Vec<CommandSpec> = Vec::with_capacity(arr.len());
+        for (i, cmd) in arr.iter().enumerate() {
+            let at = |e: String| format!("commands[{i}]：{e}");
+            let cid = cmd
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| at("缺少字符串字段 id".into()))?;
+            validate_id(cid).map_err(at)?;
+            let cname = cmd
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| at("缺少字符串字段 name".into()))?;
+            if cname.is_empty() {
+                return Err(at("name 不能为空".into()));
             }
-            if settings_ui {
-                return Err("settings（宿主渲染）与 settings_ui（插件自画）只能二选一".into());
+            if commands.iter().any(|c| c.id == cid) {
+                return Err(at(format!("命令 id {cid} 重复")));
             }
+            let f = parse_command_fields(cmd).map_err(at)?;
+            commands.push(CommandSpec {
+                id: cid.to_string(),
+                name: cname.to_string(),
+                kind: f.kind,
+                entry: f.entry,
+                args: f.args,
+                capabilities: f.capabilities,
+                settings_ui: f.settings_ui,
+                settings: f.settings,
+                run_ui: f.run_ui,
+                preview: f.preview,
+                presets: f.presets,
+                timeout_ms: f.timeout_ms,
+                hotkey: f.hotkey,
+            });
         }
-        if settings.iter().any(|s| s.kind == SettingKind::Hotkey) && hotkey.is_some() {
-            return Err("settings 里已有 type=hotkey 的项，就别再写 manifest.hotkey".into());
-        }
-
-        // 运行时参数窗：可选布尔。声明了却没有 settings = 没有窗可弹，
-        // 属于坏清单（不是静默降级成一点即跑）。
-        let run_ui = match root.get("run_ui") {
-            None | Some(Value::Null) => false,
-            Some(Value::Bool(b)) => *b,
-            Some(_) => return Err("run_ui 必须是布尔值".into()),
-        };
-        if run_ui && settings.is_empty() {
-            return Err("run_ui=true 必须同时声明 settings（否则没有参数窗可弹）".into());
-        }
-        let preview = parse_preview(&root, &settings)?;
-        let presets = parse_presets(&root, &settings, preview.as_ref())?;
-
+        // 顶层单命令字段取第一条：schema 1 的旧消费者（设置页 / 运行编排）
+        // 继续工作；多命令消费方读 `commands`。
+        let first = commands[0].clone();
         Ok(Self {
             schema,
             id,
@@ -818,22 +961,24 @@ impl Manifest {
             version,
             protocol,
             min_host,
-            kind,
-            entry,
-            args,
-            capabilities,
+            kind: first.kind,
+            entry: first.entry,
+            args: first.args,
+            capabilities: first.capabilities,
             platforms,
-            settings_ui,
-            settings,
-            run_ui,
-            preview,
-            presets,
+            settings_ui: first.settings_ui,
+            settings: first.settings,
+            run_ui: first.run_ui,
+            preview: first.preview,
+            presets: first.presets,
             description: optional_str(&root, "description"),
             author: optional_str(&root, "author"),
             license: optional_str(&root, "license"),
             released: optional_str(&root, "released"),
-            timeout_ms,
-            hotkey,
+            timeout_ms: first.timeout_ms,
+            hotkey: first.hotkey,
+            commands,
+            command_id: None,
         })
     }
 
@@ -1054,6 +1199,56 @@ mod tests {
         assert!(m.has_capability(Capability::ImageRead));
         assert!(!m.has_capability(Capability::Network));
         assert_eq!(m.args, Vec::<String>::new());
+    }
+
+    fn minimal_v2() -> &'static str {
+        r#"{
+            "schema": 2,
+            "id": "com.example.analyze",
+            "name": "分析",
+            "version": "1.0.0",
+            "protocol": 2,
+            "min_host": "0.4.0",
+            "platforms": ["windows-x64"],
+            "commands": [
+                {
+                    "id": "checkup", "name": "体检", "kind": "command",
+                    "entry": "checkup.exe",
+                    "capabilities": ["image.read", "settings.read", "settings.write"],
+                    "hotkey": "Ctrl+Shift+1"
+                },
+                {
+                    "id": "channels", "name": "调色", "kind": "editor",
+                    "entry": "channels.exe",
+                    "capabilities": ["image.read", "image.write"]
+                }
+            ]
+        }"#
+    }
+
+    #[test]
+    fn schema2_parses_commands_and_first_is_the_single_view() {
+        let m = Manifest::parse(minimal_v2()).expect("schema 2");
+        assert_eq!(m.commands.len(), 2);
+        assert_eq!(m.commands[0].id, "checkup");
+        assert_eq!(m.commands[1].id, "channels");
+        assert_eq!(m.kind, Kind::Command, "顶层单命令视图取第一条");
+        assert_eq!(m.entry, "checkup.exe");
+        assert!(m.commands[1].capabilities.contains(&Capability::ImageWrite));
+        assert_eq!(
+            m.commands[0].hotkey.as_ref().map(|h| h.pretty()),
+            Some("Ctrl+Shift+1".to_string())
+        );
+    }
+
+    #[test]
+    fn schema2_rejects_empty_or_duplicate_commands() {
+        let empty = r#"{"schema":2,"id":"com.example.a","name":"A","version":"1.0.0",
+            "protocol":2,"min_host":"0.4.0","platforms":["windows-x64"],"commands":[]}"#;
+        assert!(Manifest::parse(empty).is_err(), "空 commands 必须是坏清单");
+
+        let dup = minimal_v2().replace("\"id\": \"channels\"", "\"id\": \"checkup\"");
+        assert!(Manifest::parse(&dup).is_err(), "命令 id 重复必须是坏清单");
     }
 
     #[test]

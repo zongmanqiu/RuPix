@@ -508,3 +508,15 @@ chrome.info.visible.get() && chrome.info.props_active.get()
   无边框回退文本窗。
 - 单测：协议 v2 解析 / 序列化往返、坏格式拒绝；PNG → RGBA；插件卡撑高面板、
   换图清空、关闭按钮让位。
+
+## 16. 图片信息合并（2026-11-14）
+
+- `Card::Properties` 与 `Card::Technical` 合并为 `Card::Info`（id `info`，标题「图片信息」）；
+  卡内分四节：文件 / 图像 / 拍摄 / 技术，行仍是 `info_row`，空值整行隐藏。
+- 入口：右键「本图 ▸ 图片信息」；「文件 ▸ 属性」与「本图 ▸ 技术信息」退役，
+  属性快捷键（`Action::Properties`，ini 键 `props`）沿用，打开同一张卡。
+- 配置兼容：`info_cards` / `info_cards_collapsed` 里的旧 id `properties` / `technical`
+  经 `Card::matches_id` 都映射到 `info`；新写入只写 `info`。
+- 直方图仍是独立卡（有图，不是纯文本）；取色器仍是独立工具。
+- 产品边界（用户口径）：图片本来就有的信息走原生入口；需要额外分析的归插件
+  （详见 `docs/产品定位与边界.md` §2）。

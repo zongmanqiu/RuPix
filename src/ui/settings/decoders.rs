@@ -121,7 +121,7 @@ fn download_body(h: &Handles, config: Rc<RefCell<Config>>) -> Element {
                 .padding_xy(16, 0)
                 .child(
                     Element::label_signal(h.remote_status)
-                        .font_size(FONT_MD)
+                        .font_size(SIZE_BODY)
                         .fg(to_color(TEXT_ACCENT))
                         .weight(1.0)
                         .max_lines(1)
@@ -139,7 +139,7 @@ fn download_body(h: &Handles, config: Rc<RefCell<Config>>) -> Element {
                 .padding_xy(16, 0)
                 .child(
                     Element::label("（没有匹配的解码器）")
-                        .font_size(FONT_MD)
+                        .font_size(SIZE_BODY)
                         .fg(to_color(TEXT_SECONDARY)),
                 )
                 .visible_when({
@@ -347,7 +347,7 @@ fn remote_row(h: &Handles, e: RemoteEntry) -> Element {
         .padding_xy(16, 0)
         .child(
             Element::label(e.name.clone())
-                .font_size(FONT_MD)
+                .font_size(SIZE_BODY)
                 .weight(1.0)
                 .max_lines(1)
                 .truncate(Truncate::End),

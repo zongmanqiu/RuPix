@@ -15,7 +15,7 @@
 use windui::core::EventCtx;
 use windui::prelude::*;
 
-use super::tokens::{to_color, BG, FONT_MD};
+use super::tokens::{to_color, BG, SIZE_BODY};
 
 /// 窗宽（逻辑像素）。与 CurSeen 的文本窗同宽：一行放得下约 35 个汉字。
 pub const W: i32 = 520;
@@ -41,9 +41,9 @@ fn visual_lines(text: &str) -> usize {
             .chars()
             .map(|c| {
                 if (c as u32) >= 0x3000 {
-                    FONT_MD
+                    SIZE_BODY
                 } else {
-                    FONT_MD * 0.55
+                    SIZE_BODY * 0.55
                 }
             })
             .sum();
@@ -91,7 +91,7 @@ pub fn show(ctx: &mut EventCtx, key: &str, title: &str, text: &str) {
                     // 视图起点钉在 0：否则 windui 会把光标（默认在末尾）滚进可视区，
                     // 开窗第一眼看到的是最后几行。
                     .select_range(0, 0)
-                    .font_size(FONT_MD)
+                    .font_size(SIZE_BODY)
                     .padding_xy(PAD_X, 6)
                     .fill()
             }),

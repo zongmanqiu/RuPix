@@ -217,6 +217,12 @@ pub struct ImageCanvas {
     /// 上一帧的每屏格数（条内滚轮"一屏"要用）与目录长度（判断能不能滚）。
     strip_cap: Cell<usize>,
     strip_len: Cell<usize>,
+    /// 最近一次右键菜单动作的执行时间。
+    ///
+    /// ★ 菜单项点击后 500ms 内的双击不再交给画布：用户双击菜单项的第二次
+    ///   会落到画布上，而默认 `double_click=1` 是关窗——2026-11-14 用户报
+    ///   「选直方图秒退」就是这条路径（日志 `[close] action=Quit`，无 panic）。
+    menu_action_at: Rc<Cell<Option<std::time::Instant>>>,
     /// 上一帧的边：换边（底 ↔ 左）时清锚点——两个方向格数不同，旧位置没有意义。
     strip_side: Cell<Option<filmstrip::Side>>,
     /// 上一帧清单所属的目录（m260）：换目录时清锚点。同一目录内换图**不清**——
@@ -509,6 +515,37 @@ fn double_click_action(
         DblClick::Maximize
     } else {
         cfg
+    }
+}
+
+/// 菜单项动作执行后，画布忽略双击的时长。
+///
+/// 取系统双击时限的默认值（500ms）：比它更晚的第二击本来也不算双击。
+const MENU_ACTION_GUARD: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// 菜单动作刚执行过？（纯函数，便于单测；调用点见 [`ImageCanvas::menu_action_recent`]）
+fn menu_action_recent_at(at: &Cell<Option<std::time::Instant>>) -> bool {
+    at.get().is_some_and(|t| t.elapsed() < MENU_ACTION_GUARD)
+}
+
+/// 给菜单项动作套一层「执行时间」记录：菜单项点击后的短窗口内，画布忽略双击。
+///
+/// ★ 2026-11-14 用户报「选直方图秒退」：双击菜单项的**第二击会落到画布上**，
+///   而默认 `double_click=1` 是关窗——日志只有 `[close] action=Quit`，无 panic。
+///   不能只改默认值：用户 ini 里已有 `double_click=1`，改了也不影响既有配置。
+fn guard_menu_actions(items: &mut [MenuItem], at: &Rc<Cell<Option<std::time::Instant>>>) {
+    use windui::event::MenuAction;
+    for it in items.iter_mut() {
+        if let MenuAction::Run(f) = &it.action {
+            let f = f.clone();
+            let at = at.clone();
+            let wrapped: Rc<dyn Fn(&mut EventCtx)> = Rc::new(move |ctx| {
+                at.set(Some(std::time::Instant::now()));
+                f(ctx);
+            });
+            it.action = MenuAction::Run(wrapped);
+        }
+        guard_menu_actions(&mut it.submenu, at);
     }
 }
 
@@ -919,7 +956,13 @@ impl ImageCanvas {
             tree_hover: Cell::new(None),
             tree_truncated: Cell::new(false),
             tree_scrub: Cell::new(None),
+            menu_action_at: Rc::new(Cell::new(None)),
         }
+    }
+
+    /// 右键菜单动作刚执行过：紧接着的双击不交给画布（防菜单项双击变关窗）。
+    fn menu_action_recent(&self) -> bool {
+        menu_action_recent_at(&self.menu_action_at)
     }
 
     fn center(&self) -> (f32, f32) {
@@ -1262,13 +1305,13 @@ impl ImageCanvas {
     /// 右键菜单：**文件 → 对画面做事 → 界面 → 设置**四块，顶层 9 项（m327）。
     ///
     /// ```text
-    /// 文件 ▸      打开… / 系统菜单 ── 复制×3 ── 属性
+    /// 文件 ▸      打开… / 系统菜单 ── 复制×3 ── 清除本书阅读位置
     /// 最近 ▸      最近打开（≤100 条，最新在前；m325）
     /// 排序 ▸      文件名 / 大小 / 创建日期 / 修改日期 ── 倒序（m275）
     /// ─────
     /// 画面 ▸      缩小 / 放大 / 适应窗口 / 1:1 原尺寸 / 全屏 / 旋转 90° / 水平镜像 /
     ///            上一帧 / 暂停·继续动画 / 下一帧 ── 左键拖图 / 幻灯片放映 / 动图/文档播放速度 ▸
-    /// 本图 ▸      RAW 参数… / 跳转到…帧/页 / 旋转角度… / 技术信息 / 直方图 / 取色器
+    /// 本图 ▸      RAW 参数… / 跳转到…帧/页 / 旋转角度… / 图片信息 / 取色器
     /// 插件 ▸      外部进程命令
     /// ─────
     /// 界面 ▸      显示操作按钮 / 极简模式 / 棋盘格背景 / 缩略图条 ▸ / 信息面板 /
@@ -1289,21 +1332,18 @@ impl ImageCanvas {
     ///   「最近 ▸」下面——两者都是"接下来看哪张"：最近**往回**挑，排序**往前**排。
     ///
     /// 「文件 ▸」= **磁盘层**：点了都不改屏幕上的像素。打开（读盘）、系统菜单（把文件
-    /// 交给外壳）、复制（写剪贴板）、属性（读元数据）全在这一条轴上；排序也是磁盘层，
+    /// 交给外壳）、复制（写剪贴板）全在这一条轴上；排序也是磁盘层，
     /// 但 m327 按用户要求独立成顶层一项（见 `sort_menu`）。
     /// ★ 「复制」m327 **拍平**进本组：它当年做成子菜单是为省顶层空间，现在整块已在
     ///   「文件 ▸」里，再套一层只是把一次悬停换成两次点击。
-    /// 属性仍在块尾——资源管理器里它永远是最后一项。
+    /// ★ 属性（读元数据）2026-11-14 并入「本图 ▸ 图片信息」，本组不再重复入口。
     ///
-    /// ★ m327：**「系统菜单」「属性」没有进「本图 ▸」**，两条判据：
-    ///   ① 置灰口径——本图各项按"图解没解出来"置灰；系统菜单/属性只要路径在就该能用
-    ///      （解码失败、失败占位、文件坏了，属性照样要能看，文件照样要能交给别的程序）。
-    ///   ② 轴不同——本图改的是像素与取景；系统菜单把文件交给外壳、属性读磁盘元数据，
-    ///      两者都不碰像素。混进去之后这一组就没有一句统一的开关判据了。
+    /// ★ m327：**「系统菜单」没有进「本图 ▸」**：置灰口径只看"路径在不在"，
+    ///   解码失败、文件坏了也该能交给别的程序；轴也不同——它把文件交给外壳，不碰像素。
     ///
     /// 「本图 ▸」（m276 由「工具 ▸」改名）收的是**只作用于当前这张图**、且**不进浮条**的
     /// 低频功能：改它的裸数据解码参数、在它自己的帧/页里按号定位、换一个取景角度、
-    /// 把技术信息 / 直方图输出到右侧信息坞、取它的一个像素。与「画面 ▸」的分界不是
+    /// 把图片信息输出到右侧信息坞、取它的一个像素。与「画面 ▸」的分界不是
     /// "对不对这张图做事"，而是**有没有浮条
     /// 按钮**——画面 ▸ 线前 10 项严格等于 `Btn::ALL`，这一组只进菜单、不占浮条空间。
     ///
@@ -1387,17 +1427,18 @@ impl ImageCanvas {
             it
         });
         align_menu_columns(&mut items);
+        guard_menu_actions(&mut items, &self.menu_action_at);
         ctx.show_context_menu(at, items);
     }
 
     /// 「文件 ▸」：磁盘层（m327 由顶层五片叶子 + 一个子菜单合并而来）。
     ///
     /// 判据沿用 m287——**点了不改屏幕上的像素**。打开（读盘）、系统菜单（把文件交给
-    /// 外壳）、复制（写剪贴板）、属性（读元数据）都在这一条轴上；改像素的在「画面 ▸」
+    /// 外壳）、复制（写剪贴板）都在这一条轴上；改像素的在「画面 ▸」
     /// 「本图 ▸」。排序也是磁盘层，但 m327 按用户要求独立成顶层一项（见 `sort_menu`）。
     ///
-    /// ★ 块内顺序：打开 / 系统菜单（两条都是"拿这个文件当对象"，内容一个归我们、
-    ///   一个归外壳）→ 复制（写出去）→ 属性（读它是什么）。属性留在块尾，照资源管理器。
+    /// ★ 块内顺序：打开 / 系统菜单 → 复制 → 清除本书阅读位置。
+    ///   属性已并入「本图 ▸ 图片信息」，本组不再有属性项。
     fn file_items(&self, has_file: bool, has_image: bool) -> Vec<MenuItem> {
         let mut out = Vec::with_capacity(12);
 
@@ -1498,21 +1539,6 @@ impl ImageCanvas {
         out.append(&mut self.copy_items(has_image, has_file));
 
         out.push(MenuItem::separator());
-
-        // ── 属性（m247）：从浮条「!」与「画面 ▸」收编到顶层，m327 起在「文件 ▸」块尾 ──
-        // 文件类最后一项：读的是磁盘上这个文件的元数据与 EXIF，不依赖画面解没解出来。
-        // 快捷键 Action::Properties 走 exec_action 那条独立路径，共用同一个面板入口。
-        out.push({
-            let chrome = self.chrome.clone();
-            let cfg = self.config.clone();
-            let mut it = MenuItem::run(
-                "属性",
-                move |ctx| info_panel::open_properties(Some(ctx), &chrome, &cfg),
-                false,
-            );
-            it.shortcut = self.config.borrow().hotkeys.display(Action::Properties);
-            it
-        });
 
         // ── 清除本书阅读位置（m333）──
         // 「书」不是「图」：目录 / 压缩包层 / PDF 各是一本。清除后**当前画面不动**，
@@ -2144,7 +2170,7 @@ impl ImageCanvas {
         });
         let mut out = Vec::new();
         for ext in list.into_iter().filter(|e| e.enabled) {
-            let name = ext.manifest.name.clone();
+            let name = ext.display_name.clone();
             if ext.blocked {
                 // 宿主版本低于 manifest.min_host：可见但不给入口，原因写在标签里。
                 let mut it = MenuItem::run(
@@ -2156,7 +2182,7 @@ impl ImageCanvas {
                 out.push(it);
                 continue;
             }
-            let id = ext.manifest.id.clone();
+            let id = ext.run_key.clone();
             if crate::extensions::run::is_running(&id) {
                 out.push(MenuItem::run(
                     format!("取消「{name}」"),
@@ -2359,11 +2385,11 @@ impl ImageCanvas {
     ///
     /// m276 由「工具 ▸」改名并收编两项；前身是 m217 只有取色器一项的「工具 ▸」。
     ///
-    /// 三个"打开一个窗"的常驻项（RAW 参数 → 跳转 → 旋转角度）、两项**信息输出**
-    /// （技术信息 / 直方图）在前；分隔线后是会话开关「取色器」垫底。
+    /// 三个“打开一个窗”的常驻项（RAW 参数 → 跳转 → 旋转角度）、一项**信息输出**
+    /// （图片信息）在前；分隔线后是会话开关「取色器」垫底。
     ///
-    /// ★ 信息面板是各种功能的**输出坞**，不是一套独立的卡片管理器：技术信息 / 直方图
-    ///   都是"这张图"的输出，入口就跟着「本图 ▸」走，不再单开「信息卡」子菜单。
+    /// ★ 信息面板是各种功能的**输出坞**，不是一套独立的卡片管理器：图片信息
+    ///   是“这张图”的输出，入口就跟着「本图 ▸」走，不再单开「信息卡」子菜单。
     ///
     /// 前两项**常驻 + 置灰**：入口永远找得到（用户不必先猜"这功能在不在"），
     /// 但静态图上点不开。跳转判据是 `count > 1` 而不是 `has_index()`——单帧动图
@@ -2435,10 +2461,11 @@ impl ImageCanvas {
             out.push(it);
         }
 
-        // ── 信息输出（2026-11-14）：技术信息 / 直方图 ──
-        // 面板是输出坞，入口跟着"对这张图做事"的「本图 ▸」走。勾选 = 卡片在面板里、
-        // 且面板打开并展开该卡；取消 = 从面板移除。状态仍落 `info_cards`。
-        for card in [info_panel::Card::Technical, info_panel::Card::Histogram] {
+        // ── 信息输出（2026-11-14）：「图片信息」 ──
+        // 图片本来就有的信息（文件/EXIF/解码器）归原生「图片信息」；额外分析归插件。
+        // 直方图已退役（`levels` 插件给得更细）。
+        // 勾选 = 卡片在面板里、且面板打开并展开该卡；取消 = 从面板移除。状态仍落 `info_cards`。
+        for card in info_panel::Card::ALL {
             let mut it = self.info_card_item(card);
             it.enabled = has_image;
             out.push(it);
@@ -2490,6 +2517,9 @@ impl ImageCanvas {
         );
         it.checkable = true;
         it.checked = on;
+        if card == info_panel::Card::Info {
+            it.shortcut = self.config.borrow().hotkeys.display(Action::Properties);
+        }
         it
     }
 
@@ -3164,7 +3194,7 @@ impl Widget for ImageCanvas {
                 0
             }
         };
-        let hint_ts = TextStyle::new(14.0);
+        let hint_ts = TextStyle::new(super::tokens::SIZE_BODY);
         let mut nav: Option<(Rect, Rect)> = None;
         // m290：平移上限要按**看得见的部分**算。标题栏是画在画布顶部的浮层，`view`
         // 里含它那一块（摆图居中用的就是整块），所以这里单独告诉 core「顶上被挡了多少」。
@@ -3495,7 +3525,7 @@ impl Widget for ImageCanvas {
                 badge,
                 tk::overlay_text(),
                 Align::Center,
-                &TextStyle::new(12.0),
+                &TextStyle::new(super::tokens::SIZE_BODY),
             );
             let primary_badge = Rect::new(
                 primary_work.x + 8,
@@ -3516,7 +3546,7 @@ impl Widget for ImageCanvas {
                 primary_badge,
                 tk::overlay_text(),
                 Align::Center,
-                &TextStyle::new(12.0),
+                &TextStyle::new(super::tokens::SIZE_BODY),
             );
             let active_rect = match active {
                 Pane::Primary => primary_work,
@@ -3749,7 +3779,7 @@ impl Widget for ImageCanvas {
                 let [r, g, b, _] = pk.rgba;
                 let hex = format!("#{r:02X}{g:02X}{b:02X}");
                 let text = format!("{hex} · rgb({r}, {g}, {b}) · ({}, {})", pk.at.0, pk.at.1);
-                let ts = TextStyle::new(12.0);
+                let ts = TextStyle::new(super::tokens::SIZE_BODY);
                 let tw = self.chrome.measure_w(canvas, &text, &ts);
                 let (sw, gap, pad, box_h) = (16.0, 8.0, 9.0, 28.0);
                 let box_w = sw + gap + tw + pad * 2.0;
@@ -4721,7 +4751,7 @@ impl ImageCanvas {
                 }
                 // 双击：标题栏恒等「最大化 / 恢复」，画面区按设置对话框选的行为
                 // （菠萝默认「关窗」，与我们的默认配置一致）。
-                if p.click_count >= 2 {
+                if p.click_count >= 2 && !self.menu_action_recent() {
                     if self.chrome.locked.get() {
                         return true; // 锁定：双击也不许关窗/最大化/全屏
                     }
@@ -5056,7 +5086,7 @@ fn copy_display(chrome: &Chrome, viewer: &RefCell<Viewer>) -> CopyNow {
 /// 需要 `EventCtx` 的动作（开对话框 / 改窗口态 / 复制 / 设置窗 / 不透明度）在
 /// **兜底路径拿不到 ctx** 时返回 `false` 放行给框架，与旧版「全屏」同款处理；焦点在画布
 /// （`on_event`）时 ctx 为 `Some`，正常执行。只依赖 `chrome`/`viewer`/配置的动作两路都能
-/// 执行；「属性卡」也在这条路上——[`Action::Properties`] 的兜底路径收到 `None` 也照常
+/// 执行；「图片信息卡」也在这条路上——[`Action::Properties`] 的兜底路径收到 `None` 也照常
 /// 打开信息面板并返回 `true`，不再像旧独立属性窗那样"拿不到 ctx 就放行"。
 fn exec_action(
     ctx: Option<&mut EventCtx>,
@@ -5481,14 +5511,13 @@ mod tests {
     ];
 
     /// m327：「文件 ▸」组内顺序：打开 / 系统菜单 →（线）→ 复制×3 →（线）→
-    /// 属性 → 清除本书阅读位置（m333）。
+    /// 清除本书阅读位置（m333）。「属性」已并入「本图 ▸ 图片信息」，不在本组。
     /// `复制` 已拍平，不再有自己的子菜单标签；锚点用 `self.copy_items(`。
     /// 排序已独立成顶层一项，不在本组。
-    const FILE_GROUP_MENU_KEYS: [&str; 5] = [
+    const FILE_GROUP_MENU_KEYS: [&str; 4] = [
         "\"打开…\"",
         "\"系统菜单\"",
         "self.copy_items(",
-        "\"属性\"",
         "\"清除本书阅读位置\"",
     ];
 
@@ -5504,8 +5533,8 @@ mod tests {
         "\"动图/文档播放速度\"",
     ];
 
-    /// m276 / m280：「本图 ▸」组内静态四项的次序。三个"打开一个窗"的常驻项在前、
-    /// 会话开关垫底；技术信息 / 直方图两项输出由 `info_card_item` 生成，
+    /// m276 / m280：「本图 ▸」组内静态四项的次序。三个“打开一个窗”的常驻项在前、
+    /// 会话开关垫底；图片信息输出由 `info_card_item` 生成，
     /// 源码里不出现字面标签，由下方 contains 断言钉住接线。
     const CURRENT_IMAGE_MENU_KEYS: [&str; 4] = [
         "\"RAW 参数…\"",
@@ -5515,7 +5544,7 @@ mod tests {
     ];
 
     /// 顶层不许再出现收编进「本图 ▸」的两项，也不许留旧名「工具 ▸」；
-    /// 静态四项按 [`CURRENT_IMAGE_MENU_KEYS`] 递增；技术信息 / 直方图必须走
+    /// 静态四项按 [`CURRENT_IMAGE_MENU_KEYS`] 递增；图片信息必须走
     /// `info_card_item` 接在「旋转角度…」之后。正向喂生产源码，负向臂喂旧布局。
     fn assert_current_image_menu(src: &str) {
         let menu = src.split("fn context_menu").nth(1).expect("右键菜单");
@@ -5545,10 +5574,8 @@ mod tests {
         let group = group.split("fn copy_items").next().unwrap_or(group);
         assert_order(group, &CURRENT_IMAGE_MENU_KEYS, "本图 ▸ 组内");
         assert!(
-            group.contains("info_panel::Card::Technical")
-                && group.contains("info_panel::Card::Histogram")
-                && group.contains("self.info_card_item(card)"),
-            "技术信息 / 直方图必须从「本图 ▸」接入"
+            group.contains("info_panel::Card::ALL") && group.contains("self.info_card_item(card)"),
+            "图片信息必须从「本图 ▸」接入"
         );
         assert!(
             !src.contains("\"信息卡\""),
@@ -6344,6 +6371,48 @@ fn system_body(h: &Handles) -> Element {
         }
     }
 
+    /// 菜单动作后的双击防护：窗口只有 500ms，且过期后必须放行。
+    ///
+    /// ★ 2026-11-14 用户报「选直方图秒退」：双击菜单项的第二击会落到画布，
+    ///   默认 `double_click=1` 是关窗。`guard_menu_actions` 记录动作时间，
+    ///   本判据在 500ms 内拦下第二击。
+    #[test]
+    fn menu_action_guard_window_is_short_and_expires() {
+        use std::time::{Duration, Instant};
+        let at: Cell<Option<Instant>> = Cell::new(None);
+        assert!(!menu_action_recent_at(&at), "没执行过菜单动作时不该拦双击");
+
+        at.set(Some(Instant::now()));
+        assert!(menu_action_recent_at(&at), "菜单动作刚执行：必须拦下第二击");
+
+        at.set(Some(Instant::now() - Duration::from_millis(50)));
+        assert!(menu_action_recent_at(&at), "500ms 内仍算同一次双击");
+
+        at.set(Some(
+            Instant::now() - MENU_ACTION_GUARD - Duration::from_millis(100),
+        ));
+        assert!(!menu_action_recent_at(&at), "超过 500ms 后双击照常生效");
+    }
+
+    /// 接线钉子：右键菜单必须在弹出前给**所有**菜单项（含子菜单）套上守卫，
+    /// 而双击分支必须先问 `menu_action_recent`——纯函数绿不等于调用点接了它。
+    #[test]
+    fn context_menu_actions_are_guarded_before_showing() {
+        let src = production_src();
+        let guard = src
+            .find("guard_menu_actions(&mut items, &self.menu_action_at)")
+            .expect("右键菜单没接守卫：双击菜单项的第二击仍会交给画布");
+        let show = src
+            .find("ctx.show_context_menu(at, items)")
+            .expect("弹菜单不见了");
+        assert!(guard < show, "守卫必须在弹菜单之前完成包装");
+
+        let dbl = src
+            .find("if p.click_count >= 2 && !self.menu_action_recent()")
+            .expect("双击分支没先问 menu_action_recent");
+        assert!(dbl > 0);
+    }
+
     /// 拖拽升级成"拖窗口"的阈值**不许**把手抖算进去——判错一次，双击关窗就没了。
     #[test]
     fn double_click_jitter_is_not_a_drag() {
@@ -6596,9 +6665,9 @@ fn system_body(h: &Handles) -> Element {
     }
 
     /// m327 接线钉子：源码级测试只认标签在不在对应函数里；这条走真实构造函数，
-    /// 钉住“复制三项确实**平铺**在文件组里”，且属性仍在块尾。
+    /// 钉住“复制三项确实**平铺**在文件组里”。
     #[test]
-    fn file_group_flattens_copy_and_keeps_properties_last() {
+    fn file_group_flattens_copy_and_keeps_the_reading_item_last() {
         let (canvas, _v) = zoomed_canvas();
         let items = canvas.file_items(true, true);
         let labels: Vec<&str> = items
@@ -6614,7 +6683,6 @@ fn system_body(h: &Handles) -> Element {
                 "复制当前（PNG）",
                 "复制原文件",
                 "复制文件路径",
-                "属性",
                 "清除本书阅读位置",
             ],
             "文件 ▸ 的项序或拍平结果变了"
@@ -6629,7 +6697,7 @@ fn system_body(h: &Handles) -> Element {
             items
                 .last()
                 .is_some_and(|it| it.label == "清除本书阅读位置"),
-            "清除阅读位置是 m333 新块尾；属性仍紧挨在它前面"
+            "清除阅读位置仍是块尾"
         );
         assert!(
             !labels.contains(&"文件名"),
@@ -7977,19 +8045,18 @@ fn system_body(h: &Handles) -> Element {
         let items = canvas.current_image_items(true);
         assert_eq!(
             items.len(),
-            7,
-            "本图组 = 三项常驻 + 技术信息 + 直方图 + 分隔线 + 取色器"
+            6,
+            "本图组 = 三项常驻 + 图片信息 + 分隔线 + 取色器"
         );
         assert_eq!(items[0].label, "RAW 参数…");
         assert_eq!(items[1].label, "跳转到…帧/页");
         assert_eq!(items[2].label, "旋转角度…", "m280 新增的实时旋转入口");
-        assert_eq!(items[3].label, "技术信息", "信息面板的输出入口跟本图走");
-        assert_eq!(items[4].label, "直方图");
-        assert!(items[5].separator, "输出项与指针开关之间留一条分隔线");
-        assert_eq!(items[6].label, "取色器");
+        assert_eq!(items[3].label, "图片信息", "信息面板的输出入口跟本图走");
+        assert!(items[4].separator, "输出项与指针开关之间留一条分隔线");
+        assert_eq!(items[5].label, "取色器");
 
         // 前两项按格式置灰：测试画布是静态合成图，既不是无头裸像素、
-        // 也没有第二帧/页可去。后四项只要求「有图」，所以是可点的。
+        // 也没有第二帧/页可去。后三项只要求「有图」，所以是可点的。
         assert!(
             !items[0].enabled,
             "普通图片不该能改 RAW 参数（相机 RAW 同理）"
@@ -7997,14 +8064,14 @@ fn system_body(h: &Handles) -> Element {
         assert!(!items[1].enabled, "静态图没有第二帧/页可跳");
         assert!(items[2].enabled, "有图就能转，不挑格式");
 
-        for i in [3, 4] {
-            let it = &items[i];
+        {
+            let it = &items[3];
             assert!(it.checkable, "信息输出项要能看出开没开");
             assert!(!it.checked, "默认关");
             assert!(it.enabled, "有图时可点");
         }
 
-        let it = &items[6];
+        let it = &items[5];
         assert!(it.checkable, "菜单里要能看出开没开");
         assert!(!it.checked, "默认关");
         assert!(it.enabled, "有图时可点");
@@ -8015,9 +8082,8 @@ fn system_body(h: &Handles) -> Element {
         );
 
         let empty = canvas.current_image_items(false);
-        assert!(!empty[3].enabled, "空窗没有技术信息可输出");
-        assert!(!empty[4].enabled, "空窗没有像素可统计");
-        assert!(!empty[6].enabled, "空窗没有像素可采样，取色器必须置灰");
+        assert!(!empty[3].enabled, "空窗没有图片信息可输出");
+        assert!(!empty[5].enabled, "空窗没有像素可采样，取色器必须置灰");
     }
 
     /// m322：来源与辅图翻页都是“二选一 ▸”子菜单；`交换主辅`是动作项，

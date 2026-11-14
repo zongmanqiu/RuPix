@@ -201,15 +201,4 @@ impl Viewer {
         }
         moved
     }
-
-    /// 动画元信息（供属性卡展示）：未动画返回 None，否则 (总帧数, 每帧时长ms)。
-    /// 帧数可能为 0（GIF 惰性数帧，解码到 EOF 才回填），调用方据此显示"帧数未知"。
-    pub fn anim_summary(&self) -> Option<(u32, u32)> {
-        let a = self.loaded.as_ref()?.anim;
-        if a.delay_ms == 0 {
-            None
-        } else {
-            Some((a.count, a.delay_ms))
-        }
-    }
 }

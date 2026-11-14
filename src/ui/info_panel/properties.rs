@@ -14,7 +14,7 @@ use std::rc::Rc;
 use windui::signal::{signal, Signal};
 
 use crate::core::decode::Meta;
-use crate::core::pixels::{pixel_format_has_alpha, pixel_format_name, Histogram};
+use crate::core::pixels::{pixel_format_has_alpha, pixel_format_name};
 use crate::core::util::fmt_bytes;
 use crate::core::viewer::{DisplayState, Viewer};
 
@@ -30,8 +30,6 @@ pub struct MetaSignals {
     pub(crate) location: Signal<String>,
     pub(crate) size: Signal<String>,
     pub(crate) mtime: Signal<String>,
-    pub(crate) dims: Signal<String>,
-    pub(crate) anim: Signal<String>,
     // EXIF「拍摄信息」段——由 `platform::exif::read_exif` 填充，缺失即空串。
     pub(crate) capture_time: Signal<String>,
     pub(crate) camera: Signal<String>,
@@ -48,9 +46,6 @@ pub struct MetaSignals {
     pub(crate) tech_orientation: Signal<String>,
     pub(crate) tech_view: Signal<String>,
     pub(crate) tech_frames: Signal<String>,
-    // 直方图卡：数据 + 一行裁切统计。
-    pub(crate) histogram: Signal<Histogram>,
-    pub(crate) hist_summary: Signal<String>,
     /// 当前这张图是否真的有文件：无图时属性行整块隐藏，只显示"没有打开图片"。
     pub(crate) has_image: Signal<bool>,
     /// 上一拍"面板可见 + 属性卡 active"的取值；false→true 时强制刷新一次。
@@ -64,8 +59,6 @@ pub struct MetaSignals {
     /// 初值是 `u64::MAX`（**从不等于任何真实世代**）：建好信号集后第一次刷新必落数据，
     /// 不必依赖「开图一定把世代推到 1」这种实现细节。
     last_gen: Cell<u64>,
-    /// 直方图单独的世代号：只统计像素，不读文件 / EXIF，与属性卡门控分开。
-    last_hist_gen: Cell<u64>,
 }
 
 thread_local! {
@@ -91,8 +84,6 @@ pub fn meta_signals(scope: usize) -> MetaSignals {
                 location: signal(String::new()),
                 size: signal(String::new()),
                 mtime: signal(String::new()),
-                dims: signal(String::new()),
-                anim: signal(String::new()),
                 capture_time: signal(String::new()),
                 camera: signal(String::new()),
                 lens: signal(String::new()),
@@ -107,12 +98,9 @@ pub fn meta_signals(scope: usize) -> MetaSignals {
                 tech_orientation: signal(String::new()),
                 tech_view: signal(String::new()),
                 tech_frames: signal(String::new()),
-                histogram: signal(Histogram::default()),
-                hist_summary: signal(String::new()),
                 has_image: signal(false),
                 enabled: Cell::new(false),
                 last_gen: Cell::new(u64::MAX),
-                last_hist_gen: Cell::new(u64::MAX),
             })
             .clone()
     })
@@ -140,51 +128,6 @@ pub fn refresh_metadata_if(viewer: &Rc<RefCell<Viewer>>, wanted: bool) {
     if wanted {
         refresh_metadata(viewer);
     }
-}
-
-/// 直方图刷新门控：`wanted` = 面板可见 + 直方图卡展开。
-///
-/// 与属性卡分开是因为这一趟只读像素：不 stat、不读 EXIF；收起卡片时把世代打回
-/// `u64::MAX`，下次展开重算一次，不会拿收起期间那张旧图的分布充数。
-pub fn refresh_histogram_if(viewer: &Rc<RefCell<Viewer>>, wanted: bool) {
-    let scope = super::super::singleton::window_scope(viewer);
-    let gen = viewer.borrow().image_gen();
-    META.with(|m| {
-        let mut map = m.borrow_mut();
-        let Some(st) = map.get_mut(&scope) else {
-            return;
-        };
-        if !wanted {
-            st.last_hist_gen.set(u64::MAX);
-            return;
-        }
-        if st.last_hist_gen.get() == gen {
-            return;
-        }
-        st.last_hist_gen.set(gen);
-        let hist = viewer.borrow().histogram().unwrap_or_default();
-        set(&st.histogram, hist);
-        let summary = if hist.count == 0 {
-            "当前解码画面没有可统计的像素".to_string()
-        } else {
-            format!(
-                "当前解码画面 {}×{} · 每 {} 像素取 1 点 · 均值 {:.0} · 中位 {} · 峰值 {}\n\
-                 R {:.0} G {:.0} B {:.0} · 阴影 {:.1}% · 高光 {:.1}%",
-                hist.width,
-                hist.height,
-                hist.step,
-                hist.mean_luma(),
-                hist.median_luma(),
-                hist.peak_bin(),
-                hist.mean_channel(&hist.r),
-                hist.mean_channel(&hist.g),
-                hist.mean_channel(&hist.b),
-                hist.clip_low(),
-                hist.clip_high()
-            )
-        };
-        set(&st.hist_summary, summary);
-    });
 }
 
 /// 主窗关掉时摘掉它那一格信号与 EXIF 记账（`WinRt::close` 调）。
@@ -234,8 +177,6 @@ pub fn refresh_metadata(viewer: &Rc<RefCell<Viewer>>) {
             set(&st.location, String::new());
             set(&st.size, String::new());
             set(&st.mtime, String::new());
-            set(&st.dims, String::new());
-            set(&st.anim, String::new());
             set(&st.capture_time, String::new());
             set(&st.camera, String::new());
             set(&st.lens, String::new());
@@ -264,10 +205,6 @@ pub fn refresh_metadata(viewer: &Rc<RefCell<Viewer>>) {
             .and_then(|m| m.modified().ok())
             .map(format_utc)
             .unwrap_or_else(|| "未知".into());
-        let dims = v
-            .info_dims()
-            .map(|(w, h)| format!("{w} × {h}"))
-            .unwrap_or_else(|| "读取中…".into());
         let ext = p
             .extension()
             .map(|e| e.to_string_lossy().to_uppercase())
@@ -281,30 +218,12 @@ pub fn refresh_metadata(viewer: &Rc<RefCell<Viewer>>) {
             format!("{ext} 图像")
         };
         let tech_format = kind.clone();
-        let anim = v
-            .anim_summary()
-            .map(|(count, delay_ms)| {
-                let frames = if count > 0 {
-                    format!("{count} 帧")
-                } else {
-                    "多帧（帧数未知）".into()
-                };
-                let dur = if count > 0 {
-                    format!(" · 总时长 {:.1}s", count as f64 * delay_ms as f64 / 1000.0)
-                } else {
-                    String::new()
-                };
-                format!("{frames}{dur} · 帧延时 {delay_ms}ms")
-            })
-            .unwrap_or_default();
         set(&st.has_image, true);
         set(&st.filename, file_name(&p));
         set(&st.kind, kind);
         set(&st.location, p.to_string_lossy().to_string());
         set(&st.size, size);
         set(&st.mtime, format!("{mtime} (UTC)"));
-        set(&st.dims, dims);
-        set(&st.anim, anim);
 
         // 技术信息卡：解码器/位深/像素格式来自查询阶段的 Meta（渲染后 natural 已由
         // install 合并回缓存）；显示档尺寸与缩放/旋转来自 Viewer 现场值。
