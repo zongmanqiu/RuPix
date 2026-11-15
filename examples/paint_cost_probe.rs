@@ -50,7 +50,7 @@ const BIG: u32 = 6055;
 /// 量出来的 1:1 一直是通用 src-over，代表不了真机。
 fn make(w: u32, h: u32) -> Image {
     let mut rgba = vec![0x40u8; (w as usize) * (h as usize) * 4];
-    for a in rgba.chunks_exact_mut(4) {
+    for a in rgba.as_chunks_mut::<4>().0 {
         a[3] = 255;
     }
     Image::from_rgba(w, h, &rgba).unwrap_or_else(|e| panic!("造测试位图失败：{e}"))
@@ -749,11 +749,11 @@ fn main() {
     // 这里量 6055² 的全 alpha 扫描有多贵——它要加到 `Image::from_rgba` 那 85 ms 上。
     // 先把 alpha 字节刷成 255（否则 `all` 在第一个像素就短路、量出来的是零）：
     // 上面那几条上传/拷贝臂早已跑完，改这份缓冲不影响它们。
-    for a in up_src.chunks_exact_mut(4) {
+    for a in up_src.as_chunks_mut::<4>().0 {
         a[3] = 255;
     }
     let opaque_scan = measure("不透明检测 6055²（一次扫描）", 10, || {
-        let all = up_src.chunks_exact(4).all(|c| c[3] == 255);
+        let all = up_src.as_chunks::<4>().0.iter().all(|c| c[3] == 255);
         assert!(all);
     });
     report(&opaque_scan);

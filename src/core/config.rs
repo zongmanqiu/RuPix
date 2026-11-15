@@ -7,7 +7,7 @@
 //! | 键                | 含义                                        | 默认 |
 //! |-------------------|---------------------------------------------|------|
 //! | `stay_on_top`     | 启动时窗口置顶                              | `0`  |
-//! | `double_click`    | 双击**画面区**：0 无 / 1 关窗 / 2 最大化 / 3 全屏；标题栏双击恒为最大化/恢复 | `1`  |
+//! | `double_click`    | 双击**画面区**：0 无 / 1 关窗 / 2 最大化；标题栏双击恒为最大化/恢复    | `1`  |
 //! | `slide_interval`  | 幻灯片每张停留秒数（1..=600）        | `3`  |
 //! | `anim_speed`      | 动图切帧 / 分页切页倍速：`0.25`/`0.5`/`1`/`2`/`4`/`8` | `1`  |
 //! | `anim_autoplay`   | 动图 / 分页文档打开后自动播放（关 = 停在第 0 帧/页） | `1`  |
@@ -17,7 +17,7 @@
 //! | `ctrl_wheel`      | Ctrl+滚轮：同上四档                          | `1`  |
 //! | `alt_wheel`       | Alt+滚轮：同上四档（新增默认关闭）           | `3`  |
 //! | `shift_wheel`     | Shift+滚轮：同上四档（新增默认关闭）         | `3`  |
-//! | `init_window`     | 窗口尺寸：0 固定 / 1 全屏 / 3 图片尺寸        | `0`  |
+//! | `init_window`     | 窗口尺寸：0 固定 / 1 最大化 / 3 图片尺寸        | `0`  |
 //! | `borderless`      | 无边框形态：隐藏自绘 chrome 与底色、背景透明          | `0`  |
 //! | `window_w`        | 固定尺寸档窗口宽（100..=8192）               | `800`|
 //! | `window_h`        | 固定尺寸档窗口高（100..=8192）               | `600`|
@@ -225,16 +225,17 @@ pub enum DblClick {
     CloseWindow,
     /// 切换最大化。
     Maximize,
-    /// 切换全屏（菠萝 master 新增档位）。
-    Fullscreen,
 }
 
 impl DblClick {
+    /// ini 值 3（旧「切换全屏」）退役：读入按「切换最大化」处理——全屏与最大化
+    /// 本就是同一件事的两种口径，旧配置不用手改；写回路径（[`Self::index`]）
+    /// 不再产出 3。
     pub fn from_index(i: i64) -> Self {
         match i {
             0 => DblClick::Nothing,
             2 => DblClick::Maximize,
-            3 => DblClick::Fullscreen,
+            3 => DblClick::Maximize,
             _ => DblClick::CloseWindow,
         }
     }
@@ -244,7 +245,6 @@ impl DblClick {
             DblClick::Nothing => 0,
             DblClick::CloseWindow => 1,
             DblClick::Maximize => 2,
-            DblClick::Fullscreen => 3,
         }
     }
 
@@ -254,16 +254,10 @@ impl DblClick {
             DblClick::Nothing => "无操作",
             DblClick::CloseWindow => "关闭窗口",
             DblClick::Maximize => "切换最大化",
-            DblClick::Fullscreen => "切换全屏",
         }
     }
 
-    pub const ALL: [DblClick; 4] = [
-        DblClick::Nothing,
-        DblClick::CloseWindow,
-        DblClick::Maximize,
-        DblClick::Fullscreen,
-    ];
+    pub const ALL: [DblClick; 3] = [DblClick::Nothing, DblClick::CloseWindow, DblClick::Maximize];
 }
 
 /// 幻灯片放映每张停留的秒数边界（ini 键 `slide_interval`，m167）。
@@ -371,8 +365,12 @@ pub type CtrlWheel = WheelAction;
 pub enum InitWindow {
     /// 固定尺寸：按 `window_w × window_h` 建窗（默认档，旧版唯一行为）。
     Fixed,
-    /// 全屏：铺满当前显示器（`rcMonitor`，含任务栏那一条）。
-    Fullscreen,
+    /// 最大化：OS 工作区最大化（标题栏最大化钮的既有语义，留任务栏）。
+    ///
+    /// ★ 存储值 1 不变：旧 ini 里的「全屏」档（也曾叫「最大化」）读进来的 1
+    ///   落到这里，语义并入最大化——铺满显示器与最大化窗口在用户眼里
+    ///   都是「放到最大」，不值得为一个退役档留两套窗口逻辑。
+    Maximized,
     /// 图片尺寸：窗口客户区跟着**当前这张图**走——启动第一张、翻页、目录跳转都跟，
     /// 图多大窗多大（1:1 原始像素）；超出显示器工作区时等比缩进工作区（装不下就是
     /// 装不下），小于 `100×100` 时放大到最短边 100（再小就点不到标题栏了）。
@@ -381,12 +379,13 @@ pub enum InitWindow {
 }
 
 impl InitWindow {
-    /// 兼容旧 ini：0(旧自动/常规)→固定；1(旧最大化)→全屏；3→图片尺寸。
+    /// 兼容旧 ini：0(旧自动/常规)→固定；1→最大化（存储值不变，旧全屏档无缝并入）；
+    /// 3→图片尺寸。
     /// **2 是旧版「常规窗口」的退役值**，故意跳过落到固定——3 一直是图片尺寸的
     /// 存储号（m269 短暂退役、m271 恢复），老 ini 里的 3 现在又能生效了。
     pub fn from_index(i: i64) -> Self {
         match i {
-            1 => InitWindow::Fullscreen,
+            1 => InitWindow::Maximized,
             3 => InitWindow::Natural,
             _ => InitWindow::Fixed,
         }
@@ -395,7 +394,7 @@ impl InitWindow {
     pub fn index(self) -> i64 {
         match self {
             InitWindow::Fixed => 0,
-            InitWindow::Fullscreen => 1,
+            InitWindow::Maximized => 1,
             InitWindow::Natural => 3,
         }
     }
@@ -405,7 +404,7 @@ impl InitWindow {
     pub fn ui_index(self) -> usize {
         match self {
             InitWindow::Fixed => 0,
-            InitWindow::Fullscreen => 1,
+            InitWindow::Maximized => 1,
             InitWindow::Natural => 2,
         }
     }
@@ -418,14 +417,14 @@ impl InitWindow {
     pub fn label(self) -> &'static str {
         match self {
             InitWindow::Fixed => "固定尺寸",
-            InitWindow::Fullscreen => "全屏",
+            InitWindow::Maximized => "最大化",
             InitWindow::Natural => "图片尺寸",
         }
     }
 
     pub const ALL: [InitWindow; 3] = [
         InitWindow::Fixed,
-        InitWindow::Fullscreen,
+        InitWindow::Maximized,
         InitWindow::Natural,
     ];
 }
@@ -752,7 +751,7 @@ pub struct Config {
     pub alt_wheel: WheelAction,
     /// Shift+滚轮行为（m278 新增，默认「无」）。条内滚轮仍归缩略图条，不看这一档。
     pub shift_wheel: WheelAction,
-    /// 窗口尺寸三档（见 [`InitWindow`]）：固定 / 全屏 / 图片尺寸。
+    /// 窗口尺寸三档（见 [`InitWindow`]）：固定 / 最大化 / 图片尺寸。
     pub init_window: InitWindow,
     /// 无边框形态（m269）：自绘 chrome 全隐、底色不画、图片透明区透出桌面，
     /// 但鼠标只与本窗交互（不穿透）。与 [`Config::init_window`] **完全正交**：
@@ -1580,7 +1579,7 @@ fn default_ini() -> String {
 # 启动时窗口置顶
 stay_on_top=0
 
-# 双击图片：0 无操作 / 1 关闭窗口 / 2 切换最大化 / 3 切换全屏
+# 双击图片：0 无操作 / 1 关闭窗口 / 2 切换最大化（旧值 3「切换全屏」已并入最大化）
 double_click=1
 
 # 幻灯片放映每张停留的秒数（1..=600，越界夹紧；放映的开与关本身不落盘，关窗即停）
@@ -1624,7 +1623,7 @@ ctrl_wheel=1
 alt_wheel=3
 shift_wheel=3
 
-# 启动窗口（窗口尺寸）：0 固定尺寸 / 1 全屏（图片适应窗口）/ 3 图片尺寸（窗口贴着图走）
+# 启动窗口（窗口尺寸）：0 固定尺寸 / 1 最大化（图片适应窗口）/ 3 图片尺寸（窗口贴着图走）
 # 前两档里图片总是适应窗口；第三档窗口 = 当前图片的原始像素，翻页也跟着变。
 init_window=0
 
@@ -1749,7 +1748,8 @@ update_index_github={update_github}
 
 # 快捷键绑定（动作id:键;动作id2:键2；每个动作至多一把）。整项留空 = 全部出厂默认；
 # 单个动作写成 `fit:` = 明确解绑；键名写坏 = 该动作保持出厂默认（不会静默解绑）。动作 id：
-# prev/next/first/last/zoom_in/zoom_out/fit/actual/rotate/flip/pause/filmstrip/fullscreen
+# prev/next/first/last/zoom_in/zoom_out/fit/actual/rotate/flip/pause/filmstrip
+# （旧 ini 里的 fullscreen 键已退役，读入按 maximize 处理）
 hotkeys={hotkeys}
 
 # 右侧信息面板（1 开 / 0 关；面板默认空，点「属性」才加卡）
@@ -2063,7 +2063,7 @@ mod tests {
         let p = temp_ini("roundtrip");
         let c = Config {
             stay_on_top: true,
-            dbl_click: DblClick::Fullscreen,
+            dbl_click: DblClick::Maximize,
             minimal_mode: true,
             checker: true,
             filmstrip: true,
@@ -2071,7 +2071,7 @@ mod tests {
             locked: true,
             long_image_fit: true,
             wheel: WheelAction::Navigate,
-            init_window: InitWindow::Fullscreen,
+            init_window: InitWindow::Maximized,
             window_w: 1024,
             window_h: 768,
             opacity: 30,
@@ -2103,7 +2103,7 @@ mod tests {
 
         let back = Config::load_from(&p);
         assert!(back.stay_on_top, "stay_on_top 没存住");
-        assert_eq!(back.dbl_click, DblClick::Fullscreen);
+        assert_eq!(back.dbl_click, DblClick::Maximize);
         assert!(back.minimal_mode, "minimal_mode 没存住");
         assert!(back.checker, "checker 没存住");
         assert!(back.filmstrip, "filmstrip 没存住");
@@ -2111,7 +2111,7 @@ mod tests {
         assert!(back.locked, "locked 没存住");
         assert!(back.long_image_fit);
         assert_eq!(back.wheel, WheelAction::Navigate);
-        assert_eq!(back.init_window, InitWindow::Fullscreen);
+        assert_eq!(back.init_window, InitWindow::Maximized);
         assert_eq!(back.ui_theme, UiTheme::Light, "ui_theme 没存住");
         assert_eq!(back.anim_speed, AnimSpeed::X4, "anim_speed 没存住");
         assert!(
@@ -2562,7 +2562,7 @@ plugin_source=github
         let p = temp_ini("consume");
         std::fs::write(
             &p,
-            "stay_on_top=1\ndouble_click=3\nminimal_mode=1\n\
+            "stay_on_top=1\ndouble_click=2\nminimal_mode=1\n\
              long_image_fit=1\nwheel_behavior=1\nctrl_wheel=0\ninit_window=1\nborderless=1\nwindow_w=1024\n\
              window_h=768\nopacity=30\n\
              decoders_disabled=abc;def\nextensions_disabled=com.example.ocr\ndecoders_preferred=jpg=jpeg;png=png\nprefetch=0\nanim_speed=8\nanim_autoplay=0\nclose_to_tray=1\nspace_preview=1\ndrag_image=0\nsort_by=3\nsort_desc=1\nraw_last=1x2:3\ndownload_source=github\n\
@@ -2574,14 +2574,14 @@ plugin_source=github
         .unwrap();
         let c = Config::load_from(&p);
         assert!(c.stay_on_top, "stay_on_top 没有消费方");
-        assert_eq!(c.dbl_click, DblClick::Fullscreen, "double_click 没有消费方");
+        assert_eq!(c.dbl_click, DblClick::Maximize, "double_click 没有消费方");
         assert!(c.minimal_mode, "minimal_mode 没有消费方");
         assert!(c.long_image_fit, "long_image_fit 没有消费方");
         assert_eq!(c.wheel, WheelAction::Navigate, "wheel_behavior 没有消费方");
         assert_eq!(c.ctrl_wheel, WheelAction::Zoom, "ctrl_wheel 没有消费方");
         assert_eq!(
             c.init_window,
-            InitWindow::Fullscreen,
+            InitWindow::Maximized,
             "init_window 没有消费方"
         );
         assert!(c.borderless, "borderless 没有消费方");
@@ -2847,12 +2847,13 @@ plugin_source=github
     }
 
     /// 旧 ini 的 init_window 值必须按既定映射升级，不能误读：
-    /// 1(旧"最大化")→全屏；2(旧"常规窗口") 是退役值，回落固定；
+    /// 1→最大化（存储值不变，旧「全屏」档无缝并入最大化）；
+    /// 2(旧"常规窗口") 是退役值，回落固定；
     /// 3 一直是「图片尺寸」的存储号（m269 短暂退役、m271 恢复）。
     #[test]
     fn init_window_legacy_values_map_correctly() {
         assert_eq!(InitWindow::from_index(0), InitWindow::Fixed);
-        assert_eq!(InitWindow::from_index(1), InitWindow::Fullscreen);
+        assert_eq!(InitWindow::from_index(1), InitWindow::Maximized);
         assert_eq!(
             InitWindow::from_index(2),
             InitWindow::Fixed,
@@ -2864,6 +2865,25 @@ plugin_source=github
             "3 是「图片尺寸」的存储号，老 ini 必须还能开出这一档"
         );
         assert_eq!(InitWindow::from_index(99), InitWindow::Fixed);
+    }
+
+    /// 旧 ini 的 dbl_click 值 3（旧「切换全屏」）退役：读入按「切换最大化」处理，
+    /// 0/1/2 原样往返；写回（index）不再产出 3。
+    #[test]
+    fn dbl_click_legacy_value_3_reads_as_maximize() {
+        assert_eq!(DblClick::from_index(0), DblClick::Nothing);
+        assert_eq!(DblClick::from_index(1), DblClick::CloseWindow);
+        assert_eq!(DblClick::from_index(2), DblClick::Maximize);
+        assert_eq!(
+            DblClick::from_index(3),
+            DblClick::Maximize,
+            "旧「切换全屏」档必须无缝并入最大化"
+        );
+        assert_eq!(DblClick::ALL.len(), 3, "全屏档退役后只剩三档");
+        for d in DblClick::ALL {
+            assert_eq!(DblClick::from_index(d.index()), d, "存量三档必须往返自洽");
+        }
+        assert_eq!(DblClick::Maximize.index(), 2, "写回不再产出退役值 3");
     }
 
     /// UTF-8 BOM 不许把第一行键名吃掉（Windows 编辑器常见）。
@@ -2888,7 +2908,7 @@ plugin_source=github
             assert_eq!(InitWindow::from_index(w.index()), *w, "存储值往返");
         }
         assert_eq!(InitWindow::Fixed.index(), 0);
-        assert_eq!(InitWindow::Fullscreen.index(), 1);
+        assert_eq!(InitWindow::Maximized.index(), 1);
         assert_eq!(
             InitWindow::Natural.index(),
             3,

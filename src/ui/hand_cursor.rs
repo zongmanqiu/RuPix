@@ -220,7 +220,7 @@ mod tests {
             assert_eq!(px.len(), 32 * 32 * 4, "{name}.svg 字节数不对");
             // 不能整幅空白：有像素是实心的，才说明图真画出来了。
             assert!(
-                px.chunks_exact(4).any(|p| p[3] > 200),
+                px.as_chunks::<4>().0.iter().any(|p| p[3] > 200),
                 "{name}.svg 全透明——图是空的"
             );
         }

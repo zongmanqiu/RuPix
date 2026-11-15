@@ -32,8 +32,8 @@
 //! | Ctrl+左键拖动 / 中键拖动            | 平移图片（兜底手势，不看开关）         |
 //! | 右键                                | 上下文菜单                             |
 //!
-//! ★ **真全屏例外**（m238 修复轮）：窗口铺满显示器后不许被拖走 —— 画布里照常平移
-//! 图片，顶条那一条与空窗一律不响应（判据见 [`left_drag`] 的 `fullscreen` 分支）。
+//! ★ 2026-11-15 全屏退役：原「真全屏不许拖走」例外（m238）随全屏档整体删除——
+//! 顶条那一条与空窗不响应拖窗，这条判据保留且与窗口形态无关（判据见 [`left_drag`]）。
 //!
 //! `drag_image` **关** = 回到 2026-10-08 那套：任意位置左键拖 = 移动窗口，
 //! 平移图片只剩 Ctrl+左键、中键与鸟瞰三条。判据本体是 [`left_drag`]（纯函数，有单测）。
@@ -55,7 +55,6 @@ use std::rc::Rc;
 use windui::core::{EventCtx, Widget};
 use windui::event::{
     window_state, Event, Key, KeyEvent, MenuItem, MouseButton, PointerEvent, PointerKind,
-    WindowState,
 };
 use windui::geometry::{Point, Rect, Size};
 use windui::render::image::Fit;
@@ -431,14 +430,15 @@ fn scrub_jump(
 
 /// 左键按下之后"这一拖归谁"。判据抽成纯函数的理由与 [`beyond_slop`] 同一条：
 /// 它是手感的全部，测试要能钉住，不能靠"跑起来拖一下看看"。
+///
+/// 2026-11-15 全屏退役：原第三态 `None`（真全屏里既不搬窗也不搬图）随全屏删除，
+/// 顶条恒搬窗、画面恒按开关取舍，判据与窗口形态无关。
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum LeftDrag {
     /// 移动窗口（越过 [`DRAG_SLOP`] 才真的交给系统模态循环）。
     Window,
     /// 平移图片（`Viewer::begin_drag` 开局，Move 里跟手）。
     PanImage,
-    /// 不响应：**真全屏**里窗口铺满且固定，这一拖既不搬窗口也不搬图。
-    None,
 }
 
 /// 分工规则（ini 键 `drag_image`，默认开）。三条**全部**满足才拖图片，任一不满足
@@ -454,26 +454,14 @@ enum LeftDrag {
 /// - `!in_title`：指针不在顶部标题栏那一条里——**标题栏永远带走窗口**（判据单一来源
 ///   见 [`Chrome::in_title_strip`]）。
 ///
-/// 后三项是无边框形态（`chrome::borderless()`）与"图溢出视口"的输入，见下面那段。
+/// 后两项是无边框形态（`chrome::borderless()`）与"图溢出视口"的输入，见下面那段。
 fn left_drag(
     drag_image: bool,
     can_pan: bool,
     in_title: bool,
-    fullscreen: bool,
     borderless: bool,
     overflows: bool,
 ) -> LeftDrag {
-    // ★ m238 修复轮（用户 2026-11-05 实机）：真全屏时窗口铺满显示器且**不许被拖走**。
-    // 收起顶条只改了绘制、关掉系统圆角只改了 DWM 属性，都没动这条手势判据 —— 于是
-    // 顶缘按下仍会把全屏窗拖离显示器，看起来还是「假全屏」。全屏时：画布里照常平移
-    // 图片，顶条那一条与「拖不动图的空窗」一律不响应，不留「能拖」的假象。
-    if fullscreen {
-        return if drag_image && can_pan && !in_title {
-            LeftDrag::PanImage
-        } else {
-            LeftDrag::None
-        };
-    }
     // ★ m272（用户 2026-11-08 实机：「无边框拖窗口只有顶部那条 40dp 的隐形热区，
     //   没有任何提示」）：无边框形态整套自绘 chrome 全隐，**它没有标题栏**——顶部
     //   那条只是 `in_title_strip` 的几何残留，谁也看不见它，不会有人去试。
@@ -1309,7 +1297,7 @@ impl ImageCanvas {
     /// 最近 ▸      最近打开（≤100 条，最新在前；m325）
     /// 排序 ▸      文件名 / 大小 / 创建日期 / 修改日期 ── 倒序（m275）
     /// ─────
-    /// 画面 ▸      缩小 / 放大 / 适应窗口 / 1:1 原尺寸 / 全屏 / 旋转 90° / 水平镜像 /
+    /// 画面 ▸      缩小 / 放大 / 适应窗口 / 1:1 原尺寸 / 旋转 90° / 水平镜像 /
     ///            上一帧 / 暂停·继续动画 / 下一帧 ── 左键拖图 / 幻灯片放映 / 动图/文档播放速度 ▸
     /// 本图 ▸      RAW 参数… / 跳转到…帧/页 / 旋转角度… / 图片信息 / 取色器
     /// 插件 ▸      外部进程命令
@@ -1345,11 +1333,11 @@ impl ImageCanvas {
     /// 低频功能：改它的裸数据解码参数、在它自己的帧/页里按号定位、换一个取景角度、
     /// 把图片信息输出到右侧信息坞、取它的一个像素。与「画面 ▸」的分界不是
     /// "对不对这张图做事"，而是**有没有浮条
-    /// 按钮**——画面 ▸ 线前 10 项严格等于 `Btn::ALL`，这一组只进菜单、不占浮条空间。
+    /// 按钮**——画面 ▸ 线前 9 项严格等于 `Btn::ALL`（2026-11-15 全屏退役前是 10 项），这一组只进菜单、不占浮条空间。
     ///
-    /// 「画面 ▸」（m327 由「画面 ▸」改名）：**对屏幕上这块画面做的事**——缩放、适应、
-    /// 全屏、旋转、镜像、翻帧，加上"怎么拖、怎么自动翻"两颗。旧名「操作」把"看图"
-    /// 说成了"操作软件"，而这十颗都是看一眼就想按的简单动作；「画面」说的是对象，
+    /// 「画面 ▸」（m327 由「操作 ▸」改名）：**对屏幕上这块画面做的事**——缩放、适应、
+    /// 旋转、镜像、翻帧，加上"怎么拖、怎么自动翻"两颗。旧名「操作」把"看图"
+    /// 说成了"操作软件"，而这九颗都是看一眼就想按的简单动作；「画面」说的是对象，
     /// 不是动作的抽象层级。★ 横线之后的两项没有浮条按钮（浮条几何由 `Btn::ALL` 驱动），
     /// 但它们同属"画面"：拖图是拖画面，放映是让画面自己翻。
     ///
@@ -1360,13 +1348,12 @@ impl ImageCanvas {
     /// 装配出口会调 [`align_menu_columns`] 把**每一级**的标签左沿对齐：勾选列是
     /// 逐级判定的，纯动作列表（复制 / 插件）不补就会比别的子菜单少缩进一列。
     ///
-    /// 「画面」子菜单的前 10 项由工具栏的 [`Btn::ALL`] **自动生成**（见 [`exec_btn`]），
+    /// 「画面」子菜单的前 9 项由工具栏的 [`Btn::ALL`] **自动生成**（见 [`exec_btn`]），
     /// 底部按钮栏有什么、菜单里就有什么，加按钮不会只改一处。
-    /// 也因此原来顶层的「全屏 / 棋盘格 / 水平翻转」不再单独占一行——它们在画面里。
-    /// ★ 对账口径（2026-11-02 立，m327 修订）：**线前 10 项严格等于浮条**；线后两项
+    /// 也因此原来顶层的「棋盘格 / 水平翻转」不再单独占一行——它们在画面里。
+    /// ★ 对账口径（2026-11-02 立，m327 修订；2026-11-15 全屏退役后为 9 项）：**线前 9 项严格等于浮条**；线后两项
     ///   是浮条放不下的（放映）与不是按钮的（拖图），单独成段，不混进按钮序列。
     fn context_menu(&self, ctx: &mut EventCtx, at: Point) {
-        let ws = window_state();
         let has_file = self.viewer.borrow().current_path().is_some();
         let has_image = self.viewer.borrow().image().is_some();
 
@@ -1393,7 +1380,7 @@ impl ImageCanvas {
         items.push(self.recent_menu());
         items.push(self.sort_menu());
         items.push(MenuItem::separator());
-        items.push(MenuItem::submenu("画面", self.ops_items(ws)));
+        items.push(MenuItem::submenu("画面", self.ops_items()));
         items.push(MenuItem::submenu(
             "本图",
             self.current_image_items(has_image),
@@ -2448,7 +2435,7 @@ impl ImageCanvas {
 
         // ── 旋转角度…（m280）：整数度数 + ± 微调，输入即变 ──
         // 与上面两项同属「打开一个关于这张图的窗」，排在分隔线之前；
-        // 不进浮条也不进「画面 ▸」（那一组线前 10 项严格等于 `Btn::ALL`，m247 铁律）。
+        // 不进浮条也不进「画面 ▸」（那一组线前 9 项严格等于 `Btn::ALL`，m247 铁律）。
         {
             let chrome = self.chrome.clone();
             let v = self.viewer.clone();
@@ -2593,7 +2580,7 @@ impl ImageCanvas {
         out
     }
 
-    fn ops_items(&self, ws: WindowState) -> Vec<MenuItem> {
+    fn ops_items(&self) -> Vec<MenuItem> {
         // ★ 菜单**恒列** `Btn::ALL`：浮条为了美观把没有帧/页号的播放组藏起来，
         //   菜单不需要美观，缺项只会让人以为功能被删了（用户 2026-11-06）。
         //   从 Viewer 现算，不读 `chrome.anim`（那是绘制时回灌的 Cell，可能慢一帧）。
@@ -2621,21 +2608,13 @@ impl ImageCanvas {
             if let Some(sc) = b.shortcut(&self.config.borrow().hotkeys) {
                 it.shortcut = Some(sc);
             }
-            // 开关类给勾选列：m247 后只剩全屏这一颗带状态。
-            let state = if b == Btn::Fullscreen {
-                Some(ws.fullscreen)
-            } else {
-                None
-            };
-            if let Some(on) = state {
-                it.checkable = true;
-                it.checked = on;
-            }
+            // 2026-11-15 全屏退役：m247 的「开关类给勾选列」在这条线上只剩全屏一颗，
+            // 全屏按钮删掉后整段机制随它退役（其余按钮恒为动作项，无状态位）。
             out.push(it);
         }
         // ── 线后两项：没有浮条按钮，但同属"对画面做的事"（m327）──
         //
-        // ★ 线前 10 项**严格等于** `Btn::ALL`（同一份正本、同一顺序）；这条线之后才是
+        // ★ 线前 9 项**严格等于** `Btn::ALL`（同一份正本、同一顺序）；这条线之后才是
         //   "菜单独有"的部分。对账时按"线前 = 浮条"读，不会混。
         //   菜单恒列 `Btn::ALL` 全量；浮条另按 `Chrome::row` 裁剪，两者允许不一致——
         //   差集只是"变灰"，不是"消失"。
@@ -2839,16 +2818,11 @@ fn persist_session(cfg: &Rc<RefCell<Config>>, hub: &Hub, apply: impl FnOnce(&mut
     settings::push_to_hub(hub, &cfg.borrow());
 }
 
-fn exec_btn(ctx: &mut EventCtx, viewer: &Rc<RefCell<Viewer>>, chrome: &Rc<Chrome>, b: Btn) {
+fn exec_btn(_ctx: &mut EventCtx, viewer: &Rc<RefCell<Viewer>>, chrome: &Rc<Chrome>, b: Btn) {
     // 手动按浮条任何一颗都算"用户插手了画面"，幻灯片当场让位（见 `Chrome::slide_stop`）。
     chrome.slide_stop();
-    // 全屏要改窗口：`toggle_fullscreen` 同步改窗口尺寸 →
-    // resize/paint 被就地重放一遍 → 那里再 `viewer.borrow()`，而下面那行正握着 `borrow_mut`
-    // → 同线程重入直接 panic（UI 线程没了 = 整个查看器没了）。它压根不需要 `Viewer`。
-    if b == Btn::Fullscreen {
-        ctx.toggle_fullscreen();
-        return;
-    }
+    // 2026-11-15 全屏退役：原「Fullscreen 先分流、不带 Viewer 碰窗口动作」的整块特判
+    // 随按钮删除——现存按钮全部只动画面，没有需要在 borrow_mut 前绕开的窗口态动作。
     let mut v = viewer.borrow_mut();
     match b {
         Btn::Out => {
@@ -2870,10 +2844,6 @@ fn exec_btn(ctx: &mut EventCtx, viewer: &Rc<RefCell<Viewer>>, chrome: &Rc<Chrome
             v.step_anim(1);
         }
         Btn::PlayPause => v.toggle_anim_pause(),
-        // Fullscreen 在函数开头就分流走了（不许带着 viewer 的可变借用车窗动作）。
-        // **什么都不做**：这里放 `unreachable!` 等于把
-        // "上游改了分流、这里没同步"这种看得见的小 bug 升级成整个查看器没了。
-        Btn::Fullscreen => {}
         Btn::Rotate => {
             v.rotate_cw();
         }
@@ -3110,7 +3080,7 @@ impl Widget for ImageCanvas {
         // m254：用户**刚**打开条 / 换了边，但窗口放不下 ⇒ 先把窗口放大到刚好放得下，
         // 下一帧条自然出现（`apply_session_flags` 只置一次请求，这里消费即清）。
         // ★ 用户自己把窗口拉小（条自动隐藏）不会被反向顶大——那种"拉不动"的窗口很讨厌。
-        // 最大化 / 全屏时 `set_window_size` 由框架自行忽略，条先不显示，还原后自动出现。
+        // 最大化时 `set_window_size` 由框架自行忽略，条先不显示，还原后自动出现。
         if self.chrome.strip_fit_request.get() {
             self.chrome.strip_fit_request.set(false);
             // m269：无边框形态下条本就不显示，别为了"放得下条"把窗口顶大
@@ -3199,11 +3169,7 @@ impl Widget for ImageCanvas {
         // m290：平移上限要按**看得见的部分**算。标题栏是画在画布顶部的浮层，`view`
         // 里含它那一块（摆图居中用的就是整块），所以这里单独告诉 core「顶上被挡了多少」。
         // 判据与 `chrome::paint` 同源（`title_strip_h`），不另写一遍。
-        let chrome_top = chrome::title_strip_h(
-            window_state().fullscreen,
-            self.chrome.minimal_mode.get(),
-            &self.chrome,
-        );
+        let chrome_top = chrome::title_strip_h(self.chrome.minimal_mode.get(), &self.chrome);
         {
             let mut v = self.viewer.borrow_mut();
             v.on_viewport(
@@ -3648,7 +3614,6 @@ impl Widget for ImageCanvas {
             &info,
             has_prev,
             has_next,
-            ws.fullscreen,
             ws.topmost,
             ws.maximized,
             minimal,
@@ -3868,16 +3833,9 @@ impl Widget for ImageCanvas {
                     ctx.mark_dirty();
                     return true;
                 }
-                // 没被任何绑定命中：Esc 兜底——全屏中先退全屏，否则交给框架默认（关窗）。
-                // 这条安全网保证极简模式无标题栏时用户仍能退出（见 window.rs）。
-                if k.key == Key::Escape {
-                    if window_state().fullscreen {
-                        ctx.toggle_fullscreen();
-                        ctx.mark_dirty();
-                        return true;
-                    }
-                    return false;
-                }
+                // 没被任何绑定命中：Esc 直接交给框架默认行为（= 关窗）。2026-11-15
+                // 全屏退役：原「全屏中先退全屏」分支随全屏删除；极简模式无标题栏时
+                // 的退出安全网本来就是这条 Esc 关窗（见 window.rs）。
                 false
             }
         }
@@ -4034,15 +3992,13 @@ impl ImageCanvas {
             self.config.borrow().drag_image,
             can_pan,
             Chrome::in_title_strip(pos, view),
-            window_state().fullscreen,
             borderless,
             overflows,
         );
         if ctrl || mode == LeftDrag::PanImage {
             self.viewer.borrow_mut().begin_drag(pos);
         } else if mode == LeftDrag::Window {
-            // 只有这一支会记待定拖窗位；全屏的 `None` 什么都不记，Move 里
-            // 也就不会有那一记 `start_window_drag()`。
+            // 只有这一支会记待定拖窗位，Move 里才会有那一记 `start_window_drag()`。
             self.lmb_pending.set(Some(pos));
         }
     }
@@ -4094,13 +4050,12 @@ impl ImageCanvas {
             self.config.borrow().drag_image,
             can_pan,
             in_title,
-            window_state().fullscreen,
             borderless,
             overflows,
         );
         super::hand_cursor::apply(match mode {
             LeftDrag::PanImage => Some(false),
-            LeftDrag::Window | LeftDrag::None => None,
+            LeftDrag::Window => None,
         });
     }
 
@@ -4753,18 +4708,17 @@ impl ImageCanvas {
                 // （菠萝默认「关窗」，与我们的默认配置一致）。
                 if p.click_count >= 2 && !self.menu_action_recent() {
                     if self.chrome.locked.get() {
-                        return true; // 锁定：双击也不许关窗/最大化/全屏
+                        return true; // 锁定：双击也不许关窗/最大化
                     }
                     // 标题栏判据与「拖窗口」共用 `Chrome::in_title_strip`（单一来源）。
                     let in_title = Chrome::in_title_strip(pos, self.work_tuple());
-                    // 先拷出枚举、让 `Ref` 在这一行就结束：下面三个 `ctx.*` 都会同步动窗口
-                    // （关闭 / 最大化 / 全屏），那条路上框架可能回头再借一次 config。
+                    // 先拷出枚举、让 `Ref` 在这一行就结束：下面两个 `ctx.*` 都会同步动窗口
+                    // （关闭 / 最大化），那条路上框架可能回头再借一次 config。
                     let dbl = double_click_action(in_title, self.config.borrow().dbl_click);
                     match dbl {
                         crate::core::config::DblClick::Nothing => {}
                         crate::core::config::DblClick::CloseWindow => ctx.request_close(),
                         crate::core::config::DblClick::Maximize => ctx.toggle_maximize(),
-                        crate::core::config::DblClick::Fullscreen => ctx.toggle_fullscreen(),
                     }
                     return true;
                 }
@@ -4900,8 +4854,8 @@ impl ImageCanvas {
 /// 键→动作的映射改走 [`crate::core::hotkey::Hotkeys`]（设置页可改、唯一性由
 /// `Hotkeys::set_binding` 保证），不再写死在 `match` 里。
 ///
-/// `ctx` 仅在「全屏」这类需要改窗口态的动作里用到，故用 `Option`：测试里没有
-/// `EventCtx` 时传 `None`，此时全屏动作静默放行（交给框架默认处理），不影响其它动作。
+/// `ctx` 仅在「最大化 / 最小化 / 关窗」这类需要改窗口态的动作里用到，故用 `Option`：
+/// 测试里没有 `EventCtx` 时传 `None`，此时这类动作静默放行（交给框架默认处理），不影响其它动作。
 pub fn handle_key(
     mut ctx: Option<&mut EventCtx>,
     // 每窗一份的实时调色状态：热键打开参数窗时要和看图窗共用同一份（`None` 只出现在
@@ -5084,7 +5038,7 @@ fn copy_display(chrome: &Chrome, viewer: &RefCell<Viewer>) -> CopyNow {
 /// `App::on_shortcut`（兜底，`ctx` 为 `ShortcutCtx` 而非 `EventCtx`）共用同一份语义。
 ///
 /// 需要 `EventCtx` 的动作（开对话框 / 改窗口态 / 复制 / 设置窗 / 不透明度）在
-/// **兜底路径拿不到 ctx** 时返回 `false` 放行给框架，与旧版「全屏」同款处理；焦点在画布
+/// **兜底路径拿不到 ctx** 时返回 `false` 放行给框架；焦点在画布
 /// （`on_event`）时 ctx 为 `Some`，正常执行。只依赖 `chrome`/`viewer`/配置的动作两路都能
 /// 执行；「图片信息卡」也在这条路上——[`Action::Properties`] 的兜底路径收到 `None` 也照常
 /// 打开信息面板并返回 `true`，不再像旧独立属性窗那样"拿不到 ctx 就放行"。
@@ -5277,10 +5231,6 @@ fn exec_action(
             true
         }
         // ── 需要 EventCtx：兜底路径放行（返回 false）──
-        Action::Fullscreen => ctx.is_some_and(|c| {
-            c.toggle_fullscreen();
-            true
-        }),
         // m330：与标题栏 📌 / 设置页写同一份 `stay_on_top`；窗口样式由 runtime 差分下发。
         Action::Topmost => {
             let on = !cfg.borrow().stay_on_top;
@@ -5296,13 +5246,9 @@ fn exec_action(
             true
         }),
         Action::Close => ctx.is_some_and(|c| {
-            // Esc 出厂绑到本动作。全屏里先退全屏（看图器通用约定 + 极简模式安全网），
-            // 不在全屏才真关窗——否则按一次 Esc 会在全屏查看时直接退出程序。
-            if window_state().fullscreen {
-                c.toggle_fullscreen();
-            } else {
-                c.request_close();
-            }
+            // Esc 出厂绑到本动作，恒等于关窗（2026-11-15 全屏退役：原「全屏里先退
+            // 全屏」分支随之删除，极简模式的安全网本来就是这条 Esc 关窗）。
+            c.request_close();
             true
         }),
         Action::CopyImage => {
@@ -5524,7 +5470,7 @@ mod tests {
     /// m327：「排序 ▸」组内 = 四个维度 →（线）→ 倒序。
     const SORT_MENU_KEYS: [&str; 3] = ["SortBy::ALL", "MenuItem::separator()", "\"倒序\""];
 
-    /// m327：「画面 ▸」= 线前 10 项（`Btn::ALL`）→（线）→ 拖图 / 放映。
+    /// m327：「画面 ▸」= 线前 9 项（`Btn::ALL`，2026-11-15 全屏退役前为 10）→（线）→ 拖图 / 放映。
     /// 前段接的是 `ops_row`；线后两项必须按这个顺序出现。
     const OPS_TAIL_MENU_KEYS: [&str; 4] = [
         "ops_row(has_index)",
@@ -5815,7 +5761,7 @@ fn system_body(h: &Handles) -> Element {
         assert_prefetch_card(old, "m265 旧版式模拟");
     }
 
-    /// m262 / m327：界面七项自己是一条轴、不画分隔线；「画面 ▸」把浮条十颗与
+    /// m262 / m327：界面七项自己是一条轴、不画分隔线；「画面 ▸」把浮条九颗与
     /// 拖图/放映分成两段，中间**只许一条线**。三态档位必须走共用轴，不许就地硬编码。
     #[test]
     fn view_and_ops_groups_keep_one_separator_each() {
@@ -5835,7 +5781,7 @@ fn system_body(h: &Handles) -> Element {
         assert_eq!(
             ops.matches("MenuItem::separator()").count(),
             1,
-            "「画面 ▸」只许一条线：浮条十颗 ── 拖图/放映"
+            "「画面 ▸」只许一条线：浮条九颗 ── 拖图/放映"
         );
         assert!(body.contains("settings::FILMSTRIP_POS"), "标签要取共用表");
         assert!(
@@ -6352,12 +6298,7 @@ fn system_body(h: &Handles) -> Element {
     #[test]
     fn title_bar_double_click_always_toggles_maximize() {
         use crate::core::config::DblClick;
-        for cfg in [
-            DblClick::Nothing,
-            DblClick::CloseWindow,
-            DblClick::Maximize,
-            DblClick::Fullscreen,
-        ] {
+        for cfg in [DblClick::Nothing, DblClick::CloseWindow, DblClick::Maximize] {
             assert_eq!(
                 double_click_action(true, cfg),
                 DblClick::Maximize,
@@ -6429,36 +6370,6 @@ fn system_body(h: &Handles) -> Element {
         assert!(beyond_slop(origin, (origin.0 - 20.0, origin.1 + 3.0)));
     }
 
-    /// m238 修复轮：真全屏里窗口不许被拖走（用户实机「全屏还能拖标题栏」）。
-    #[test]
-    fn left_drag_never_moves_the_window_in_fullscreen() {
-        use LeftDrag::{None as NoDrag, PanImage, Window};
-        assert_eq!(
-            left_drag(true, true, false, true, false, false),
-            PanImage,
-            "画布里仍可平移图"
-        );
-        assert_eq!(
-            left_drag(true, true, true, true, false, false),
-            NoDrag,
-            "顶条那一条不再拖窗口"
-        );
-        assert_eq!(
-            left_drag(false, true, false, true, false, false),
-            NoDrag,
-            "开关关掉也不拖窗口"
-        );
-        assert_eq!(
-            left_drag(true, false, false, true, false, false),
-            NoDrag,
-            "空窗也不拖窗口"
-        );
-        assert_eq!(left_drag(false, true, true, true, false, false), NoDrag);
-        // 非全屏回归：顶条永远带走窗口，别把旧行为改坏。
-        assert_eq!(left_drag(true, true, true, false, false, false), Window);
-        assert_eq!(left_drag(false, false, false, false, false, false), Window);
-    }
-
     /// 左键这一拖归谁：`drag_image` 开关 × 有没有可平移余量 × 是不是标题栏，**八格全钉**。
     ///
     /// 只有一格（开关开 + 拖得动 + 画布内）是本次新增的行为，其余七格一律回到拖窗口——
@@ -6467,33 +6378,35 @@ fn system_body(h: &Handles) -> Element {
     /// ★ "拖得动"到 2026-11-03 第四条口径时已经放宽到**几乎总是真**，判据本体见
     /// `Viewer::pan_limits` → `overscroll`（并集的一半减一枚衣角；纵向自 m290 起还要
     /// 避开顶上那条自绘标题栏，见 `Viewer::chrome_top`）。
+    /// ★ 2026-11-15 全屏退役：m238 的 `left_drag_never_moves_the_window_in_fullscreen`
+    /// 整支删除；其中「顶条永远带走窗口」的非全屏回归断言本来就与这支重复，未丢覆盖。
     #[test]
     fn left_drag_yields_the_window_unless_there_is_room_in_the_canvas() {
         use LeftDrag::{PanImage, Window};
         assert_eq!(
-            left_drag(true, true, false, false, false, false),
+            left_drag(true, true, false, false, false),
             PanImage,
             "本次功能的全部新行为"
         );
         assert_eq!(
-            left_drag(true, true, true, false, false, false),
+            left_drag(true, true, true, false, false),
             Window,
             "标题栏永远拖窗口"
         );
         assert_eq!(
-            left_drag(true, false, false, false, false, false),
+            left_drag(true, false, false, false, false),
             Window,
             "空窗（没有图）时别堵死拖窗口"
         );
-        assert_eq!(left_drag(true, false, true, false, false, false), Window);
+        assert_eq!(left_drag(true, false, true, false, false), Window);
         assert_eq!(
-            left_drag(false, true, false, false, false, false),
+            left_drag(false, true, false, false, false),
             Window,
             "开关关掉就是 2026-10-08 那套分工"
         );
-        assert_eq!(left_drag(false, true, true, false, false, false), Window);
-        assert_eq!(left_drag(false, false, false, false, false, false), Window);
-        assert_eq!(left_drag(false, false, true, false, false, false), Window);
+        assert_eq!(left_drag(false, true, true, false, false), Window);
+        assert_eq!(left_drag(false, false, false, false, false), Window);
+        assert_eq!(left_drag(false, false, true, false, false), Window);
     }
 
     /// m272：无边框形态**没有标题栏**，整块画面就是搬窗口的地。
@@ -6502,47 +6415,34 @@ fn system_body(h: &Handles) -> Element {
     /// 没有任何提示」——那条热区是 `in_title_strip` 的几何残留，画面上根本看不见，
     /// 等于那个形态搬不动窗口。新判据只留一条分界：图**溢出视口**（100% / 放大过）
     /// 时归图片，否则归窗口；顶部那条在无边框下不再有特殊含义。
-    ///
-    /// 真全屏（m238）仍然先判：全屏 + 无边框也不许把窗口拖离显示器。
     #[test]
     fn borderless_drags_the_whole_canvas_as_a_title_bar() {
-        use LeftDrag::{None as NoDrag, PanImage, Window};
+        use LeftDrag::{PanImage, Window};
         // 常态（图适应视口）：画面任意位置都搬窗口，包括顶部那条。
         assert_eq!(
-            left_drag(true, true, false, false, true, false),
+            left_drag(true, true, false, true, false),
             Window,
             "无边框开图：整块画面搬窗口"
         );
         assert_eq!(
-            left_drag(true, true, true, false, true, false),
+            left_drag(true, true, true, true, false),
             Window,
             "顶部那条也搬窗口——这个形态没有标题栏可谈"
         );
         // 图真的溢出：回落到平移图片（与普通窗口"放大后画面拖图"同构）。
         assert_eq!(
-            left_drag(true, true, false, false, true, true),
+            left_drag(true, true, false, true, true),
             PanImage,
             "100% / 放大过之后才拖图"
         );
         // 开关关掉：无边框下更该一律搬窗口，别留"拖不动"的形态。
         assert_eq!(
-            left_drag(false, true, false, false, true, true),
+            left_drag(false, true, false, true, true),
             Window,
             "关掉 drag_image 就是纯搬窗口"
         );
         // 空窗（没有图 ⇒ overflows 恒假）：搬窗口。
-        assert_eq!(left_drag(true, false, false, false, true, false), Window);
-        // 全屏优先：无边框 + 全屏照样不许拖走窗口，但画布仍可平移。
-        assert_eq!(
-            left_drag(true, true, false, true, true, false),
-            PanImage,
-            "全屏 + 无边框：画布仍可平移图片"
-        );
-        assert_eq!(
-            left_drag(true, false, false, true, true, false),
-            NoDrag,
-            "全屏 + 无边框 + 拖不动：不响应，不留能拖的假象"
-        );
+        assert_eq!(left_drag(true, false, false, true, false), Window);
     }
 
     /// 接线自检：`ImageCanvas::press_left` 真的按 [`left_drag`] 的结论开局。

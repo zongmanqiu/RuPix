@@ -85,7 +85,7 @@ unsafe fn render(upright: bool, r: u8, g: u8, b: u8) -> Option<Vec<u8>> {
     //  读回改用裸指针另建的只读切片。debug 回归测试抓不到这一类（只在 release 成立）。
     {
         let prefill = std::slice::from_raw_parts_mut(bits as *mut u8, size);
-        for px in prefill.chunks_exact_mut(4) {
+        for px in prefill.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&[0xFF, 0x00, 0xFF, 0x00]);
         }
     }
@@ -180,7 +180,7 @@ unsafe fn render(upright: bool, r: u8, g: u8, b: u8) -> Option<Vec<u8>> {
     //  切片在这里**重新构造**（只读），不复用绘制前的任何借用（见上面的 noalias 说明）。
     let drawn = std::slice::from_raw_parts(bits as *const u8, size);
     let mut out = Vec::with_capacity(size);
-    for px in drawn.chunks_exact(4) {
+    for px in drawn.as_chunks::<4>().0 {
         let a = px[1];
         out.extend_from_slice(&[r, g, b, if a < 8 { 0 } else { a }]);
     }
@@ -200,7 +200,7 @@ mod tests {
         let tilted = render_pin_rgba(false, 208, 208, 208).expect("GDI 斜躺渲染失败");
         let upright = render_pin_rgba(true, 208, 208, 208).expect("GDI 立正渲染失败");
         assert_eq!(tilted.len(), (SIZE * SIZE * 4) as usize);
-        let count = |v: &[u8]| v.chunks_exact(4).filter(|p| p[3] > 0).count();
+        let count = |v: &[u8]| v.as_chunks::<4>().0.iter().filter(|p| p[3] > 0).count();
         assert!(
             count(&tilted) > 100,
             "斜躺位图应有可见字形，实际 {} 像素",
@@ -210,7 +210,9 @@ mod tests {
         assert_ne!(tilted, upright, "两姿态位图应不同（旋转真的生效）");
         let green = render_pin_rgba(true, 126, 201, 126).expect("GDI 绿色渲染失败");
         let green_px = green
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[3] > 200 && p[1] > p[0] && p[1] > p[2])
             .count();
         assert!(green_px > 30, "立正绿位图应含目标绿色像素，实际 {green_px}");

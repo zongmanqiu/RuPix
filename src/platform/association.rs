@@ -862,7 +862,9 @@ fn get_string_on(hk: HKEY, value: &str) -> Option<String> {
     }
     // len 含结尾 NUL；按 UTF-16 解到第一个 NUL。
     let u16s: Vec<u16> = buf[..len as usize]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .take_while(|&u| u != 0)
         .collect();

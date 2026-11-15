@@ -77,7 +77,7 @@ fn main() {
         // 计时里只留 `fit_to` 自己（含它读完整份源、写出档位那趟）。
         let src: Vec<u8> = {
             let mut v = vec![0u8; (w as usize) * (h as usize) * 4];
-            for (i, px) in v.chunks_exact_mut(4).enumerate() {
+            for (i, px) in v.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let g = (i % 251) as u8;
                 px.copy_from_slice(&[g, g >> 1, g >> 2, 255]);
             }
@@ -120,8 +120,10 @@ fn main() {
         for _ in 0..rounds {
             let t0 = Instant::now();
             let mut acc: u64 = 0;
-            for word in src.chunks_exact(8) {
-                acc = acc.wrapping_add(u64::from_ne_bytes(word.try_into().unwrap()));
+            for word in src.as_chunks::<8>().0.iter() {
+                // `as_chunks` 直接给 `&[u8; 8]`，解引用就是 `from_ne_bytes` 要的定长数组——
+                // 旧写法经 `try_into().unwrap()` 从 &[u8] 降形，那枚 unwrap 在这里本就多余。
+                acc = acc.wrapping_add(u64::from_ne_bytes(*word));
             }
             sums.push(t0.elapsed());
             black_box(acc);

@@ -762,7 +762,7 @@ fn overscroll_keeps_a_sliver_and_never_the_whole_window() {
 /// ⇒ 旧口径把「看图上缘」那一侧的 24dp 衣角推到画布顶 24dp 处，正好落在标题栏底下，
 /// 画面看起来整块全空（用户 2026-11-09 拍板要做的那条）。
 ///
-/// 本条钉住修正后的几何：无边框 / 全屏（不画标题栏）时**一个像素都不许变**；
+/// 本条钉住修正后的几何：无边框（不画标题栏）时**一个像素都不许变**；
 /// 画标题栏时那一侧要多让出标题栏的高度，另一侧（看图下缘）**不许被牵连**。
 #[test]
 fn pan_limit_keeps_the_corner_below_the_title_bar() {
@@ -801,7 +801,7 @@ fn clamp_pan_respects_the_title_bar_aware_range() {
     v.clamp_pan();
     assert_eq!(v.pan.1, -386.0, "夹取必须落在标题栏感知过的下限上");
 
-    // 标题栏收掉（切无边框 / 退出全屏）：区间放宽，但图**不该自己跳**——
+    // 标题栏收掉（切无边框）：区间放宽，但图**不该自己跳**——
     // 旧位置在新区间里仍然合法，跳一下反而是惊吓。
     v.set_chrome_top(0.0);
     assert_eq!(v.pan.1, -386.0, "区间放宽后不该把图拽走");
@@ -827,7 +827,7 @@ fn pan_range_head_is_clamped_to_the_travel() {
     assert_eq!(r.min, 10.0, "head 超过整段行程时按一半算");
     assert_eq!(r.max, 10.0);
     assert!(r.min <= r.max, "区间不许倒挂");
-    // head = 0 ⇒ 与对称口径逐值相同（无边框 / 全屏那两种形态不许有任何行为变化）。
+    // head = 0 ⇒ 与对称口径逐值相同（无边框形态不许有任何行为变化）。
     let z = PanRange::with_head(10.0, 0.0);
     assert_eq!(z, PanRange::symmetric(10.0), "head = 0 必须等于对称口径");
 }
@@ -1925,6 +1925,92 @@ fn step_uses_prefetched_neighbor_without_new_decode() {
     );
     // 预读缓存被消费掉，b 不应残留。
     assert!(v.prefetched.iter().all(|e| e.path != pb));
+}
+
+/// m346 夹具：造一个"有路由 + 无路由"混排的目录，并**直接打开那个无路由的文件**。
+///
+/// 单测进程里没有解码器，`declared_exts()` 只剩内置登记表，所以 `.svg` 有路由、
+/// `.dicom`（无人认领）无路由——正好复刻真机"直接打开一个后缀无人认领的文件，
+/// 它被 `ensure_listed` 注入进清单"的场景。
+fn m346_mixed_dir(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = crate::core::paths::test_scratch_root()
+        .join(format!("sv-m346-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for n in ["a.svg", "b.dicom", "c.svg"] {
+        std::fs::File::create(dir.join(n)).unwrap();
+    }
+    (dir.join("b.dicom"), dir)
+}
+
+/// m346：左右键翻页**跳过确定无解的文件**（后缀无人认领），落到第一个有路由的。
+/// 打开 `.dicom`（ensure_listed 注入）后，翻页不能停在它上面。
+#[test]
+fn step_skips_unroutable_files_and_lands_on_routeable() {
+    let (b_dicom, _dir) = m346_mixed_dir("skip");
+    let c = _dir.join("c.svg");
+    let a = _dir.join("a.svg");
+    let mut v = viewer_in_dir(&b_dicom);
+    // 清单排序后 = [a.svg, b.dicom, c.svg]，当前在 b.dicom（第 2 张，index 1）。
+    assert_eq!(
+        v.gallery.as_ref().unwrap().position(),
+        2,
+        "打开 b.dicom 后当前项是它"
+    );
+
+    // 往右翻：b.dicom 无路由 → 跳过 → 落到 c.svg。
+    assert!(v.step(1), "向右翻要跳过无路由的 b.dicom，落到 c.svg");
+    assert_eq!(
+        v.gallery.as_ref().unwrap().current(),
+        Some(&c),
+        "翻页后当前项应是 c.svg"
+    );
+
+    // 往左翻：c.svg 有路由，正常左移到 a.svg。
+    assert!(v.step(-1), "向左翻落到 a.svg");
+    assert_eq!(v.gallery.as_ref().unwrap().current(), Some(&a));
+
+    // 再从 a.svg 往右：a → b(无路由，跳过) → c。
+    assert!(v.step(1), "a 往右要跳过 b.dicom 落到 c.svg");
+    assert_eq!(v.gallery.as_ref().unwrap().current(), Some(&c));
+}
+
+/// m346：多步翻页（`|delta|>1`）按**有路由的**计数落脚，无路由的不占步数。
+/// 从 b.dicom（index1）向右走 2 步：跳过 b.dicom，第 1 步 c.svg、第 2 步回绕到 a.svg。
+#[test]
+fn step_multi_counts_only_routeable_files() {
+    let (b_dicom, dir) = m346_mixed_dir("multi");
+    let a = dir.join("a.svg");
+    let mut v = viewer_in_dir(&b_dicom);
+    assert_eq!(v.gallery.as_ref().unwrap().position(), 2);
+    assert!(v.step(2), "两步翻页要数满两个有路由的文件");
+    // 方向上第 2 个有路由的：c.svg（第 1 个）→ 回绕 a.svg（第 2 个）。
+    assert_eq!(v.gallery.as_ref().unwrap().current(), Some(&a));
+}
+
+/// m346：整圈都凑不出有路由的落点时返回 false，**且索引不挪**（不空转）。
+/// 直接打开一个无路由文件、目录里再无其它图：清单只有它自己（n=1），翻页无解。
+#[test]
+fn step_returns_false_when_nothing_routeable_ahead() {
+    let dir = crate::core::paths::test_scratch_root()
+        .join(format!("sv-m346-none-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let lonely = dir.join("x.dicom");
+    std::fs::File::create(&lonely).unwrap();
+    let mut v = viewer_in_dir(&lonely);
+    assert_eq!(
+        v.gallery.as_ref().unwrap().len(),
+        1,
+        "目录里只有一张无路由图"
+    );
+    let before = v.gallery.as_ref().unwrap().position();
+    assert!(!v.step(1), "整圈无有路由文件时翻页必须返回 false");
+    assert_eq!(
+        v.gallery.as_ref().unwrap().position(),
+        before,
+        "返回 false 时索引不许挪"
+    );
 }
 
 /// m101 的夹具：自己造一个三张图的目录（不与 [`gallery_dir`] 共用，

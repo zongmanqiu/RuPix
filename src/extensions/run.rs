@@ -142,6 +142,9 @@ pub struct JobOutcome {
     /// 编辑型的源文件路径（命令型 None）。
     pub target: Option<PathBuf>,
     pub result: Result<JobOutput, String>,
+    /// 本次结果是否来自被取消的调用：runtime 的 poll 臂据此静默吞掉
+    /// 取消结果（不弹失败 toast、不移卡——旧任务被取消是为了给新任务让路）。
+    pub cancelled: bool,
 }
 
 static JOBS: OnceLock<Mutex<Vec<JobOutcome>>> = OnceLock::new();
@@ -537,6 +540,9 @@ fn finish(
         id: id.to_string(),
         target,
         result: result.map_err(|f| f.text),
+        // 与三振同一个取消位口径：用户取消过的调用如实记账，
+        // runtime 对它静默（不 toast、不移卡）。
+        cancelled: cancelled(job),
     });
 }
 
@@ -1233,6 +1239,43 @@ mod tests {
             "late cleanup must not deregister another task instance"
         );
         assert!(!is_running(id), "own cleanup must remove its registration");
+    }
+
+    /// ★ 任务 8 的记账钉子：`finish` 入队的 `JobOutcome.cancelled` 要如实反映
+    /// 用户是否取消过这次调用——runtime 的 poll 臂据此把取消结果静默吞掉。
+    /// 手工构造 JobHandle（register + cancel），不拉真实子进程。
+    #[test]
+    fn finish_records_cancelled_flag_on_outcome() {
+        let quiet_id = "test.outcome.quiet";
+        let quiet = register(quiet_id).expect("非取消路径：注册一个任务");
+        finish(
+            quiet_id,
+            "test.package.outcome.quiet",
+            "quiet".into(),
+            &quiet,
+            None,
+            Err("boom".into()),
+        );
+        assert!(
+            poll().iter().any(|o| o.id == quiet_id && !o.cancelled),
+            "没取消过的调用，出队的 JobOutcome.cancelled 必须是 false"
+        );
+
+        let stopped_id = "test.outcome.cancelled";
+        let stopped = register(stopped_id).expect("取消路径：注册一个任务");
+        assert!(cancel(stopped_id), "先置取消位再收尾");
+        finish(
+            stopped_id,
+            "test.package.outcome.cancelled",
+            "stopped".into(),
+            &stopped,
+            None,
+            Err("cancelled".into()),
+        );
+        assert!(
+            poll().iter().any(|o| o.id == stopped_id && o.cancelled),
+            "取消过的调用，出队的 JobOutcome.cancelled 必须是 true"
+        );
     }
 
     #[test]

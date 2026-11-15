@@ -977,7 +977,7 @@ unsafe extern "C" fn fake_region(
         return crate::core::abi::ERR_BUFFER_TOO_SMALL;
     }
     let buf = unsafe { std::slice::from_raw_parts_mut(out, need) };
-    for px in buf.chunks_exact_mut(4) {
+    for px in buf.as_chunks_mut::<4>().0 {
         px.copy_from_slice(&[0x11, 0x22, 0x33, 0xff]);
     }
     crate::core::abi::ERR_OK

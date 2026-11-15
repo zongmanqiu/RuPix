@@ -469,7 +469,7 @@ fn downscale_rows_opaque(
         for dx in 0..tw {
             let (sx0, sx1) = band(dx, w, tw, ceil_x);
             let mut acc = [0u32; 4];
-            for p in col[sx0 * 4..sx1 * 4].chunks_exact(4) {
+            for p in col[sx0 * 4..sx1 * 4].as_chunks::<4>().0 {
                 acc[0] += p[0];
                 acc[1] += p[1];
                 acc[2] += p[2];
@@ -509,7 +509,7 @@ fn downscale_rows_alpha(
         col.fill([0; 4]);
         for sy in sy0..sy1 {
             let row = &rgba[sy * w * 4..(sy + 1) * w * 4];
-            for (px, acc) in row.chunks_exact(4).zip(col.iter_mut()) {
+            for (px, acc) in row.as_chunks::<4>().0.iter().zip(col.iter_mut()) {
                 let a = u32::from(px[3]);
                 acc[0] += u32::from(px[0]) * a;
                 acc[1] += u32::from(px[1]) * a;
@@ -552,7 +552,7 @@ fn has_transparency(rgba: &[u8], simd: bool) -> bool {
     }
     #[cfg(not(target_arch = "x86_64"))]
     let _ = simd;
-    rgba.chunks_exact(4).any(|px| px[3] != 255)
+    rgba.as_chunks::<4>().0.iter().any(|px| px[3] != 255)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1038,7 +1038,7 @@ mod tests {
             (256, 256, 1, 1),
         ] {
             let mut src = vec![0u8; w * h * 4];
-            for px in src.chunks_exact_mut(4) {
+            for px in src.as_chunks_mut::<4>().0 {
                 s = s
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
@@ -1070,7 +1070,7 @@ mod tests {
             (256, 128, 1, 1),
         ] {
             let mut src = vec![0u8; w * h * 4];
-            for px in src.chunks_exact_mut(4) {
+            for px in src.as_chunks_mut::<4>().0 {
                 s = s
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
@@ -1102,7 +1102,7 @@ mod tests {
         ];
         for (w, h, tw, th) in cases {
             let mut src = vec![0u8; (w * h * 4) as usize];
-            for px in src.chunks_exact_mut(4) {
+            for px in src.as_chunks_mut::<4>().0 {
                 s = s
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
@@ -1141,7 +1141,7 @@ mod tests {
     fn downscale_alpha_hint_opaque_matches_fast_path() {
         let (w, h, tw, th) = (37u32, 29u32, 13u32, 9u32);
         let mut src = vec![0u8; (w * h * 4) as usize];
-        for (i, px) in src.chunks_exact_mut(4).enumerate() {
+        for (i, px) in src.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             px[0] = (i % 251) as u8;
             px[1] = (i / 3 % 241) as u8;
             px[2] = (i / 7 % 239) as u8;
@@ -1157,7 +1157,7 @@ mod tests {
     fn downscale_alpha_multithread_matches_single() {
         let (w, h, tw, th) = (64u32, 48u32, 13u32, 11u32);
         let mut src = vec![0u8; (w * h * 4) as usize];
-        for (i, px) in src.chunks_exact_mut(4).enumerate() {
+        for (i, px) in src.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let a = ((i * 37) % 256) as u8;
             px[0] = (i * 11 % 256) as u8;
             px[1] = (i * 17 % 256) as u8;
@@ -1205,7 +1205,7 @@ mod tests {
         ];
         for (w, h, tw, th) in cases {
             let mut src = vec![0u8; (w * h * 4) as usize];
-            for px in src.chunks_exact_mut(4) {
+            for px in src.as_chunks_mut::<4>().0 {
                 s = s
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
@@ -1252,7 +1252,7 @@ mod tests {
         ];
         for (w, h, mw, mh) in cases {
             let mut src = vec![0u8; (w * h * 4) as usize];
-            for px in src.chunks_exact_mut(4) {
+            for px in src.as_chunks_mut::<4>().0 {
                 s = s
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
@@ -1285,7 +1285,7 @@ mod tests {
     fn fit_oriented_with_alpha_matches_orient_then_fit_alpha() {
         let (w, h, mw, mh) = (37u32, 29u32, 13u32, 11u32);
         let mut src = vec![0u8; (w * h * 4) as usize];
-        for (i, px) in src.chunks_exact_mut(4).enumerate() {
+        for (i, px) in src.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             px[0] = (i * 7 % 251) as u8;
             px[1] = (i * 13 % 241) as u8;
             px[2] = (i * 19 % 239) as u8;
@@ -1312,7 +1312,7 @@ mod tests {
         let src = {
             let mut s = 0x0BADC0DE_0BADC0DEu64;
             let mut v = vec![0u8; 31 * 17 * 4];
-            for px in v.chunks_exact_mut(4) {
+            for px in v.as_chunks_mut::<4>().0 {
                 s = s
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
@@ -1564,7 +1564,7 @@ mod rotate_tests {
         let i = (2 * 5 + 2) * 4;
         src[i..i + 4].copy_from_slice(&[200, 100, 50, 255]);
         let out = rotated(&src, 5, 5, 30);
-        for px in out.chunks_exact(4) {
+        for px in out.as_chunks::<4>().0 {
             if px[3] > 0 {
                 // 预乘还原后，颜色只能是原色与透明的混合，不该出现 (0,0,0) 实心黑。
                 assert!(px[0] > 0 || px[3] == 0, "透明邻域把红通道拉黑了：{px:?}");

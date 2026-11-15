@@ -545,7 +545,7 @@ pub fn gamma_table(gamma_pct: i32) -> [u8; 256] {
 pub fn channel_gamma(rgba: &[u8], gain: [i32; 3], bias: [i32; 3], gamma_pct: i32) -> Vec<u8> {
     let curve = gamma_table(gamma_pct);
     let mut out = rgba.to_vec();
-    for px in out.chunks_exact_mut(4) {
+    for px in out.as_chunks_mut::<4>().0 {
         for c in 0..3 {
             let n = px[c] as i64 * gain[c] as i64 / 100 + bias[c] as i64;
             px[c] = curve[n.clamp(0, 255) as usize];
@@ -568,7 +568,7 @@ pub fn channel_gamma_lut(rgba: &[u8], gain: [i32; 3], bias: [i32; 3], gamma_pct:
     }
     let [r, g, b] = tables;
     let mut out = rgba.to_vec();
-    for px in out.chunks_exact_mut(4) {
+    for px in out.as_chunks_mut::<4>().0 {
         px[0] = r[px[0] as usize];
         px[1] = g[px[1] as usize];
         px[2] = b[px[2] as usize];
@@ -729,10 +729,19 @@ mod preview_pixel_tests {
         }
         let (ow, oh, out) = sample_strided(&px, w, h, 4);
         assert_eq!((ow, oh), (2, 2));
-        let zeros = out.chunks_exact(4).filter(|p| p[0] == 0).count();
-        let fulls = out.chunks_exact(4).filter(|p| p[0] == 255).count();
+        let zeros = out.as_chunks::<4>().0.iter().filter(|p| p[0] == 0).count();
+        let fulls = out
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] == 255)
+            .count();
         assert_eq!((zeros, fulls), (2, 2), "0 与 255 各占一半，抽样不改分布");
-        assert!(out.chunks_exact(4).all(|p| p[0] == 0 || p[0] == 255));
+        assert!(out
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| p[0] == 0 || p[0] == 255));
     }
 
     #[test]
@@ -795,7 +804,7 @@ mod preview_pixel_tests {
         }
         let alpha: Vec<u8> = channel_linear_lut(&src, [-100, -100, -100], [255, 255, 255]);
         assert!(
-            alpha.chunks_exact(4).all(|p| p[3] == 0xA5),
+            alpha.as_chunks::<4>().0.iter().all(|p| p[3] == 0xA5),
             "第 4 字节不许改"
         );
     }

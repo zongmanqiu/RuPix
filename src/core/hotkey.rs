@@ -95,8 +95,6 @@ pub enum Action {
     FrameNext,
     /// 缩略图条开关。
     Filmstrip,
-    /// 全屏切换。
-    Fullscreen,
     // ── 以下 15 个把右键菜单 / 标题栏按钮的全集也纳入可绑动作（2026-10-14 快捷键优化，
     //    m167 又添了幻灯片放映）。
     //    默认**全部不绑**（避免与既有键撞、也不给老用户制造新拦截），需要就到设置页自绑。
@@ -124,7 +122,7 @@ pub enum Action {
     Lock,
     /// 最小化窗口。
     Minimize,
-    /// 最大化 / 还原切换。
+    /// 最大化切换（最大化 / 还原互翻，与 `name()`「最大化切换」同一措辞；OS 工作区口径）。
     Maximize,
     /// 关闭窗口。
     Close,
@@ -146,7 +144,11 @@ pub enum Action {
 
 impl Action {
     /// 动作总数（也是 `bindings` 数组长度）。
-    pub const COUNT: usize = 36;
+    ///
+    /// 全屏动作退役（2026-11-15）后从这里除名：36 → 35。存储层只有
+    /// `id` 字符串这一种（`from_id` 兼容旧值），没有按下标落盘的动作，
+    /// 所以缩一位不需要任何 ini 迁移。
+    pub const COUNT: usize = 35;
 
     /// 全部动作，下标顺序与枚举定义严格一致（见类型注释）。
     pub const ALL: [Action; Action::COUNT] = [
@@ -164,7 +166,6 @@ impl Action {
         Action::FramePrev,
         Action::FrameNext,
         Action::Filmstrip,
-        Action::Fullscreen,
         Action::Open,
         Action::CopyImage,
         Action::CopyPath,
@@ -215,7 +216,6 @@ impl Action {
             Action::FramePrev => "frame_prev",
             Action::FrameNext => "frame_next",
             Action::Filmstrip => "filmstrip",
-            Action::Fullscreen => "fullscreen",
             Action::Open => "open",
             Action::CopyImage => "copy_img",
             Action::CopyPath => "copy_path",
@@ -257,7 +257,10 @@ impl Action {
             "frame_prev" => Some(Action::FramePrev),
             "frame_next" => Some(Action::FrameNext),
             "filmstrip" => Some(Action::Filmstrip),
-            "fullscreen" => Some(Action::Fullscreen),
+            // 旧 ini 兼容：`fullscreen` 动作已退役，落在这里的绑定按同义的
+            // 「最大化切换」处理——老配置不用手改，语义无缝并入唯一幸存的
+            // 「放到最大」类动作。`id()` 不再产出 fullscreen，写回自然消失。
+            "fullscreen" => Some(Action::Maximize),
             "open" => Some(Action::Open),
             "copy_img" => Some(Action::CopyImage),
             "copy_path" => Some(Action::CopyPath),
@@ -300,7 +303,6 @@ impl Action {
             Action::FramePrev => "上一帧",
             Action::FrameNext => "下一帧",
             Action::Filmstrip => "缩略图条",
-            Action::Fullscreen => "全屏",
             Action::Open => "打开",
             Action::CopyImage => "复制当前图像（PNG）",
             Action::CopyPath => "复制文件路径",
@@ -313,7 +315,7 @@ impl Action {
             Action::Topmost => "窗口置顶",
             Action::Lock => "锁定",
             Action::Minimize => "最小化",
-            Action::Maximize => "最大化 / 还原",
+            Action::Maximize => "最大化切换",
             Action::Close => "关闭窗口",
             Action::Slideshow => "幻灯片放映",
             Action::PanUp => "向上平移",
@@ -682,9 +684,12 @@ impl Default for Hotkeys {
             ctrl: true,
             ..dhk(Base::Down, false)
         }];
-        b[Action::Fullscreen.index()] = vec![dhk(Base::F(11), false)];
-        // 「关闭窗口」出厂绑 Esc（2026-10-14 用户口径）：看图器通用退出键。全屏里
-        // 按 Esc 先退全屏再关窗，由 `canvas::exec_action` 的 Close 臂守住。
+        // F11 出厂归「最大化切换」：全屏动作退役后这把功能键原位重绑到同义的
+        // 最大化切换——老用户按 F11 的肌肉记忆不丢，也免了「最常用的窗口形态
+        // 切换键从此失灵」的静默回退。
+        b[Action::Maximize.index()] = vec![dhk(Base::F(11), false)];
+        // 「关闭窗口」出厂绑 Esc（2026-10-14 用户口径）：看图器通用退出键，
+        // 框架默认行为就是关窗，不需要任何前置分支。
         b[Action::Close.index()] = vec![dhk(Base::Escape, false)];
         // WASD 平移（m216）：视口往哪边看就按哪个字母（W=上看，A=左看，S=下看，
         // D=右看）。裸 ↑/↓ 已裁决**不做**纵向平移（Ctrl+↑/↓ 是不透明度档），
@@ -924,7 +929,8 @@ mod tests {
         );
         assert_eq!(
             hk.match_action(&ev(VKey::F(11), false, false, false, false)),
-            Some(Action::Fullscreen)
+            Some(Action::Maximize),
+            "F11 随全屏退役改绑最大化切换"
         );
         // 逐帧那两把：页与帧合流之后，多页文档也走它们（没有第二套键）。
         assert_eq!(
@@ -1083,16 +1089,26 @@ mod tests {
     }
 
     /// 部分解析：只给了 prev 的 INI 段，其余动作必须保持默认，prev 被覆盖。
+    ///
+    /// ★ 旧 ini 兼容在这里一并钉住：动作 id `fullscreen` 已退役，`from_id`
+    /// 把它读成 `Action::Maximize`，绑定原样落到最大化切换上。
     #[test]
     fn partial_ini_keeps_other_defaults() {
-        let back = Hotkeys::from_ini("prev:Right;fullscreen:F5");
+        let back = Hotkeys::from_ini("prev:Right;maximize:F5");
         assert_eq!(
             back.bindings[Action::Prev.index()],
             vec![dhk(Base::Right, false)]
         );
         assert_eq!(
-            back.bindings[Action::Fullscreen.index()],
+            back.bindings[Action::Maximize.index()],
             vec![dhk(Base::F(5), false)]
+        );
+        // 旧 ini 写法 `fullscreen:F5`：读入映射到 Maximize（全屏退役，语义并入）。
+        let legacy = Hotkeys::from_ini("fullscreen:F5");
+        assert_eq!(
+            legacy.bindings[Action::Maximize.index()],
+            vec![dhk(Base::F(5), false)],
+            "旧 fullscreen 键应读成最大化切换的绑定"
         );
         // 未提及的动作沿默认——**除非**其默认键被本 ini 显式划给了别的动作：
         // 唯一性（写入即夺键，与 set_binding 同规）下 prev:Right 夺走 Next 的默认
@@ -1137,13 +1153,14 @@ mod tests {
     }
 
     /// 动作集扩到 35（2026-10-14 扩到 27 + 2026-10-18 逐帧两把 + 2026-10-31 m167 幻灯片
-    /// 一把 + m216 WASD 平移四把 + m217 取色器一把），id 双向映射自洽；
-    /// 那批新动作默认不绑，仅「关闭窗口」出厂绑 Esc（看图器通用退出键，见
-    /// `Hotkeys::default`），逐帧的 `,` / `.` 属出厂就绑的那一组；
+    /// 一把 + m216 WASD 平移四把 + m217 取色器一把；2026-11-15 全屏退役减回 35），
+    /// id 双向映射自洽；
+    /// 那批新动作默认不绑，出厂就绑的只有「上一张/下一张/首末张/缩放/旋转/镜像/
+    /// 暂停/缩略图条/F11 最大化切换/Esc 关窗/不透明度/WASD/取色器」这一组；
     /// 2026-10-19 起不透明度 `Ctrl+↑/↓` 也出厂就绑（m53-K，消除两个孤儿动作）。
     #[test]
     fn expanded_action_set_ids_round_trip_and_new_unbound() {
-        assert_eq!(Action::COUNT, 36);
+        assert_eq!(Action::COUNT, 35);
         for a in Action::ALL {
             assert_eq!(
                 Action::from_id(a.id()),
@@ -1164,7 +1181,6 @@ mod tests {
             Action::Topmost,
             Action::Lock,
             Action::Minimize,
-            Action::Maximize,
             // 放映也一样出厂不绑键（与上面那一组同一条规矩：不给老用户制造新拦截）。
             // 入口是右键「画面」子菜单那一项，想要键的人在快捷键页自绑——那一页
             // 遍历 `Action::ALL`，这一行是自动多出来的。

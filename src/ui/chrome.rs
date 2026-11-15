@@ -178,7 +178,6 @@ pub enum Btn {
     In,
     Fit,
     Actual,
-    Fullscreen,
     Rotate,
     Mirror,
     // ── 动画组（`Chrome::row` 按"是不是动图"整组显隐，浮条与右键菜单同步）──
@@ -249,12 +248,11 @@ impl Btn {
     /// （与 [`TitleBtn::glyph`] 的 `locked`/`maximized` 同一手法）。
     fn glyph(self, paused: bool) -> &'static str {
         match self {
-            Btn::Out => "\u{E71F}",        // ZoomOut
-            Btn::In => "\u{E8A3}",         // ZoomIn
-            Btn::Fit => "\u{E799}",        // AspectRatio
-            Btn::Actual => "\u{E71E}",     // Zoom（1:1 原尺寸）
-            Btn::Fullscreen => "\u{E740}", // FullScreen
-            Btn::Rotate => "\u{E7AD}",     // Rotate
+            Btn::Out => "\u{E71F}",    // ZoomOut
+            Btn::In => "\u{E8A3}",     // ZoomIn
+            Btn::Fit => "\u{E799}",    // AspectRatio
+            Btn::Actual => "\u{E71E}", // Zoom（1:1 原尺寸）
+            Btn::Rotate => "\u{E7AD}", // Rotate
             // MDL2 没有专用"镜像"字形，Switch（双向对箭头）是视觉上最接近的。
             Btn::Mirror => "\u{E8AB}", // Switch
             // 上一帧 / 下一帧用 Previous / Next（竖线 + 单三角）：双三角的
@@ -292,7 +290,6 @@ impl Btn {
             Btn::In => Action::ZoomIn,
             Btn::Fit => Action::Fit,
             Btn::Actual => Action::ActualSize,
-            Btn::Fullscreen => Action::Fullscreen,
             Btn::Rotate => Action::Rotate,
             Btn::Mirror => Action::Flip,
             Btn::FrameBack => Action::FramePrev,
@@ -315,12 +312,12 @@ impl Btn {
     /// 插到中间就得改成逐颗过滤。翻页两颗紧挨动画组之后，同样必须连续
     /// （与动画组互斥显隐，二者在 `ALL` 里各占一段连续区间）。
     /// m247：只留操作类按钮；棋盘格归「界面 ▸」、属性归「文件 ▸」，两颗都不再是按钮。
-    pub const ALL: [Btn; 10] = [
+    /// 全屏退役（2026-11-15）：`Btn::Fullscreen` 整颗删除，浮条「画面 ▸」同源少一项。
+    pub const ALL: [Btn; 9] = [
         Btn::Out,
         Btn::In,
         Btn::Fit,
         Btn::Actual,
-        Btn::Fullscreen,
         Btn::Rotate,
         Btn::Mirror,
         Btn::FrameBack,
@@ -1525,15 +1522,15 @@ impl Chrome {
     }
 }
 
-// 按钮尺寸常量（逻辑 dp）。7 键时浮条总宽 7×34 + 6×3 + 2×8 = 272，
+// 按钮尺寸常量（逻辑 dp）。6 键时浮条总宽 6×34 + 5×3 + 2×8 = 221，
 // 最小窗口（360）内放得下；`BTN_W` 定 34 就是为这条，再宽会顶破 360。
-/// 满组 10 颗 + 2 颗余量（与旧 14 颗同比例）：`8×2 + 12×BTN_W + 11×BTN_GAP`。
+/// 满组 9 颗 + 2 颗余量（与旧 14 颗同比例）：`8×2 + 11×BTN_W + 10×BTN_GAP`。
 /// 余量是刻意的：门槛宁可宽一点，也不让动画组在放不下的窗口里挤掉信息格。
-const FULL_ROW_W: f32 = 8.0 * 2.0 + 12.0 * 34.0 + 11.0 * 3.0;
-/// 7 颗（收掉末尾动画组）时的浮条宽——状态格的门槛照它算。
-const NARROW_ROW_W: f32 = 8.0 * 2.0 + 7.0 * 34.0 + 6.0 * 3.0;
+const FULL_ROW_W: f32 = 8.0 * 2.0 + 11.0 * 34.0 + 10.0 * 3.0;
+/// 6 颗（收掉末尾动画组）时的浮条宽——状态格的门槛照它算。
+const NARROW_ROW_W: f32 = 8.0 * 2.0 + 6.0 * 34.0 + 5.0 * 3.0;
 /// 动画组在 `Btn::ALL` 里的起点（末尾连续三颗）。
-const ANIM_START: usize = 7;
+const ANIM_START: usize = 6;
 
 /// 辅图只有页/帧可切时的尾段：不挂播放钮（它不能替主图播放）。
 static FRAME_PAIR: [Btn; 2] = [Btn::FrameBack, Btn::FrameFwd];
@@ -1596,12 +1593,12 @@ const fn info_cell_w(text_w: f32) -> f32 {
 const INFO_CELL_MAX: f32 = info_cell_w(INFO_TEXT_MAX);
 /// 整行档与视口边缘、与浮条之间的间距。
 const INFO_GAP: f32 = 8.0;
-/// 状态进浮条所需的最小视口宽：9 颗按钮 + **满格**。窄于此退到浮条上方整行。
+/// 状态进浮条所需的最小视口宽：6 颗按钮 + **满格**。窄于此退到浮条上方整行。
 const PILL_INFO_MIN_W: f32 = NARROW_ROW_W + INFO_CELL_MAX;
-/// 动画三颗与状态格**同时**在场所需宽：12 颗 + 满格。
+/// 动画三颗与状态格**同时**在场所需宽：11 颗 + 满格。
 ///
-/// 状态优先于动画按钮：587–698 这一段窗口里动图少三颗按钮（`,` `.` `P` 与右键菜单
-/// 照旧可用），换来的是状态不必另起一行压在画上——用户 2026-10-18 报的就是那一行。
+/// 状态优先于动画按钮：`PILL_INFO_MIN_W` 与 `FULL_ROW_MIN_W` 之间的窗口里动图少三颗按钮
+/// （`,` `.` `P` 与右键菜单照旧可用），换来的是状态不必另起一行压在画上——用户 2026-10-18 报的就是那一行。
 const FULL_ROW_MIN_W: f32 = FULL_ROW_W + INFO_CELL_MAX;
 
 /// 信息条落位判据（纯算术，单测直接驱动它，不必造画布）。
@@ -1657,20 +1654,14 @@ fn clip_text(canvas: &mut dyn Canvas, text: &str, ts: &TextStyle, avail_w: f32) 
     format!("{kept}{ELL}")
 }
 
-/// 顶条（自绘标题栏 + 画布上的标题钮）这一帧画不画。**m238**。
+/// 顶条（自绘标题栏 + 画布上的标题钮）这一帧画不画。
 ///
-/// ★ 全屏时**默认不画**——用户口径「全屏不该还留着标题栏」。但顶缘悬停仍能把它
-///   唤出：与极简模式共用同一份 `hover_title`，而那位由 `in_title_strip` 的几何
-///   独立算出，不看这一帧画没画，所以不会「收了就唤不回」。满组 5 颗钮
-///   （置顶 / 锁定 / 最小化 / 最大化 / 关闭）因此仍然可达；面板头部只留
-///   「信息 + 关闭面板」，窗口五颗钮始终连在画布顶条。
-/// ★ 非全屏的判据一字未动：传统模式常驻，极简模式只靠悬停。
-fn title_visible(fullscreen_on: bool, minimal_mode: bool, hover_title: bool) -> bool {
-    if fullscreen_on {
-        hover_title
-    } else {
-        !minimal_mode || hover_title
-    }
+/// ★ 2026-11-15 全屏退役：m238 的「全屏默认收起顶条、顶缘悬停唤回」整条语义随全屏档
+///   删除——最大化是 OS 工作区形态，标题栏本来就归系统最大化语义管，不再另设收条。
+///   保留的是极简悬停语义：传统模式常驻，极简模式只靠悬停。悬停位与画没画无关
+///   （由 `in_title_strip` 的几何独立算出），所以不会「收了就唤不回」。
+fn title_visible(minimal_mode: bool, hover_title: bool) -> bool {
+    !minimal_mode || hover_title
 }
 
 /// 这一帧标题栏实际占掉的高度（逻辑像素）；不画时为 0。**m290**。
@@ -1680,9 +1671,8 @@ fn title_visible(fullscreen_on: bool, minimal_mode: bool, hover_title: bool) -> 
 /// 高度画，于是衣角要么被吃掉、要么多留一截。
 ///
 /// 唯一消费方是 `ui::canvas`，喂给 [`Viewer::set_chrome_top`](crate::core::viewer::Viewer)。
-pub fn title_strip_h(fullscreen_on: bool, minimal_mode: bool, chrome: &Chrome) -> f32 {
-    let show =
-        !borderless() && title_visible(fullscreen_on, minimal_mode, chrome.hover_title.get());
+pub fn title_strip_h(minimal_mode: bool, chrome: &Chrome) -> f32 {
+    let show = !borderless() && title_visible(minimal_mode, chrome.hover_title.get());
     if show {
         STRIP_H as f32
     } else {
@@ -1705,7 +1695,7 @@ fn to_canvas(view: (f32, f32, f32, f32), rel: (f32, f32, f32, f32)) -> (f32, f32
 /// `view` 是画布摆图/悬浮层共用的视口矩形 (x, y, w, h)；`info` 是右侧信息文本（"3/12 · 100%"）；
 /// `has_prev/has_next` 控制箭头是否画；其余是开关态。
 /// `minimal_mode` 为 true 时：各元素仅在悬停时显示；false 时：始终显示。
-#[allow(clippy::too_many_arguments)] // 11 个参数：绘制需要的开关态，合并成结构体反而更难读
+#[allow(clippy::too_many_arguments)] // 10 个参数：绘制需要的开关态，合并成结构体反而更难读
 pub fn paint(
     canvas: &mut dyn Canvas,
     view: (f32, f32, f32, f32),
@@ -1713,7 +1703,6 @@ pub fn paint(
     info: &str,
     has_prev: bool,
     has_next: bool,
-    fullscreen_on: bool,
     topmost_on: bool,
     maximized_on: bool,
     minimal_mode: bool,
@@ -1736,7 +1725,7 @@ pub fn paint(
     let bl = borderless();
     // m290：判据收进 `title_strip_h`，与"给平移上限算标题栏挡了多少"共用同一份。
     // 两处各写一遍就会错位——衣角要么被吃掉、要么多留一截。
-    let show_title = title_strip_h(fullscreen_on, minimal_mode, chrome) > 0.0;
+    let show_title = title_strip_h(minimal_mode, chrome) > 0.0;
     // 悬停信息条也算"在浮条上"：整行档（窄窗）就住在那儿。不认它的后果是极简模式下
     // 指针停在状态那一行 2 秒后整组消失、且再也悬不回来（`info_rect` 只有画出来才非零）。
     // 三条来源取或：常驻（传统模式）／指针在浮条上（`activity` 现算）／状态刚变
@@ -1837,7 +1826,7 @@ pub fn paint(
                 canvas.fill_rect(lx, ly, lw, lh, &Paint::fill(c));
             }
             let fg = match tb {
-                // 锁住态：绿色高亮（同 Checker/Fullscreen/置顶 激活模式）。
+                // 锁住态：绿色高亮（同 Checker/置顶 激活模式）。
                 TitleBtn::Lock if locked => tk::overlay_text_active(),
                 _ if !active => tk::overlay_text_muted(),
                 _ => tk::overlay_text(),
@@ -2018,17 +2007,11 @@ pub fn paint(
                 canvas.fill_round_rect(hx, hy, hw, hh, 6.0, &Paint::fill(c));
             }
             let glyph = b.glyph(paused);
-            // 开关类按钮激活时给一点绿色，扫一眼能看出状态（m247 后只剩全屏）。
-            let color = if b == Btn::Fullscreen && fullscreen_on {
-                tk::overlay_text_active()
-            } else {
-                tk::overlay_text()
-            };
             let (tx, ty, tw, th) = local(bx, by, bw, bh);
             canvas.draw_text(
                 glyph,
                 Rect::new(tx as i32, ty as i32, tw as i32, th as i32),
-                color,
+                tk::overlay_text(),
                 Align::Center,
                 &icon_ts,
             );
@@ -2104,7 +2087,7 @@ mod tests {
     use super::*;
     use windui::geometry::Color;
 
-    /// m279 判据本体：十颗按钮的名字必须与它对应动作的名字**逐字相同**。
+    /// m279 判据本体：九颗按钮的名字必须与它对应动作的名字**逐字相同**。
     /// 快捷键页读 `Action::name()`、浮条与右键「画面 ▸」读 `Btn::name()`——
     /// 以前两张表各写一遍，改一处忘一处就是用户看到的「动画上一帧 / 上一帧」。
     fn assert_btn_names_follow_actions(pick: impl Fn(Btn) -> &'static str, what: &str) {
@@ -2158,29 +2141,14 @@ mod tests {
         );
     }
 
-    /// m238：全屏默认收起顶条、顶缘悬停仍唤得出；非全屏行为一字不变。
-    /// 八个组合全列出来，防止日后有人把某个分支「顺手简化」掉。
+    /// 极简悬停语义（2026-11-15 全屏退役后顶条判据只剩这一条）。
+    /// 四个组合全列出来，防止日后有人把某个分支「顺手简化」掉。
     #[test]
-    fn title_visible_fullscreen_hides_but_hover_recalls() {
-        // 全屏：默认不画，悬停才画（极简与否都一样）。
-        assert!(
-            !title_visible(true, false, false),
-            "全屏+传统：不该还留顶条"
-        );
-        assert!(
-            title_visible(true, false, true),
-            "全屏+顶缘悬停：要能唤回按钮"
-        );
-        assert!(!title_visible(true, true, false), "全屏+极简：也不该有顶条");
-        assert!(
-            title_visible(true, true, true),
-            "全屏+极简+悬停：同样唤得回"
-        );
-        // 非全屏：与改动前的 `!minimal_mode || hover_title` 逐项一致。
-        assert!(title_visible(false, false, false), "传统模式常驻");
-        assert!(title_visible(false, false, true), "传统模式悬停也仍画");
-        assert!(!title_visible(false, true, false), "极简模式平时收起");
-        assert!(title_visible(false, true, true), "极简模式悬停唤出");
+    fn title_visible_keeps_minimal_hover_semantics() {
+        assert!(title_visible(false, false), "传统模式常驻");
+        assert!(title_visible(false, true), "传统模式悬停也仍画");
+        assert!(!title_visible(true, false), "极简模式平时收起");
+        assert!(title_visible(true, true), "极简模式悬停唤出");
     }
 
     #[test]
@@ -2431,7 +2399,7 @@ mod tests {
         }
     }
 
-    /// 行的颗数与浮条宽度：静态 7 颗、可播放（动图或多页文档）10 颗；
+    /// 行的颗数与浮条宽度：静态 6 颗、可播放（动图或多页文档）9 颗；
     /// **窗口放不下"满组 + 状态格"时播放组也退回**——状态格优先，因为按钮还有
     /// 快捷键与右键菜单，状态没有第二处。
     ///
@@ -2440,23 +2408,23 @@ mod tests {
     #[test]
     fn row_follows_playability_and_width() {
         let count = |anim: bool, vw: f32| Chrome::row_len_ex(anim, vw, false);
-        assert_eq!(count(false, 1920.0), 7);
-        assert_eq!(count(true, 1920.0), 10);
+        assert_eq!(count(false, 1920.0), 6);
+        assert_eq!(count(true, 1920.0), 9);
         assert_eq!(
             count(true, FULL_ROW_MIN_W - 1.0),
-            7,
-            "放不下 10 颗 + 格子就不给播放组"
+            6,
+            "放不下 9 颗 + 格子就不给播放组"
         );
-        assert_eq!(count(true, FULL_ROW_MIN_W), 10);
-        assert_eq!(count(true, 360.0), 7, "窄窗不许把按钮挤出窗口");
-        // anim=true 时显示 10 颗（7 + 3 播放），宽度 = 格 + 16 + 10×34 + 9×3
+        assert_eq!(count(true, FULL_ROW_MIN_W), 9);
+        assert_eq!(count(true, 360.0), 6, "窄窗不许把按钮挤出窗口");
+        // anim=true 时显示 9 颗（6 + 3 播放），宽度 = 格 + 16 + 9×34 + 8×3
         let (_x, _y, w, _h) = Chrome::pill(
             (0.0, 0.0, 1920.0, 1080.0),
             true,
             Chrome::cell_reserve(1920.0),
         );
-        let w10 = 8.0 * 2.0 + 10.0 * 34.0 + 9.0 * 3.0;
-        assert_eq!(w, w10 + INFO_CELL_MAX, "10 颗 + 满格");
+        let w9 = 8.0 * 2.0 + 9.0 * 34.0 + 8.0 * 3.0;
+        assert_eq!(w, w9 + INFO_CELL_MAX, "9 颗 + 满格");
     }
 
     /// 辅图底栏：有页/帧号时只挂「上一页 / 下一页」两颗，不挂播放钮。
@@ -2468,15 +2436,15 @@ mod tests {
         assert!(shown.contains(&Btn::FrameBack));
         assert!(shown.contains(&Btn::FrameFwd));
         assert!(!shown.contains(&Btn::PlayPause), "辅图不该挂主图播放钮");
-        assert_eq!(shown.len(), 9, "7 颗常用 + 2 颗页/帧");
-        assert_eq!(Chrome::row_len_ex(true, wide, true), 9);
+        assert_eq!(shown.len(), 8, "6 颗常用 + 2 颗页/帧");
+        assert_eq!(Chrome::row_len_ex(true, wide, true), 8);
         let (_, _, w, _) = Chrome::pill_ex(
             (0.0, 0.0, 1920.0, 1080.0),
             true,
             Chrome::cell_reserve(1920.0),
             true,
         );
-        assert_eq!(w, 8.0 * 2.0 + 9.0 * 34.0 + 8.0 * 3.0 + INFO_CELL_MAX);
+        assert_eq!(w, 8.0 * 2.0 + 8.0 * 34.0 + 7.0 * 3.0 + INFO_CELL_MAX);
     }
 
     /// 浮条总宽必须在**最小窗口**（360，见 `ui::window` 的 `min_size`）内放得下。
@@ -2485,7 +2453,7 @@ mod tests {
     /// 旋转/镜像按钮时踩过的坑（用户报"新按钮没有背景"）。
     #[test]
     fn pill_fits_min_window() {
-        // 动图态 + **满格**一起量：窄到放不下 10 颗时 `Chrome::row` 自己退回 7 颗，
+        // 动图态 + **满格**一起量：窄到放不下 9 颗时 `Chrome::row` 自己退回 6 颗，
         // 而格宽自适应之后"最坏那一帧"就是满格，只有按它判才兜得住。
         let (_x, _y, w, _h) =
             Chrome::pill((0.0, 0.0, 360.0, 260.0), true, Chrome::cell_reserve(360.0));
@@ -2626,7 +2594,6 @@ mod tests {
             false,
             false,
             false,
-            false,
             "一张图.jpg",
         );
         let (ix, iy, iw, ih) = chrome.info_rect.get();
@@ -2661,7 +2628,6 @@ mod tests {
             "12/340 · 100%",
             true,
             true,
-            false,
             false,
             false,
             false,
@@ -3182,7 +3148,6 @@ mod tests {
                 true,
                 false,
                 false,
-                false,
                 chrome.minimal_mode.get(),
                 "",
             );
@@ -3217,7 +3182,7 @@ mod tests {
             circles: Vec::new(),
         };
         paint(
-            &mut spy, view, &alone, "", false, false, false, false, false, true, "",
+            &mut spy, view, &alone, "", false, false, false, false, true, "",
         );
         assert_eq!(spy.circles.len(), 0, "没有邻居就没有箭头，浮现与否都一样");
     }
@@ -3236,7 +3201,7 @@ mod tests {
                 circles: Vec::new(),
             };
             paint(
-                &mut spy, view, chrome, "", true, true, false, false, false, true, "",
+                &mut spy, view, chrome, "", true, true, false, false, true, "",
             );
             let near = |tx: f32, ty: f32| {
                 spy.circles
@@ -3389,7 +3354,6 @@ mod tests {
                 info,
                 true,
                 true,
-                false,
                 false,
                 false,
                 false,
@@ -3853,7 +3817,11 @@ mod tests {
         let (x, _, w, _) = Chrome::pill(view, false, cell);
         assert!(w > cell + 16.0, "有按钮时胶囊必须更宽：{w}");
         assert_eq!(x, (1200.0 - w) / 2.0, "常态下浮条居中");
-        assert_eq!(Chrome::row(false, 1200.0).0.len(), 7);
+        assert_eq!(
+            Chrome::row(false, 1200.0).0.len(),
+            6,
+            "静态排 6 颗（全屏退役前 7）"
+        );
         assert!(Chrome::btn_rect(Btn::Out, view, false, cell).is_some());
 
         assert!(set_toolbar_buttons(false), "从开到关应报变化（要标脏）");

@@ -60,7 +60,7 @@ fn naive(rgba: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
 fn make(w: u32, h: u32) -> Vec<u8> {
     let mut s = 0x2545_F491_4F6C_DD1Du64;
     let mut v = vec![0u8; (w as usize) * (h as usize) * 4];
-    for px in v.chunks_exact_mut(4) {
+    for px in v.as_chunks_mut::<4>().0 {
         s = s
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
@@ -118,7 +118,7 @@ fn cand_u32(rgba: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
         for dx in 0..tw {
             let (sx0, sx1) = band(dx, w, tw, false);
             let mut acc = [0u32; 4];
-            for p in col[sx0 * 4..sx1 * 4].chunks_exact(4) {
+            for p in col[sx0 * 4..sx1 * 4].as_chunks::<4>().0 {
                 acc[0] += p[0];
                 acc[1] += p[1];
                 acc[2] += p[2];
@@ -157,7 +157,7 @@ fn cand_u16(rgba: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
         for dx in 0..tw {
             let (sx0, sx1) = band(dx, w, tw, false);
             let mut acc = [0u32; 4];
-            for p in col[sx0 * 4..sx1 * 4].chunks_exact(4) {
+            for p in col[sx0 * 4..sx1 * 4].as_chunks::<4>().0 {
                 acc[0] += p[0] as u32;
                 acc[1] += p[1] as u32;
                 acc[2] += p[2] as u32;
@@ -274,7 +274,7 @@ fn horizontal_into<T: Copy + Into<u32>>(
     for dx in 0..tw {
         let (sx0, sx1) = band(dx, col.len() / 4, tw, false);
         let mut acc = [0u32; 4];
-        for p in col[sx0 * 4..sx1 * 4].chunks_exact(4) {
+        for p in col[sx0 * 4..sx1 * 4].as_chunks::<4>().0 {
             acc[0] += p[0].into();
             acc[1] += p[1].into();
             acc[2] += p[2].into();
@@ -373,7 +373,7 @@ fn horizontal_only(rgba: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
         for dx in 0..tw {
             let (sx0, sx1) = band(dx, w, tw, false);
             let mut acc = [0u32; 4];
-            for p in col[sx0 * 4..sx1 * 4].chunks_exact(4) {
+            for p in col[sx0 * 4..sx1 * 4].as_chunks::<4>().0 {
                 acc[0] += p[0];
                 acc[1] += p[1];
                 acc[2] += p[2];

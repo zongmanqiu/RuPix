@@ -178,7 +178,9 @@ fn run_editor_probe(dir: &Path) -> Result<(), String> {
     // 4×2 探针图：每像素首字节 = 序号；反相结果可逐字节断言，不靠肉眼。
     let probe: Vec<u8> = (0..8u8).flat_map(|i| [i, 0, 200, 255]).collect();
     let inverted: Vec<u8> = probe
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| [255 - p[0], 255 - p[1], 255 - p[2], p[3]])
         .collect();
     let mut fails: Vec<String> = Vec::new();

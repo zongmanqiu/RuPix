@@ -147,7 +147,7 @@ mod tests {
         let near = |px: &[u8], c: [u8; 3]| {
             px[3] > 200 && (0..3).all(|i| (px[i] as i32 - c[i] as i32).abs() <= 10)
         };
-        let has = |c: [u8; 3]| rgba.chunks_exact(4).any(|px| near(px, c));
+        let has = |c: [u8; 3]| rgba.as_chunks::<4>().0.iter().any(|px| near(px, c));
         assert!(has([209, 69, 39]), "品牌橙红 #D14527 缺失");
         assert!(has([39, 43, 41]), "品牌深灰 #272B29 缺失");
     }
@@ -194,7 +194,7 @@ mod tests {
             // 生成器写错通道序/掩码阈值/行方向都会在这里逐字节暴露。
             let mut want_bgra = Vec::with_capacity(rgba.len());
             let mut want_mask = Vec::with_capacity((size * size) as usize);
-            for px in rgba.chunks_exact(4) {
+            for px in rgba.as_chunks::<4>().0 {
                 want_bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
                 want_mask.push(px[3] < 128);
             }
@@ -243,7 +243,7 @@ mod tests {
                 let mut bgra = Vec::with_capacity(rgba.len());
                 let mut mask = Vec::with_capacity(rgba.len() / 4);
                 // 现场光栅与期望值同为顶行优先 RGBA；这里转 BGRA 并据 alpha 推掩码。
-                for px in rgba.chunks_exact(4) {
+                for px in rgba.as_chunks::<4>().0 {
                     bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
                     mask.push(px[3] < 128);
                 }

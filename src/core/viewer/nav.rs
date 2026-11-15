@@ -555,15 +555,58 @@ impl Viewer {
     }
 
     /// 相对翻页。**永远循环**（用户拍板 2026-10-09）：3/3 再下一张 → 1/3。
+    ///
+    /// ★ 跳过"确定无解"的文件（2026-11-15 m346）：方向上逐个探，数满 `|delta|` 个
+    ///   **有路由**的文件才落脚——后缀被内置 SVG 或解码器自述认领的（见
+    ///   [`crate::core::gallery::is_image_ext_in`]）**照常尝试解码、不跳过**；只有路由层
+    ///   就确定无解的（后缀无人认领，如 `.dicom`）才跳过。判据与画廊建清单同源，
+    ///   保证"清单里有没有它"和"翻页会不会落到它"永远一致。整圈都凑不齐 `|delta|`
+    ///   个有路由的文件，就停在原处返回 `false`（不空转、不挪索引）。
+    ///
+    /// 只读探位再跳（`jump_to`），不边移边探——否则整圈无解时索引被挪走却返回
+    /// `false`，UI 以为没动、实际已移位，下一次翻页就从错位置起跳。
     pub fn step(&mut self, delta: isize) -> bool {
+        let sign = delta.signum();
+        let want = delta.unsigned_abs();
+        let declared = crate::core::formats::declared_exts();
+        let target = {
+            let Some(g) = self.gallery.as_ref() else {
+                return false;
+            };
+            let n = g.len();
+            if n <= 1 || want == 0 {
+                return false;
+            }
+            let cur = g.position() - 1;
+            let mut count = 0usize;
+            let mut target = None;
+            for k in 1..n {
+                let idx = ((cur as isize + sign * k as isize).rem_euclid(n as isize)) as usize;
+                let routed = g
+                    .peek(idx)
+                    .map(|p| crate::core::gallery::is_image_ext_in(p, &declared))
+                    .unwrap_or(true);
+                if routed {
+                    count += 1;
+                    if count >= want {
+                        target = Some(idx);
+                        break;
+                    }
+                }
+            }
+            target
+        };
+        let Some(idx) = target else {
+            return false;
+        };
         let moved = match self.gallery.as_mut() {
-            Some(g) => g.step_looped(delta),
+            Some(g) => g.jump_to(idx),
             None => false,
         };
         if moved {
             // 记方向供预读窗口定向（见 [`Self::last_dir`]）。跳转/新开图不经过这里，
             // 各自把方向清 0——那时"下一张往哪边"没有依据可赌。
-            self.last_dir = delta.signum() as i8;
+            self.last_dir = sign as i8;
             self.navigate();
         }
         moved

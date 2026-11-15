@@ -1307,7 +1307,7 @@ fn main() {
     {
         let mk = |w: u32, h: u32, a: u8| -> Image {
             let mut rgba = vec![0x40u8; (w as usize) * (h as usize) * 4];
-            for px in rgba.chunks_exact_mut(4) {
+            for px in rgba.as_chunks_mut::<4>().0 {
                 px[3] = a;
             }
             Image::from_rgba(w, h, &rgba).unwrap_or_else(|e| panic!("造 {w}×{h} 位图失败：{e}"))

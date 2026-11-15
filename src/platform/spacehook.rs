@@ -34,8 +34,9 @@
 //! 分层：platform 禁 windui ✓（本文件零 UI 框架依赖）；对 core 只向下取格式清单、配置
 //! 与解码（core < platform 方向合法）。选中探测与显示器度量（屏幕/工作区/DPI）复用
 //! [`crate::platform::shell_selection`] 的经典 Shell COM 三跳（语言无关、不读本地化文本）。
-//! 预览尺寸与主窗「启动窗口」两档同源：全屏档铺 `rcMonitor`、固定档按主窗客户区
-//! （`preview_box`，纯函数 + 单测）。
+//! 预览尺寸与主窗「启动窗口」三档同源：最大化档铺工作区（留任务栏）、固定档按主窗客户区
+//! （`preview_box`，纯函数 + 单测）。2026-11-15 全屏退役：满屏铺 `rcMonitor` 那一档随主窗
+//! 全屏一起删除。
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -83,8 +84,8 @@ const OFF: usize = 0;
 /// 预览图的**目标框**：与主窗「窗口尺寸」三档同源（`InitWindow`），不再按工作区比例
 /// 拍一个 `0.85` 的常数——用户要的是"空格看图打开的图片大小和主窗口一样"。
 ///
-/// - `Fullscreen`：整块显示器。主窗全屏铺的就是 `rcMonitor`（`toggle_fullscreen` 按
-///   `MonitorFromWindow` 取），含任务栏那一条。
+/// - `Maximized`：铺**工作区**（留任务栏）——与主窗最大化钮同一 OS 语义。2026-11-15
+///   全屏退役前的 `Fullscreen` 档铺 `rcMonitor` 整块显示器含任务栏，整条随全屏删除。
 /// - `Fixed`：主窗**客户区**。ini 的 `window_w × window_h` 是**整窗**尺寸（`Window::size`
 ///   收的是整窗 dp），要先减掉系统边框与标题栏（`frameless_frame` 给的 96 DPI 口径），
 ///   与 `runtime` 里 `set_client_size(w - fw, h - fh)` 是同一笔账；再按显示器 DPI 换成
@@ -102,10 +103,11 @@ fn preview_box(
     frame: (i32, i32),
 ) -> (i32, i32, i32, i32) {
     use crate::core::config::InitWindow;
-    let (mon_x, mon_y, mon_w, mon_h) = m.mon;
+    let (mon_w, mon_h) = (m.mon.2, m.mon.3);
     let (work_x, work_y, work_w, work_h) = m.work;
     let (w, h) = match init {
-        InitWindow::Fullscreen => (mon_w, mon_h),
+        // 最大化档：铺工作区（留任务栏），与主窗最大化钮同口径；居中走下面的统一算式。
+        InitWindow::Maximized => (work_w, work_h),
         InitWindow::Fixed => {
             // dp（整窗）→ 减外框 → 按 DPI 换物理像素；四舍五入用 +dpi/2。
             let scale = |dp: u32, frame_dp: i32| -> i32 {
@@ -120,18 +122,15 @@ fn preview_box(
     };
     let w = w.clamp(1, mon_w.max(1));
     let h = h.clamp(1, mon_h.max(1));
-    let (x, y) = if matches!(init, InitWindow::Fullscreen) {
-        (mon_x, mon_y)
-    } else {
-        (work_x + (work_w - w) / 2, work_y + (work_h - h) / 2)
-    };
+    // 全屏退役（2026-11-15）后三档统一居中于工作区，不再有铺整屏的定位特判。
+    let (x, y) = (work_x + (work_w - w) / 2, work_y + (work_h - h) / 2);
     (x, y, w, h)
 }
 
 /// 预览窗的取景策略：窗口取「框」还是取「图」。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PreviewFit {
-    /// 固定 / 全屏：图片**适应**这个框——小图放大铺满、大图缩小装下，与主窗同一口径。
+    /// 固定 / 最大化：图片**适应**这个框——小图放大铺满、大图缩小装下，与主窗同一口径。
     Adapt,
     /// 图片尺寸：窗口就是图片原始像素（超出屏幕才缩），1:1 不放大。
     Native,
@@ -194,9 +193,16 @@ static SPACE_DOWN: AtomicBool = AtomicBool::new(false);
 /// 长按松手收起的选项镜像（ini 键 `space_hold_close`；UI 线程写、钩子读）。
 static HOLD_CLOSE: AtomicBool = AtomicBool::new(false);
 /// 本次空格 DOWN 的起点（`GetTickCount64` 毫秒；0 = 这次按键不走长按判据）。
-/// 只在这一种情况下非 0：**按下那一刻预览已经开着**且选项开启——这样“按一下开预览”
-/// 那一次按键的 UP 不会被误判成长按（否则按住不放刚打开就会立刻关掉）。
+/// 记账范围（m344 起**开启预览的那次按下也记账**）：按住 ≥ [`HOLD_CLOSE_MS`]
+/// 才开的预览，松手即收（hold-to-preview 手感）；轻点开启（<750 ms）的 UP
+/// 照旧不收，预览保持打开。旧的顾虑「按住不放刚打开就会立刻关掉」并不存在——
+/// 时长裁决只在 UP 时刻做一次，按住期间没有任何自动收路径。
 static HOLD_STARTED_AT: AtomicU64 = AtomicU64::new(0);
+/// 本次按下**发生时**预览是否已经开着（DOWN 写、UP 读，与 `HOLD_STARTED_AT` 同批）。
+/// m345 起用它把两类按下分开：**预览开着时的按**（`true`）在 DOWN 时刻即时投递
+/// 收窗——「再按一下就关」的跟手感；**开预览的那次按**（`false`）才走时长裁决，
+/// 由 UP 按按住时长决定松手即关还是保持打开。
+static DOWN_PRESS_PREVIEW_OPEN: AtomicBool = AtomicBool::new(false);
 /// 解码世代：连按空格时旧线程的成品作废（一轮就有的设计，原样保留）。
 static GEN: AtomicU64 = AtomicU64::new(0);
 /// 当前预览的文件路径：预览态翻页以它为基准。只在控制线程写，导航 worker 读。
@@ -371,6 +377,7 @@ pub fn set_hold_close(on: bool) {
     }
     if !on {
         HOLD_STARTED_AT.store(0, Ordering::Relaxed);
+        DOWN_PRESS_PREVIEW_OPEN.store(false, Ordering::Relaxed);
     }
 }
 
@@ -458,18 +465,38 @@ pub fn engage(
     }
 }
 
-/// 长按松手是否该收起。
+/// 长按松手是否该收起（时长判据本体）。
 ///
-/// 选项 `space_hold_close` 关着时，DOWN 就投递收窗（老行为）。开着时只记下按下的
-/// 时刻，等 UP 再看按了多久：≥ [`HOLD_CLOSE_MS`] 且预览仍开着才收，轻点保持打开。
-/// 这里**只记时间不投递**：用户可能在按住期间用 Esc 或点外部把预览关掉，
+/// 选项 `space_hold_close` 关着时，DOWN 就投递收窗（老行为）。开着时按下时刻
+/// 都记（含开启预览的那次，见 `HOLD_STARTED_AT`），等 UP 再裁决时长。
+/// 这里**只判时长不投递**：用户可能在按住期间用 Esc 或点外部把预览关掉，
 /// keydown 就收会让“本来已经关了”再吃一次关闭（预览不存在时 toggle 甚至会重开）。
 fn hold_close_due(enabled: bool, preview_open: bool, pressed_at: u64, now: u64) -> bool {
     enabled && preview_open && pressed_at != 0 && now.saturating_sub(pressed_at) >= HOLD_CLOSE_MS
 }
 
-/// 长按判定阈值：用户口径 750 ms。低于它算轻点，保持现有 toggle 的“点一下开、点一下收”
-/// 之外的新语义（开着时轻点 = 不动）。
+/// UP 时刻的收起裁决（m345 用户口径「再按一下就关」+「按住看、松手关」）。
+///
+/// - `was_open` = 这次按下**发生时**预览已经开着：收窗已在 DOWN 时刻即时投递，
+///   UP 不再重复收。
+/// - `!was_open` = 开预览的那次按：按时长——按住 ≥ [`HOLD_CLOSE_MS`] 松手即关，
+///   轻点保持打开。
+/// - `preview_open=false`：按住期间预览被 Esc / 点外部关掉，一律不动，
+///   防“本来已经关了”再收一次。
+fn hold_up_should_close(
+    hold_on: bool,
+    preview_open: bool,
+    was_open: bool,
+    pressed_at: u64,
+    now: u64,
+) -> bool {
+    hold_on && preview_open && !was_open && hold_close_due(true, true, pressed_at, now)
+}
+
+/// 长按判定阈值：用户口径 750 ms。低于它算轻点：**开启侧**轻点打开并保持（预览
+/// 留在屏上），按住 ≥750 ms 的开那次松手即收；**开着侧**（m345 起）任何一次按
+/// 都在 DOWN 时刻即时关，不再看时长。750 ms 这条线同时挡住"刚建窗就被 UP 收掉"的
+/// 竞态（建窗慢于 750 ms 时轻点开启仍保持）。
 pub const HOLD_CLOSE_MS: u64 = 750;
 
 // ───────────────────────── 钩子（微秒级，快进快出） ─────────────────────────
@@ -493,9 +520,11 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         if kb.flags.contains(LLKHF_UP) {
             SPACE_DOWN.store(false, Ordering::Relaxed);
             let pressed_at = HOLD_STARTED_AT.swap(0, Ordering::Relaxed);
-            if hold_close_due(
+            let was_open = DOWN_PRESS_PREVIEW_OPEN.swap(false, Ordering::Relaxed);
+            if hold_up_should_close(
                 HOLD_CLOSE.load(Ordering::Relaxed),
                 PREVIEW_HWND.load(Ordering::Acquire) != 0,
+                was_open,
                 pressed_at,
                 unsafe { GetTickCount64() },
             ) {
@@ -512,6 +541,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                 }
                 SPACE_DOWN.store(false, Ordering::Relaxed);
                 HOLD_STARTED_AT.store(0, Ordering::Relaxed);
+                DOWN_PRESS_PREVIEW_OPEN.store(false, Ordering::Relaxed);
             }
             if unsafe { modifiers_held() } {
                 // 带修饰的空格不归我们（QuickLook：`Modifiers != None` 跳过；Win 键
@@ -522,16 +552,25 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                 Intent::Pass => {}
                 Intent::Open => {
                     SPACE_DOWN.store(true, Ordering::Relaxed);
-                    HOLD_STARTED_AT.store(0, Ordering::Relaxed);
+                    // m344（用户口径「按住看、松手关」）：开启预览的这次按下**也要记账**。
+                    // 之前这里存 0，"按住开启"那次的 UP 永远拿不到起点，松手必然留窗——
+                    // "长按松手收起"只对预览开着时的第二次按生效。现在按住 ≥750ms
+                    // 开的预览松手即收；轻点开启的 UP 仍因未达阈值保持打开，
+                    // 750 ms 这条线同时挡住了"刚建窗就被 UP 收掉"的竞态。
+                    HOLD_STARTED_AT.store(unsafe { GetTickCount64() }.max(1), Ordering::Relaxed);
+                    DOWN_PRESS_PREVIEW_OPEN.store(false, Ordering::Relaxed);
                     notify_space();
                 }
                 Intent::Close => {
                     SPACE_DOWN.store(true, Ordering::Relaxed);
                     if HOLD_CLOSE.load(Ordering::Relaxed) {
-                        // 长按松手收起：DOWN 只记起点，UP 才裁决。轻点（<750ms）
-                        // 不动，保持预览打开——这是用户点名的语义。
+                        // m345：预览已经开着时的按——**DOWN 时刻即时收**（"再按一下
+                        // 就关"的跟手感）。记时与按位镜像照记：UP 时预览若还开着，
+                        // `was_open=true` 走 `hold_up_should_close` 直接跳过，不会重复收。
+                        DOWN_PRESS_PREVIEW_OPEN.store(true, Ordering::Relaxed);
                         HOLD_STARTED_AT
                             .store(unsafe { GetTickCount64() }.max(1), Ordering::Relaxed);
+                        notify_close();
                     } else {
                         HOLD_STARTED_AT.store(0, Ordering::Relaxed);
                         // 老行为：意图（收/开）不在钩子里定夺，控制线程按当下的
@@ -947,7 +986,7 @@ fn decode_and_post(path: PathBuf, gen: u64, ctrl: usize) {
     let bmp = decoded.bitmap;
     let (mut w, mut h) = (bmp.width.max(1), bmp.height.max(1));
     let mut premul = rgba_to_premul_bgra(&bmp.rgba);
-    // ★ m271：固定 / 全屏档要**适应**目标框——小图放大铺满、大图缩小装下，与主窗
+    // ★ m271：固定 / 最大化档要**适应**目标框——小图放大铺满、大图缩小装下，与主窗
     //   里同一档的观感一致（`probe_decode` 只负责缩，放大的这一半在这里补）。
     //   图片尺寸档保持 1:1：小图就是小图，窗口贴着它。
     if fit == PreviewFit::Adapt {
@@ -1398,6 +1437,47 @@ mod tests {
         );
     }
 
+    /// m345 UP 裁决矩阵：两类按下各走各的路。
+    /// 开那次（`was_open=false`）按时长；开着时的按（`was_open=true`）已在 DOWN
+    /// 即时收，UP 不再重复。预览在按住期间被关（preview_open=false）一律不动。
+    #[test]
+    fn hold_up_should_close_matrix() {
+        // 选项关：全不动（老 toggle 的 DOWN 投递路径不在钩子里判）。
+        assert!(
+            !hold_up_should_close(false, true, false, 1_000, 9_000),
+            "选项关着：UP 不裁决"
+        );
+        assert!(!hold_up_should_close(false, true, true, 1_000, 9_000));
+
+        // 开那次（was_open=false）：按住 ≥750 松手即关；轻点（<750）保持打开。
+        assert!(
+            hold_up_should_close(true, true, false, 1_000, 1_750),
+            "按住开启满 750ms 松手即关"
+        );
+        assert!(hold_up_should_close(true, true, false, 1_000, 9_000));
+        assert!(
+            !hold_up_should_close(true, true, false, 1_000, 1_749),
+            "轻点开启保持打开"
+        );
+        assert!(
+            !hold_up_should_close(true, true, false, 0, 9_000),
+            "没有起点不判长按"
+        );
+
+        // 开着时的按（was_open=true）：收窗已在 DOWN 投递，UP 不再重复收。
+        assert!(
+            !hold_up_should_close(true, true, true, 1_000, 9_000),
+            "开着时的按由 DOWN 即时收，UP 不重复"
+        );
+
+        // 按住期间预览被 Esc / 点外部关掉：一律不动，防"本来已经关了"再收。
+        assert!(
+            !hold_up_should_close(true, false, false, 1_000, 9_000),
+            "预览已关不许再收"
+        );
+        assert!(!hold_up_should_close(true, false, true, 1_000, 9_000));
+    }
+
     /// 预乘转换：不透明仅换通道顺序；alpha=0 全清；半透明整数预乘；尾数不 panic。
     #[test]
     fn rgba_to_premul_converts_correctly() {
@@ -1416,10 +1496,11 @@ mod tests {
         assert!(rgba_to_premul_bgra(&[]).is_empty());
     }
 
-    /// 预览尺寸口径（m270）：跟主窗「启动窗口」两档走，固定档要扣掉系统外框再按 DPI
+    /// 预览尺寸口径（m270）：跟主窗「窗口尺寸」档位走（2026-11-15 全屏退役后档位为
+    /// 最大化），固定档要扣掉系统外框再按 DPI
     /// 换算，两条都必须夹到显示器以内。
     #[test]
-    fn preview_box_follows_the_two_init_window_entries() {
+    fn preview_box_follows_the_init_window_entries() {
         use crate::core::config::InitWindow;
         use crate::platform::shell_selection::MonitorMetrics;
         let m = MonitorMetrics {
@@ -1427,11 +1508,11 @@ mod tests {
             work: (0, 0, 1920, 1040),
             dpi: 96,
         };
-        // 全屏档：整块屏幕，连任务栏那一条也铺。
+        // 最大化档：铺工作区（留任务栏），随主窗「窗口尺寸」最大化改后的口径。
         assert_eq!(
-            preview_box(InitWindow::Fullscreen, 800, 600, &m, (16, 39)),
-            (0, 0, 1920, 1080),
-            "全屏档必须按 rcMonitor 而不是工作区"
+            preview_box(InitWindow::Maximized, 800, 600, &m, (16, 39)),
+            (0, 0, 1920, 1040),
+            "最大化档必须按 rcWork 而不是 rcMonitor"
         );
         // 固定档：800×600 是整窗尺寸，客户区 784×561，居中于工作区。
         assert_eq!(
@@ -1472,7 +1553,7 @@ mod tests {
         );
         assert_eq!(preview_fit(InitWindow::Natural), PreviewFit::Native);
         assert_eq!(preview_fit(InitWindow::Fixed), PreviewFit::Adapt);
-        assert_eq!(preview_fit(InitWindow::Fullscreen), PreviewFit::Adapt);
+        assert_eq!(preview_fit(InitWindow::Maximized), PreviewFit::Adapt);
     }
 
     /// 放大用双线性且活在**预乘**空间：混合处颜色与 alpha 同比例，透明一侧不拉黑。

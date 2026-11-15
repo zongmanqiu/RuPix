@@ -13,8 +13,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use windui::prelude::*;
-
 use super::*;
 use crate::core::config::Config;
 // ★ 写全 `crate::decoders::`：本文件自己就叫 `settings::decoders`，裸写会撞名

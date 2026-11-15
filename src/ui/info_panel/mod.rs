@@ -348,16 +348,11 @@ impl InfoPanel {
         }
     }
 
-    /// 清空所有插件输出（换图 / 关窗）。
-    pub fn clear_plugin_cards(&self) {
-        if !self.plugin_cards.get().is_empty() {
-            self.plugin_cards.set(Vec::new());
-            self.layout_dirty.set(true);
-        }
-    }
-
-    /// 图片路径变了就清掉插件输出；缩放/旋转同一路径不清。
-    pub fn sync_plugin_scope(&self, path: Option<&std::path::Path>) {
+    /// 图片路径变了**不清插件输出**：旧卡的数据交给 runtime 重跑覆盖
+    ///（跨图自动刷新），本函数只负责报告"哪些卡需要重跑"——换图时返回
+    /// 当前全部插件卡的 key（即需要重跑的插件 run_key 集）；同一路径
+    ///（缩放 / 旋转 / 折叠等）返回空集。插件已不在的 key 由 runtime 移卡。
+    pub fn sync_plugin_scope(&self, path: Option<&std::path::Path>) -> Vec<String> {
         let changed = {
             let mut last = self.plugin_scope.borrow_mut();
             if last.as_deref() == path {
@@ -367,9 +362,14 @@ impl InfoPanel {
                 true
             }
         };
-        if changed {
-            self.clear_plugin_cards();
+        if !changed {
+            return Vec::new();
         }
+        self.plugin_cards
+            .get()
+            .iter()
+            .map(|c| c.key.clone())
+            .collect()
     }
 
     /// 面板里加入属性卡并展开（「属性」菜单项 / 快捷键的落点）。
@@ -1454,9 +1454,11 @@ mod tests {
         properties::forget_window(9_998);
     }
 
-    /// 插件输出卡要真的进面板，并在换图时清空。
+    /// 插件输出卡要真的进面板，并且换图**不清卡**（跨图保持）：
+    /// `sync_plugin_scope` 同一路径返回空集、卡不动；换图返回需要重跑的
+    /// run_key 集且卡留在面板里；新内容仍由 push 替换路径覆盖。
     #[test]
-    fn plugin_card_adds_height_and_clears_on_image_scope_change() {
+    fn plugin_card_survives_image_scope_change_and_reports_refresh_keys() {
         use windui::core::{NodeId, Tree};
         use windui::text::NullTextEngine;
 
@@ -1480,6 +1482,15 @@ mod tests {
         let scroll = find_scroll(&tree, root).expect("面板里要有 scroll");
         let h_empty = tree.get(scroll).unwrap().content_h;
 
+        let img_a = std::path::Path::new("a.png");
+        let img_b = std::path::Path::new("b.png");
+
+        // 首次记账：面板里没有插件卡，换图也不产生刷新集。
+        assert!(
+            chrome.info.sync_plugin_scope(Some(img_a)).is_empty(),
+            "没有插件卡时换图不应要求重跑任何插件"
+        );
+
         chrome.info.push_plugin_card(plugin_output::PluginCard {
             key: "levels".into(),
             title: "色阶分析".into(),
@@ -1493,6 +1504,34 @@ mod tests {
         let h_card = tree.get(scroll).unwrap().content_h;
         assert!(h_card > h_empty, "插件输出卡要把面板内容撑高");
 
+        // 同一路径（缩放 / 旋转 / 折叠）：返回空集，卡原样不动。
+        assert!(
+            chrome.info.sync_plugin_scope(Some(img_a)).is_empty(),
+            "同一路径的 sync 不应要求重跑"
+        );
+        tree.layout_root(size, &mut NullTextEngine);
+        assert_eq!(
+            tree.get(scroll).unwrap().content_h,
+            h_card,
+            "同路径 sync 不许动卡"
+        );
+
+        // 换图：不清卡（跨图保持），返回该卡的 run_key 集，交给 runtime 重跑。
+        let refresh = chrome.info.sync_plugin_scope(Some(img_b));
+        assert_eq!(
+            refresh,
+            vec!["levels".to_string()],
+            "换图要报告需要重跑的插件卡"
+        );
+        tree.layout_root(size, &mut NullTextEngine);
+        assert_eq!(
+            tree.get(scroll).unwrap().content_h,
+            h_card,
+            "换图后卡要留在面板里（跨图保持）"
+        );
+
+        // 折叠往返（2026-11-15 复核补回）：跨图刷新机制不改变折叠行为——
+        // 折叠变矮、仍留卡头、再展开回原高。
         chrome.info.toggle_plugin_card("levels");
         tree.layout_root(size, &mut NullTextEngine);
         let h_collapsed = tree.get(scroll).unwrap().content_h;
@@ -1501,7 +1540,6 @@ mod tests {
             h_collapsed > h_empty,
             "收起后仍留卡头（标题行），不是整张卡消失"
         );
-
         chrome.info.toggle_plugin_card("levels");
         tree.layout_root(size, &mut NullTextEngine);
         assert_eq!(
@@ -1510,12 +1548,21 @@ mod tests {
             "再点一次展开回原高度"
         );
 
-        chrome
-            .info
-            .sync_plugin_scope(Some(std::path::Path::new("another.png")));
+        // 内容仍由 push 替换路径覆盖：同 key 推入新图的统计，卡内容换血。
+        chrome.info.push_plugin_card(plugin_output::PluginCard {
+            key: "levels".into(),
+            title: "色阶分析".into(),
+            expanded: true,
+            blocks: vec![plugin_output::PluginBlock::Text {
+                title: Some("摘要".into()),
+                text: "均值 10\n中位 12\n峰值 250\n第四行\n第五行".into(),
+            }],
+        });
         tree.layout_root(size, &mut NullTextEngine);
-        let h_cleared = tree.get(scroll).unwrap().content_h;
-        assert_eq!(h_cleared, h_empty, "换图后插件输出要清空");
+        assert!(
+            tree.get(scroll).unwrap().content_h > h_card,
+            "同 key 重推应替换卡内容（行数变多应撑更高）"
+        );
         properties::forget_window(9_996);
     }
 

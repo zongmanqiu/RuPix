@@ -56,7 +56,7 @@ fn main() {
     }
     let c = Config {
         stay_on_top: true,
-        dbl_click: DblClick::Fullscreen,
+        dbl_click: DblClick::Maximize,
         wheel: WheelAction::Navigate,
         opacity: 30,
         ..Config::default()
@@ -69,7 +69,7 @@ fn main() {
     // 判据 3：读回来逐项一致。
     let back = Config::load();
     let same = back.stay_on_top
-        && back.dbl_click == DblClick::Fullscreen
+        && back.dbl_click == DblClick::Maximize
         && back.wheel == WheelAction::Navigate
         && back.opacity == 30;
     println!("[3] 往返一致 : {}", if same { "PASS" } else { "FAIL" });

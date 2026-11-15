@@ -30,7 +30,9 @@ fn legacy_ini_loads_without_loss() {
 
     let expected = Config {
         stay_on_top: true,
-        dbl_click: DblClick::Fullscreen,
+        // 旧 fixture 的 double_click=3 原是「切换全屏」；2026-11-15 全屏退役后
+        // 兼容臂把它读成「切换最大化」（写回恒 0/1/2，见 config.rs 的 from_index）。
+        dbl_click: DblClick::Maximize,
         // 旧版 fixture 不含 decode_timeout_s（2026-11-04 挂死恢复新增）→ 回默认 20 秒。
         decode_timeout_s: 20,
         space_hold_close: false,
@@ -51,7 +53,8 @@ fn legacy_ini_loads_without_loss() {
         // m278 两个新键在旧 fixture 里同样不存在 → 回默认「无」。
         alt_wheel: WheelAction::None,
         shift_wheel: WheelAction::None,
-        init_window: InitWindow::Fullscreen,
+        // 旧 fixture 的 init_window=1：存储值不变，档位语义随全屏退役改为「最大化」。
+        init_window: InitWindow::Maximized,
         // 旧 fixture 不含 borderless（m269 新增）→ 回默认关。
         borderless: false,
         window_w: 1024,

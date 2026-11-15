@@ -80,7 +80,9 @@ fn dwords(data: &[u8]) -> (Vec<u32>, usize) {
     let n = data.len() / 4;
     let length = if n & 1 == 0 { n } else { n - 1 };
     let dw: Vec<u32> = data[..length * 4]
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     (dw, length)

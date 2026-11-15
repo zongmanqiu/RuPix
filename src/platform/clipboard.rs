@@ -205,7 +205,7 @@ fn dib_block(w: u32, h: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
 ///    8 MP 图就白扔 8 MB，而照片、截图、解码器回写的位图绝大多数一个透明像素都没有。
 ///    逐像素扫一遍 alpha 只要几毫秒，且在后台线程里。
 fn png_block_compact(w: u32, h: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
-    let opaque = rgba.chunks_exact(4).all(|p| p[3] == 255);
+    let opaque = rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255);
     let mut out = Vec::new();
     {
         let mut enc = png::Encoder::new(&mut out, w, h);
@@ -214,7 +214,7 @@ fn png_block_compact(w: u32, h: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
         if opaque {
             enc.set_color(png::ColorType::Rgb);
             let mut rgb = Vec::with_capacity((w as usize) * (h as usize) * 3);
-            for px in rgba.chunks_exact(4) {
+            for px in rgba.as_chunks::<4>().0 {
                 rgb.extend_from_slice(&px[..3]);
             }
             let mut writer = enc

@@ -81,7 +81,7 @@ const TITLE: &str = "RuPix";
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StartOp {
     Topmost,
-    Fullscreen,
+    Maximize,
 }
 
 /// WindowOp 是单槽；返回实际是否提交，调用者据此更新 applied/pending。
@@ -98,14 +98,10 @@ fn submit_window_op(
     true
 }
 
-/// 还原固定尺寸只适用于固定尺寸档，全屏档自己管还原。
-fn needs_restored_size(
-    was_maximized: bool,
-    maximized: bool,
-    fullscreen: bool,
-    mode: InitWindow,
-) -> bool {
-    was_maximized && !maximized && !fullscreen && mode == InitWindow::Fixed
+/// 还原固定尺寸只适用于固定尺寸档；最大化档由系统还原（2026-11-15 全屏退役，
+/// 原「全屏档自己管还原」判据随全屏删除）。
+fn needs_restored_size(was_maximized: bool, maximized: bool, mode: InitWindow) -> bool {
+    was_maximized && !maximized && mode == InitWindow::Fixed
 }
 
 /// 「图片尺寸」档的窗口客户区：图片原始像素等比缩进工作区（m269 起，m271 归到
@@ -142,17 +138,15 @@ fn apply_pending_window(
         return false;
     };
     let ws = ctx.window_state();
-    if *sent || ws.maximized {
+    if *sent {
         return false;
     }
     let completed = match mode {
-        InitWindow::Fullscreen => {
-            ws.fullscreen || submit_window_op(ctx, sent, |ctx| ctx.toggle_fullscreen())
-        }
-        _ if ws.fullscreen => {
-            submit_window_op(ctx, sent, |ctx| ctx.toggle_fullscreen());
-            false // 退出全屏占一拍；尺寸待办仍在。
-        }
+        // 最大化档：已最大化即完成并消费待办——windui `maximize` 本就「已最大化则
+        // 无操作」，但不消费会让一枚永远消费不掉的待办占着这条通道。
+        InitWindow::Maximized => ws.maximized || submit_window_op(ctx, sent, |ctx| ctx.maximize()),
+        // 尺寸两档在最大化形态下不成立：等还原之后再发（原「先退全屏」特判随全屏退役删除）。
+        _ if ws.maximized => false,
         InitWindow::Fixed => {
             let (fw, fh) = crate::platform::window_frame::frameless_frame();
             submit_window_op(ctx, sent, |ctx| {
@@ -583,8 +577,8 @@ impl WinRt {
             if c.stay_on_top {
                 v.push(StartOp::Topmost);
             }
-            if c.init_window == InitWindow::Fullscreen {
-                v.push(StartOp::Fullscreen);
+            if c.init_window == InitWindow::Maximized {
+                v.push(StartOp::Maximize);
             }
             v
         });
@@ -761,11 +755,57 @@ impl WinRt {
         // 抓手光标按显示器 DPI 复核（脏读一次系统度量，代价可忽略）。
         crate::ui::hand_cursor::refresh_for_dpi();
         // 插件后台调用完成：UI 线程只取结果，不参与启动/等待/终止。
-        // 换图时清掉上一张图的插件输出（同一路径的缩放/旋转不清）。
+        // 换图**不清卡**：`sync_plugin_scope` 报告需要重跑的卡 key，这里逐张找回
+        // 插件重发同一条命令（2026-11-15 插件输出卡跨图自动刷新）。手动 ✕ 关卡
+        // 后卡不在面板，自然不再重跑；旧任务被取消的结果由 poll 臂按 `cancelled` 静默。
         let current_plugin_path = self.viewer.borrow().current_path();
-        self.chrome
+        // 本轮**实际发起重跑**的卡 key（m347 用户口径「结果过期且即将重跑时静默丢弃」）。
+        // poll 取出过期 Ok 结果时，若它的 key 在这份集里，说明卡正被重跑接管——
+        // 静默丢弃、不弹 toast（见下面 stale 分支）；不在集里才保留原 toast（真意外）。
+        let mut rerunning: Vec<String> = Vec::new();
+        let refresh_keys = self
+            .chrome
             .info
             .sync_plugin_scope(current_plugin_path.as_deref());
+        if !refresh_keys.is_empty() {
+            // 整图在循环外只取一份：`whole_image_for_plugin` 旋转过就要做一次整图像素
+            // 变换，装进 for 里就是"有几张卡转几遍"（与右键菜单 m166 同一笔账）。
+            let pixels = self.viewer.borrow().whole_image_for_plugin();
+            let list = crate::extensions::discover_configured(&config.borrow());
+            for key in refresh_keys {
+                let Some(ext) = list.iter().find(|e| e.run_key == key) else {
+                    log::warn!("[plugin-panel] id={key} verdict=dropped（插件已不在，卡移除）");
+                    self.chrome.info.remove_plugin_card(&key);
+                    continue;
+                };
+                // 只有「命令型 + 声明 image.read + 当前有图」才谈得上自动重跑，
+                // 其余（编辑型 / 无图）旧数据留在卡上会误导：宁可空不可错，撤卡。
+                if !matches!(ext.manifest.kind, crate::core::ext::Kind::Command)
+                    || !ext
+                        .manifest
+                        .has_capability(crate::core::ext::Capability::ImageRead)
+                    || current_plugin_path.is_none()
+                {
+                    self.chrome.info.remove_plugin_card(&key);
+                    continue;
+                }
+                // 在跑就静默停：这份旧结果是为新任务让路，不该打扰用户。
+                let _ = crate::extensions::run::cancel(&key);
+                let path = current_plugin_path.clone();
+                // 与右键菜单同一条路：能力分流 / 8MP 闸 / 抽样判据全在 `start_command`
+                // 内部（`pixels_to_send` 是唯一正本），UI 不另抄。
+                if let Err(e) =
+                    crate::extensions::run::start_command(ext.clone(), path, None, pixels.clone())
+                {
+                    log::warn!("[plugin-panel] id={key} verdict=restart-failed：{e}");
+                    self.chrome.info.remove_plugin_card(&key);
+                } else {
+                    // 重跑成功：这条 key 的过期结果（可能在队列里还没被 poll 取走）
+                    // 由 poll 的 stale 分支静默丢弃，不弹"结果未显示"打扰用户。
+                    rerunning.push(key);
+                }
+            }
+        }
         for job in crate::extensions::poll() {
             match job.result {
                 Ok(crate::extensions::run::JobOutput::Text {
@@ -780,11 +820,20 @@ impl WinRt {
                     if had_outputs {
                         let same_image = job.target.as_deref() == current_plugin_path.as_deref();
                         if !same_image {
-                            log::warn!(
-                                "[plugin-panel] id={} verdict=stale（输出对应图片已切换）",
-                                job.id
-                            );
-                            ctx.toast_err("插件输出对应图片已切换，结果未显示");
+                            if rerunning.contains(&job.id) {
+                                // 卡正被本轮重跑接管（m347）：这份过期结果静默丢弃，
+                                // 新任务的结果随后原位替换，不弹 toast 打扰用户。
+                                log::info!(
+                                    "[plugin-panel] id={} verdict=stale-silent（卡已重跑，过期结果丢弃）",
+                                    job.id
+                                );
+                            } else {
+                                log::warn!(
+                                    "[plugin-panel] id={} verdict=stale（输出对应图片已切换）",
+                                    job.id
+                                );
+                                ctx.toast_err("插件输出对应图片已切换，结果未显示");
+                            }
                         } else {
                             match crate::ui::info_panel::plugin_output::card_from_outputs(
                                 &job.id,
@@ -914,7 +963,17 @@ impl WinRt {
                         ));
                     }
                 }
-                Err(e) => ctx.toast_err(format!("{}：{}", job.plugin, e)),
+                Err(e) => {
+                    if job.cancelled {
+                        // 跨图重跑静默取消的旧结果：给新任务让路，不打扰用户、不动卡。
+                        log::info!("[plugin-cancel] id={} verdict=silent", job.id);
+                    } else {
+                        // 失败（非取消）：撤卡 + 提示——宁可空不可错，
+                        // 旧图的统计数据留在卡上会误导。
+                        self.chrome.info.remove_plugin_card(&job.id);
+                        ctx.toast_err(format!("{}：{}", job.plugin, e));
+                    }
+                }
             }
         }
         // ★ 解码挂死熔断（2026-11-04）：worker 超时后把"当时正在用的解码器"记进 core 的
@@ -1062,7 +1121,7 @@ impl WinRt {
         if let Some(s) = self.viewer.borrow_mut().take_note() {
             ctx.toast(s);
         }
-        // 启动置顶 / 全屏：一次只发一个，发完出队（见 `StartOp` 的说明）。
+        // 启动置顶 / 最大化：一次只发一个，发完出队（见 `StartOp` 的说明）。
         let op = {
             let mut q = self.startup_ops.borrow_mut();
             if q.is_empty() {
@@ -1075,7 +1134,7 @@ impl WinRt {
         if let Some(op) = op {
             submit_window_op(ctx, &mut window_op_sent, |ctx| match op {
                 StartOp::Topmost => ctx.toggle_topmost(),
-                StartOp::Fullscreen => ctx.toggle_fullscreen(),
+                StartOp::Maximize => ctx.maximize(),
             });
         }
         // 极简模式即时生效：`sync` 刚把勾选写进配置，这一帧就推给当前窗口。
@@ -1089,13 +1148,13 @@ impl WinRt {
         // "配置值变了"就等于"用户刚点了"，不再有会话态与配置各说各话的窗口。
         let ws = ctx.window_state();
         let mode = config.borrow().init_window;
-        if needs_restored_size(self.was_maximized.get(), ws.maximized, ws.fullscreen, mode) {
+        if needs_restored_size(self.was_maximized.get(), ws.maximized, mode) {
             self.restored_size_pending.set(true);
         }
         if mode != InitWindow::Fixed {
             self.restored_size_pending.set(false);
         }
-        self.was_maximized.set(ws.maximized || ws.fullscreen);
+        self.was_maximized.set(ws.maximized);
         let want_stay = config.borrow().stay_on_top;
         let stay_due = !window_op_sent && self.applied_stay.get() != want_stay;
         if stay_due
@@ -1285,17 +1344,14 @@ impl WinRt {
             // 到点只记一条 warn，不弹提示：阈值没有现场数据校准过，误报比不报更坏。
             crate::core::decode_watchdog::watchdog_check();
         }
-        // 「永远居中」：侦测「最大化/全屏 → 常规」这一次跳变，把窗口复位成
+        // 「永远居中」：侦测「最大化 → 常规」这一次跳变，把窗口复位成
         // 固定尺寸档的配置值并由平台层按工作区居中。`set_window_size` 在
         // 最大化态是空操作，所以必须等还原之后再发；跳变检测保证它只在
         // 真的还原那一帧触发一次。
         let ws = ctx.window_state();
         // 有待办的窗口动作时让路：同一帧只有一个窗口操作位，先发这个会把
-        // 队列里那枚（全屏）顶掉，而且 `window_pending` 已被清空、不会重试。
-        if self.restored_size_pending.get()
-            && !ws.maximized
-            && !ws.fullscreen
-            && self.window_pending.get().is_none()
+        // 队列里那枚顶掉，而且 `window_pending` 已被清空、不会重试。
+        if self.restored_size_pending.get() && !ws.maximized && self.window_pending.get().is_none()
         {
             // 尺寸**当帧从配置读**。过去这里用装配期捕获的那一份，于是「改了固定尺寸
             // → 最大化 → 还原」回到的是**旧**尺寸，新值非得重启才生效（审计 O3）。
@@ -1324,10 +1380,10 @@ impl WinRt {
         }
         let ws = ctx.window_state();
         // ★ m271「图片尺寸」档：窗口客户区跟着**当前这张图**走，与无边框正交。
-        //   换图（路径或自然尺寸变了）/ 改档 / 退出全屏都会重算；一拍只发一个窗口操作，
+        //   换图（路径或自然尺寸变了）/ 改档 / 最大化都会重算；一拍只发一个窗口操作，
         //   槽被占就下一拍补，所以判据一律是「状态」不是「事件」。
-        if mode != InitWindow::Natural || ws.maximized || ws.fullscreen {
-            // 离开该档、或正处在最大化/全屏：清账。回到常规态时按当前图重新开窗。
+        if mode != InitWindow::Natural || ws.maximized {
+            // 离开该档、或正处在最大化：清账。回到常规态时按当前图重新开窗。
             *self.natural_size.borrow_mut() = None;
         } else if !window_op_sent {
             let key = {
@@ -1822,16 +1878,13 @@ mod tests {
         assert!(!pending.get());
     }
 
+    /// 全屏退役（2026-11-15）后固定尺寸还原判据只剩「从最大化回来」一条路：
+    /// 非固定档还原不请求尺寸；仍在最大化里不请求；只有刚退出最大化才请求。
     #[test]
-    fn host_audit_fullscreen_restore_never_requests_fixed_size() {
-        assert!(!needs_restored_size(
-            true,
-            false,
-            false,
-            InitWindow::Fullscreen
-        ));
-        assert!(needs_restored_size(true, false, false, InitWindow::Fixed));
-        assert!(!needs_restored_size(true, true, false, InitWindow::Fixed));
+    fn host_audit_maximize_restore_requests_fixed_size_only_right_after_leaving() {
+        assert!(!needs_restored_size(true, false, InitWindow::Maximized));
+        assert!(needs_restored_size(true, false, InitWindow::Fixed));
+        assert!(!needs_restored_size(true, true, InitWindow::Fixed));
     }
 
     /// m269：窗口形状必须等比跟着图片，不能被框架「分别夹宽高」拉变形。
