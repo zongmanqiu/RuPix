@@ -63,12 +63,16 @@ impl Memento {
 /// 已加载的列表（首次访问时从盘上读；进程内唯一缓存，最近在前）。
 static CACHE: Mutex<Option<Vec<Memento>>> = Mutex::new(None);
 
-/// 刚被用户清掉、但画面还停在原状态的那一本。
+/// 刚被用户清掉、但画面还停在原状态的那几本。
 ///
 /// 没有它，菜单刚清完、下一拍防抖保存又把同一份状态写回去——用户会看到
 /// "删了又回来"。只有当这本书真的**换了一项/一页/一个视图**（`Memento`
 /// 不再相等）时才解除抑制，新进度照常落盘；清完后原样关窗则保持已清。
-static SUPPRESS: Mutex<Option<Memento>> = Mutex::new(None);
+///
+/// ★ 2026-11-24：从单槽改成按 key 的列表。多窗口下 A 窗清除位置后，B 窗任何一次
+///   `put` 都会走进「换了一本书」分支把 A 的抑制清掉，A 关窗时已清除的位置又复活
+///   （审计 M34）。
+static SUPPRESS: Mutex<Vec<Memento>> = Mutex::new(Vec::new());
 
 /// 书键：普通目录按 Windows 口径归一（大小写不敏感、斜杠统一、去尾斜杠）。
 pub fn dir_key(dir: &Path) -> String {
@@ -121,14 +125,14 @@ pub fn remove_with_state(m: &Memento) {
     let key = m.key.clone();
     mutate(|list| list.retain(|x| x.key != key));
     let mut g = SUPPRESS.lock().unwrap_or_else(|e| e.into_inner());
-    *g = Some(m.clone());
+    g.retain(|x| x.key != key);
+    g.push(m.clone());
 }
 
 /// 清空全部阅读记忆（连抑制一起清）。
 pub fn clear() {
     mutate(|list| list.clear());
-    let mut g = SUPPRESS.lock().unwrap_or_else(|e| e.into_inner());
-    *g = None;
+    SUPPRESS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 // ── 纯逻辑（单测直接打） ────────────────────────────────────────────
@@ -159,25 +163,20 @@ fn upsert(list: &mut Vec<Memento>, m: Memento) {
 
 fn suppressed(key: &str) -> bool {
     let g = SUPPRESS.lock().unwrap_or_else(|e| e.into_inner());
-    g.as_ref().is_some_and(|m| m.key == key)
+    g.iter().any(|m| m.key == key)
 }
 
 /// `put` 之前过一遍抑制：同一本、同一份状态 → 不写；一旦状态真的变了，
-/// 解除抑制并让新进度落盘。
+/// 只解除**这一本**的抑制并让新进度落盘（别的书的抑制不受影响）。
 fn suppress_put(m: &Memento) -> bool {
     let mut g = SUPPRESS.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(sup) = g.as_ref() else {
+    let Some(pos) = g.iter().position(|x| x.key == m.key) else {
         return false;
     };
-    if sup.key == m.key {
-        if sup == m {
-            return true;
-        }
-        *g = None;
-        return false;
+    if g[pos] == *m {
+        return true;
     }
-    // 换了一本书：上一本的抑制到此为止。
-    *g = None;
+    g.remove(pos);
     false
 }
 
@@ -460,7 +459,7 @@ mod tests {
         let first = m("f:c:\\a.pdf", "a.pdf", 0, 0);
         {
             let mut g = SUPPRESS.lock().unwrap();
-            *g = Some(first.clone());
+            *g = vec![first.clone()];
         }
         assert!(suppressed(&first.key), "清除后先进入抑制态");
         assert!(suppress_put(&first), "同一份状态不许写回");

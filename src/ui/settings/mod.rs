@@ -748,6 +748,9 @@ impl Handles {
     pub fn refresh_after_dir_change(&self, c: &Config) {
         refresh_catalogs();
         self.refresh_decoder_cards(c);
+        // 下载卡也要一起重算：装完/卸载后「可下载 / 可升级」与按钮态都变了。
+        // 旧实现只刷两张已安装卡，下载卡停在旧快照直到用户动搜索框（M50）。
+        self.remote_recompute();
     }
 
     /// 一次目录扫描喂两张卡（已安装 + 首选解码器）。
@@ -1041,12 +1044,16 @@ pub(crate) fn settings_window(config: &Rc<RefCell<Config>>, hub: &Hub) -> Window
                     shortcuts::sync_plugin_hotkey_texts(&cfg, None);
                     return true;
                 }
-                let key = crate::extensions::plugin_hotkey_items(&cfg_sc.borrow())
+                let item = crate::extensions::plugin_hotkey_items(&cfg_sc.borrow())
                     .into_iter()
-                    .find(|(pid, _, _, _)| pid == &id)
-                    .map(|(_, _, k, _)| k);
-                if let Some(key) = key {
-                    if let Err(e) = crate::extensions::set_plugin_hotkey(&id, &key, &hk.to_spec()) {
+                    .find(|item| item.run_key == id);
+                if let Some(item) = item {
+                    if let Err(e) = crate::extensions::set_plugin_hotkey(
+                        &cfg_sc.borrow(),
+                        &id,
+                        &item.key,
+                        &hk.to_spec(),
+                    ) {
                         log::warn!("插件「{id}」快捷键保存失败：{e}");
                     } else {
                         // 同一个键在宿主/别的插件里出现 ⇒ 旧的清空（最后绑定的人赢）。
@@ -1117,6 +1124,11 @@ pub(crate) fn settings_window(config: &Rc<RefCell<Config>>, hub: &Hub) -> Window
                 Rc::new(move |ctx, idx| {
                     if idx == TAB_DECODERS {
                         h.enter_decoders(&cfg_switch.borrow());
+                        ctx.mark_dirty();
+                    } else if idx == TAB_EXTENSIONS {
+                        // 插件可能在设置窗关着时被自动隔离 / 外部增删：进页先重读，
+                        // 否则「解除隔离」按钮永远不出现（M50）。
+                        h.plugin.reload(&cfg_switch);
                         ctx.mark_dirty();
                     }
                 })

@@ -11,7 +11,7 @@
 //! | `slide_interval`  | 幻灯片每张停留秒数（1..=600）        | `3`  |
 //! | `anim_speed`      | 动图切帧 / 分页切页倍速：`0.25`/`0.5`/`1`/`2`/`4`/`8` | `1`  |
 //! | `anim_autoplay`   | 动图 / 分页文档打开后自动播放（关 = 停在第 0 帧/页） | `1`  |
-//! | `show_title_bar`  | 标题条：1 完整（文件名+三钮）/ 0 无按钮     | `1`  |
+//! | `show_title_bar`  | **旧键**：1 = 非极简；0 = 极简模式（标题条/工具条/信息条静止时全隐藏）。现行键是 `minimal_mode` | `1`  |
 //! | `long_image_fit`  | 长图自动按宽适应（竖向可拖）                | `0`  |
 //! | `wheel_behavior`  | 滚轮：0 放大/缩小 / 1 下一张·上一张 / 2 不透明度± / 3 无 | `0`  |
 //! | `ctrl_wheel`      | Ctrl+滚轮：同上四档                          | `1`  |
@@ -1055,7 +1055,8 @@ impl Config {
                     // 只读介质下写失败照样降级成内存会话，但**要留一条 warn**——`paths`
                     // 模块文档写的就是"静默降级并留一条 warn"，过去这一处连个痕都没有
                     // （审计 二-① / m64）：便携盘只读时，用户与日志都不知道偏好没落盘。
-                    if let Err(e) = std::fs::write(&p, default_ini()) {
+                    // 首次写入也走原子写：半途断电不该留下 0 字节或半截 ini。
+                    if let Err(e) = write_atomic(&p, default_ini().as_bytes()) {
                         log::warn!(
                             "首次写入默认配置 {} 失败（本次会话只在内存里生效）：{e}",
                             p.display()
@@ -1077,7 +1078,8 @@ impl Config {
     /// 记在配置文件里"的意义就是**用户打开 ini 看得见它**。只在 `save_to` 里写的话，
     /// 升上来的老用户若从不改任何设置，那四条永远不会出现在盘上（内存里用着默认值，
     /// 文件里查无此事）。所以启动时补一次：缺哪个补哪个，缺的整段带注释追加在末尾，
-    /// **既有行与用户自己的注释一行不动**（不做整份重写——那会抹掉注解）。
+    /// **既有行与用户自己的注释逐字节保留**（读全文 → 末尾追加 → 原子整写；不再
+    /// 直接 append，断电不会留下半行）。
     ///
     /// 追加而不是重排：解析器按 `key=value` 逐行认，行序无关（见 `load_from`）。
     /// 读不到 / 写不进就放弃（只读介质下只是"看不见"而已，行为仍用内存默认值）。
@@ -1085,6 +1087,9 @@ impl Config {
         let Ok(text) = std::fs::read_to_string(p) else {
             return;
         };
+        // Windows 编辑器常给 UTF-8 加 BOM；判断首行键名时先剥掉，否则会把
+        // `\u{feff}decoder_index_gitee` 当成"缺失"，再追加一份默认值覆盖用户的镜像。
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
         let present = |key: &str| {
             text.lines()
                 .any(|l| l.split_once('=').is_some_and(|(k, _)| k.trim() == key))
@@ -1116,19 +1121,13 @@ impl Config {
             };
             block.push_str(&format!("{k}={v}\n"));
         }
-        // 前面补一行换行，避免贴在原有最后一行上（有些编辑器保存时没有收尾换行）。
-        if let Err(e) = std::fs::OpenOptions::new()
-            .append(true)
-            .open(p)
-            .and_then(|mut f| {
-                use std::io::Write;
-                // 文件末尾若不是换行，先补一个，否则新块的头一行会粘到上一行尾部。
-                if !text.is_empty() && !text.ends_with('\n') {
-                    f.write_all(b"\n")?;
-                }
-                f.write_all(block.as_bytes())
-            })
-        {
+        let mut out = text.to_string();
+        // 文件末尾若不是换行，先补一个，否则新块的头一行会粘到上一行尾部。
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&block);
+        if let Err(e) = write_atomic(p, out.as_bytes()) {
             log::warn!("补登记清单地址到 {} 失败：{e}", p.display());
         }
     }
@@ -1136,7 +1135,7 @@ impl Config {
     /// 写盘（全键重写）。路径不可得或写入失败时静默放弃（见模块头）。
     pub fn save(&self) {
         if let Some(p) = crate::core::paths::config_path() {
-            self.save_to(&p);
+            let _ = self.save_to(&p);
         }
     }
 
@@ -1198,9 +1197,27 @@ impl Config {
                 "init_window" => cfg.init_window = InitWindow::from_index(v.parse().unwrap_or(0)),
                 "borderless" => set_bool(&mut cfg.borderless, v, "borderless"),
                 // 固定尺寸档的窗口宽高：越界/乱码一律夹回区间（用户手改 ini 也钳住）。
-                "window_w" => cfg.window_w = v.parse().unwrap_or(800).clamp(WINDOW_MIN, WINDOW_MAX),
-                "window_h" => cfg.window_h = v.parse().unwrap_or(600).clamp(WINDOW_MIN, WINDOW_MAX),
-                "opacity" => cfg.opacity = quantize_opacity(v.parse().unwrap_or(OPACITY_DEFAULT)),
+                // 先按 i64 解析再夹：`-1` 要**抬到下限**，而 u32 直接解析会整串失败、
+                // 回落默认值（反而比下限还宽）；天文数字也落到上限。
+                "window_w" => {
+                    cfg.window_w = v
+                        .parse::<i64>()
+                        .map(|n| n.clamp(WINDOW_MIN as i64, WINDOW_MAX as i64) as u32)
+                        .unwrap_or(800)
+                }
+                "window_h" => {
+                    cfg.window_h = v
+                        .parse::<i64>()
+                        .map(|n| n.clamp(WINDOW_MIN as i64, WINDOW_MAX as i64) as u32)
+                        .unwrap_or(600)
+                }
+                "opacity" => {
+                    cfg.opacity = quantize_opacity(
+                        v.parse::<i64>()
+                            .map(|n| n.clamp(OPACITY_MIN as i64, OPACITY_MAX as i64) as u8)
+                            .unwrap_or(OPACITY_DEFAULT),
+                    )
+                }
                 // 默认打开方式的订阅表：只做最朴素的切分 / 去点 / 小写。
                 // 「什么算合法后缀」不在这里判——那是 `platform::association::normalize`
                 // 的事，配置层复制一份判据就等于给它埋第二个漂移点。
@@ -1371,7 +1388,7 @@ impl Config {
     /// exe 目录不需要建（`parent()` 天然存在），这里也不 `create_dir_all`：
     /// 便携目录写不进去就是**只读介质**，那属于 `paths` 模块文档里说的"静默降级为
     /// 内存会话"，不该在这里大费周章地补mkdir。
-    fn save_to(&self, p: &Path) {
+    fn save_to(&self, p: &Path) -> bool {
         let opacity = quantize_opacity(self.opacity);
         let assoc_exts = self.assoc_exts.join(";");
         let decoders_disabled = self.decoders_disabled.join(";");
@@ -1393,6 +1410,7 @@ impl Config {
         let info_panel_width = self
             .info_panel_width
             .clamp(INFO_PANEL_W_MIN, INFO_PANEL_W_MAX);
+        let prefetch_depth = self.prefetch_depth.clamp(1, PREFETCH_DEPTH_MAX);
         let body = format!(
             "stay_on_top={}\ndouble_click={}\nslide_interval={}\nanim_speed={}\nanim_autoplay={}\nminimal_mode={}\n\
              checker={}\nfilmstrip={}\nfilmstrip_left={}\nlocked={}\n\
@@ -1428,7 +1446,7 @@ impl Config {
             extensions_isolated,
             decoders_preferred,
             self.prefetch as i32,
-            self.prefetch_depth,
+            prefetch_depth,
             self.close_to_tray as i32,
             self.space_preview as i32,
             self.space_hold_close as i32,
@@ -1462,26 +1480,36 @@ impl Config {
         //
         // 目录句柄的 fsync 不做：Windows 上 `FlushFileBuffers` 对目录只是把该目录项自身
         // 的元数据推一遍，而改名已经在日志里了——多开一次句柄换不到任何额外保证。
-        let tmp = p.with_extension("tmp");
-        let staged = (|| -> std::io::Result<()> {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(body.as_bytes())?;
-            f.sync_all()?;
-            drop(f);
-            std::fs::rename(&tmp, p)
-        })();
-        match staged {
-            Ok(()) => {}
+        match write_atomic(p, body.as_bytes()) {
+            Ok(()) => true,
             Err(e) => {
-                // 半成品不留盘：临时文件写成了但 rename 没过，也一并清掉。
-                let _ = std::fs::remove_file(&tmp);
                 log::warn!(
                     "偏好写入 {} 失败（本次会话只在内存里生效）：{e}",
                     p.display()
                 );
+                false
             }
         }
     }
+}
+
+/// 整文件原子写：临时文件 → `sync_all` → rename。失败时清掉临时文件。
+///
+/// 与 `Config::save_to` 同一套口径；首次写默认 ini 与 backfill 也走这里，
+/// 保证「正式文件永远是完整的一份」这条对**所有**写入路径成立。
+fn write_atomic(p: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = p.with_extension("tmp");
+    let staged = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, p)
+    })();
+    if staged.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    staged
 }
 
 // ── 保存防抖（M1）───────────────────────────────────────────
@@ -1531,23 +1559,28 @@ pub(crate) fn poll_at(c: &Config, p: &Path, now: Instant) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .is_some_and(|d| now >= d);
-    if due {
-        *SAVE_DEADLINE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        c.save_to(p);
+    if !due {
+        return false;
     }
-    due
+    *SAVE_DEADLINE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let ok = c.save_to(p);
+    if !ok {
+        // 写失败不能把脏位吞掉：杀软/索引短暂持锁、磁盘满都会失败，下一次轮询
+        // 必须重试。返回值也必须如实（K44 的排障读数靠它）。
+        mark_dirty();
+    }
+    ok
 }
 
 /// [`poll_at`] 的不计时代：只要脏过就写。
 pub(crate) fn flush_at(c: &Config, p: &Path) -> bool {
-    if SAVE_DEADLINE
+    let dirty = SAVE_DEADLINE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take()
-        .is_some()
-    {
-        c.save_to(p);
-        true
+        .is_some();
+    if dirty {
+        c.save_to(p)
     } else {
         false
     }

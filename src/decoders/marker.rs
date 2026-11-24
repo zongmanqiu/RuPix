@@ -15,11 +15,28 @@
 //! 时残留标记也不会被当成解码器扫描（目录扫描只认 `*.dll`）。写失败（只读介质 /
 //! 杀软）只记一条 warn，加载照常进行——不能因为面包屑写不下去就不让用户看图。
 
+use std::collections::HashSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 /// 标记后缀。`common_0.2.6.dll` → `common_0.2.6.dll.loading`。
 const SUFFIX: &str = ".loading";
+
+/// 本进程的身份。OS 可能复用 pid，单靠 pid 不够；用启动时刻混进来。
+fn process_nonce() -> u64 {
+    static NONCE: OnceLock<u64> = OnceLock::new();
+    *NONCE.get_or_init(|| {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        t ^ ((std::process::id() as u64) << 32)
+    })
+}
+
+/// 本进程里**已经出过硬故障**的 DLL：它们留下的标记不能被当成"另一个线程正在加载"。
+static FAULTED: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
 
 /// 某个 DLL 的标记路径。
 pub(super) fn path_for(dll: &Path) -> PathBuf {
@@ -28,13 +45,48 @@ pub(super) fn path_for(dll: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// 盘上是否有一枚上次留下的标记。
+/// 盘上的标记是不是**上一次进程崩溃**留下的。
+///
+/// 不能只看"文件在不在"：同一进程里另一个线程正在 `LoadLibrary` 时文件也在，
+/// 旧判据会把并发扫描误报成「上次加载崩溃，本次跳过」（2026-11-24 审计 M13）。
+/// 标记里写进程 nonce：同 nonce = 本进程正在加载（不算残留）；不同 nonce /
+/// 没有 nonce 的老格式 = 残留；本进程已记过硬故障 = 残留。
 pub(super) fn stale(dll: &Path) -> bool {
-    path_for(dll).is_file()
+    if faulted(dll) {
+        return true;
+    }
+    let Ok(s) = std::fs::read_to_string(path_for(dll)) else {
+        return false;
+    };
+    match s
+        .lines()
+        .find_map(|l| l.strip_prefix("nonce=").and_then(|v| v.parse::<u64>().ok()))
+    {
+        Some(v) => v != process_nonce(),
+        None => true,
+    }
+}
+
+/// 记一笔"本进程在这个 DLL 上出过硬故障"（SEH / panic 穿出加载闸门）。
+pub(super) fn note_fault(dll: &Path) {
+    let mut g = FAULTED.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(HashSet::new).insert(dll.to_path_buf());
+}
+
+fn faulted(dll: &Path) -> bool {
+    FAULTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|s| s.contains(dll))
 }
 
 /// 清除标记（用户点「清除标记并重试」）。标记本来就不在也算成功。
 pub(super) fn clear(dll: &Path) -> std::io::Result<()> {
+    // 硬故障记录也一起清：用户明确要求重试，不能还被同一进程的内存标记挡住。
+    if let Some(s) = FAULTED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        s.remove(dll);
+    }
     match std::fs::remove_file(path_for(dll)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -62,7 +114,8 @@ impl Drop for LoadingGuard {
 pub(super) fn begin(dll: &Path) -> Option<LoadingGuard> {
     let path = path_for(dll);
     let body = format!(
-        "pid={}\nstarted={:?}\n",
+        "nonce={}\npid={}\nstarted={:?}\n",
+        process_nonce(),
         std::process::id(),
         std::time::SystemTime::now()
     );
@@ -104,7 +157,10 @@ mod tests {
         let (dir, dll) = scratch("guard");
         {
             let guard = begin(&dll).expect("临时目录可写，标记必须建得出来");
-            assert!(stale(&dll), "加载期间标记必须在盘上");
+            assert!(
+                !stale(&dll),
+                "本进程正在加载的标记不算崩溃残留（并发扫描不能误报）"
+            );
             drop(guard);
         }
         assert!(!stale(&dll), "正常返回后标记必须清掉");

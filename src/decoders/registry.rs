@@ -2,8 +2,11 @@
 //!
 //! 两份清单同源：都来自一次目录扫描 + 逐个 DLL 读自述，按热加载代次缓存。
 //! 「清单与实际能力不可能脱节」这条性质就落在这里。
+use std::collections::{HashMap, HashSet};
+
 use super::dllmeta::*;
 use super::*;
+use crate::platform::seh::invoke;
 
 // ── 供设置页「解码器」展示的列表（UI 线程安全）───────────────────────
 
@@ -140,7 +143,7 @@ pub(super) fn declared_cached() -> DeclaredExts {
     let mut vector: HashSet<String> = HashSet::new();
     let mut region: HashSet<String> = HashSet::new();
     if !safe_mode() {
-        for e in list_decoders() {
+        for e in keep_newest_per_id(list_decoders()) {
             // 只认自述读成功的、且没被用户关掉的解码器。
             if !matches!(e.health, Health::Ok) || is_disabled(&e.id) {
                 continue;
@@ -333,28 +336,34 @@ pub fn list_decoders() -> Vec<DecoderEntry> {
             abi,
             metadata,
         ) = match inspect(&p) {
-            Inspect::Ok { desc, sym, .. } => (
-                desc.id.clone(),
-                desc.display_name.clone(),
-                desc.description.clone(),
-                desc.extensions.clone(),
-                Health::Ok,
-                // 可选导出 `iv_render_raw`：认领的扩展名要走参数窗。
-                sym.render_raw.is_some(),
-                {
-                    // 矢量后缀精确清单（m152 v2）：成员级 metadata 声明优先，
-                    // 否则按 DLL 级口径（全部自述后缀）。口径见 [`vector_exts_of`]。
-                    vector_exts_of(&desc)
-                },
-                {
-                    // 能不能按可视区域重渲：实现了 ABI v6 的 iv_render_region（或声明了
-                    // CAP_REGION）的矢量解码器——宿主据此才敢发区域请求。
-                    let exts = vector_exts_of(&desc);
-                    region_capable(&exts, sym.render_region.is_some(), desc.caps)
-                },
-                Some(desc.abi),
-                desc.metadata.clone(),
-            ),
+            Inspect::Ok { desc, lib, sym } => {
+                // FreeLibrary 会跑 DllMain(DETACH)。`inspect` 的 SEH 闸门只包住
+                // 加载；返回后的 `lib` 若在这里自然析构，坏 DLL 卸载时崩溃就没有闸门
+                // 了（2026-11-24 审计 H09）。先显式放进 invoke 再取字段。
+                let _ = invoke(|| drop(lib));
+                (
+                    desc.id.clone(),
+                    desc.display_name.clone(),
+                    desc.description.clone(),
+                    desc.extensions.clone(),
+                    Health::Ok,
+                    // 可选导出 `iv_render_raw`：认领的扩展名要走参数窗。
+                    sym.render_raw.is_some(),
+                    {
+                        // 矢量后缀精确清单（m152 v2）：成员级 metadata 声明优先，
+                        // 否则按 DLL 级口径（全部自述后缀）。口径见 [`vector_exts_of`]。
+                        vector_exts_of(&desc)
+                    },
+                    {
+                        // 能不能按可视区域重渲：实现了 ABI v6 的 iv_render_region（或声明了
+                        // CAP_REGION）的矢量解码器——宿主据此才敢发区域请求。
+                        let exts = vector_exts_of(&desc);
+                        region_capable(&exts, sym.render_region.is_some(), desc.caps)
+                    },
+                    Some(desc.abi),
+                    desc.metadata.clone(),
+                )
+            }
             // 版本不符时**仍然知道**它自述的是哪一版：这个数字是用户排查
             // "为什么它被拒"的唯一线索，别丢。
             Inspect::AbiMismatch { got } => (
@@ -416,4 +425,37 @@ pub fn list_decoders() -> Vec<DecoderEntry> {
         });
     }
     out
+}
+
+/// 同 id 只留版本最高的那枚（**只给扩展名并集用**，不改 `list_decoders` 的展示：
+/// 设置页要把输掉的重复 DLL 也列出来，用户才知道磁盘上多了什么）。
+pub(super) fn keep_newest_per_id(out: Vec<DecoderEntry>) -> Vec<DecoderEntry> {
+    let mut winners: HashMap<String, (Option<String>, usize)> = HashMap::new();
+    for (i, e) in out.iter().enumerate() {
+        let ver = parse_dll_version(&e.file);
+        match winners.get(&e.id) {
+            None => {
+                winners.insert(e.id.clone(), (ver, i));
+            }
+            Some((best_ver, _)) => {
+                let better = match (ver.as_deref(), best_ver.as_deref()) {
+                    (Some(a), Some(b)) => crate::decoders::remote::version_cmp(a, b).is_gt(),
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if better {
+                    winners.insert(e.id.clone(), (ver, i));
+                }
+            }
+        }
+    }
+    if winners.len() == out.len() {
+        return out;
+    }
+    let keep: HashSet<usize> = winners.values().map(|(_, i)| *i).collect();
+    out.into_iter()
+        .enumerate()
+        .filter(|(i, _)| keep.contains(i))
+        .map(|(_, e)| e)
+        .collect()
 }

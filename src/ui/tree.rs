@@ -170,6 +170,12 @@ pub fn hit(panel: Rect, n: usize, first: usize, pos: (f32, f32), notice: bool) -
     if !panel.contains(p) {
         return None;
     }
+    // 行只画在 `row_rect`（左右各留 PAD），命中也要按同一条边界：点在面板左右
+    // 那 8px 空白条上不该进层（2026-11-24 审计 M56）。
+    let row = row_rect(panel, 0);
+    if p.x < row.x || p.x >= row.x + row.w {
+        return None;
+    }
     let dy = p.y - panel.y - PAD;
     if dy < 0 {
         return None;

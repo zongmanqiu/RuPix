@@ -124,11 +124,14 @@ impl Thumbs {
     ///   现在与主画面共用 [`decode::ensure_raw_params`] 的推断 / 会话值，并走
     ///   `request_raw(..., Thumb)`；参数一变就把旧格子作废重发。
     pub fn ensure(&mut self, decoder: &Decoder, paths: &[&Path], allow_new: bool) {
-        // 先算出"可见但还缺图"的集合：只把这一批交给解码线程。
-        // 就绪 / 失败的格子不在其中 ⇒ 队列里同路径的旧请求会作废（seed 之后尤其重要）。
-        // `Vec::new()` 而不是 `with_capacity`：空闲时所有格子都已就绪/失败，`missing`
-        // 为空，不该为它分配一块用不上的缓冲。
+        // 两个集合，别混：
+        // - `missing` = 完全没有格子的（这一帧要发新请求）；
+        // - `wanted`  = 可见且**尚未就绪/失败**的（含 Pending）——交给解码线程的
+        //   作废集合。旧实现只把 `missing` 交过去，于是"已经发出、正在排队"的那几格
+        //   在下一帧就从可见集里消失，被解码线程当成滚过去了取消、删格、再重发，
+        //   大图缩略图永远填不上（2026-11-24 审计 H03）。
         let mut missing: Vec<&Path> = Vec::new();
+        let mut wanted: Vec<&Path> = Vec::new();
         for p in paths {
             let headerless = decode::is_headerless_path(p);
             let raw = if headerless {
@@ -141,11 +144,18 @@ impl Thumbs {
                 self.raw_used.insert(p.to_path_buf(), raw);
                 self.forget(p);
             }
+            let settled = matches!(
+                self.slots.get(*p),
+                Some((Slot::Ready(_), _)) | Some((Slot::Failed, _))
+            );
+            if !settled {
+                wanted.push(*p);
+            }
             if !self.slots.contains_key(*p) {
                 missing.push(*p);
             }
         }
-        decoder.set_thumb_view(&missing);
+        decoder.set_thumb_view(&wanted);
         if !allow_new {
             return;
         }

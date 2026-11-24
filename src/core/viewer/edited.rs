@@ -206,6 +206,12 @@ impl Viewer {
         rgba: Vec<u8>,
         orient: (u8, bool),
     ) -> bool {
+        // 先验长度再变换：`transformed` 恒补齐输出（截断源会被静默补成透明黑），
+        // 之后 `install_edited` 的 `len == w*h*4` 必然通过 ⇒ 半黑图被当成合法编辑
+        // 落进覆盖账本（2026-11-24 审计 M41）。
+        if rgba.len() < (w as usize).saturating_mul(h as usize).saturating_mul(4) {
+            return false;
+        }
         if orient == (0, false) {
             return self.install_edited(path, w, h, rgba);
         }

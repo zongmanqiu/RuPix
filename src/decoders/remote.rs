@@ -226,12 +226,21 @@ pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 pub fn install_state(e: &RemoteEntry, installed: &[DecoderEntry]) -> InstallState {
     use std::cmp::Ordering;
 
-    let Some(cur) = installed.iter().find(|d| d.id == e.id) else {
-        return InstallState::Absent;
-    };
-    // 文件名读不出版本号（不是 `<id>_<ver>.dll` 这个形状）就无从比较：当成"没有可用的
-    // 同 id 版本"，让用户下这一份名字规整的——装完目录里的那份形状才是对的。
-    let Some(local) = parse_dll_version(&cur.file) else {
+    // 同 id 可能有多枚（热升级后旧 DLL 删不掉）：必须取**版本最高**的那枚再比，
+    // 否则目录里躺着 0.1.0 就会把已装的 0.2.0 报成「可升级」（2026-11-24 审计 L51）。
+    let mut cur: Option<(&DecoderEntry, String)> = None;
+    for d in installed.iter().filter(|d| d.id == e.id) {
+        let Some(v) = parse_dll_version(&d.file) else {
+            continue;
+        };
+        let better = cur
+            .as_ref()
+            .is_none_or(|(_, best)| version_cmp(&v, best).is_gt());
+        if better {
+            cur = Some((d, v));
+        }
+    }
+    let Some((_, local)) = cur else {
         return InstallState::Absent;
     };
     match version_cmp(&local, &e.version) {
@@ -251,7 +260,7 @@ pub fn split_formats(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// `id` / `version` 能不能直接拼进文件名：只认小写字母、数字、点、连字符、下划线。
+/// `id` 能不能直接拼进文件名：只认字母、数字、点、连字符、下划线。
 ///
 /// 这两段最终会拼成 `decoders/<id>_<ver>.dll` 落盘，所以这里不是"好看"的问题——
 /// 放任一个 `/` 或 `..` 进来，下载就成了往任意路径写文件。
@@ -261,6 +270,13 @@ fn is_safe_stem(s: &str) -> bool {
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
         && !s.starts_with('.')
+}
+
+/// 版本段还必须能被 `parse_dll_version` 认出来：数字开头且**不含 `_`**
+/// （它按最后一个下划线切 id 与版本）。否则装完永远显示「未安装」、旧版本清不掉
+/// （2026-11-24 审计 L50）。
+fn is_safe_version(s: &str) -> bool {
+    is_safe_stem(s) && s.starts_with(|c: char| c.is_ascii_digit()) && !s.contains('_')
 }
 
 /// 过渡兼容（2026-10-26 起，2026-10-28 补仓库改名）：线上旧清单有两个历史包袱——
@@ -308,8 +324,8 @@ fn entry_from(v: &Value) -> Option<RemoteEntry> {
     let text = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let id = text("id");
     let version = text("version");
-    // 身份段要能当文件名用，否则整项作废（见 `is_safe_stem`）。
-    if !is_safe_stem(&id) || !is_safe_stem(&version) {
+    // 身份段要能当文件名用，否则整项作废（见 `is_safe_stem` / `is_safe_version`）。
+    if !is_safe_stem(&id) || !is_safe_version(&version) {
         return None;
     }
     let name = text("name");
@@ -540,23 +556,33 @@ pub fn start_refresh(src: SourceId, url: String) -> Result<(), BeginError> {
         }
         g.running = true;
     }
-    std::thread::spawn(move || {
-        // 先解析成功再落盘：拉到半截 / 格式变了，本地那份必须原样留着。
-        // 落盘失败 = 整次刷新失败：刚取到的清单一并丢掉，不交付"只在内存里新"的态。
-        let result = match fetch(&url) {
-            Ok((cat, text)) => match save_local(&text) {
-                Ok(()) => Ok(cat),
-                Err(e) => {
-                    log::warn!("新清单未能写入本地文件，本次刷新按失败处理：{e}");
-                    Err(e)
+    let spawned = std::thread::Builder::new()
+        .name("decoder-refresh".into())
+        .spawn(move || {
+            // 线程 panic 不能把 `running` 永久留在 true：否则「刷新」永远报 Busy。
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // 先解析成功再落盘：拉到半截 / 格式变了，本地那份必须原样留着。
+                // 落盘失败 = 整次刷新失败：刚取到的清单一并丢掉，不交付"只在内存里新"的态。
+                match fetch(&url) {
+                    Ok((cat, text)) => match save_local(&text) {
+                        Ok(()) => Ok(cat),
+                        Err(e) => {
+                            log::warn!("新清单未能写入本地文件，本次刷新按失败处理：{e}");
+                            Err(e)
+                        }
+                    },
+                    Err(e) => Err(e),
                 }
-            },
-            Err(e) => Err(e),
-        };
-        let mut g = REFRESH.lock().unwrap_or_else(|e| e.into_inner());
-        g.running = false;
-        g.done = Some(RefreshOutcome { src, result });
-    });
+            }))
+            .unwrap_or_else(|_| Err("刷新线程异常退出（已隔离）".to_string()));
+            let mut g = REFRESH.lock().unwrap_or_else(|e| e.into_inner());
+            g.running = false;
+            g.done = Some(RefreshOutcome { src, result });
+        });
+    if let Err(e) = spawned {
+        REFRESH.lock().unwrap_or_else(|e| e.into_inner()).running = false;
+        return Err(BeginError::Refused(format!("起不来刷新线程：{e}")));
+    }
     Ok(())
 }
 

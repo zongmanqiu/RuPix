@@ -609,6 +609,9 @@ impl CompanionPane {
         if !detail_only {
             self.image = None;
             self.natural = None;
+            // 换目标必须清掉旧图的页/帧信息：否则 JPG 首解落地前底栏仍显示
+            // 上一份 PDF 的「1/5」，按 . 还会给 JPG 发越界页号（M58）。
+            self.anim = None;
         }
         self.failed = false;
         self.pending = false;
@@ -690,10 +693,9 @@ impl CompanionPane {
                             self.image = Some(shot.image);
                         }
                         None => {
-                            self.anim = None;
-                            self.natural = None;
+                            // detail 重解失败（缩放辅图）时保留旧成品：能看的图不该
+                            // 因为一次“要更清晰”的请求失败就变空白（M58）。
                             self.failed = true;
-                            self.image = None;
                         }
                     }
                 }

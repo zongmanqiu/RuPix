@@ -1017,6 +1017,9 @@ impl ImageCanvas {
         // 保守取"动画组也在"的那一行：这里若跟随当前显隐，切到动图的一刻缩略图
         // 会跟着往上跳一格——避让位置必须是稳定的。
         let (px, py, pw, ph) = Chrome::pill(view, true, Chrome::cell_reserve(view.2));
+        // `pill` 返回的是**视口相对**坐标，`bx/by` 是窗口绝对坐标：先换成同一空间，
+        // 否则缩略图条/树贴左时避让判定永远漏判（2026-11-24 审计 H17）。
+        let (px, py) = (px + view.0, py + view.1);
         let bx = content.x as f32 + content.w as f32 - NAV_W - NAV_MARGIN;
         let mut by = content.y as f32 + content.h as f32 - NAV_H - NAV_MARGIN;
         // 重叠判定不分浮条当前是否可见：它出现的位置是固定的，若按可见态算，
@@ -1029,6 +1032,12 @@ impl ImageCanvas {
                 by = raised;
             }
         }
+        // 夹回内容矩形：窗口矮/窄时鸟瞰盒不许伸进标题栏或缩略图条——那会让
+        // 标题钮先被 `nav_grab` 吃掉（2026-11-24 审计 H17）。
+        let max_x = ((content.x + content.w) as f32 - NAV_W).max(content.x as f32);
+        let max_y = ((content.y + content.h) as f32 - NAV_H).max(content.y as f32);
+        let bx = bx.clamp(content.x as f32, max_x);
+        let by = by.clamp(content.y as f32, max_y);
         Rect::new(bx as i32, by as i32, NAV_W as i32, NAV_H as i32)
     }
 
@@ -3100,6 +3109,11 @@ impl Widget for ImageCanvas {
         // 主辅视图（m322）：默认关；窗口够宽才分栏，太窄退回单栏。
         // `last_work` 仍是 chrome/胶片条/命中的整块；主图只用 `primary_work`。
         let companion_on = self.chrome.companion.get() && work.w >= 720 && !chrome::borderless();
+        // 辅图被宽度/无边框挤掉时，活动 pane 必须回到主图：否则底栏、缩放键、
+        // 帧键、联动步长全打给一个不画的 pane（2026-11-24 审计 H16）。
+        if !companion_on && self.chrome.active_pane.get() == Pane::Companion {
+            self.chrome.active_pane.set(Pane::Primary);
+        }
         let companion_gap = if companion_on { 1 } else { 0 };
         let primary_work = if companion_on {
             Rect::new(
@@ -3736,10 +3750,23 @@ impl Widget for ImageCanvas {
         // ⑥ 取色器浮层（m217）：最后画，压在包括鸟瞰/缩略图条在内的所有图层之上。
         // 判据与点击复制共用 `Viewer::pick_at` —— 屏上显示哪一格，就复制哪一格。
         if let (true, Some(pos)) = (self.chrome.picker.get(), self.chrome.picker_at.get()) {
-            if let Some(pk) = self
-                .viewer
-                .borrow()
-                .pick_at(from_rect(self.view_work()), pos)
+            // 只在主图 pane 的可见矩形里取样：主图放大后 dst 可覆盖条/树/辅图区，
+            // 不裁剪就会在那些区域弹出「主图隐藏像素」的色块（2026-11-24 审计 M60）。
+            // 矩形还是 0（首帧 / 无头测试）时不裁剪。
+            let pw = self.primary_work.get();
+            let in_primary = pw.w <= 1
+                || pw.h <= 1
+                || pw.contains(windui::geometry::Point {
+                    x: pos.0 as i32,
+                    y: pos.1 as i32,
+                });
+            if let Some(pk) = in_primary
+                .then(|| {
+                    self.viewer
+                        .borrow()
+                        .pick_at(from_rect(self.view_work()), pos)
+                })
+                .flatten()
             {
                 let [r, g, b, _] = pk.rgba;
                 let hex = format!("#{r:02X}{g:02X}{b:02X}");
@@ -4261,12 +4288,13 @@ impl ImageCanvas {
                             }
                         }
                     }
-                    // 不透明度 + / −：新增档。同样过碎增量与节奏闸，免得触控板一格跳十档。
-                    // 向上滚 = +、向下滚 = −，与 `WheelAction::pair()` 登记的反向一致。
+                    // 不透明度 + / −：新增档。★ 不共用翻页节奏闸——闸里只存方向、
+                    // 不存"这一下是翻页还是调透明度"，被压住的那一下会被 16ms 轮询
+                    // 当成翻页执行（2026-11-24 审计 H14）。这里直接逐格执行。
                     crate::core::config::WheelAction::Opacity => {
                         let (acc, dir) = wheel_detent(self.wheel_acc.get(), delta);
                         self.wheel_acc.set(acc);
-                        if dir != 0 && self.chrome.wheel_gate(dir) {
+                        if dir != 0 {
                             let a = if dir > 0 {
                                 Action::OpacityUp
                             } else {
@@ -4450,8 +4478,12 @@ impl ImageCanvas {
                 }
                 let left = self.chrome.pointer_left();
                 let strip = self.strip_hover.replace(None).is_some();
+                // 悬停位全部清掉：树行也要一起清，否则指针移出窗口后那一行仍高亮
+                // （2026-11-24 审计 M60）。
+                let tree = self.tree_hover.replace(None).is_some();
                 if left
                     || strip
+                    || tree
                     || was_nav
                     || was_strip
                     || was_dragging_strip
@@ -4480,7 +4512,16 @@ impl ImageCanvas {
                 self.chrome.slide_stop();
                 // 取色模式（m217）：点画面 = 取色并复制 HEX，随即退出模式。
                 // 浮条/标题钮/箭头仍让给原逻辑——点按钮不该被误当成取样。
-                if self.chrome.picker.get() && self.chrome_hit(pos).is_none() {
+                let pw = self.primary_work.get();
+                if self.chrome.picker.get()
+                    && self.chrome_hit(pos).is_none()
+                    && (pw.w <= 1
+                        || pw.h <= 1
+                        || pw.contains(windui::geometry::Point {
+                            x: pos.0 as i32,
+                            y: pos.1 as i32,
+                        }))
+                {
                     let pick = self
                         .viewer
                         .borrow()
@@ -4525,7 +4566,8 @@ impl ImageCanvas {
                                 tree_scrub_first(
                                     &TreeScrub {
                                         grab_at: pos.1,
-                                        thumb0: thumb.y as f32,
+                                        // 相对轨道原点（`tree_scrub_first` 自己不再减 track.y）。
+                                        thumb0: (thumb.y - track.y) as f32,
                                         span,
                                         max_first,
                                     },
@@ -4541,13 +4583,12 @@ impl ImageCanvas {
                                 )
                             };
                             self.tree_first.set(first);
-                            // 跳转之后滑块换了位置 ⇒ `thumb0` 跟着换，否则再拖会先弹回。
-                            let thumb0 = track.y as f32
-                                + if max_first > 0 && span > 0.0 {
-                                    (first as f32 / max_first as f32) * span
-                                } else {
-                                    0.0
-                                };
+                            // 跳转之后滑块换了位置 ⇒ `thumb0` 跟着换（存相对轨道原点）。
+                            let thumb0 = if max_first > 0 && span > 0.0 {
+                                (first as f32 / max_first as f32) * span
+                            } else {
+                                0.0
+                            };
                             self.tree_scrub.set(Some(TreeScrub {
                                 grab_at: pos.1,
                                 thumb0,
@@ -4598,7 +4639,12 @@ impl ImageCanvas {
                 // ★ 走 `nav_grab` 而不是在这里内联 —— 那里明确了"调用期间不得持有
                 // viewer 的 Ref"这条铁律，理由见它的注释。写成本作用域内联的
                 // `if let Some(dst) = self.viewer.borrow()...` 就是一次进程崩溃。
-                if !self.chrome.locked.get() && self.nav_grab(pos) {
+                if !self.chrome.locked.get()
+                    && self.chrome_hit(pos).is_none()
+                    && !Chrome::in_title_strip(pos, self.work_tuple())
+                    && !self.in_strip_panel(pos)
+                    && self.nav_grab(pos)
+                {
                     self.nav_drag.set(true);
                     ctx.mark_dirty();
                     return true;
@@ -4671,12 +4717,13 @@ impl ImageCanvas {
                         };
                         self.strip_first.set(Some(first));
                         // 跳转之后滑块在新位置 ⇒ `thumb0` 也要跟着换，否则再拖会先弹回。
-                        let thumb0 = t0
-                            + if max_first > 0 && span > 0.0 {
-                                (first as f32 / max_first as f32) * span
-                            } else {
-                                0.0
-                            };
+                        // ★ 存**相对轨道原点**的偏移：`scrub_first` 按 `main - grab + thumb0`
+                        //   算行程，带绝对原点会一抓就跳十几张（2026-11-24 审计 H15）。
+                        let thumb0 = if max_first > 0 && span > 0.0 {
+                            (first as f32 / max_first as f32) * span
+                        } else {
+                            0.0
+                        };
                         self.strip_scrub.set(Some(StripScrub {
                             grab_at: if horizontal { pos.0 } else { pos.1 },
                             thumb0,
@@ -4915,7 +4962,7 @@ pub fn handle_key(
             if let (Some(state), Some(ctx_ref)) = (live, ctx.as_mut()) {
                 let target = crate::extensions::discover_configured(&cfg.borrow())
                     .into_iter()
-                    .find(|e| e.manifest.id == plugin_id);
+                    .find(|e| e.run_key == plugin_id);
                 if let Some(ext) = target {
                     if ext.manifest.run_ui && ext.manifest.preview.is_some() {
                         let cur = viewer.borrow().current_path();

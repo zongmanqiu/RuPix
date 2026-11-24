@@ -23,13 +23,17 @@
 //! 要么是新文件，不会是半截 JSON（半截 JSON = 插件下次读到就当设置没了）。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use crate::core::ext_protocol::Settings;
 
 /// 设置文件名（插件目录内）。`install_zip` 也要按它判断"新包是否自带设置区"。
 pub(crate) const FILE_NAME: &str = "settings.json";
-/// 临时文件名（原子写的中转站）。
-const TMP_NAME: &str = "settings.json.tmp";
+
+/// 同一份设置文件的写入口互斥（UI 设置窗 / 快捷键页 / 后台任务线程都会写）。
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 这个插件的设置文件路径。`None` = 拿不到 exe 目录（便携模式下没有 exe 同级目录）。
 pub fn settings_path(plugin_id: &str) -> Option<PathBuf> {
@@ -137,7 +141,10 @@ pub fn load_for(ext: &super::Extension) -> Settings {
 ///
 /// ★ 不能直接 `save`：同一个 `settings.json` 里还住着同包其他命令的键，
 ///   整体覆盖会把它们清掉。
-pub fn merge_into_for(ext: &super::Extension, incoming: &Settings) -> Result<Settings, String> {
+pub fn merge_into_for(
+    ext: &super::Extension,
+    incoming: &[(String, String)],
+) -> Result<Settings, String> {
     let Some(prefix) = key_prefix(ext) else {
         return merge_into(&ext.manifest.id, incoming);
     };
@@ -161,21 +168,37 @@ pub fn save(plugin_id: &str, items: &Settings) -> Result<(), String> {
 }
 
 /// 写到指定路径（原子写：先临时文件再改名）。
+///
+/// 临时名带 pid + 递增序号：旧实现固定 `settings.json.tmp`，后台任务线程与 UI 设置窗
+/// 同时写会互相截断/抢 rename（2026-11-24 审计 M24）。整个写在 `WRITE_LOCK` 内，
+/// 读改写（`merge_into_at`）也不会丢更新。
 fn save_to(path: &Path, items: &Settings) -> Result<(), String> {
+    let _g = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    save_to_unlocked(path, items)
+}
+
+fn save_to_unlocked(path: &Path, items: &Settings) -> Result<(), String> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).map_err(|e| format!("建插件目录失败：{e}"))?;
-    let tmp = dir.join(TMP_NAME);
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!("settings.json.{}.{}.tmp", std::process::id(), seq));
     let body = to_json(items);
     std::fs::write(&tmp, body.as_bytes()).map_err(|e| format!("写设置临时文件失败：{e}"))?;
     // std::fs::rename 支持替换已有文件；不预删，才能在替换失败时保住旧设置。
-    std::fs::rename(&tmp, path).map_err(|e| format!("替换设置文件失败：{e}"))
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(format!("替换设置文件失败：{e}"))
+        }
+    }
 }
 
 /// 把插件回传的新设置**合并**进现有设置（同名键覆盖，新键追加）。
 ///
 /// 为什么要合并而不是整体替换：插件只知道自己改的那几个键，宿主是**它所有
 /// 设置的持有者**——整体替换会让插件"没提到的键"被清空（插件重启后偏好全丢）。
-pub fn merge_into(plugin_id: &str, incoming: &Settings) -> Result<Settings, String> {
+pub fn merge_into(plugin_id: &str, incoming: &[(String, String)]) -> Result<Settings, String> {
     let Some(path) = settings_path(plugin_id) else {
         return Err("拿不到插件目录（便携模式？）".into());
     };
@@ -183,7 +206,13 @@ pub fn merge_into(plugin_id: &str, incoming: &Settings) -> Result<Settings, Stri
 }
 
 /// 合并写（路径与 id 分开，单测用）。
-fn merge_into_at(path: &Path, plugin_id: &str, incoming: &Settings) -> Result<Settings, String> {
+fn merge_into_at(
+    path: &Path,
+    plugin_id: &str,
+    incoming: &[(String, String)],
+) -> Result<Settings, String> {
+    // 读改写必须整段互斥：两个写者各自 load 再 save 会丢一半更新。
+    let _g = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut cur = load_from(path, plugin_id);
     for (k, v) in incoming {
         match cur.iter_mut().find(|(ck, _)| ck == k) {
@@ -191,7 +220,7 @@ fn merge_into_at(path: &Path, plugin_id: &str, incoming: &Settings) -> Result<Se
             None => cur.push((k.clone(), v.clone())),
         }
     }
-    save_to(path, &cur)?;
+    save_to_unlocked(path, &cur)?;
     Ok(cur)
 }
 
@@ -324,15 +353,15 @@ mod tests {
         let path = dir.join(FILE_NAME);
         let old: Settings = vec![("lang".into(), "old".into())];
         save_to(&path, &old).expect("initial settings");
-        // Allow the temporary write but deny DELETE sharing: rename must fail after writing.
+        // 打开**目标文件**并拒绝 DELETE 共享：写临时文件能成功，rename 覆盖会失败。
         let held = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .share_mode(0x1 | 0x2)
-            .open(dir.join(TMP_NAME))
-            .expect("hold temporary file");
+            .open(&path)
+            .expect("hold target file");
         let result = save_to(&path, &vec![("lang".into(), "new".into())]);
         let preserved = load_from(&path, "test.audit.save");
         drop(held);

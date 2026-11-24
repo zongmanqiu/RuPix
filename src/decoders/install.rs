@@ -37,13 +37,14 @@
 //! 另外会把**同 id 的旧版本文件**清掉：两枚自述同一个 id 的 DLL 躺在目录里，选谁全看
 //! 扫描顺序，用户会看到"版本号变了又变"。
 use std::io::{Cursor, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 use super::catalog;
 use super::dllmeta::{inspect, Inspect};
-use super::remote::RemoteEntry;
+use super::remote::{version_cmp, RemoteEntry};
 use super::SourceId;
+use crate::platform::seh::invoke;
 
 /// 单枚 DLL 的上限。现有最大一枚 7.9 MB；32 MiB 是"这明显不是解码器"的闸。
 const MAX_DLL_BYTES: usize = 32 << 20;
@@ -140,16 +141,26 @@ pub fn start(e: &RemoteEntry, src: SourceId) -> Result<(), String> {
         });
     }
     let job = e.clone();
-    std::thread::spawn(move || {
-        let result = install(&job, src);
-        let mut g = SLOT.lock().unwrap_or_else(|x| x.into_inner());
-        g.running = None;
-        g.done = Some(Outcome {
-            id: job.id,
-            name: job.name,
-            result,
+    let spawned = std::thread::Builder::new()
+        .name("decoder-install".into())
+        .spawn(move || {
+            // 线程体 panic 不能把 `running` 永久留在 true（UI 会一直显示"下载中"，
+            // 后续安装全被 Busy 拒绝，只能重启）。catch_unwind 兜住 install 整段。
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| install(&job, src)))
+                    .unwrap_or_else(|_| Err("安装线程异常退出（已隔离，目录未改动）".to_string()));
+            let mut g = SLOT.lock().unwrap_or_else(|x| x.into_inner());
+            g.running = None;
+            g.done = Some(Outcome {
+                id: job.id,
+                name: job.name,
+                result,
+            });
         });
-    });
+    if let Err(e) = spawned {
+        SLOT.lock().unwrap_or_else(|x| x.into_inner()).running = None;
+        return Err(format!("起不来下载线程：{e}"));
+    }
     Ok(())
 }
 
@@ -231,7 +242,14 @@ fn unpack_zip(
             if rel.is_empty() || rel.to_ascii_lowercase().ends_with(".dll") {
                 return Err(format!("ZIP 许可证目录里不允许 DLL：{name}"));
             }
-            docs.push((PathBuf::from(rel), buf));
+            let rel = PathBuf::from(rel);
+            // `name` 的分段校验挡不住「盘符前缀」：`pkg/C:/Users/...` 的每段都合法，
+            // 而 Windows 上 `join` 遇到 `C:` 会整体替换基路径 ⇒ 任意路径写文件。
+            // 只允许纯 `Normal` 组件（2026-11-24 审计 H08）。
+            if rel.is_absolute() || rel.components().any(|c| !matches!(c, Component::Normal(_))) {
+                return Err(format!("ZIP 许可证路径越界：{name}"));
+            }
+            docs.push((rel, buf));
         } else {
             return Err(format!("ZIP 顶层只允许 {dll_name} 和 {pkg_dir}：{name}"));
         }
@@ -341,7 +359,10 @@ fn place_package(
     // ① **先验**：读不出自述、id 与清单不符、版本与清单不符、abi 出界——都在这里当场结束，
     //    上面只写了暂存，正式目录一个字节都没动。
     let verdict = match inspect(&stage_dll) {
-        Inspect::Ok { desc, .. } => {
+        Inspect::Ok { desc, lib, .. } => {
+            // `FreeLibrary` 会跑解码器的 DllMain(DETACH)：坏 DLL 在这里访问违规
+            // 会直接带走宿主。必须在 SEH 闸门里卸载（2026-11-24 审计 H09）。
+            let _ = invoke(|| drop(lib));
             if desc.id != id {
                 Err(format!("自述 id 是「{}」，清单写的是「{id}」", desc.id))
             } else if let Some((_, v)) = desc
@@ -382,7 +403,14 @@ fn place_package(
     if pkg_dir.exists() {
         let _ = std::fs::remove_dir_all(&old_dir);
         if let Err(err) = std::fs::rename(&pkg_dir, &old_dir) {
-            restore_old(&target, &pkg_dir, &old_dll, &old_dir);
+            // 此刻旧 DLL 已被挪到 `.old`，而 `pkg_dir` **还在原位**（rename 失败）。
+            // 不能走 `restore_old`：它第一步就 `remove_dir_all(package_dir)`，删掉的
+            // 正是用户原有的许可证目录；`old_dir` 也不存在，恢复不回来。
+            if old_dll.exists() {
+                if let Err(err2) = std::fs::rename(&old_dll, &target) {
+                    log::warn!("回滚：旧 DLL 挪不回 {}：{err2}", target.display());
+                }
+            }
             let _ = std::fs::remove_dir_all(&stage);
             return Err(format!("旧许可证目录挪不开：{err}"));
         }
@@ -403,14 +431,18 @@ fn place_package(
 
     // ③ 收尾：删掉挪开的旧档。★ 被加载着的那一份删不掉是真机常态（code=5），留着不碍事
     //（文件名以 `.old` 结尾，扫描只认 `*.dll`），但必须出声——它是"上一次是热更新"的唯一痕迹。
-    if let Err(err) = std::fs::remove_file(&old_dll) {
-        log::warn!(
-            "挪开的旧 DLL 删不掉（多半正被加载）：{}：{err}",
-            old_dll.display()
-        );
+    if old_dll.exists() {
+        if let Err(err) = std::fs::remove_file(&old_dll) {
+            log::warn!(
+                "挪开的旧 DLL 删不掉（多半正被加载）：{}：{err}",
+                old_dll.display()
+            );
+        }
     }
-    if let Err(err) = std::fs::remove_dir_all(&old_dir) {
-        log::warn!("挪开的旧许可证目录删不掉：{}：{err}", old_dir.display());
+    if old_dir.exists() {
+        if let Err(err) = std::fs::remove_dir_all(&old_dir) {
+            log::warn!("挪开的旧许可证目录删不掉：{}：{err}", old_dir.display());
+        }
     }
     drop_older_versions(dir, &target, id);
     drop_older_packages(dir, &pkg_dir, id);
@@ -461,12 +493,26 @@ fn drop_older_versions(dir: &std::path::Path, keep: &std::path::Path, id: &str) 
         let Some(name) = p.file_name().map(|s| s.to_string_lossy().to_string()) else {
             continue;
         };
-        // `<id>_<ver>.dll`：最后一个下划线之前那段就是 id。
+        // `<id>_<ver>.dll`：最后一段必须是**合法版本号**，不是随便一个 `<id>_xxx.dll`。
+        // 旧实现按"最后一个下划线前 == id"直接删，会把用户手工放进来的
+        // `common_debug.dll` 当旧版本清掉（2026-11-24 审计 L49）。
+        let Some(ver) = super::parse_dll_version(&name) else {
+            continue;
+        };
         if name.rsplit_once('_').map(|(stem, _)| stem) != Some(id) {
             continue;
         }
-        if let Err(err) = std::fs::remove_file(&p) {
-            log::warn!("旧版本 {name} 删不掉（可能正被加载）：{err}");
+        let keep_ver = keep
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .and_then(|s| super::parse_dll_version(&s));
+        if keep_ver
+            .as_deref()
+            .is_none_or(|k| version_cmp(&ver, k).is_lt())
+        {
+            if let Err(err) = std::fs::remove_file(&p) {
+                log::warn!("旧版本 {name} 删不掉（可能正被加载）：{err}");
+            }
         }
     }
 }

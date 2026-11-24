@@ -383,8 +383,10 @@ impl Hotkey {
 
     /// 把一次按键事件（带修饰键状态）抓成一条快捷键。
     ///
-    /// - 主键是纯修饰键（`VKey::Alt` 等）或无法识别的键 → 返回 `None`：捕获态下
-    ///   用户按着 Ctrl 的那一下不该被当成「绑了 Ctrl」这条快捷键（见 `runtime::mod`）。
+    /// - 纯修饰键 / Tab / 未知键不会走到这里：`ui::to_key_input` 已把它们翻译成
+    ///   `None`（捕获态下按着 Ctrl 的那一下不该被当成「绑了 Ctrl」）。
+    /// - `F13` 及更远的功能键也返回 `None`：windui 只发 `F1..=F12`，能被写进 ini
+    ///   却永远匹配不到，不如在捕获时就拒绝（`from_spec` 同一判据）。
     /// - 修饰键取自事件当时的 `ctrl/alt/shift/meta`（Win = `meta`）。
     pub fn from_event(ev: &KeyInput) -> Option<Hotkey> {
         let base = match ev.key {
@@ -403,7 +405,8 @@ impl Hotkey {
             VKey::Insert => Base::Insert,
             VKey::ContextMenu => Base::ContextMenu,
             VKey::Escape => Base::Escape,
-            VKey::F(n) => Base::F(n),
+            VKey::F(n) if (1..=12).contains(&n) => Base::F(n),
+            VKey::F(_) => return None,
             VKey::NumpadAdd => Base::NumAdd,
             VKey::NumpadSubtract => Base::NumSub,
             VKey::NumpadMultiply => Base::NumMul,
@@ -669,9 +672,7 @@ impl Default for Hotkeys {
         // 不绑成方向键——那会让「翻图片」和「翻帧」两套语义共用一把键）。
         b[Action::FramePrev.index()] = vec![dhk(Base::Char(','), false)];
         b[Action::FrameNext.index()] = vec![dhk(Base::Char('.'), false)];
-        // 翻页：`[` 上一页 / `]` 下一页。与逐帧同区（右手食指两侧）但**不撞**——
-        // 逐帧那两个是 `,` `.`，方括号在它们的右上方一格。多页文档与动画是互斥的
-        // 两种图，同一只手换一根手指，不需要另置一套方向键语义。
+        // 缩略图条开关：`T`（T = Thumbnail）。与逐帧的 `,` `.`、翻页不撞。
         b[Action::Filmstrip.index()] = vec![dhk(Base::Char('T'), false)];
         // 不透明度 ±1 档（10%）：带 Ctrl——裸 ↑/↓ 曾被预留作纵向平移，m216 落地
         // WASD 后该预留作废（纵向归 W/S），裸 ↑/↓ 维持无绑定。

@@ -211,6 +211,7 @@ impl Gallery {
         if self.sort == sort {
             return false;
         }
+        let old_sort = self.sort;
         self.sort = sort;
         if self.dir.as_os_str().is_empty() {
             return false;
@@ -221,7 +222,12 @@ impl Gallery {
                 *self = g;
                 changed
             }
-            Err(_) => false,
+            Err(_) => {
+                // 目录暂时读不到（拔盘 / 被删）：清单与排序偏好必须保持同一份，
+                // 否则 `sort()` 报告新口径、`files` 还是旧顺序（2026-11-24 审计 M33）。
+                self.sort = old_sort;
+                false
+            }
         }
     }
 
@@ -377,12 +383,12 @@ impl Gallery {
         if files.is_empty() {
             return Err(ViewError::NoImages(self.dir.clone()));
         }
-        let index = match anchor {
-            Some(a) if files.iter().any(|p| same_path(p, &a)) => {
-                // 红线豁免: 上行的 `any` 已确认 `a` 在 `files` 中，position 必为 Some。
-                files.iter().position(|p| same_path(p, &a)).unwrap()
-            }
-            _ => old_index.min(files.len() - 1),
+        let index = match files
+            .iter()
+            .position(|p| anchor.as_ref().is_some_and(|a| same_path(p, a)))
+        {
+            Some(i) => i,
+            None => old_index.min(files.len() - 1),
         };
         Ok(Self {
             dir: self.dir.clone(),
@@ -579,6 +585,21 @@ fn sort_found(found: FoundList, sort: SortSpec) -> Vec<PathBuf> {
     let names: Vec<String> = found.iter().map(|f| file_name_of(&f.path)).collect();
     let mut order: Vec<usize> = (0..found.len()).collect();
     order.sort_by(|&a, &b| {
+        // 「时间读不到」的条目不论升序/倒序都排最后：旧实现靠 `Option` 的 Ord
+        // （None < Some）在升序里把它顶到最前，与字段文档相反（2026-11-24 审计 M33）。
+        let a_missing = match sort.by {
+            SortBy::Created => found[a].created.is_none(),
+            SortBy::Modified => found[a].modified.is_none(),
+            _ => false,
+        };
+        let b_missing = match sort.by {
+            SortBy::Created => found[b].created.is_none(),
+            SortBy::Modified => found[b].modified.is_none(),
+            _ => false,
+        };
+        if a_missing != b_missing {
+            return if a_missing { Cmp::Greater } else { Cmp::Less };
+        }
         let primary = match sort.by {
             SortBy::Name => Cmp::Equal,
             SortBy::Size => found[a].size.cmp(&found[b].size),

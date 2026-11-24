@@ -213,7 +213,8 @@ impl Host {
             return Vec::new();
         }
         self.refresh_catalog();
-        // 读文件（mmap，失败回退整读）。嗅探只读头几个字节，开销极小。
+        // 读文件（mmap，失败回退读**固定前缀**）。嗅探只认魔数，回退时整读一个
+        // 几十 GB 的改名文件会直接把内存打爆（2026-11-24 审计 M16）。
         let mapped = std::fs::File::open(path)
             .ok()
             .and_then(|f| unsafe { memmap2::Mmap::map(&f).ok() });
@@ -221,10 +222,14 @@ impl Host {
         let data: &[u8] = match &mapped {
             Some(m) => &m[..],
             None => {
-                let Ok(bytes) = std::fs::read(path) else {
+                use std::io::Read as _;
+                let Ok(mut f) = std::fs::File::open(path) else {
                     return Vec::new();
                 };
-                fallback = bytes;
+                let mut head = vec![0u8; 64 * 1024];
+                let n = f.read(&mut head).unwrap_or(0);
+                head.truncate(n);
+                fallback = head;
                 &fallback
             }
         };
@@ -372,6 +377,14 @@ impl Host {
                 "解码器「{id}」不支持裸数据参数化解码（缺少 iv_render_raw 导出）"
             )));
         };
+        // 与整幅路径同一套挂死归属：raw 也是外来 FFI，挂在这里必须能被超时监督者
+        // 认出来，也必须挡住本会话已熔断的解码器（见 `core::decode` 的 CURRENT_DECODER）。
+        crate::core::decode::report_current_decoder(&id);
+        if crate::core::decode::is_hung_decoder(&id) {
+            return Err(crate::core::error::ViewFailure::unsupported(format!(
+                "解码器「{id}」本次会话已因超时停用"
+            )));
+        }
         // 同一枚 DLL 的调用权（见 `dll_lock` 模块头）。
         let _dll = super::dll_lock::enter(key, &id, self.class())
             .map_err(crate::core::error::ViewFailure::unsupported)?;
@@ -614,6 +627,13 @@ impl Host {
 
         let mut last_err = String::new();
         for (key, id, f, last_error) in cands {
+            // 区域重渲同样要上报/检查：挂死在 `iv_render_region` 里时，超时监督者
+            // 必须能认出是这一枚，而不是拿上一笔整幅解码的 id 去熔断别人。
+            crate::core::decode::report_current_decoder(&id);
+            if crate::core::decode::is_hung_decoder(&id) {
+                last_err = format!("解码器「{id}」本次会话已因超时停用");
+                continue;
+            }
             let Ok(_dll) = super::dll_lock::enter(&key, &id, self.class()) else {
                 continue;
             };
@@ -649,8 +669,13 @@ impl Host {
                         anim: anim_of(region.index, &info),
                     }));
                 }
-                Err(e) => {
-                    last_err = format!("解码器「{id}」{e}");
+                Err((msg, fault)) => {
+                    // 崩溃/抛异常要照常计三振、区分介质故障：只拼成字符串会让一个
+                    // 在 `iv_render_region` 里稳定 AV 的解码器永远不被拉黑。
+                    if let Some(f) = fault {
+                        self.charge_fault(&id, f.as_ref());
+                    }
+                    last_err = format!("解码器「{id}」{msg}");
                     continue;
                 }
             }
@@ -1145,13 +1170,15 @@ pub(super) fn region_target(size: (f32, f32), density: f32) -> (u32, u32, f32) {
 /// （见本文件末尾的 `region_roundtrip_*` 用例）。
 ///
 /// 失败一律返回人话（`Err`），由调用方决定是换下一枚解码器还是交给上层。
+pub(super) type RegionFailure = (String, Option<Box<dyn std::any::Any + Send>>);
+
 pub(super) fn region_roundtrip(
     f: crate::core::abi::IvRenderRegionFn,
     last_error: unsafe extern "C" fn(*mut std::ffi::c_char, usize) -> i32,
     data: &[u8],
     req: &crate::core::abi::IvRegionReq,
     ext: Option<&std::ffi::CString>,
-) -> Result<(Bitmap, u32, u32, Vec<u8>, IvRenderOut), String> {
+) -> Result<(Bitmap, u32, u32, Vec<u8>, IvRenderOut), RegionFailure> {
     // ① 查询阶段：out = NULL（不写像素），拿画布尺寸与所需字节数。
     let mut info = IvRenderOut::default();
     let q = invoke(|| unsafe {
@@ -1168,23 +1195,26 @@ pub(super) fn region_roundtrip(
     match q {
         Ok(ERR_OK) => {}
         Ok(code) => {
-            return Err(format!(
-                "区域渲染查询失败（code={code}）：{}",
-                last_error_msg(last_error)
+            return Err((
+                format!(
+                    "区域渲染查询失败（code={code}）：{}",
+                    last_error_msg(last_error)
+                ),
+                None,
             ))
         }
-        Err(_) => return Err("区域渲染时出错（解码器崩溃或访问违规）".into()),
+        Err(e) => return Err(("区域渲染时出错（解码器崩溃或访问违规）".into(), Some(e))),
     }
     let (aw, ah) = (info.actual_w, info.actual_h);
     if aw == 0 || ah == 0 {
-        return Err("区域渲染返回了 0 尺寸".into());
+        return Err(("区域渲染返回了 0 尺寸".into(), None));
     }
     // 查询回报不可信：与常规解码同一道总预算闸，必须早于分段与分配。
     let px = aw as u64 * ah as u64;
     if px > MAX_PIXELS || info.bytes_needed > MAX_PIXELS * 4 {
-        return Err(too_large_msg(aw, ah));
+        return Err((too_large_msg(aw, ah), None));
     }
-    let (pix_len, icc_len) = out_segments(&info)?;
+    let (pix_len, icc_len) = out_segments(&info).map_err(|e| (e, None))?;
     // ② 渲染阶段：宿主按契约分配 `bytes_needed + icc_len`（缓冲由宿主分配，解码器只写）。
     let mut buf = vec![0u8; pix_len + icc_len];
     let r = invoke(|| unsafe {
@@ -1201,15 +1231,18 @@ pub(super) fn region_roundtrip(
     match r {
         Ok(ERR_OK) => {}
         Ok(code) => {
-            return Err(format!(
-                "区域渲染失败（code={code}）：{}",
-                last_error_msg(last_error)
+            return Err((
+                format!(
+                    "区域渲染失败（code={code}）：{}",
+                    last_error_msg(last_error)
+                ),
+                None,
             ))
         }
-        Err(_) => return Err("区域渲染时出错（解码器崩溃或访问违规）".into()),
+        Err(e) => return Err(("区域渲染时出错（解码器崩溃或访问违规）".into(), Some(e))),
     }
     let icc = take_icc(&mut buf, pix_len, icc_len);
-    let rgba = to_rgba8(buf, aw, ah, info.pixel_format, info.bit_depth)?;
+    let rgba = to_rgba8(buf, aw, ah, info.pixel_format, info.bit_depth).map_err(|e| (e, None))?;
     Ok((
         Bitmap {
             width: aw,

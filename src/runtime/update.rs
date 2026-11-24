@@ -66,12 +66,15 @@ impl Phase {
         }
     }
 
-    /// 超过这个时长还没回投终态 = 后台线程已经失联（HTTP 四阶段各 30 s，两条地址
-    /// 也走不完 90 s），届时把任务位收回，否则「检查更新」在本进程里就永久废了。
+    /// 超过这个时长还没回投终态 = 后台线程已经失联。
+    ///
+    /// 检查：单条 URL 最坏四阶段各 30 s、两条就是 240 s，必须大于它（旧的 90 s
+    /// 会让「超时回收任务位」与真线程并发，见 M02）。
+    /// 下载：按 64 MiB 包的最慢可接受速率给足余量。
     fn budget(self) -> Duration {
         match self {
-            Phase::Check => Duration::from_secs(90),
-            Phase::Download => Duration::from_secs(600),
+            Phase::Check => Duration::from_secs(300),
+            Phase::Download => Duration::from_secs(3600),
         }
     }
 }
@@ -80,12 +83,17 @@ struct Slot {
     phase: Option<Phase>,
     /// 任务位的到期时刻；`Phase::budget` 用尽即视为线程失联。
     deadline: Option<Instant>,
+    /// 当前任务代号：过期的线程回投终态时只丢事件、不回收新任务的任务位。
+    token: u64,
     events: Vec<Event>,
 }
+
+static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 static SLOT: Mutex<Slot> = Mutex::new(Slot {
     phase: None,
     deadline: None,
+    token: 0,
     events: Vec::new(),
 });
 
@@ -118,19 +126,26 @@ fn send(ev: Event) {
     bounded_push(&mut g.events, ev);
 }
 
-/// 终态：收回任务位，并且保证一定进得了队列。
-fn finish(ev: Event) {
+/// 终态：收回**自己那一笔**的任务位，并且保证一定进得了队列。
+fn finish(token: u64, ev: Event) {
     let mut g = lock();
+    if g.token != token {
+        // 这是一条已超时、已被新任务顶掉的旧线程：只丢事件，不许清掉新任务的任务位。
+        log::warn!("丢弃过期更新任务（token={token}）的终态");
+        return;
+    }
     g.phase = None;
     g.deadline = None;
     bounded_push(&mut g.events, ev);
 }
 
 /// 线程都没起来：任务位立刻放回空闲，调用方把具体原因交给 `poll` 弹提示。
-fn idle() {
+fn idle(token: u64) {
     let mut g = lock();
-    g.phase = None;
-    g.deadline = None;
+    if g.token == token {
+        g.phase = None;
+        g.deadline = None;
+    }
 }
 
 /// 有界追加（纯函数，单测可无头钉住）。进度帧可丢，终态把中间帧全顶掉也要进队。
@@ -154,7 +169,7 @@ fn bounded_push(events: &mut Vec<Event>, ev: Event) -> bool {
 }
 
 /// 抢占任务位。`Err` 里那句话是**可以直接 toast 的**（区分「正在检查」/「正在下载」）。
-fn begin(phase: Phase) -> Result<(), String> {
+fn begin(phase: Phase) -> Result<u64, String> {
     let mut g = lock();
     if let Some(cur) = g.phase {
         let expired = g.deadline.is_none_or(|d| Instant::now() >= d);
@@ -164,9 +179,11 @@ fn begin(phase: Phase) -> Result<(), String> {
         // 上一次的线程没有回投终态（起不来 / 卡在网络上）：明说一句再放行新任务。
         log::warn!("上一次更新任务超时未回投（{cur:?}），回收任务位");
     }
+    let token = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     g.phase = Some(phase);
     g.deadline = Some(Instant::now() + phase.budget());
-    Ok(())
+    g.token = token;
+    Ok(token)
 }
 
 fn spawn(name: &str, f: impl FnOnce() + Send + 'static) -> Result<(), String> {
@@ -317,8 +334,7 @@ fn apply(ctx: &mut EventCtx, hub: &Hub, ev: Event) {
 
 /// 内部入口：地址已由 UI 从 ini 读出、经 `core::update::Request` 投递过来。
 fn start_check_urls(urls: &[String; 2], source: usize) -> Result<(), String> {
-    begin(Phase::Check)?;
-    send(Event::CheckStarted);
+    let token = begin(Phase::Check)?;
     let first = source.min(1);
     let ordered = [urls[first].clone(), urls[1 - first].clone()];
     let spawned = spawn("rupix-update-check", move || {
@@ -326,17 +342,23 @@ fn start_check_urls(urls: &[String; 2], source: usize) -> Result<(), String> {
         // 上一轮只有一句「任务没能启动」时，两种原因在日志里长得一模一样。
         log::info!("检查更新：{}（备用 {}）", ordered[0], ordered[1]);
         let result = check_job(&ordered, first);
-        finish(match result {
-            Ok(update::Outcome::UpToDate { latest }) => Event::UpToDate(latest),
-            Ok(update::Outcome::Available(p)) => Event::Available(p),
-            Err(e) => Event::CheckFailed(e),
-        });
+        finish(
+            token,
+            match result {
+                Ok(update::Outcome::UpToDate { latest }) => Event::UpToDate(latest),
+                Ok(update::Outcome::Available(p)) => Event::Available(p),
+                Err(e) => Event::CheckFailed(e),
+            },
+        );
     });
     if let Err(e) = spawned {
-        idle();
+        idle(token);
         log::warn!("起不来检查线程：{e}");
         return Err("更新任务没能启动，请稍后重试".into());
     }
+    // ★ 「已开始」必须在线程真的起来之后再投：否则起线程失败时状态行先被改成
+    // 「正在检查…」、busy=true，而任务位已空，按钮永久禁用（M02）。
+    send(Event::CheckStarted);
     Ok(())
 }
 
@@ -375,21 +397,21 @@ fn check_job(urls: &[String; 2], source: usize) -> Result<update::Outcome, Strin
 
 /// 用户点说明窗里的「更新」后才下载。首选源失败自动换备用源。
 pub fn start_download(p: &Plan) -> Result<(), String> {
-    begin(Phase::Download)?;
-    send(Event::DownloadStarted);
+    let token = begin(Phase::Download)?;
     let plan = p.clone();
     let spawned = spawn("rupix-update-fetch", move || {
         log::info!("开始下载更新包 {}：{}", plan.version, plan.urls[0]);
         match download_job(&plan) {
-            Ok(()) => finish(Event::Ready),
-            Err(e) => finish(Event::DownloadFailed(e)),
+            Ok(()) => finish(token, Event::Ready),
+            Err(e) => finish(token, Event::DownloadFailed(e)),
         }
     });
     if let Err(e) = spawned {
-        idle();
+        idle(token);
         log::warn!("起不来下载线程：{e}");
         return Err("更新任务没能启动，请稍后重试".into());
     }
+    send(Event::DownloadStarted);
     Ok(())
 }
 
@@ -406,7 +428,6 @@ fn download_job(p: &Plan) -> Result<(), String> {
     }
     fs::create_dir_all(&stage).map_err(|e| format!("建解压目录失败：{e}"))?;
 
-    send(Event::DownloadStarted);
     let mut bytes: Option<Vec<u8>> = None;
     let mut errors = Vec::new();
     for url in [&p.urls[0], &p.urls[1]]

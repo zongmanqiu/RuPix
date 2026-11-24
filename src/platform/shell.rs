@@ -399,6 +399,13 @@ impl FileMenu {
         // SAFETY: 子类过程是 `extern "system"` 且只在这条线程上跑。
         let subclassed =
             unsafe { SetWindowSubclass(window, Some(menu_subclass), SUBCLASS_ID, 0).as_bool() };
+        if !subclassed {
+            // 装不上子类意味着图标与文字都会是空白格——那比"没有这一项"更让人
+            // 困惑，所以宁可什么都不弹。必须在 `TrackPopupMenuEx` **之前**返回：
+            // 它是模态调用，弹过之后再返回会把用户选中的命令丢掉（M-L33）。
+            log::warn!("系统菜单：owner-draw 转发没装上，这次不弹（避免弹出一片空格）");
+            return Ok(());
+        }
         HOOK.with(|c| c.set(&hook));
         // SAFETY: 菜单句柄、窗口句柄都由调用方保证存活；`TPM_RETURNCMD` 让返回值
         // 直接是命令 id 而不是 BOOL。`TPM_LEFTALIGN | TPM_TOPALIGN` 都是 0，省掉。
@@ -414,17 +421,9 @@ impl FileMenu {
         };
         HOOK.with(|c| c.set(std::ptr::null()));
         log::debug!("系统菜单：TrackPopupMenuEx → id={}", cmd.0);
-        if subclassed {
-            // SAFETY: 与上面的 `SetWindowSubclass` 成对。
-            unsafe {
-                let _ = RemoveWindowSubclass(window, Some(menu_subclass), SUBCLASS_ID);
-            }
-        } else {
-            // 装不上子类意味着图标与文字都会是空白格——那比"没有这一项"更让人
-            // 困惑，所以宁可什么都不弹。实测只有"同一 hwnd 同一 id 重复装"会走到
-            // 这里（正常路径不可能），留一条 warn 供取证。
-            log::warn!("系统菜单：owner-draw 转发没装上，这次不弹（避免弹出一片空格）");
-            return Ok(());
+        // SAFETY: 与上面的 `SetWindowSubclass` 成对。
+        unsafe {
+            let _ = RemoveWindowSubclass(window, Some(menu_subclass), SUBCLASS_ID);
         }
         // 菜单关掉之后按 MSDN 的收尾补一条空消息，免得焦点卡在已经消失的菜单上。
         // SAFETY: 窗口句柄有效。
@@ -447,6 +446,9 @@ impl FileMenu {
             hwnd: window,
             lpVerb: PCSTR((id - MENU_CMD_FIRST) as usize as *const u8),
             nShow: SW_SHOWNORMAL.0,
+            // `ptInvoke` 只有配上这面旗才生效（MSDN）；没有它坐标会被外壳忽略，
+            // 依赖点击点的动词会落到默认位置（M-L35）。
+            fMask: windows::Win32::UI::Shell::CMIC_MASK_PTINVOKE,
             ptInvoke: self.at,
             ..Default::default()
         };

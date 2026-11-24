@@ -156,7 +156,7 @@ pub fn plugin_hk_bootstrap(config: &Config) {
     let items = crate::extensions::plugin_hotkey_items(config);
     let keys: Vec<(String, String)> = items
         .iter()
-        .map(|(id, _, k, _)| (id.clone(), k.clone()))
+        .map(|item| (item.run_key.clone(), item.key.clone()))
         .collect();
     let text_count = PLUGIN_HK.with(|cell| {
         let mut b = cell.borrow_mut();
@@ -178,6 +178,9 @@ pub fn plugin_hk_bootstrap(config: &Config) {
             ui.rows = keys;
             ui.texts = items.iter().map(|_| signal(String::new())).collect();
         }
+        // 设置窗重开时旧捕获态必须复位：上次用标题栏 × 关窗不会触发框的 on_blur，
+        // 残留的 capturing 会让重开后的第一个按键被当成插件捕获（M54）。
+        ui.capturing.set(None);
         ui.texts.len()
     });
     let _ = text_count;
@@ -190,14 +193,19 @@ pub fn sync_plugin_hotkey_texts(config: &Config, capturing: Option<&str>) {
         return;
     };
     let items = crate::extensions::plugin_hotkey_items(config);
-    for (i, (id, _, _, raw)) in items.iter().enumerate() {
+    for item in items.iter() {
+        // 按行键找下标，不按"当前插件列表下标"：设置窗打开期间启停插件会改列表
+        // 顺序，按 i 写会把值写进别人的框（M54）。
+        let Some(i) = ui.rows.iter().position(|(id, _)| id == &item.run_key) else {
+            continue;
+        };
         let Some(text) = ui.texts.get(i) else {
             continue;
         };
-        let t = if capturing == Some(id.as_str()) {
+        let t = if capturing == Some(item.run_key.as_str()) {
             "按下按键…".to_string()
         } else {
-            Hotkey::from_spec(raw)
+            Hotkey::from_spec(&item.raw)
                 .map(|h| h.pretty())
                 .unwrap_or_else(|| "（空）".to_string())
         };
@@ -317,6 +325,22 @@ pub fn shortcuts_page(
             c.shift_wheel = def.shift_wheel;
         }
         crate::core::config::mark_dirty();
+        // 恢复默认键之后，插件里占着同一把键的设置必须清掉：运行期「内置优先」会把
+        // 插件键静默丢弃，界面却还显示着它（M54）。
+        let snapshot = cfg_def.borrow().clone();
+        for item in crate::extensions::plugin_hotkey_items(&snapshot) {
+            if let Some(hk) = Hotkey::from_spec(&item.raw) {
+                if snapshot.hotkeys.uses(&hk) {
+                    let _ = crate::extensions::set_plugin_hotkey(
+                        &snapshot,
+                        &item.run_key,
+                        &item.key,
+                        "",
+                    );
+                }
+            }
+        }
+        sync_plugin_hotkey_texts(&cfg_def.borrow(), None);
         // 下拉框选中项由信号驱动：写信号即刷 UI；config 也同步改掉，sync 时二者相等、
         // 不会重复标脏。
         h.dcb.set(def.dbl_click.index() as usize);
@@ -341,15 +365,15 @@ pub fn shortcuts_page(
     // 信号由 `plugin_hk_bootstrap`（开窗前）建好；这里只取，不在窗口内容里造。
     let plugin_texts = plugin_hk_ui().map(|u| u.texts).unwrap_or_default();
     let mut plugin_rows: Vec<Element> = Vec::new();
-    for (i, (id, name, _key, _)) in plugin_items.iter().enumerate() {
-        let label = format!("{name} > 快捷键");
+    for (i, item) in plugin_items.iter().enumerate() {
+        let label = format!("{} > {}", item.name, item.key);
         let text = match plugin_texts.get(i) {
             Some(t) => *t,
             None => continue,
         };
-        let id_click = id.clone();
+        let id_click = item.run_key.clone();
         let text_click = text;
-        let id_blur = id.clone();
+        let id_blur = item.run_key.clone();
         let cfg_blur = config.clone();
         let box_el = hotkey_box(
             text,

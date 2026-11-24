@@ -34,15 +34,17 @@ pub enum Value {
     Str(String),
     Arr(Vec<Value>),
     /// 对象按**键值对序列**存（不是 `HashMap`）：清单里的字段顺序是契约的一部分，
-    /// 保留顺序才能让"清单结构变了"这类 diff 一眼看出来；同名键取第一个（与浏览器一致）。
+    /// 保留顺序才能让"清单结构变了"这类 diff 一眼看出来；同名键**后者胜出**
+    /// （与 `JSON.parse` / 浏览器一致，2026-11-24 审计修正——旧实现取第一个，
+    /// 与注释声称的浏览器行为相反）。
     Obj(Vec<(String, Value)>),
 }
 
 impl Value {
-    /// 取对象字段；非对象或没有该键返回 `None`。
+    /// 取对象字段；非对象或没有该键返回 `None`。同名键取最后一个。
     pub fn get(&self, key: &str) -> Option<&Value> {
         match self {
-            Value::Obj(kv) => kv.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            Value::Obj(kv) => kv.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v),
             _ => None,
         }
     }

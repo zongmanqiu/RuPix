@@ -115,6 +115,10 @@ fn fit_image_into(w: u32, h: u32, max_w: u32, max_h: u32) -> (i32, i32) {
     let (fw, fh) = (w.max(1) as f64, h.max(1) as f64);
     let s = (mw / fw).min(mh / fh).min(1.0);
     let (mut cw, mut ch) = ((fw * s).round(), (fh * s).round());
+    // 极端宽高比（1×100000）会把短边算成 0，随后 `100.0/cw` 是 inf、尺寸饱和成
+    // i32::MAX。先把两边夹到至少 1。
+    cw = cw.max(1.0);
+    ch = ch.max(1.0);
     let s_min = (100.0 / cw).max(100.0 / ch);
     if s_min > 1.0 {
         cw *= s_min;
@@ -266,9 +270,13 @@ fn rebind_rotate(chrome: &Chrome, current: Option<&std::path::Path>) -> bool {
 /// 与极简模式不同，这里**直接拿配置当真值**：三个开关的所有入口（菜单、浮条、
 /// 标题栏、键盘）都当场写配置并推设置页（m53-L），不存在"只改窗口不改配置"的
 /// 临时态，所以不存在把用户操作每帧覆写回去的风险。
-fn apply_session_flags(chrome: &Chrome, cfg: &Config) -> bool {
+fn apply_session_flags(chrome: &Chrome, cfg: &Config, seen_gen: &std::cell::Cell<u64>) -> bool {
+    // 多窗口：`set_*` 只有第一个窗口看得到 changed=true，其余窗口靠全局代次
+    // 知道自己也该重绘（2026-11-24 审计 M09）。
+    let gen = crate::ui::chrome::session_flags_gen();
+    let mut changed = seen_gen.replace(gen) != gen;
     // m245：按钮显隐是全局配置的运行时镜像；值变了也要标脏，否则切换后不重绘。
-    let mut changed = crate::ui::chrome::set_toolbar_buttons(cfg.show_toolbar_buttons);
+    changed |= crate::ui::chrome::set_toolbar_buttons(cfg.show_toolbar_buttons);
     // m269：形态开关也是全局镜像；值变了要标脏，否则切换后不重绘、热区也还旧着。
     changed |= crate::ui::chrome::set_borderless(cfg.borderless);
     // 无边框不开放主辅视图：进入这个形态时把会话态收回单图，
@@ -495,6 +503,9 @@ struct WinRt {
     /// 只靠“改令牌的那一帧”标脏，只会有第一扇窗变色，其余窗口要等下一次输入。
     /// 每窗各存一份“见过的值”，窗口段差分标整窗。
     seen_theme: Cell<crate::ui::tokens::Theme>,
+    /// 上一次见到的全局会话镜像代次（工具按钮 / 无边框）。多窗口下让每扇窗
+    /// 都能对同一次切换重绘（M09）。
+    session_flags_seen: Cell<u64>,
     startup_ops: RefCell<Vec<StartOp>>,
     was_maximized: Cell<bool>,
     /// 无边框形态是否已经推给框架（框架默认不透明，故初值 false）。
@@ -530,6 +541,10 @@ impl Drop for WinRt {
     /// `HWND` 上继续投 `WM_TIMER`。
     fn drop(&mut self) {
         self.wake_hwnd.store(0, Ordering::Relaxed);
+        // 托盘「退出」走 `quit_app → DestroyWindow`，不经过 `WM_CLOSE`；窗口在这里
+        // 被销毁时把当前阅读位置落盘，否则 `run()` 返回后 `flush_reading` 的
+        // `Weak::upgrade` 全部失败，最后一次进度丢失（M01）。
+        self.save_reading_now();
     }
 }
 
@@ -602,6 +617,7 @@ impl WinRt {
             applied_opacity,
             applied_anim_autoplay: Cell::new(config.borrow().anim_autoplay),
             seen_theme: Cell::new(crate::ui::tokens::theme()),
+            session_flags_seen: Cell::new(crate::ui::chrome::session_flags_gen()),
             startup_ops,
             was_maximized: Cell::new(false),
             borderless_applied,
@@ -1064,10 +1080,7 @@ impl WinRt {
             self.chrome.companion.get(),
             self.chrome.companion_source.get(),
             self.chrome.companion_link.get(),
-            self.viewer
-                .borrow()
-                .anim_info()
-                .is_some_and(|a| a.has_index()),
+            self.viewer.borrow().anim_info().is_some_and(|a| a.paged),
         )
     }
 
@@ -1214,7 +1227,7 @@ impl WinRt {
         }
         // 三个会话态（m53-L）：所有切换入口都当场写配置并推设置页，所以配置
         // 是唯一真值——这里每帧对齐一次，设置页勾「棋盘格」也就即时上屏。
-        if apply_session_flags(&self.chrome, &config.borrow()) {
+        if apply_session_flags(&self.chrome, &config.borrow(), &self.session_flags_seen) {
             ctx.mark_dirty();
         }
         // 锁定兜底（m342 评审）：某个面板控件（分隔条 / 窗口按钮 / 卡片标题 / 滚动条）
@@ -1283,6 +1296,19 @@ impl WinRt {
             // 后，当前目录都变了）。比对放在收变化信号之前，保证新 watcher 装上后下一波
             // 变化能被收到。★ 借出来比（m106）：这一格每 16 ms 走一次，而目录几乎从不真变。
             let cur_dir = v.gallery_dir();
+            // 监控线程可能因网络盘掉线 / 句柄异常自己退出：结构体还在但已死。
+            // 把它当成"没装配"重臂一次，否则当前目录的自动刷新永久失效（M07）。
+            {
+                let dead = self
+                    .watcher
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|w| !w.is_alive());
+                if dead {
+                    *self.watcher.borrow_mut() = None;
+                    *self.watched_dir.borrow_mut() = None;
+                }
+            }
             let changed = {
                 let watched = self.watched_dir.borrow();
                 cur_dir != watched.as_deref()
@@ -1320,6 +1346,9 @@ impl WinRt {
                 }
                 if dirty {
                     self.last_dir_rescan.set(now);
+                    // 物理变化到达：先让清单缓存代次失效，再重扫（与旧 watcher 线程里
+                    // 的顺序一致，但依赖方向从 platform→core 收回运行时）。
+                    crate::core::gallery::note_dir_change();
                     // `_shared`：同一次文件变动会被每扇窗各报一次，只让第一扇窗真读盘
                     // （清单缓存在 `core::gallery::listing_for_event`，按代次失效）。
                     if v.rescan_dir_shared() {
@@ -1351,7 +1380,10 @@ impl WinRt {
         let ws = ctx.window_state();
         // 有待办的窗口动作时让路：同一帧只有一个窗口操作位，先发这个会把
         // 队列里那枚顶掉，而且 `window_pending` 已被清空、不会重试。
-        if self.restored_size_pending.get() && !ws.maximized && self.window_pending.get().is_none()
+        if self.restored_size_pending.get()
+            && !ws.maximized
+            && !ws.minimized
+            && self.window_pending.get().is_none()
         {
             // 尺寸**当帧从配置读**。过去这里用装配期捕获的那一份，于是「改了固定尺寸
             // → 最大化 → 还原」回到的是**旧**尺寸，新值非得重启才生效（审计 O3）。
@@ -1382,7 +1414,7 @@ impl WinRt {
         // ★ m271「图片尺寸」档：窗口客户区跟着**当前这张图**走，与无边框正交。
         //   换图（路径或自然尺寸变了）/ 改档 / 最大化都会重算；一拍只发一个窗口操作，
         //   槽被占就下一拍补，所以判据一律是「状态」不是「事件」。
-        if mode != InitWindow::Natural || ws.maximized {
+        if mode != InitWindow::Natural || ws.maximized || ws.minimized {
             // 离开该档、或正处在最大化：清账。回到常规态时按当前图重新开窗。
             *self.natural_size.borrow_mut() = None;
         } else if !window_op_sent {
@@ -2036,26 +2068,51 @@ mod tests {
     fn session_flags_follow_config() {
         let chrome = Chrome::new(false);
         let mut cfg = Config::default();
-        assert!(!apply_session_flags(&chrome, &cfg), "全默认不该报重绘");
+        assert!(
+            !apply_session_flags(
+                &chrome,
+                &cfg,
+                &Cell::new(crate::ui::chrome::session_flags_gen())
+            ),
+            "全默认不该报重绘"
+        );
 
         cfg.checker = true;
         cfg.filmstrip = true;
         cfg.locked = true;
-        assert!(apply_session_flags(&chrome, &cfg), "翻转要报重绘");
+        assert!(
+            apply_session_flags(
+                &chrome,
+                &cfg,
+                &Cell::new(crate::ui::chrome::session_flags_gen())
+            ),
+            "翻转要报重绘"
+        );
         assert!(
             chrome.strip_fit_request.get(),
             "刚打开条要请 paint 检查一次「放不下先放大窗口」"
         );
         chrome.strip_fit_request.set(false); // 相当于 paint 消费掉
         assert!(chrome.checker.get() && chrome.filmstrip.get() && chrome.locked.get());
-        assert!(!apply_session_flags(&chrome, &cfg), "已对齐后不该反复重绘");
+        assert!(
+            !apply_session_flags(
+                &chrome,
+                &cfg,
+                &Cell::new(crate::ui::chrome::session_flags_gen())
+            ),
+            "已对齐后不该反复重绘"
+        );
         assert!(
             !chrome.strip_fit_request.get(),
             "没有变化就不该反复请求放大（否则用户拉不小窗口）"
         );
 
         cfg.checker = false;
-        assert!(apply_session_flags(&chrome, &cfg));
+        assert!(apply_session_flags(
+            &chrome,
+            &cfg,
+            &Cell::new(crate::ui::chrome::session_flags_gen())
+        ));
         assert!(!chrome.checker.get(), "取消勾选棋盘格要当场生效");
         assert!(chrome.filmstrip.get(), "其余两位不该被顺手改掉");
     }

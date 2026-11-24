@@ -507,7 +507,10 @@ impl Viewer {
         if archive {
             hint == m.item
         } else {
-            hint.eq_ignore_ascii_case(&m.item)
+            // 与 `Gallery::slot_for` / `reading::same_path` 同一口径：归一化
+            // 分隔符方向、尾斜杠与 ASCII 大小写。只做大小写忽略会让 `/` 与 `\`
+            // 写法不同的记忆永远匹配不上（2026-11-24 审计 M30）。
+            crate::core::reading::same_path(Path::new(&m.item), Path::new(&hint))
         }
     }
 

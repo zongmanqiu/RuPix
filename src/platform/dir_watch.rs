@@ -46,6 +46,9 @@ pub struct DirWatcher {
     // （把 `HANDLE` 整个移进线程，外面就没有下手的地方了。）
     handle: HANDLE,
     stop: Arc<AtomicBool>,
+    /// 监控线程还活着吗。线程因任何错误（网络盘掉线、句柄被回收）退出时置 false，
+    /// runtime 据此重臂——旧实现线程死了但 `watcher` 仍是 `Some`，目录监控静默失效。
+    alive: Arc<AtomicBool>,
     /// 只用来**放手**（drop 掉 `JoinHandle` = detach），从不 `join`——见 [`DirWatcher::drop`]。
     thread: Option<JoinHandle<()>>,
 }
@@ -72,25 +75,43 @@ impl DirWatcher {
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         let stop = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
         // `HANDLE` 不保证 `Send`，改传其数值副本；`usize` 一定 `Send`。
         let handle_raw = handle.0 as usize;
         let stop_thread = stop.clone();
-        let thread = thread::Builder::new()
+        let alive_thread = alive.clone();
+        let thread = match thread::Builder::new()
             .name("dir-watch".into())
-            .spawn(move || watch_loop(handle_raw, tx, stop_thread))
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+            .spawn(move || {
+                watch_loop(handle_raw, tx, stop_thread);
+                alive_thread.store(false, Ordering::Relaxed);
+            }) {
+            Ok(t) => t,
+            Err(e) => {
+                // 线程没起来：已打开的目录句柄必须在这里关掉，否则每失败一次漏一枚。
+                let _ = unsafe { CloseHandle(handle) };
+                return Err(std::io::Error::other(e.to_string()));
+            }
+        };
 
         Ok(Self {
             handle,
             stop,
+            alive,
             thread: Some(thread),
         })
+    }
+
+    /// 监控线程是否还活着。runtime 用它发现"线程已死但结构体还在"并重臂。
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
     }
 }
 
 impl Drop for DirWatcher {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.alive.store(false, Ordering::Relaxed);
         // 先取消挂起的通知读，再关句柄。只关句柄**不保证**能叫醒阻塞中的
         // `ReadDirectoryChangesW`（微软给的正规打断方式是 `CancelIoEx(h, NULL)`——
         // 它取消这个句柄上**所有线程**发起的 I/O，正合我们"读在另一条线程上"的形状）。
@@ -145,11 +166,8 @@ fn watch_loop(raw: usize, tx: Sender<DirEvent>, stop: Arc<AtomicBool>) {
             // 句柄被 `Drop` 关掉（目录被删 / 重臂）都会走到这——正常退出。
             break;
         }
-        // 物理变化的**唯一**信号点：让清单缓存作废（`core::gallery::note_dir_change`）。
-        // 放在 `send` 之前——先作废再通知，避免某扇窗收到事件后按旧代次命中缓存。
-        // ★ N 扇窗就有 N 个 watcher，于是这里一次变化会递增 N 次；这是**故意**的：
-        //   代次只需要单调，而"多推几次"只会让缓存更早失效（偏保守），不会让它更晚。
-        crate::core::gallery::note_dir_change();
+        // 只发事件；清单缓存作废由上层（runtime）在收事件时统一做——`platform`
+        // 不该反向依赖 `core::gallery`（2026-11-24 审计 L45）。
         if tx.send(DirEvent::Changed).is_err() {
             break; // 接收端（runtime）已走，自然退出。
         }

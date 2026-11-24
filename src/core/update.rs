@@ -169,10 +169,12 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
     if root.as_array().is_some() || root.as_str().is_some() {
         return Err("update.json 根必须是对象".into());
     }
-    let version = field(&root, "version")?.trim().to_string();
-    if Version::parse(&version).is_none() {
-        return Err(format!("update.json 的 version 不合法：{version}"));
-    }
+    // 版本统一归一成 `主.次.补` 再入清单：解析器接受 `v1.2` / `1.2.3-rc1`，但包名
+    // 判定是逐字比较——不归一就会出现「清单能解析、地址永远匹配不上」的清单。
+    let version_raw = field(&root, "version")?.trim();
+    let version = Version::parse(version_raw)
+        .ok_or_else(|| format!("update.json 的 version 不合法：{version_raw}"))?
+        .to_string();
     let urls = root
         .get("urls")
         .ok_or_else(|| "update.json 缺字段 urls".to_string())?;
@@ -201,12 +203,20 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
 
 /// 清单地址白名单。
 pub fn is_safe_manifest_url(url: &str) -> bool {
-    MANIFEST_PREFIXES.iter().any(|p| url.starts_with(p))
+    official_url(url, &MANIFEST_PREFIXES)
 }
 
 /// 下载地址白名单。
 pub fn is_safe_asset_url(url: &str) -> bool {
-    ASSET_PREFIXES.iter().any(|p| url.starts_with(p))
+    official_url(url, &ASSET_PREFIXES)
+}
+
+/// 官方域 + 没有 `.`/`..` 段、没有反斜杠：只做前缀匹配时 `.../RuPix/../x` 也能过，
+/// 主机若做归一化就会把请求带到同主机的另一个路径（2026-11-24 审计 Q08）。
+fn official_url(url: &str, prefixes: &[&str]) -> bool {
+    prefixes.iter().any(|p| url.starts_with(p))
+        && !url.contains('\\')
+        && !url.split('/').any(|seg| seg == "." || seg == "..")
 }
 
 /// 版本对应的包名：`0.1.1` → `RuPix_0.1.1.zip`。

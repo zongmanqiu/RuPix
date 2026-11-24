@@ -146,6 +146,6 @@ fn garbage_values_never_panic() {
     let cfg = Config::load_from(&p);
     let _ = fs::remove_file(&p);
     assert!(!cfg.stay_on_top, "看不懂的布尔值应回退默认（0）");
-    assert_eq!(cfg.opacity, 90, "越界不透明度回退默认档");
+    assert_eq!(cfg.opacity, 100, "越界不透明度夹到上限（不是回落默认档）");
     assert_eq!(cfg.window_w, 800, "非数字宽高回退默认");
 }

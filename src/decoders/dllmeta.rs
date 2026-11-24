@@ -130,6 +130,10 @@ fn read_metadata(ptr: *const IvMetadata) -> Vec<(String, String)> {
     if meta.size < std::mem::size_of::<IvMetadata>() as u32
         || meta.field_count > MAX_FIELDS
         || (meta.field_count > 0 && meta.fields.is_null())
+        // 键语义版本 / reserved 是契约的一部分：不认识的新语义按旧含义读会
+        // 把 `vector_exts` 之类解析错（2026-11-24 审计 L54）。宁可整表不认。
+        || meta.version != crate::core::abi::METADATA_VERSION
+        || meta.reserved != 0
     {
         return Vec::new();
     }
@@ -201,6 +205,9 @@ pub(super) fn inspect(path: &Path) -> Inspect {
     match invoke(|| inspect_inner(path)) {
         Ok(v) => v,
         Err(_) => {
+            // 本进程在这枚 DLL 上出过硬故障：标记不能按"并发加载"放过，
+            // 否则下一轮扫描还会再撞一次（见 `marker::stale`）。
+            marker::note_fault(path);
             // SEH 硬故障不会跑 Rust 析构，标记会留下；本次也按"已跳过"收口，
             // 让设置页当场能显示/清除，而不是只报一句泛化错误。
             if marker::stale(path) {

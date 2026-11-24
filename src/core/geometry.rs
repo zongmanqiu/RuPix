@@ -30,7 +30,12 @@ pub fn oriented(rgba: Vec<u8>, w: u32, h: u32, o: i32) -> (Vec<u8>, u32, u32) {
         _ => return (rgba, w, h),
     };
     let (ow, oh) = if matches!(o, 5..=8) { (h, w) } else { (w, h) };
-    let mut out = vec![0u8; rgba.len()];
+    // 解码器违约给出短缓冲时不许越界：宁可交一张透明图，也不让 UI 线程 panic。
+    let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+    if rgba.len() < need {
+        return (vec![0u8; need], ow, oh);
+    }
+    let mut out = vec![0u8; need];
     for y in 0..oh {
         for x in 0..ow {
             let (sx, sy) = map(x, y, w, h);
@@ -70,6 +75,15 @@ fn fit_to_impl(
     max_h: u32,
     alpha_format: bool,
 ) -> Bitmap {
+    // 0 维图没有可缩的内容；直接交一张 1×1 透明图，别把 0 带进面积平均
+    // （`band` 在 n=0 时返回空区间，`acc / cnt` 会整数除零 panic）。
+    if w == 0 || h == 0 {
+        return Bitmap {
+            width: w.max(1),
+            height: h.max(1),
+            rgba: vec![0u8; (w.max(1) as usize) * (h.max(1) as usize) * 4],
+        };
+    }
     let (tw, th) = fit_dims(w, h, max_w, max_h);
     if (tw, th) == (w, h) {
         return Bitmap {
@@ -124,6 +138,13 @@ fn fit_oriented_impl(
     max_h: u32,
     alpha_format: bool,
 ) -> Bitmap {
+    if w == 0 || h == 0 {
+        return Bitmap {
+            width: w.max(1),
+            height: h.max(1),
+            rgba: vec![0u8; (w.max(1) as usize) * (h.max(1) as usize) * 4],
+        };
+    }
     if !matches!(o, 2..=8) {
         return fit_to_impl(rgba, w, h, max_w, max_h, alpha_format);
     }
@@ -165,10 +186,20 @@ pub fn fit_dims(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     if w == 0 || h == 0 {
         return (w.max(1), h.max(1));
     }
-    if max_w == 0 || max_h == 0 || (w <= max_w && h <= max_h) {
+    let sx = if max_w == 0 {
+        f64::INFINITY
+    } else {
+        max_w as f64 / w as f64
+    };
+    let sy = if max_h == 0 {
+        f64::INFINITY
+    } else {
+        max_h as f64 / h as f64
+    };
+    let s = sx.min(sy).min(1.0);
+    if s >= 1.0 {
         return (w, h);
     }
-    let s = (max_w as f64 / w as f64).min(max_h as f64 / h as f64);
     (
         ((w as f64 * s).floor() as u32).max(1),
         ((h as f64 * s).floor() as u32).max(1),
@@ -477,6 +508,9 @@ fn downscale_rows_opaque(
             }
             let cnt = rows * (sx1 - sx0) as u32;
             let d = &mut out[o + dx * 4..o + dx * 4 + 4];
+            if cnt == 0 {
+                continue;
+            }
             for c in 0..4 {
                 d[c] = (acc[c] / cnt) as u8;
             }
@@ -531,6 +565,9 @@ fn downscale_rows_alpha(
             let cnt = rows * (sx1 - sx0) as u32;
             let alpha = acc[3];
             let d = &mut out[o + dx * 4..o + dx * 4 + 4];
+            if cnt == 0 {
+                continue;
+            }
             d[3] = (alpha / cnt) as u8;
             for c in 0..3 {
                 d[c] = acc[c].checked_div(alpha).unwrap_or(0) as u8;

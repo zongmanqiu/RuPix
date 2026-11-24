@@ -111,6 +111,12 @@ impl PluginUi {
 
     /// 当前内存清单的摘要（切来源 / 安装完成后重算）。
     pub fn recompute_state(&self) {
+        // 没有清单时别把「清单异常，请「刷新」」覆盖成「0 个可下载」：状态行是用户
+        // 唯一的排障入口（与解码器卡同一条守卫，M51）。
+        if self.available.get().is_empty() {
+            self.bump();
+            return;
+        }
         let src = SourceId::from_ui_index(self.source.get());
         let state = summary(&self.available.get(), &self.installed.get(), src);
         self.set_state(state);
@@ -413,6 +419,7 @@ fn available_body(config: &Rc<RefCell<Config>>, ui: PluginUi) -> Element {
                 .visible_when(move || {
                     !ui.available_filter.get().trim().is_empty()
                         && ui.available_view.get().is_empty()
+                        && !ui.available.get().is_empty()
                 }),
         )
         .child(
@@ -430,7 +437,14 @@ fn available_body(config: &Rc<RefCell<Config>>, ui: PluginUi) -> Element {
 }
 
 fn installed_row(ext: Extension, config: Rc<RefCell<Config>>, ui: PluginUi) -> Element {
-    let enabled = signal(ext.enabled);
+    // 从配置算初值：停用后行因搜索/刷新重建时，旧快照会把开关画回「开」（M50）。
+    let enabled = signal(
+        !config
+            .borrow()
+            .extensions_disabled
+            .iter()
+            .any(|x| x == &ext.manifest.id),
+    );
     let show_info = {
         let ext = ext.clone();
         let config = config.clone();

@@ -31,7 +31,7 @@
 
 ```powershell
 cd main
-python build\release_pack.py --version 0.4.0
+python build\release_pack.py --version 0.4.1
 ```
 
 产出在 `../.temp/release-out/`，只有一个包：
@@ -47,7 +47,7 @@ python build\release_pack.py --version 0.4.0
 - 解码器许可文件夹从 `.temp/decoder-packages/<id>_<ver>.stage/<id>_<ver>/` 取；缺任何
   一枚，`release_pack.py` 直接中止，不会生成"少一个文件夹"的包。
 - 打包固定 7-Zip 标准 ZIP/Deflate（`-mx=9 -mtm=off -mta=off -mtc=off`）。
-- **0.4.0 自动更新暂停**：0.3.x 更新器只接受四文件包，遇到 `decoders/` 会拒绝；本版不
+- **0.4.x 自动更新暂停**：0.3.x 更新器只接受四文件包，遇到 `decoders/` 会拒绝；本版不
   发布新的 `update.json`，0.3.x 用户手动下载。下一版先把更新器改成接受这个单包，再恢复
   自动更新；不再另造"更新信封"。
 

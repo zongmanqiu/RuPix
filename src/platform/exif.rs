@@ -189,7 +189,10 @@ fn locate_png_exif(bytes: &[u8]) -> Option<usize> {
         if typ == b"eXIf" && len >= 8 {
             return Some(data);
         }
-        if typ == b"IDAT" || typ == b"IEND" {
+        // 只有 IEND 才终止。PNG 规范只禁止 eXIf 出现在 IDAT **分块中间**，
+        // 允许它在 IDAT 之后（部分手机/ExifTool 导出就这样）；旧实现在第一个
+        // IDAT 早退，这类合法 PNG 永远读不到拍摄信息（2026-11-24 审计 Q-EXIF）。
+        if typ == b"IEND" {
             return None;
         }
         // 跳到下一 chunk：payload + 4B CRC
@@ -289,6 +292,10 @@ fn parse_tiff(tiff: &[u8]) -> ExifInfo {
     // 工作量预算：见 [`EXIF_MAX_ENTRIES`]。合法文件的条目总数远够不着，只有畸形
     // 结构会被它截断（截断=停止采集，已采到的字段照常显示）。
     let mut budget = exif_budget(tiff.len());
+    // 字节预算：真正的 UI 线程冻结来自"65535 条 × 每条复制整段 TIFF"，只数条目
+    // 拦不住。上界取 2×TIFF 长度（合法文件所有字符串加起来也到不了），超过就停止
+    // 采集（已采到的字段照常显示）。
+    let mut bytes_left = tiff.len().saturating_mul(2).max(4096);
     walk(
         tiff,
         &endian,
@@ -298,6 +305,7 @@ fn parse_tiff(tiff: &[u8]) -> ExifInfo {
         false,
         &mut visited,
         &mut budget,
+        &mut bytes_left,
     );
     build_info(&c)
 }
@@ -330,6 +338,7 @@ fn walk(
     in_gps: bool,
     visited: &mut HashSet<(usize, bool)>,
     budget: &mut usize,
+    bytes: &mut usize,
 ) {
     if depth > MAX_DEPTH {
         return;
@@ -352,6 +361,10 @@ fn walk(
         match budget.checked_sub(1) {
             Some(rest) => *budget = rest,
             None => return,
+        }
+        // 条目本身也吃工作量；真正的大头是下面的字符串复制，按字节另外扣。
+        if !charge(bytes, 12) {
+            return;
         }
         let Some(tag) = e.u16(tiff, p) else {
             return;
@@ -391,41 +404,74 @@ fn walk(
                 }
             }
         };
+        // ── 已知 tag 的**类型必须对**：声明成错误的类型时，读取器会把邻居条目的
+        //    字节当成本条目的值（0x829A 声明成 ASCII 会把下一条的 tag/type/count
+        //    读成快门速度）。类型不符一律跳过（2026-11-24 审计 M48）。
+        let ascii = ty == 2;
+        let rational = ty == 5 || ty == 10;
         // GPS 子 IFD 用低位 tag 号（0x0001..0x0006），与 TIFF/EXIF 主 IFD 的
         // tag 号可能重号——靠 `in_gps` 上下文标志分派，不看 depth。
         if in_gps {
             match tag {
-                0x0001 => c.gps_lat_ref = read_ascii(tiff, e, vbase, n as usize, inline),
-                0x0002 => c.gps_lat = read_dms(tiff, e, vbase, inline, n as usize),
-                0x0003 => c.gps_lon_ref = read_ascii(tiff, e, vbase, n as usize, inline),
-                0x0004 => c.gps_lon = read_dms(tiff, e, vbase, inline, n as usize),
-                0x0005 => {
+                0x0001 if ascii && charge(bytes, n as usize) => {
+                    c.gps_lat_ref = read_ascii(tiff, e, vbase, n as usize, inline)
+                }
+                0x0002 if rational && charge(bytes, 24) => {
+                    c.gps_lat = read_dms(tiff, e, vbase, inline, n as usize)
+                }
+                0x0003 if ascii && charge(bytes, n as usize) => {
+                    c.gps_lon_ref = read_ascii(tiff, e, vbase, n as usize, inline)
+                }
+                0x0004 if rational && charge(bytes, 24) => {
+                    c.gps_lon = read_dms(tiff, e, vbase, inline, n as usize)
+                }
+                0x0005 if ty == 1 => {
                     // AltitudeRef：BYTE 单值，TIFF 左对齐 → 首字节即值。
                     // 0=海平面以上，1=以下。不看字节序（BYTE 是单字节）。
                     c.gps_alt_below = tiff.get(p + 8).copied().unwrap_or(0) == 1;
                 }
-                0x0006 => c.gps_alt = read_rational(tiff, e, vbase, inline),
+                0x0006 if rational && charge(bytes, 8) => {
+                    c.gps_alt = read_rational(tiff, e, vbase, inline)
+                }
                 _ => {}
             }
             p += 12;
             continue;
         }
         match tag {
-            0x010F => c.make = read_ascii(tiff, e, vbase, n as usize, inline),
-            0x0110 => c.model = read_ascii(tiff, e, vbase, n as usize, inline),
+            0x010F if ascii && charge(bytes, n as usize) => {
+                c.make = read_ascii(tiff, e, vbase, n as usize, inline)
+            }
+            0x0110 if ascii && charge(bytes, n as usize) => {
+                c.model = read_ascii(tiff, e, vbase, n as usize, inline)
+            }
             // Orientation（274）：SHORT 单值，存在 value/offset 字段的**低半部**（m48 那条
             // 同族坑）。0 保持"没有标签"，与解码器侧照实回报的口径一致。
             0x0112 => {
                 c.orientation = read_short_or_long(tiff, e, vbase, ty, inline).unwrap_or(0) as u16;
             }
             0x0132 => { /* DateTime (改过时间)，暂不采集 */ }
-            0x829A => c.exposure_time = read_rational(tiff, e, vbase, inline),
-            0x829D => c.fnumber = read_rational(tiff, e, vbase, inline),
+            0x829A if rational && charge(bytes, 8) => {
+                c.exposure_time = read_rational(tiff, e, vbase, inline)
+            }
+            0x829D if rational && charge(bytes, 8) => {
+                c.fnumber = read_rational(tiff, e, vbase, inline)
+            }
             0x8769 => {
                 // ExifIfd 子 IFD 指针（LONG 单值，存于 value/offset 位置）
                 if let Some(sub) = e.u32(tiff, p + 8) {
                     if sub > 0 {
-                        walk(tiff, e, sub as usize, c, depth + 1, false, visited, budget);
+                        walk(
+                            tiff,
+                            e,
+                            sub as usize,
+                            c,
+                            depth + 1,
+                            false,
+                            visited,
+                            budget,
+                            bytes,
+                        );
                     }
                 }
             }
@@ -433,17 +479,44 @@ fn walk(
                 // GPSInfo 子 IFD 指针
                 if let Some(sub) = e.u32(tiff, p + 8) {
                     if sub > 0 {
-                        walk(tiff, e, sub as usize, c, depth + 1, true, visited, budget);
+                        walk(
+                            tiff,
+                            e,
+                            sub as usize,
+                            c,
+                            depth + 1,
+                            true,
+                            visited,
+                            budget,
+                            bytes,
+                        );
                     }
                 }
             }
             0x8827 => c.iso = read_short_or_long(tiff, e, vbase, ty, inline),
-            0x9003 => c.datetime_orig = read_ascii(tiff, e, vbase, n as usize, inline),
-            0x920A => c.focal_length = read_rational(tiff, e, vbase, inline),
-            0xA434 => c.lens_model = read_ascii(tiff, e, vbase, n as usize, inline),
+            0x9003 if ascii && charge(bytes, n as usize) => {
+                c.datetime_orig = read_ascii(tiff, e, vbase, n as usize, inline)
+            }
+            0x920A if rational && charge(bytes, 8) => {
+                c.focal_length = read_rational(tiff, e, vbase, inline)
+            }
+            0xA434 if ascii && charge(bytes, n as usize) => {
+                c.lens_model = read_ascii(tiff, e, vbase, n as usize, inline)
+            }
             _ => {}
         }
         p += 12;
+    }
+}
+
+/// 扣字节预算；不够就拒绝这一次读取（畸形条目不再复制整段 TIFF）。
+fn charge(bytes: &mut usize, cost: usize) -> bool {
+    match bytes.checked_sub(cost) {
+        Some(rest) => {
+            *bytes = rest;
+            true
+        }
+        None => false,
     }
 }
 
@@ -681,7 +754,18 @@ mod tests {
             let e = Endian { le: true };
             let mut c = Collected::default();
             let mut free = usize::MAX;
-            walk(&t, &e, 8, &mut c, 0, false, &mut HashSet::new(), &mut free);
+            let mut bytes = usize::MAX;
+            walk(
+                &t,
+                &e,
+                8,
+                &mut c,
+                0,
+                false,
+                &mut HashSet::new(),
+                &mut free,
+                &mut bytes,
+            );
             c
         };
         assert_eq!(c.exposure_time, Some(1.0 / 250.0));
@@ -708,7 +792,18 @@ mod tests {
         let e = Endian { le: true };
         let mut c = Collected::default();
         let mut free = usize::MAX;
-        walk(&t, &e, 8, &mut c, 0, false, &mut HashSet::new(), &mut free);
+        let mut bytes = usize::MAX;
+        walk(
+            &t,
+            &e,
+            8,
+            &mut c,
+            0,
+            false,
+            &mut HashSet::new(),
+            &mut free,
+            &mut bytes,
+        );
         assert!(
             c.make.is_empty(),
             "未知类型不许从邻近字节拼出值：{:?}",
@@ -732,7 +827,18 @@ mod tests {
         let e = Endian { le: true };
         let mut c = Collected::default();
         let mut free = usize::MAX;
-        walk(&t, &e, 8, &mut c, 0, false, &mut HashSet::new(), &mut free);
+        let mut bytes = usize::MAX;
+        walk(
+            &t,
+            &e,
+            8,
+            &mut c,
+            0,
+            false,
+            &mut HashSet::new(),
+            &mut free,
+            &mut bytes,
+        );
         assert_eq!(
             c.exposure_time, None,
             "count=0 不许从下一条目/next-IFD 拼出一个值"
@@ -1103,7 +1209,18 @@ mod tests {
         let mut col = Collected::default();
         let mut visited = HashSet::new();
         let mut free = usize::MAX;
-        walk(&t, &e, 8, &mut col, 0, false, &mut visited, &mut free);
+        let mut bytes = usize::MAX;
+        walk(
+            &t,
+            &e,
+            8,
+            &mut col,
+            0,
+            false,
+            &mut visited,
+            &mut free,
+            &mut bytes,
+        );
         assert_eq!(
             visited.len(),
             4,
@@ -1200,6 +1317,7 @@ mod tests {
         let e = Endian { le: false };
         let mut col = Collected::default();
         let mut budget = 7usize;
+        let mut bytes = usize::MAX;
         walk(
             &t,
             &e,
@@ -1209,6 +1327,7 @@ mod tests {
             false,
             &mut HashSet::new(),
             &mut budget,
+            &mut bytes,
         );
         assert_eq!(
             budget, 0,

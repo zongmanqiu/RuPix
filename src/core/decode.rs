@@ -221,6 +221,9 @@ pub fn infer_raw_params_for(ext: &str, len: u64) -> Option<RawParams> {
         1.0,
         5.0 / 4.0,
         16.0 / 10.0,
+        32.0 / 9.0,
+        21.0 / 9.0,
+        2.39,
     ] {
         let ideal = ((total as f64 / num as f64) * aspect).sqrt();
         let center = ideal as u64;
@@ -254,7 +257,9 @@ pub fn infer_raw_params_for(ext: &str, len: u64) -> Option<RawParams> {
         return Some(params);
     }
 
-    // No standard aspect (e.g. a deliberate strip): fall back to common widths.
+    // No standard aspect (e.g. a deliberate strip): fall back to the first common
+    // width that divides evenly. 标准比例（含 32:9 / 21:9）在上面已经优先命中，
+    // 这里只服务“打成条”的抓帧（4096×66 这类），保持清单顺序可预期。
     const WIDTHS: &[u64] = &[
         4096, 1920, 2048, 3840, 2560, 1280, 640, 1024, 1600, 3000, 3200, 4000, 5120, 5760, 6000,
         6144, 6400, 7680, 8000, 8192, 10000, 12000, 16384,
@@ -1111,11 +1116,17 @@ fn with_backend<T>(
 
 static DECODE_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(20_000);
 
-/// 正在解码的那个解码器 id（由 `decoders::decode_with` 上报）。
+/// 正在解码的那个解码器 id（由各解码入口上报）。
 ///
 /// 为什么用全局而不是 thread-local：读它的**不是**解码线程，而是超时后的监督者
 /// （worker 已经卡死，问不了它）。写入频率 = 每笔解码一次，代价是一次短锁。
-static CURRENT_DECODER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+///
+/// ★ 2026-11-24：带上是哪一笔（`seq`）。旧实现只有一个 `Option<String>`，worker
+///   每笔结束又不清它，于是「这一笔在进解码器之前就卡住」时监督者读到的是**上一笔**
+///   的解码器 id，把无辜解码器熔断、真凶照常放行；多窗口并发时还会串到别的窗口。
+///   `seq` 取自解码线程的 `CURRENT_SEQ`（每笔开始由 `set_current_req` 写入），
+///   超时分支只认与被打断那一笔相同的 id。
+static CURRENT_DECODER: std::sync::Mutex<Option<(u64, String)>> = std::sync::Mutex::new(None);
 
 /// 这一笔解码**走到哪一段了**（诊断坐标）。
 ///
@@ -1207,22 +1218,36 @@ pub fn decode_timeout() -> Option<Duration> {
     }
 }
 
-/// 上报"下一步要进哪个解码器"。由 `decoders::decode_with` 在拿到 id 后立刻调。
+/// 上报"下一步要进哪个解码器"。由各解码入口在拿到 id 后立刻调。
+///
+/// `seq` 取解码线程自己的 `CURRENT_SEQ`：探针/直调路径没有 UI 在等（seq=0），
+/// 不上报——否则超时分支会把一条无主的 id 算到别人头上。
 pub(crate) fn report_current_decoder(id: &str) {
+    let seq = CURRENT_SEQ.with(|c| c.get());
+    if seq == 0 {
+        return;
+    }
     let mut g = CURRENT_DECODER.lock().unwrap_or_else(|e| e.into_inner());
-    *g = Some(id.to_string());
+    *g = Some((seq, id.to_string()));
 }
 
 /// 当前解码器 id 的人读形式（诊断日志用；`current_decoder` 是它的私有底座）。
 pub fn current_decoder_name() -> Option<String> {
-    current_decoder()
+    current_decoder().map(|(_, id)| id)
 }
 
-fn current_decoder() -> Option<String> {
+fn current_decoder() -> Option<(u64, String)> {
     CURRENT_DECODER
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
+}
+
+/// 只在这一笔自己的上报存在时返回 id：`seq` 不匹配 = 上一笔的残留，不能拿它熔断。
+fn current_decoder_for(seq: u64) -> Option<String> {
+    current_decoder()
+        .filter(|(s, _)| *s == seq)
+        .map(|(_, id)| id)
 }
 
 /// 该解码器是否已在本次会话被熔断（挂死过）。`decoders::decode_with` 用它挡在调用之前。
@@ -1233,7 +1258,8 @@ pub fn is_hung_decoder(id: &str) -> bool {
         .any(|x| x == id)
 }
 
-/// 取走**尚未上报**的熔断 id（`runtime` 取走 → 写进 `decoders_disabled` 落盘 + 提示）。
+/// 取走**尚未上报**的熔断 id（`runtime` 取走后只在本会话 `decoders::add_disabled` +
+/// 提示，**不写 ini**——2026-11-04 口径：一次偶发挂死不该变成「该格式永久打不开」）。
 ///
 /// 取走之后 `is_hung_decoder` 仍然为真（那是本会话的判据，不是待办队列）。
 pub fn take_hung_decoders() -> Vec<String> {
@@ -1412,7 +1438,7 @@ fn decode_loop(
                     .unwrap_or_default(),
                 req.max_w,
                 req.max_h,
-                req.allow_scaled,
+                scaled_of(&req),
                 req.seq,
                 if cancelled { "作废" } else { "解" }
             );
@@ -1432,7 +1458,7 @@ fn decode_loop(
                     // 是新的后端实例，它进不进那个 DLL 由 `decode_with` 的
                     // `is_hung_decoder` 挡（本会话立即生效）；先记熔断再换线程只是让日志
                     // 的因果顺序好读。
-                    let hung = current_decoder();
+                    let hung = current_decoder_for(req.seq);
                     if let Some(id) = hung.as_deref() {
                         note_hung(id);
                     }
@@ -1648,7 +1674,8 @@ pub fn probe_scaled(path: &Path, max_w: u32, max_h: u32) -> Result<Decoded, Stri
 }
 
 /// 缩略图口径的探针：与 [`probe_decode`] 走**同一条生产链路**，但请求语义换成
-/// [`ReqKind::Thumb`]——带缩放意图，与真实缩略图请求逐字节同形。
+/// [`ReqKind::Thumb`]——带缩放意图。裸像素同样取会话参数：真实缩略图走的是
+/// `request_raw`，探针不带 `raw` 会对 `.bgra/.rgb/…` 给出与线上相反的结论。
 ///
 /// 存在的理由只有一个：缩放腿的账必须在生产链路上量（读文件 + probe + 查询阶段 +
 /// 解码 + `fit_to` 补齐），库层面的对比 本仓历史记录 §缩略图档已经做过。
@@ -1660,7 +1687,7 @@ pub fn probe_thumb(path: &Path, max_w: u32, max_h: u32) -> Result<Decoded, Strin
         max_h,
         region: None,
         frame_index: 0,
-        raw: None,
+        raw: get_raw_params(path),
         kind: ReqKind::Thumb,
         allow_scaled: false,
     };

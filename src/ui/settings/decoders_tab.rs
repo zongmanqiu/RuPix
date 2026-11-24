@@ -225,7 +225,10 @@ pub fn decoder_row(
     config: Rc<RefCell<Config>>,
     hint: Option<String>,
 ) -> Element {
-    let sig = signal(e.enabled);
+    // 初值从**配置**算，不取 `e.enabled` 快照：停用后列表因搜索词变化重建时，
+    // 旧快照会把开关画回「开」，与配置相反（2026-11-24 审计 M49）。
+    let enabled_now = !config.borrow().decoders_disabled.iter().any(|x| x == &e.id);
+    let sig = signal(enabled_now);
     let id = e.id.clone();
     let detail_entry = e.clone();
 
@@ -267,6 +270,7 @@ pub fn decoder_row(
     let change = {
         let config = config.clone();
         let id = id.clone();
+        let h = *h;
         move |on: bool| {
             let mut c = config.borrow_mut();
             if on {
@@ -280,6 +284,9 @@ pub fn decoder_row(
             // 开关当场 +1，让格式清单与解码行为同拍生效（与「刷新」按钮同一入口）。
             crate::decoders::request_rescan();
             crate::core::config::mark_dirty();
+            // 开关改了「已安装 / 首选解码器」两张卡的内容：让下一拍重扫，
+            // 否则首选卡仍列着刚停用的解码器（M49）。
+            h.decoders_seen.set(false);
             log::info!("解码器「{id}」已{}", if on { "启用" } else { "停用" });
         }
     };

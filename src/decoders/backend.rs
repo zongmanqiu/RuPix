@@ -103,9 +103,18 @@ impl crate::core::decode::DecodeBackend for Host {
                     thumbnail,
                 )
                 .unwrap_or_else(|| {
-                    Err(ViewFailure::other(
-                        "裸数据文件没有尺寸信息：请从「打开…」重新选择该文件以指定宽/高/布局",
-                    ))
+                    // `None` = 没有任何解码器认领，**不是**「普通解码失败」。相机 RAW
+                    // 有完整文件头，没有对应解码器时让用户去填宽高只会白忙；只有真正的
+                    // 无头格式才给参数窗引导（2026-11-24 审计 L53）。
+                    if crate::core::decode::is_headerless_ext(ext) {
+                        Err(ViewFailure::other(
+                            "裸数据文件没有尺寸信息：请从「打开…」重新选择该文件以指定宽/高/布局",
+                        ))
+                    } else {
+                        Err(ViewFailure::unsupported(format!(
+                            "没有解码器支持 .{ext}（解码器缺失或已停用）"
+                        )))
+                    }
                 });
         }
         // 位图全部交给解码器。没有解码器认领时给出可行动的提示，而不是一句含混的"打不开"。

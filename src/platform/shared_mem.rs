@@ -27,6 +27,10 @@ use windows::Win32::System::Memory::{
 pub const HEADER_LEN: usize = 32;
 const MAGIC: &[u8; 8] = b"RPXIMG01";
 
+/// 一份图像映射的硬上限。插件可以把 stride/height 声明成任意值，宿主不能照单全收：
+/// 128M 像素（≈512 MiB RGBA）已经远超任何编辑场景，超过就是恶意或写错。
+const MAX_SHARED_BYTES: usize = 512 << 20;
+
 /// 一份已映射的 RGBA 图像。
 ///
 /// `view` 的生命周期与 `Self` 绑定；`pixels()` 返回的切片在 drop 前有效。
@@ -60,6 +64,16 @@ impl SharedImage {
             )
         }
         .map_err(|e| format!("CreateFileMappingW({name}) 失败：{e}"))?;
+        // 同名对象已存在时 `CreateFileMappingW` 会"成功"返回已有对象的句柄，
+        // 只在 GetLastError 里留一个 ERROR_ALREADY_EXISTS。名字可预测（pid+自增），
+        // 不查这一位就等于允许同用户进程先建一个同名 section 抢注我们的图像。
+        let last = unsafe { windows::Win32::Foundation::GetLastError() };
+        if last == windows::Win32::Foundation::ERROR_ALREADY_EXISTS {
+            let _ = unsafe { CloseHandle(handle) };
+            return Err(format!(
+                "共享内存名 {name} 已被占用（可能是抢注），拒绝复用"
+            ));
+        }
 
         let view = unsafe { MapViewOfFile(handle, FILE_MAP_WRITE, 0, 0, total) };
         if view.Value.is_null() {
@@ -85,6 +99,11 @@ impl SharedImage {
     pub fn open(name: &str) -> Result<Self, String> {
         if !name.starts_with("Local\\rupix-ext-") {
             return Err("共享内存名必须以 Local\\rupix-ext- 开头".into());
+        }
+        // `Local\rupix-ext-host-*` 是宿主**送进去的输入图**。插件把它原样回传，
+        // 宿主就会把输入当成编辑结果接受（一次静默的 no-op 编辑）；这里直接拒绝。
+        if name.starts_with("Local\\rupix-ext-host-") {
+            return Err("插件不能把宿主送进来的输入图当作结果回传".into());
         }
         let name_w = wide(name);
         let handle = unsafe { OpenFileMappingW(FILE_MAP_READ.0, false, PCWSTR(name_w.as_ptr())) }
@@ -220,9 +239,11 @@ fn validate(name: &str, width: u32, height: u32, stride: u32) -> Result<(), Stri
     if width == 0 || height == 0 {
         return Err("共享内存尺寸不能为 0".into());
     }
-    let min_stride = width.checked_mul(4).ok_or("宽度溢出")?;
-    if stride < min_stride {
-        return Err(format!("stride {stride} < width*4 {min_stride}"));
+    let expected = width.checked_mul(4).ok_or("宽度溢出")?;
+    if stride != expected {
+        return Err(format!(
+            "stride 必须等于 width*4（收到 {stride}，期望 {expected}；不支持行填充）"
+        ));
     }
     if !name.is_empty() && !name.starts_with("Local\\rupix-ext-") {
         return Err("共享内存名必须以 Local\\\\rupix-ext- 开头".into());
@@ -234,8 +255,8 @@ fn pixel_len(width: u32, height: u32, stride: u32) -> Result<usize, String> {
     let stride = stride as usize;
     let height = height as usize;
     let len = stride.checked_mul(height).ok_or("像素长度溢出")?;
-    if len > u32::MAX as usize {
-        return Err("像素长度超过 4 GiB".into());
+    if len > u32::MAX as usize || len > MAX_SHARED_BYTES {
+        return Err(format!("像素长度 {len} 超过上限 {MAX_SHARED_BYTES} 字节"));
     }
     let _ = width;
     Ok(len)

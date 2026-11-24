@@ -58,7 +58,37 @@ pub fn shell(content: Vec<Element>, right: Vec<Element>) -> Element {
 /// 左侧还挂了一组按钮（对象级动作，例如「还原」）时的壳。
 ///
 /// 两组之间是弹性空白，因此右侧那组**永远贴右**，与左侧有几颗按钮无关。
-pub fn shell_split(content: Vec<Element>, left: Vec<Element>, right: Vec<Element>) -> Element {
+/// 内容可滚动版的壳：内容区吃满剩余高度，底栏固定贴底。
+///
+/// 用于设置项数量不定的对话框（插件参数窗）——直接 `shell` + 很多行会把底栏挤出
+/// `fit_content` 上限，窗口又不可缩放，按钮就点不到了（2026-11-24 审计 M52）。
+pub fn shell_scroll(content: Vec<Element>, right: Vec<Element>) -> Element {
+    let body = Element::col().fill().spacing(GAP).children(content);
+    let scroll = Element::scroll().weight(1.0).child(body);
+    let bar = footer_bar(Vec::new(), right);
+    Element::col()
+        .fill()
+        .padding(DIALOG_PAD)
+        .spacing(GAP)
+        .child(scroll)
+        .child(bar)
+}
+
+/// 内容自己吃掉剩余高度的壳（没有尾部弹性空白）。
+///
+/// 给「正文本来就是 weight(1.0)」的窗用：`shell` 的尾部 spacer 会与正文各分一半，
+/// 文本区只到窗口中段（2026-11-24 审计 M55）。
+pub fn shell_fill(content: Vec<Element>, right: Vec<Element>) -> Element {
+    let bar = footer_bar(Vec::new(), right);
+    Element::col()
+        .fill()
+        .padding(DIALOG_PAD)
+        .spacing(GAP)
+        .children(content)
+        .child(bar)
+}
+
+fn footer_bar(left: Vec<Element>, right: Vec<Element>) -> Element {
     let mut bar = Element::row()
         .cross(Align::Center)
         .spacing(GAP)
@@ -67,8 +97,11 @@ pub fn shell_split(content: Vec<Element>, left: Vec<Element>, right: Vec<Element
         bar = bar.children(left);
     }
     bar = bar.child(Element::flex_spacer());
-    let bar = bar.children(right);
+    bar.children(right)
+}
 
+pub fn shell_split(content: Vec<Element>, left: Vec<Element>, right: Vec<Element>) -> Element {
+    let bar = footer_bar(left, right);
     Element::col()
         .fill()
         .padding(DIALOG_PAD)

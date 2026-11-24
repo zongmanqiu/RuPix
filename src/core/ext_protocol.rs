@@ -68,8 +68,11 @@ impl ImageRef {
         if width == 0 || height == 0 {
             return Err("图像尺寸不能为 0".into());
         }
-        if stride < width.saturating_mul(4) {
-            return Err("stride 小于 width*4".into());
+        let expected = width.saturating_mul(4);
+        if stride != expected {
+            return Err(format!(
+                "stride 必须等于 width*4（收到 {stride}，期望 {expected}；带行填充的布局不支持）"
+            ));
         }
         Ok(Self {
             name,
@@ -218,7 +221,15 @@ impl Request {
         };
         let sample_step = match root.get("sample_step") {
             None | Some(Value::Null) => 1,
-            Some(v) => v.as_i64().filter(|n| *n >= 1).unwrap_or(1) as u32,
+            Some(v) => {
+                let n = v
+                    .as_i64()
+                    .ok_or_else(|| "sample_step 必须是整数".to_string())?;
+                if n < 1 {
+                    return Err("sample_step 必须 >= 1".into());
+                }
+                u32::try_from(n).map_err(|_| "sample_step 超出 u32".to_string())?
+            }
         };
         let args = match root.get("args") {
             None | Some(Value::Null) => Vec::new(),
@@ -335,6 +346,16 @@ impl Response {
         }
         if let Some(st) = &self.settings {
             s.push_str(&format!(",\"settings\":{}", settings_to_json(st)));
+        }
+        if let Some(url) = &self.open_url {
+            s.push_str(&format!(",\"open_url\":{}", quote(url)));
+        }
+        if let Some((ext, data)) = &self.open_image {
+            s.push_str(&format!(
+                ",\"open_image\":{{\"ext\":{},\"base64\":{}}}",
+                quote(ext),
+                quote(data)
+            ));
         }
         s.push('}');
         s

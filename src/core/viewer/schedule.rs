@@ -81,7 +81,10 @@ impl Viewer {
             self.need_at = None;
             // 目标档记账（防"解码器不理 target"时每轮重发）：落地不清，换图才清。
             self.vector_zoom_req = Some((path.clone(), target));
-            self.want_seq = self.send_decode(path, target.0, target.1, 0, ReqKind::Main, false);
+            // 分页文档（PDF/EMF…）放大重渲必须落在**当前页**：旧实现写死 0，
+            // 第 N 页一放大就跳回第 1 页（2026-11-24 审计 M37）。
+            let frame = self.loaded.as_ref().map_or(0, |l| l.anim.index);
+            self.want_seq = self.send_decode(path, target.0, target.1, frame, ReqKind::Main, false);
             return false;
         }
         // 先把"当前 loaded 是不是本图的整图、若是则目标档是哪一档"读清楚。
@@ -313,6 +316,11 @@ impl Viewer {
         if self.anim_paused {
             return;
         }
+        // 换图窗口里 `loaded` 还停在上一个文件：此时按旧图的帧号/延时给新图发请求，
+        // 会让新图从中间帧开始或直接解码失败（2026-11-24 审计 M38）。
+        if !self.screen_is_current() {
+            return;
+        }
         let Some(at) = self.anim_next_at else { return };
         if Instant::now() < at {
             return;
@@ -331,6 +339,11 @@ impl Viewer {
         } else {
             l.anim.index + 1
         };
+        // 单帧动图（count==1 且带延时）：`(0+1)%1 == 0`，继续发就是同一帧无限重解。
+        if next == l.anim.index {
+            self.anim_next_at = None;
+            return;
+        }
         let Some(g) = self.gallery.as_ref() else {
             return;
         };
@@ -750,6 +763,9 @@ impl Viewer {
                 self.native_requested = None;
                 // 缩放重渲失败同理：不清账，同一倍率下再也不会有第二次请求（m189）。
                 self.vector_zoom_req = None;
+                // 按帧/跳页的意图随这次失败一起作废：留着它 `is_seeking()` 恒真，
+                // 阅读位置在本会话里永远不再落盘（2026-11-24 审计 M39）。
+                self.step_target = None;
                 // 渲染失败 = 同 seq 的预览不再可信，一并清掉。
                 self.preview_meta = None;
                 self.anim_next_at = None;

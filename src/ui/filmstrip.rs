@@ -173,7 +173,9 @@ pub fn fits(side: Side, vw: f32, vh: f32) -> bool {
 pub fn grow_to_fit(side: Side, vw: f32, vh: f32) -> (f32, f32) {
     match side {
         Side::Bottom => (vw, vh.max(MIN_VIEW_H)),
-        Side::Left => (vw.max(MIN_VIEW_W), vh),
+        // 左条扣的是宽，但 `fits` 还要求高度放得下一格 + 留白：只补宽会
+        // “放大完仍判放不下”，条永远不出现（2026-11-24 审计 M56）。
+        Side::Left => (vw.max(MIN_VIEW_W), vh.max(ITEM_H + 2.0 * MARGIN + 40.0)),
     }
 }
 

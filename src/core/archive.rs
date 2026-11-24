@@ -250,7 +250,8 @@ pub struct TreeNode {
     pub dir: bool,
     /// 缩进层级：根 = 0，根的直接子项 = 1。
     pub depth: usize,
-    /// 这一层**直接**有几张图（不含子层）。0 = 空层，照样可以进。
+    /// 这一层**直接**有几项（不含子层；含非图片文件，界面用它标「有内容」）。
+    /// 0 = 空层，照样可以进。
     pub images: usize,
 }
 
@@ -360,8 +361,10 @@ impl ExtraSink {
             self.broken.insert(key.to_string());
             return;
         }
-        // 单条 / 路径闸门只跳过这一条，不该把整包预落盘停摆。
-        if size > MAX_ONE || !valid_entry(last) {
+        // 单条 / 路径闸门只跳过这一条，不该把整包预落盘停摆；但这一层不能再写
+        // 就绪标记——否则切进去会少一张图且永远不补（2026-11-24 审计 L11）。
+        if size > MAX_ONE || !valid_leaf(last) {
+            self.broken.insert(key.to_string());
             return;
         }
         let fits = {
@@ -460,13 +463,17 @@ fn parse_tree(path: &Path) -> Vec<TreeNode> {
         if l.is_empty() || l.starts_with('#') {
             continue;
         }
-        // 行格式：`depth \t kind \t images \t label`。★ segs **不入盘**——靠 depth 用栈
-        // 推出来，省一半体积，也免得"两处各记一份路径"写歪。
+        // 行格式：`depth \t kind \t images \t label \t segs`。★ segs 从 m-2026-11-24
+        // 起直接入盘：旧实现靠 `depth` + 栈推，要求写盘顺序是树的**先序**；而写盘用的
+        // `BTreeSet` 是字典序（`-`、`.`、空格都小于 `/`），`ch1-old` 会排在 `ch1/sub`
+        // 前面，读回时 `sub` 被挂到 `ch1-old` 下 ⇒ 点树节点进错层。空第五列 =
+        // 老会话目录（按旧栈逻辑兜底）。
         let mut p = l.split('\t');
         let (Some(d), Some(k), Some(n), Some(label)) = (p.next(), p.next(), p.next(), p.next())
         else {
             continue;
         };
+        let segs_field = p.next();
         let (Ok(depth), Ok(images)) = (d.parse::<usize>(), n.parse::<usize>()) else {
             continue;
         };
@@ -483,8 +490,12 @@ fn parse_tree(path: &Path) -> Vec<TreeNode> {
         }
         stack.truncate(depth - 1);
         stack.push(label.to_string());
+        let segs: Vec<String> = match segs_field {
+            Some(s) if !s.is_empty() => s.split('/').map(str::to_string).collect(),
+            _ => stack.clone(),
+        };
         out.push(TreeNode {
-            segs: stack.clone(),
+            segs,
             label: label.to_string(),
             dir: k == "d",
             depth,
@@ -495,6 +506,18 @@ fn parse_tree(path: &Path) -> Vec<TreeNode> {
 }
 
 fn write_tree(path: &Path, nodes: &[TreeNode], truncated: bool) -> Result<(), String> {
+    // 制表符 / 换行会把一行拆成两行或两列；树标签只用于显示，清洗比整层失败好。
+    fn field(s: &str) -> String {
+        s.chars()
+            .map(|c| {
+                if matches!(c, '\t' | '\n' | '\r') {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect()
+    }
     let mut s = String::new();
     s.push_str(if truncated {
         "#truncated 1\n"
@@ -503,11 +526,12 @@ fn write_tree(path: &Path, nodes: &[TreeNode], truncated: bool) -> Result<(), St
     });
     for n in nodes {
         s.push_str(&format!(
-            "{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\n",
             n.depth,
             if n.dir { "d" } else { "a" },
             n.images,
-            n.label
+            field(&n.label),
+            field(&n.segs.join("/"))
         ));
     }
     fs::write(path, s).map_err(|e| format!("写树索引失败：{e}"))
@@ -618,7 +642,7 @@ fn build_tree(
         }
         // 路径穿越 / 盘符只对**要落盘的那一层**检查：别层的名字只用来画树，不进文件系统，
         // 而一个带 `:` 的条目名（漫画包里不少见）不该把整个包拒掉。
-        if !valid_entry(last) {
+        if !valid_leaf(last) {
             return Err(format!("压缩包含非法路径：{name}"));
         }
         if size > MAX_ONE {
@@ -1185,6 +1209,10 @@ fn extract_one(source: &Path, name: &str, limit: u64) -> Result<Option<Vec<u8>>,
 }
 
 /// 路径穿越 / 盘符 / 空段 / 控制字符一律拒绝。ZIP 里目录只是名字带 `/` 的条目。
+///
+/// 用于**整条相对路径**（测试与将来可能的入口）。落盘前判断单个文件名请用
+/// [`valid_leaf`]：它允许 `:`，因为 `flat_name` 会把 `:` 清洗成 `_`。
+#[cfg(test)]
 fn valid_entry(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('/')
@@ -1192,6 +1220,20 @@ fn valid_entry(name: &str) -> bool {
         && name
             .split('/')
             .all(|p| !p.is_empty() && p != "." && p != ".." && !p.contains(':'))
+}
+
+/// 单个文件名（不含 `/`）的安全判据：只拒绝空、`.`、`..`、控制字符与残留分隔符。
+///
+/// ★ 不再拒绝 `:`：漫画包里 `第01话:彩页.jpg` 很常见，而落盘用的是
+/// [`flat_name`]（`:` → `_`），本来就不会把盘符带进文件系统。旧实现在这里返回
+/// `Err`，一条带 `:` 的页名会让**整层**打不开（2026-11-24 审计 H05）。
+fn valid_leaf(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.chars().any(|c| c.is_control())
+        && !name.contains('/')
+        && !name.contains('\\')
 }
 
 /// 把层内相对名折成单层文件名：序号 + 原名。
@@ -1298,11 +1340,13 @@ fn session_dir(path: &Path) -> Result<PathBuf, String> {
         .modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
     // FNV-1a：只把哈希写进目录名，不把用户的原路径落到 temp 里。
+    // 路径先折叠大小写：Windows 上 `C:\A.zip` 与 `c:\a.zip` 是同一个文件，
+    // 不折叠会各建一份会话目录（退出时才收，纯浪费）。
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in path.to_string_lossy().as_bytes() {
+    for b in path.to_string_lossy().to_ascii_lowercase().as_bytes() {
         h = fnv(h, *b);
     }
     for b in meta.len().to_le_bytes() {

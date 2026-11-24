@@ -1047,7 +1047,7 @@ fn region_roundtrip_rejects_zero_sized_output() {
     // target = 0 时假解码器回填 0×0 —— 正是要拦下的那种"解码器没算尺寸"。
     let e = super::decode::region_roundtrip(fake_region, fake_last_error, b"abc", &req, None)
         .expect_err("0 尺寸必须判失败");
-    assert!(e.contains("0 尺寸"), "错误文案要说清是尺寸问题：{e}");
+    assert!(e.0.contains("0 尺寸"), "错误文案要说清是尺寸问题：{}", e.0);
 }
 
 /// ★ 画布恒定：**放大到 4000%（密度 40×）时，画布仍是一屏大小**。

@@ -125,16 +125,19 @@ impl Viewer {
             // 会清掉，下一帧这里不再过滤，缩略图照常补。
             .filter(|p| !(main_in_flight && g.current().is_some_and(|c| c == *p)))
             .collect();
-        let n = refs.len();
+        // ★ 过滤只影响"给谁发缩略图请求"，**不许改窗口格数**：`n` 同时被 canvas 用来
+        //   做 layout / scroll_bar / strip_cap，少一格会让整条每帧抖一次，还会把预读
+        //   窗口的最后一格踢掉（2026-11-24 审计 H02）。
+        let win_n = n;
         self.thumbs.ensure(&self.decoder, &refs, !scrolling);
         // m265：这一屏同时也是「图片预读」的下注范围。条滚到哪儿，预读跟到哪儿；
         // 点格子能切到的图就全在这一屏里，不需要按当前索引去猜。
         // 滚动中 `request_prefetch` 会早退（见 `prefetch.rs`）；停手那一刻补发一次。
-        self.set_prefetch_strip(first, n);
+        self.set_prefetch_strip(first, win_n);
         if just_settled {
             self.request_prefetch();
         }
-        (first, n)
+        (first, win_n)
     }
 
     /// 记下这一帧的条窗口起点，返回 `(是否还在滚动, 是否刚刚停手)`。
@@ -197,6 +200,8 @@ impl Viewer {
     pub fn goto(&mut self, idx: usize) -> bool {
         let moved = self.gallery.as_mut().is_some_and(|g| g.jump_to(idx));
         if moved {
+            // 远跳没有方向依据：清掉上一次键盘翻页的方向，别让预读继续按旧方向下注。
+            self.last_dir = 0;
             self.navigate();
         }
         moved

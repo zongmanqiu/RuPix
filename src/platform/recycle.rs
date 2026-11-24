@@ -82,8 +82,13 @@ fn describe(rc: i32, aborted: bool) -> String {
         return "操作被外壳中止".to_string();
     }
     match rc {
-        0x402 => "路径不存在".to_string(),   // 文档口径：源/目的路径非法
-        0x4C7 => "已被用户取消".to_string(), // ERROR_CANCELLED
+        // `SHFileOperationW` 返回的是 `DE_*` 外壳操作码，不是 `GetLastError`。
+        0x75 => "已被用户取消".to_string(),     // DE_OPCANCELLED
+        0x7C => "路径不存在或非法".to_string(), // DE_INVALIDFILES
+        0x78 => "拒绝访问（源）".to_string(),   // DE_ACCESSDENIEDSRC
+        0x79 => "拒绝访问（目标）".to_string(), // DE_PATHTOODEEP / access denied
+        0x81 => "文件名过长".to_string(),       // DE_FILENAMETOOLONG
+        0x402 => "路径不存在".to_string(),      // 历史映射（部分外壳版本给这个值）
         _ => format!("外壳返回 0x{rc:04X}"),
     }
 }

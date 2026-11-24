@@ -21,12 +21,18 @@ pub fn fmt_bytes(n: u64) -> String {
         return format!("{n} B");
     }
     let f = n as f64;
-    let (v, unit) = if f < K * K {
-        (f / K, "KB")
-    } else if f < K * K * K {
-        (f / (K * K), "MB")
+    // 先按一位小数取整再选单位：否则 1024*1024-1 会走进 KB 分支，显示成
+    // 「1024.0 KB」而不是「1.0 MB」（单位边界前一个字节的进位）。
+    let round1 = |v: f64| (v * 10.0).round() / 10.0;
+    let kb = round1(f / K);
+    let mb = round1(f / (K * K));
+    let gb = round1(f / (K * K * K));
+    let (v, unit) = if kb < 1024.0 {
+        (kb, "KB")
+    } else if mb < 1024.0 {
+        (mb, "MB")
     } else {
-        (f / (K * K * K), "GB")
+        (gb, "GB")
     };
     format!("{v:.1} {unit}")
 }
@@ -45,6 +51,11 @@ mod tests {
         assert_eq!(fmt_bytes(1024), "1.0 KB");
         assert_eq!(fmt_bytes(1536), "1.5 KB");
         assert_eq!(fmt_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(
+            fmt_bytes(1024 * 1024 - 1),
+            "1.0 MB",
+            "单位边界前一个字节要进位，不能显示成 1024.0 KB"
+        );
         assert_eq!(fmt_bytes(1024 * 1024 * 1024), "1.0 GB");
         assert_eq!(fmt_bytes(2500 * 1024 * 1024), "2.4 GB");
     }

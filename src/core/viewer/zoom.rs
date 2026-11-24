@@ -194,8 +194,10 @@ impl Viewer {
             self.pan = (0.0, 0.0);
             self.mark_need();
         } else {
-            // 退出 fit 时把当前推导出的倍率固化下来，画面才不会跳。
-            self.zoom = self.scale();
+            // 退出 fit 时把当前推导出的倍率固化下来，画面才不会跳；但必须与手动档
+            // 用同一个上下限——fit 档允许小图放大到超过 MAX_ZOOM，原样写进 `zoom`
+            // 会让下一次滚轮/按钮反而把画面缩小（2026-11-24 审计 M40）。
+            self.zoom = self.scale().clamp(MIN_ZOOM, MAX_ZOOM);
             self.fit = false;
         }
     }

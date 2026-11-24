@@ -145,7 +145,20 @@ fn write_stamp(p: &Path) {
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(p, body);
+    // 原子替换：另一个实例在"已截断、尚未写完"的窗口里读到空文件会误报
+    // 「上次异常退出」（2026-11-24 审计 M44）。先写临时文件再 rename。
+    use std::io::Write as _;
+    let tmp = p.with_extension("tmp");
+    let staged = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, p)
+    })();
+    if staged.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 fn remove_stamp(p: &Path) {

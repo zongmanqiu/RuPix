@@ -170,7 +170,6 @@ impl Capability {
                 | Self::SettingsWrite
                 | Self::OpenUrl
                 | Self::OpenFile
-                | Self::UiPanel
         )
     }
 }
@@ -318,6 +317,9 @@ fn parse_presets(
         .find(|s| s.kind == SettingKind::Choice)
         .map(|s| s.choices.clone())
         .ok_or_else(|| "presets 需要一个 choice 设置项".to_string())?;
+    if !choices.iter().any(|c| c == "custom") {
+        return Err("presets 的 choice 里必须有字面量 \"custom\" 作为自定义哨兵".into());
+    }
     if table.len() >= choices.len() {
         return Err("presets 必须给 choice 留一个「自定义」取值".into());
     }
@@ -509,6 +511,12 @@ fn parse_settings(root: &Value) -> Result<Vec<SettingSpec>, String> {
         let range = if kind == SettingKind::Int {
             parse_range(item).map_err(at)?
         } else {
+            // 非 int 上写 min/max 是清单笔误：旧实现静默忽略，作者会以为范围生效了。
+            if item.get("min").is_some() || item.get("max").is_some() {
+                return Err(at(format!(
+                    "min/max 只能用于 type=int（这一项是 {kind_text}）"
+                )));
+            }
             None
         };
         let default = normalize_default(item, kind, &choices, range).map_err(at)?;
@@ -606,10 +614,15 @@ fn normalize_default(
         }
         SettingKind::Text => Ok(text),
         SettingKind::Hotkey => {
-            if text.is_empty() || Hotkey::from_spec(&text).is_some() {
-                Ok(text)
-            } else {
-                Err(format!("hotkey 的 default=\"{text}\" 不是宿主认得的键串"))
+            if text.is_empty() {
+                return Ok(text);
+            }
+            match Hotkey::from_spec(&text) {
+                Some(hk) if hk.is_reserved() => {
+                    Err("裸空格已保留给「空格看图」，插件的 hotkey 不能占用".into())
+                }
+                Some(_) => Ok(text),
+                None => Err(format!("hotkey 的 default=\"{text}\" 不是宿主认得的键串")),
             }
         }
     }
@@ -762,6 +775,14 @@ fn parse_command_fields(root: &Value) -> Result<CommandFields, String> {
                 .ok_or_else(|| "hotkey 必须是字符串（键串）".to_string())?;
             let hk =
                 Hotkey::from_spec(s).ok_or_else(|| format!("hotkey=\"{s}\" 不是宿主认得的键串"))?;
+            if hk.is_reserved() {
+                return Err("裸空格已保留给「空格看图」，插件的 hotkey 不能占用".into());
+            }
+            if kind != Kind::Command {
+                return Err(
+                    "只有命令型插件可以声明 hotkey（编辑器/面板没有「按一下就跑」的语义）".into(),
+                );
+            }
             Some(hk)
         }
     };
@@ -793,6 +814,18 @@ fn parse_command_fields(root: &Value) -> Result<CommandFields, String> {
     if settings.iter().any(|s| s.kind == SettingKind::Hotkey) && hotkey.is_some() {
         return Err("settings 里已有 type=hotkey 的项，就别再写 manifest.hotkey".into());
     }
+    let hotkey_items = settings
+        .iter()
+        .filter(|s| s.kind == SettingKind::Hotkey)
+        .count();
+    if hotkey_items > 1 {
+        return Err("settings 里最多只能有一个 type=hotkey 项（宿主只读第一个）".into());
+    }
+    if hotkey_items == 1 && kind != Kind::Command {
+        // 不判坏清单：历史清单里编辑器确实带过 hotkey 项（成对出现的设置窗
+        // 还会渲染它）。运行期 `build_hotkey_table` 会跳过并留日志。
+        log::warn!("设置项 type=hotkey 只对命令型插件生效；kind={kind:?} 的这条不会进热键表");
+    }
 
     // 运行时参数窗：可选布尔。声明了却没有 settings = 没有窗可弹，
     // 属于坏清单（不是静默降级成一点即跑）。
@@ -805,6 +838,9 @@ fn parse_command_fields(root: &Value) -> Result<CommandFields, String> {
         return Err("run_ui=true 必须同时声明 settings（否则没有参数窗可弹）".into());
     }
     let preview = parse_preview(root, &settings)?;
+    // preview 隐含 run_ui：声明了实时参数却没有参数窗入口，滑块永远调不到。
+    // 旧清单可能只写了 preview（历史上确实如此），这里补成 true 而不是判坏清单。
+    let run_ui = run_ui || preview.is_some();
     let presets = parse_presets(root, &settings, preview.as_ref())?;
 
     Ok(CommandFields {
@@ -1407,11 +1443,11 @@ mod tests {
             ClipboardWrite,
             SettingsRead,
             SettingsWrite,
-            UiPanel,
         ] {
             assert!(c.host_provides(), "{} 应该是宿主真开通道的能力", c.as_str());
         }
         for c in [
+            UiPanel,
             SelectionRead,
             FileRead,
             FileWrite,

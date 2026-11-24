@@ -698,11 +698,14 @@ fn run_command(
     // 设置写回（能力最小化）：只有声明 `settings.write` 的插件能让宿主落盘。
     persist_settings(ext, &resp);
 
-    let text = resp.text.unwrap_or_else(|| "完成".into());
+    // 只回结构化 `outputs`、没给 `text` 的插件：不许把「完成」这类占位词写进
+    // 用户剪贴板（旧实现会覆盖用户原有剪贴板内容，见 2026-11-24 审计 M26）。
+    let had_text = resp.text.is_some();
+    let text = resp.text.unwrap_or_default();
     // 剪贴板（能力最小化）：只有声明 `clipboard.write` 的插件，宿主才把结果
     // 自动写进系统剪贴板（OCR 类插件的常见诉求）。写失败只 warn——
     // 结果已经在结果窗里了，剪贴板写不进去不是这次调用的失败。
-    let copied = if ext.manifest.has_capability(Capability::ClipboardWrite) {
+    let copied = if had_text && ext.manifest.has_capability(Capability::ClipboardWrite) {
         match crate::platform::clipboard::copy_text(&text) {
             Ok(()) => {
                 log::info!("插件 {} 的结果已写入剪贴板", ext.manifest.id);

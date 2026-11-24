@@ -16,7 +16,7 @@
 use windui::core::EventCtx;
 use windui::prelude::*;
 
-use super::dialog_footer::{action, shell};
+use super::dialog_footer::{action, shell_fill};
 use super::tokens::{to_color, BG, SIZE_BODY, TEXT};
 use crate::core::update::{self, Plan};
 
@@ -39,6 +39,10 @@ pub fn open(ctx: &mut EventCtx, plan: &Plan) {
     let latest = plan.version.clone();
     let notes = plan.notes.clone();
     let plan = plan.clone();
+    // 关旧窗 / 开新窗用不同键：同键时滞留的 WM_CLOSE 会把刚开的新窗收走，
+    // 而 `single` 本键只会聚焦旧窗、内容（版本/说明/下载 Plan）全是旧的（M55）。
+    let (old_key, win_key) = super::singleton::recycle(KEY);
+    ctx.close_window(old_key);
     ctx.open_window(
         Window::new("发现新版本", W, H)
             .owned(true)
@@ -46,12 +50,12 @@ pub fn open(ctx: &mut EventCtx, plan: &Plan) {
             .min_size(MIN_W, MIN_H)
             .centered(true)
             .bg(to_color(BG))
-            .single(KEY)
+            .single(win_key)
             .content(move || content(&latest, &notes, plan.clone())),
     );
 }
 
-/// 窗内容：标题行 + 文本区 + 底栏。工厂形态（`Window::content` 会被重复调用）。
+/// 窗内容：标题行 + 文本区 + 底栏。内容只建一次（`Window::content` 是 `FnOnce`）。
 fn content(latest: &str, notes: &str, plan: Plan) -> Element {
     let title = Element::label(format!("发现新版本 {latest}"))
         .font_size(SIZE_BODY)
@@ -77,7 +81,7 @@ fn content(latest: &str, notes: &str, plan: Plan) -> Element {
         }
     });
 
-    shell(
+    shell_fill(
         vec![title, body],
         vec![update_btn, action("取消", |ctx| ctx.request_close())],
     )
@@ -139,8 +143,8 @@ mod tests {
         );
 
         let (rects, kids) = measure();
-        // 壳的格子：标题 / 文本区 / 弹性空白 / 底栏。
-        assert!(rects.len() >= 4, "壳应有「标题 + 文本 + 空白 + 底栏」四格");
+        // 壳的格子：标题 / 文本区 / 底栏（`shell_fill` 不再插弹性空白）。
+        assert!(rects.len() >= 3, "壳应有「标题 + 文本 + 底栏」三格");
         let area = rects[1];
         assert_eq!(
             area.w,
@@ -148,7 +152,7 @@ mod tests {
             "文本区必须铺满内容宽度"
         );
         assert!(
-            area.h > H / 3,
+            area.h > H / 2,
             "文本区必须吃掉剩余高度，不能缩成一小块：{} / {}",
             area.h,
             H

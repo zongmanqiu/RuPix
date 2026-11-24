@@ -30,7 +30,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -145,9 +145,21 @@ fn wipe_width(step: u32) -> f32 {
 ///   不会出现「画没了但还点得着」。
 static TOOLBAR_BUTTONS: AtomicBool = AtomicBool::new(true);
 
+/// 全局镜像的代次：多窗口下 `set_*` 只有第一个窗口看得到 `changed=true`，
+/// 其余窗口要靠这个数字知道自己也该重绘（2026-11-24 审计 M09）。
+static SESSION_FLAGS_GEN: AtomicU64 = AtomicU64::new(0);
+
+pub fn session_flags_gen() -> u64 {
+    SESSION_FLAGS_GEN.load(Ordering::Relaxed)
+}
+
 /// 写镜像，返回「值变没变」（调用方据此标脏）。
 pub fn set_toolbar_buttons(on: bool) -> bool {
-    TOOLBAR_BUTTONS.swap(on, Ordering::Relaxed) != on
+    let changed = TOOLBAR_BUTTONS.swap(on, Ordering::Relaxed) != on;
+    if changed {
+        SESSION_FLAGS_GEN.fetch_add(1, Ordering::Relaxed);
+    }
+    changed
 }
 
 /// ★ m269 无边框形态（ini 键 `borderless` 的运行时镜像）。
@@ -159,7 +171,11 @@ static BORDERLESS: AtomicBool = AtomicBool::new(false);
 
 /// 写镜像，返回「值变没变」（调用方据此标脏）。
 pub fn set_borderless(on: bool) -> bool {
-    BORDERLESS.swap(on, Ordering::Relaxed) != on
+    let changed = BORDERLESS.swap(on, Ordering::Relaxed) != on;
+    if changed {
+        SESSION_FLAGS_GEN.fetch_add(1, Ordering::Relaxed);
+    }
+    changed
 }
 
 /// 当前是不是无边框形态。画布（不画底色、不摆缩略图条）与命中都读这一份。
@@ -806,6 +822,10 @@ impl Chrome {
         if dir == 0 || Instant::now() < self.wheel_due.get() {
             return None;
         }
+        // 与键盘闸同一条：兜出去的那一翻也要把闸推后一个间隔，否则紧跟的惯性
+        // 事件会在 8ms 后再翻一张（2026-11-24 审计 M59）。
+        self.wheel_due
+            .set(Instant::now() + self.wheel_interval.get());
         self.wheel_pending.set(0);
         Some(dir)
     }

@@ -241,9 +241,10 @@ pub fn declared_raw_exts() -> HashSet<String> {
 /// 可选导出 `iv_render_raw`，它认领哪些扩展名，哪些就走参数窗。宿主不手写第二份后缀表——
 /// 删掉解码器，裸数据路线随之消失，不会出现"弹了参数窗却没人接"的错位。
 pub fn is_raw(ext: &str) -> bool {
+    let ext = ext.trim_start_matches('.').to_ascii_lowercase();
     SOURCE
         .get()
-        .is_some_and(|s| s.declared_raw_exts().contains(ext))
+        .is_some_and(|s| s.declared_raw_exts().contains(&ext))
 }
 
 /// 内置解码库的登记项（m56：内置路从此**有身份**，不再只是路由里一行硬编码后缀）。

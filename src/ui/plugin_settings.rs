@@ -353,34 +353,40 @@ fn build_sync(
         norms[i] = *norm;
         ranges[i] = (*lo, *hi);
     }
-    // 预设下拉：找到第一个 choice 设置项的取值表，把声明式数值按名字对上下标。
-    let ci = specs.iter().position(|s| s.kind == SettingKind::Choice)?;
-    let Bound::Choice { idx, values, .. } = &bounds[ci] else {
-        return None;
-    };
-    let custom_idx = values.iter().position(|v| v == "custom").unwrap_or(0);
-    let presets: Vec<(usize, [i32; 6], i32)> = ext
-        .manifest
-        .presets
-        .iter()
-        .filter_map(|p| {
-            values
+    // 预设下拉：**可选**。没有 choice 的合法 preview 也要能实时调色（旧实现直接
+    // `?` 返回 None，footer 退化成 Legacy，点「应用」什么也不发生，M53）。
+    let preset = specs.iter().position(|s| s.kind == SettingKind::Choice);
+    let (preset_idx, custom_idx, presets, last_preset) = match preset {
+        Some(ci) => {
+            let Bound::Choice { idx, values, .. } = &bounds[ci] else {
+                return None;
+            };
+            let custom_idx = values.iter().position(|v| v == "custom").unwrap_or(0);
+            let presets: Vec<(usize, [i32; 6], i32)> = ext
+                .manifest
+                .presets
                 .iter()
-                .position(|v| v == &p.value)
-                .map(|i| (i, p.values, p.gamma))
-        })
-        .collect();
-    let last = idx.get();
+                .filter_map(|p| {
+                    values
+                        .iter()
+                        .position(|v| v == &p.value)
+                        .map(|i| (i, p.values, p.gamma))
+                })
+                .collect();
+            (*idx, custom_idx, presets, Cell::new(idx.get()))
+        }
+        None => (signal(0usize), 0, Vec::new(), Cell::new(0)),
+    };
     Some(Rc::new(SyncState {
         norms,
         ranges,
-        preset_idx: *idx,
+        preset_idx,
         custom_idx,
         presets,
         state: state.clone(),
         path,
         reset_seen: Cell::new(state.reset.get()),
-        last_preset: Cell::new(last),
+        last_preset,
     }))
 }
 
@@ -532,7 +538,7 @@ fn open(ctx: &mut EventCtx, ext: &Extension, config: &Rc<RefCell<Config>>, mode:
             .is_some_and(|keys| keys.iter().any(|k| k == &spec.key))
     };
     let specs: Vec<SettingSpec> = match (&mode, &live_keys) {
-        (Mode::Run(_), Some(_)) => specs_all
+        (Mode::Run(o), Some(_)) if o.on_apply.is_none() => specs_all
             .iter()
             .filter(|s| is_live_key(s))
             .cloned()
@@ -551,7 +557,7 @@ fn open(ctx: &mut EventCtx, ext: &Extension, config: &Rc<RefCell<Config>>, mode:
     // 初值：参数窗读当前显示状态（每张图都从原图起步），设置窗才读落盘那一份。
     let stored = crate::extensions::settings::load_for(ext);
     let seeds: Vec<(String, String)> = match (&mode, &live_keys) {
-        (Mode::Run(o), Some(_)) => {
+        (Mode::Run(o), Some(_)) if o.on_apply.is_none() => {
             let cur = o.state.tint.get().filter(|t| t.path == o.path);
             live_seed(ext, cur.as_ref())
         }
@@ -800,7 +806,8 @@ fn open(ctx: &mut EventCtx, ext: &Extension, config: &Rc<RefCell<Config>>, mode:
                                 .child(Element::label_signal(text).width(60))
                                 .width(CONTROL_GROUP_W)
                         }
-                        Bound::Hotkey(_) => {
+                        Bound::Hotkey(raw) => {
+                            let raw = *raw;
                             let text = hk_texts
                                 .get(hk_seen)
                                 .copied()
@@ -814,13 +821,16 @@ fn open(ctx: &mut EventCtx, ext: &Extension, config: &Rc<RefCell<Config>>, mode:
                                 text,
                                 move |_ctx| {
                                     // 点框即清空再进捕获（快捷键页同款）：捕获中失焦留空 =
-                                    // 解绑，这是唯一的解绑通道。
+                                    // 解绑，这是唯一的解绑通道。**原始值也要清**——旧实现
+                                    // 只改显示文本，点「确定」仍写回旧键（M52）。
                                     cap_click.set(Some(row));
+                                    raw.set(String::new());
                                     text_click.set("按下按键…".to_string());
                                 },
                                 move |_ctx| {
                                     if cap_blur.get() == Some(row) {
                                         cap_blur.set(None);
+                                        raw.set(String::new());
                                         if text_blur.get() == "按下按键…" {
                                             text_blur.set("（空）".to_string());
                                         }
@@ -854,7 +864,7 @@ fn open(ctx: &mut EventCtx, ext: &Extension, config: &Rc<RefCell<Config>>, mode:
                     let c = cancel_fn.clone();
                     right.push(super::dialog_footer::action("取消", move |ctx| c(ctx)));
                 }
-                super::dialog_footer::shell(rows, right)
+                super::dialog_footer::shell_scroll(rows, right)
             }),
     );
 }

@@ -192,8 +192,9 @@ fn expand_manifest(
             m.hotkey = cmd.hotkey;
             Extension {
                 run_key: format!("{package_id}:{}", cmd.id),
-                // 菜单 / 设置窗只显示命令名：包名已在 manifest 里，不要在每个入口前重复。
-                display_name: cmd.name.clone(),
+                // 菜单 / 设置窗显示「包名 · 命令名」：两个不同包的同名命令（都叫
+                // 「体检」）在快捷键页 / toast 里必须分得开（2026-11-24 审计 M27）。
+                display_name: format!("{package_name} · {}", cmd.name),
                 package_name: package_name.clone(),
                 command_id: Some(cmd.id.clone()),
                 manifest: m,
@@ -297,9 +298,28 @@ fn ensure_cache(config: &crate::core::config::Config) {
 ///
 /// 放在 `extensions` 而不是 UI：它是纯数据（清单 + 设置区），而 `hotkey` 冲突清空
 /// （[`vacate_hotkey`]）也要读同一份清单——UI 层不许被底层反向依赖。
-pub fn plugin_hotkey_items(
-    config: &crate::core::config::Config,
-) -> Vec<(String, String, String, String)> {
+/// 一条「插件声明式热键」。
+///
+/// ★ 2026-11-24：`plugin_id` 是**包 id**（用于目录/设置文件），`run_key` 是
+///   schema 2 的「包:命令」唯一键（用于运行与 UI 行身份）。旧实现把 `run_key`
+///   当 `plugin_id` 用，`:` 过不了 `validate_id`，设置路径直接拿不到，多命令
+///   插件绑键永远保存失败（审计 H13）。
+pub struct PluginHotkeyItem {
+    pub plugin_id: String,
+    pub run_key: String,
+    pub name: String,
+    pub key: String,
+    pub raw: String,
+}
+
+/// 声明了 `type=hotkey` 的已安装插件。
+///
+/// ★ 判据只看**清单 schema**：没有 schema 的老插件（`manifest.hotkey` 那条路）
+/// 不进这份清单——它们的键位在发布物里，用户改不了，列出来只会让人点了没反应。
+///
+/// 放在 `extensions` 而不是 UI：它是纯数据（清单 + 设置区），而 `hotkey` 冲突清空
+/// （[`vacate_hotkey`]）也要读同一份清单——UI 层不许被底层反向依赖。
+pub fn plugin_hotkey_items(config: &crate::core::config::Config) -> Vec<PluginHotkeyItem> {
     let list = installed_cached(config);
     let mut out = Vec::new();
     for ext in list {
@@ -316,12 +336,13 @@ pub fn plugin_hotkey_items(
             .find(|(k, _)| k == &spec.key)
             .map(|(_, v)| v)
             .unwrap_or_else(|| spec.default.clone());
-        out.push((
-            ext.run_key.clone(),
-            ext.display_name.clone(),
-            spec.key.clone(),
+        out.push(PluginHotkeyItem {
+            plugin_id: ext.manifest.id.clone(),
+            run_key: ext.run_key.clone(),
+            name: ext.display_name.clone(),
+            key: spec.key.clone(),
             raw,
-        ));
+        });
     }
     out
 }
@@ -374,22 +395,24 @@ pub fn vacate_hotkey(
 
     // 2) 其它插件：设置区里那把键同样清空（写的是同一个 settings.json，走原子写）。
     let mut plugins_changed = false;
-    for (id, _, key, raw) in plugin_hotkey_items(config) {
-        if Some(id.as_str()) == keep_plugin {
+    let list = installed_cached(config);
+    for item in plugin_hotkey_items(config) {
+        if keep_plugin.is_some_and(|k| k == item.run_key || k == item.plugin_id) {
             continue;
         }
-        if crate::core::hotkey::Hotkey::from_spec(&raw).as_ref() == Some(hk) {
-            let mut items = settings::load(&id);
-            match items.iter_mut().find(|(k, _)| k == &key) {
-                Some(slot) => slot.1 = String::new(),
-                None => items.push((key.clone(), String::new())),
-            }
-            if let Err(e) = settings::save(&id, &items) {
-                log::warn!("插件「{id}」同键热键清空失败：{e}");
-            } else {
-                plugins_changed = true;
-                log::info!("[hotkey] 新键抢占，已清空插件「{id}」的同键");
-            }
+        if crate::core::hotkey::Hotkey::from_spec(&item.raw).as_ref() != Some(hk) {
+            continue;
+        }
+        let Some(ext) = list.iter().find(|e| e.run_key == item.run_key) else {
+            continue;
+        };
+        // 必须走 `merge_into_for`：schema 2 的键在 settings.json 里带 `<命令>.` 前缀，
+        // 直接 `save` 会把同包其它命令的设置一起清掉（2026-11-24 审计 H13）。
+        if let Err(e) = settings::merge_into_for(ext, &[(item.key.clone(), String::new())]) {
+            log::warn!("插件「{}」同键热键清空失败：{e}", item.plugin_id);
+        } else {
+            plugins_changed = true;
+            log::info!("[hotkey] 新键抢占，已清空插件「{}」的同键", item.name);
         }
     }
     if plugins_changed {
@@ -401,17 +424,21 @@ pub fn vacate_hotkey(
 ///
 /// 两个入口改的是**同一个文件**（`plugins/<id>/settings.json`），谁写都一样——
 /// 这就是"两处同步"的实现方式：不是互相同步，而是**只有一个真源**。
-pub fn set_plugin_hotkey(plugin_id: &str, spec_key: &str, spec: &str) -> Result<(), String> {
+pub fn set_plugin_hotkey(
+    config: &crate::core::config::Config,
+    run_key: &str,
+    spec_key: &str,
+    spec: &str,
+) -> Result<(), String> {
     // m278：程序化写入也验一次保留键（捕获路径已先拦，这里是最后一道）。
     if crate::core::hotkey::Hotkey::from_spec(spec).is_some_and(|h| h.is_reserved()) {
         return Err("裸空格已保留给「空格看图」".to_string());
     }
-    let mut items = settings::load(plugin_id);
-    match items.iter_mut().find(|(k, _)| k == spec_key) {
-        Some(slot) => slot.1 = spec.to_string(),
-        None => items.push((spec_key.to_string(), spec.to_string())),
-    }
-    settings::save(plugin_id, &items)?;
+    let list = installed_cached(config);
+    let Some(ext) = list.iter().find(|e| e.run_key == run_key) else {
+        return Err("插件已不在安装目录里".into());
+    };
+    settings::merge_into_for(ext, &[(spec_key.to_string(), spec.to_string())])?;
     // 热键表读的就是这份文件：写完立刻失效缓存，下一次按键就按新键判。
     invalidate_installed_cache();
     Ok(())
@@ -464,6 +491,14 @@ fn build_hotkey_table(list: &[Extension], builtins: &Hotkeys) -> DynamicHotkeys 
                 "插件 {} 声明的热键 {} 不生效：插件已被隔离",
                 ext.manifest.id,
                 key.pretty()
+            );
+            continue;
+        }
+        // 裸空格保留给「空格看图」：低级钩子永不吞键，插件占了就是一次按键跑两件事。
+        if key.is_reserved() {
+            log::warn!(
+                "插件 {} 声明的热键「空格」不生效：保留给空格看图",
+                ext.manifest.id
             );
             continue;
         }
@@ -681,103 +716,117 @@ pub fn parse_catalog(text: &str, installed_ids: &[String]) -> Result<Vec<Availab
     let arr = root.as_array().ok_or("插件清单根必须是数组")?;
     let mut out = Vec::with_capacity(arr.len());
     for (i, item) in arr.iter().enumerate() {
-        let id = item
-            .get("id")
-            .and_then(crate::core::json::Value::as_str)
-            .ok_or_else(|| format!("第 {} 项缺 id", i + 1))?;
-        crate::core::ext::validate_id(id)?;
-        let name = item
-            .get("name")
-            .and_then(crate::core::json::Value::as_str)
-            .ok_or_else(|| format!("{id} 缺 name"))?;
-        let version = item
-            .get("version")
-            .and_then(crate::core::json::Value::as_str)
-            .ok_or_else(|| format!("{id} 缺 version"))?;
-        let protocol = item
-            .get("protocol")
-            .and_then(crate::core::json::Value::as_u64)
-            .and_then(|n| u32::try_from(n).ok())
-            .ok_or_else(|| format!("{id} 缺 protocol"))?;
-        let kind_s = item
-            .get("kind")
-            .and_then(crate::core::json::Value::as_str)
-            .ok_or_else(|| format!("{id} 缺 kind"))?;
-        let kind = Kind::parse(kind_s).ok_or_else(|| format!("{id} kind 不认识：{kind_s}"))?;
-        let file = item
-            .get("file")
-            .and_then(crate::core::json::Value::as_str)
-            .ok_or_else(|| format!("{id} 缺 file"))?;
-        if file.contains('/') || file.contains('\\') || file.contains("..") {
-            return Err(format!("{id} 的 file 必须是同目录文件名"));
-        }
-        let description = item
-            .get("description")
-            .and_then(crate::core::json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let size = item
-            .get("size")
-            .and_then(crate::core::json::Value::as_u64)
-            .unwrap_or(0);
-        let capabilities = match item.get("capabilities") {
-            None | Some(crate::core::json::Value::Null) => Vec::new(),
-            Some(v) => v
-                .as_array()
-                .ok_or_else(|| format!("{id} 的 capabilities 必须是数组"))?
-                .iter()
-                .map(|x| {
-                    x.as_str()
-                        .and_then(Capability::parse)
-                        .ok_or_else(|| format!("{id} 含未知能力"))
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        };
-        out.push(AvailablePlugin {
-            id: id.to_string(),
-            name: name.to_string(),
-            version: version.to_string(),
-            protocol,
-            min_host: item
-                .get("min_host")
+        // 单项坏不废整份：与解码器清单同一条容错口径（`decoders::remote` 是逐项跳过）。
+        // 旧实现任一项缺字段/出现新能力串就让整份 `plugins.json` 作废，插件页整页不可用。
+        let parsed = (|| -> Result<AvailablePlugin, String> {
+            let id = item
+                .get("id")
                 .and_then(crate::core::json::Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            kind,
-            description,
-            file: file.to_string(),
-            size,
-            capabilities,
-            released: item
-                .get("released")
+                .ok_or_else(|| format!("第 {} 项缺 id", i + 1))?;
+            crate::core::ext::validate_id(id)?;
+            let name = item
+                .get("name")
                 .and_then(crate::core::json::Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            author: item
-                .get("author")
+                .ok_or_else(|| format!("{id} 缺 name"))?;
+            let version = item
+                .get("version")
                 .and_then(crate::core::json::Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            license: item
-                .get("license")
+                .ok_or_else(|| format!("{id} 缺 version"))?;
+            let protocol = item
+                .get("protocol")
+                .and_then(crate::core::json::Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| format!("{id} 缺 protocol"))?;
+            let kind_s = item
+                .get("kind")
                 .and_then(crate::core::json::Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            urls: {
-                let mut m = std::collections::HashMap::new();
-                for key in ["gitee", "github"] {
-                    m.insert(
-                        key.to_string(),
-                        item.get(key)
-                            .and_then(crate::core::json::Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                    );
+                .ok_or_else(|| format!("{id} 缺 kind"))?;
+            let kind = Kind::parse(kind_s).ok_or_else(|| format!("{id} kind 不认识：{kind_s}"))?;
+            // `file` 只服务离线包：远程条目可以没有它（下载走 `urls`）。
+            let file = item
+                .get("file")
+                .and_then(crate::core::json::Value::as_str)
+                .unwrap_or("");
+            if !file.is_empty() {
+                let p = Path::new(file);
+                if p.components().count() != 1
+                    || !matches!(p.components().next(), Some(std::path::Component::Normal(_)))
+                {
+                    return Err(format!("{id} 的 file 必须是同目录文件名"));
                 }
-                m
-            },
-            installed: installed_ids.iter().any(|x| x == id),
-        });
+            }
+            let description = item
+                .get("description")
+                .and_then(crate::core::json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let size = item
+                .get("size")
+                .and_then(crate::core::json::Value::as_u64)
+                .unwrap_or(0);
+            let capabilities = match item.get("capabilities") {
+                None | Some(crate::core::json::Value::Null) => Vec::new(),
+                Some(v) => v
+                    .as_array()
+                    .ok_or_else(|| format!("{id} 的 capabilities 必须是数组"))?
+                    .iter()
+                    .map(|x| {
+                        x.as_str()
+                            .and_then(Capability::parse)
+                            .ok_or_else(|| format!("{id} 含未知能力"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            };
+            Ok(AvailablePlugin {
+                id: id.to_string(),
+                name: name.to_string(),
+                version: version.to_string(),
+                protocol,
+                min_host: item
+                    .get("min_host")
+                    .and_then(crate::core::json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                kind,
+                description,
+                file: file.to_string(),
+                size,
+                capabilities,
+                released: item
+                    .get("released")
+                    .and_then(crate::core::json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                author: item
+                    .get("author")
+                    .and_then(crate::core::json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                license: item
+                    .get("license")
+                    .and_then(crate::core::json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                urls: {
+                    let mut m = std::collections::HashMap::new();
+                    for key in ["gitee", "github"] {
+                        m.insert(
+                            key.to_string(),
+                            item.get(key)
+                                .and_then(crate::core::json::Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                        );
+                    }
+                    m
+                },
+                installed: installed_ids.iter().any(|x| x == id),
+            })
+        })();
+        match parsed {
+            Ok(p) => out.push(p),
+            Err(e) => log::warn!("跳过插件清单第 {} 项：{e}", i + 1),
+        }
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(out)
@@ -785,6 +834,17 @@ pub fn parse_catalog(text: &str, installed_ids: &[String]) -> Result<Vec<Availab
 
 /// 清单项对应的本地 ZIP（`docs/<file>`）；路径由清单解析阶段白名单校验。
 pub fn local_package_path(entry: &AvailablePlugin) -> Option<PathBuf> {
+    if entry.file.is_empty() {
+        return None;
+    }
+    // 解析期已校验一次；这里是另一次使用（跨会话落盘），再验一遍纯 Normal 组件，
+    // 防止 `C:evil.zip` 这类带盘符前缀的名字让 `join` 整体替换基路径。
+    let p = Path::new(&entry.file);
+    if p.components().count() != 1
+        || !matches!(p.components().next(), Some(std::path::Component::Normal(_)))
+    {
+        return None;
+    }
     Some(crate::core::paths::docs_dir()?.join(&entry.file))
 }
 
@@ -932,7 +992,8 @@ fn install_zip(bytes: &[u8], root: &Path, id: &str, replace: bool) -> Result<(),
                     log::info!("插件 {id} 升级：旧设置区已保留");
                 }
                 None => {
-                    if staging.join(settings::FILE_NAME).is_file() {
+                    // 此刻 `staging` 已经被 rename 成 `dest`，要查的是新目录。
+                    if dest.join(settings::FILE_NAME).is_file() {
                         log::info!("插件 {id} 升级：包自带设置区，沿用新包的那份");
                     }
                 }
@@ -1170,11 +1231,16 @@ mod tests {
 
     /// 造一枚带热键声明的扩展（纯内存，不落盘）。
     fn ext_with(id: &str, kind: &str, hotkey: &str) -> Extension {
+        // 只有命令型允许 hotkey（解析期硬约束）：editor 夹具不再挂 hotkey。
+        let hotkey_field = if kind == "command" {
+            format!(r#","hotkey":"{hotkey}""#)
+        } else {
+            String::new()
+        };
         let text = format!(
             r#"{{"schema":1,"id":"{id}","name":"{id}","version":"1.0.0","protocol":1,
                 "min_host":"0.0.1","kind":"{kind}","entry":"x.exe",
-                "capabilities":["image.read"],"platforms":["windows-x64"],
-                "hotkey":"{hotkey}"}}"#
+                "capabilities":["image.read"],"platforms":["windows-x64"]{hotkey_field}}}"#
         );
         let manifest = Manifest::parse(&text).expect("manifest 应能解析");
         Extension {
@@ -1209,7 +1275,7 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].run_key, "analyze:checkup");
         assert_eq!(list[0].command_id.as_deref(), Some("checkup"));
-        assert_eq!(list[0].display_name, "体检");
+        assert_eq!(list[0].display_name, "图片分析 · 体检");
         assert_eq!(list[0].manifest.kind, Kind::Command);
         assert_eq!(list[1].run_key, "analyze:channels");
         assert_eq!(list[1].manifest.kind, Kind::Editor);
@@ -1304,24 +1370,25 @@ mod tests {
             let text = format!(
                 r#"[{{"id":"{quoted}","name":"P","version":"1.0.0","protocol":1,"kind":"command","file":"p.zip"}}]"#
             );
+            // 单项坏只跳过、不废整份（与解码器清单同口径）：坏 id 不应产出条目。
             assert!(
-                parse_catalog(&text, &[]).is_err(),
+                parse_catalog(&text, &[]).expect("整份仍可解析").is_empty(),
                 "bad id accepted: {id:?}"
             );
             let incomplete = format!(r#"[{{"id":"{quoted}"}}]"#);
-            let err = parse_catalog(&incomplete, &[]).expect_err("id must be checked first");
-            // 判据是**顺序**而不是文案：只给 id 的项如果先查了别的字段，错误里
-            // 必然提到 name / version（那说明坏 id 被放过了）。
             assert!(
-                !err.contains("name") && !err.contains("version"),
-                "id 校验必须排在其他字段之前：{err}"
+                parse_catalog(&incomplete, &[])
+                    .expect("单项残缺也要能解析")
+                    .is_empty(),
+                "残缺项不该产出条目"
             );
         }
         let long = "a".repeat(65);
-        let err = parse_catalog(&format!(r#"[{{"id":"{long}"}}]"#), &[]).expect_err("long id");
         assert!(
-            !err.contains("name") && !err.contains("version"),
-            "超长 id 也要在字段校验之前被挡下：{err}"
+            parse_catalog(&format!(r#"[{{"id":"{long}"}}]"#), &[])
+                .expect("整份仍可解析")
+                .is_empty(),
+            "超长 id 不该产出条目"
         );
     }
 

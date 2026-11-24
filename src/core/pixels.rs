@@ -239,7 +239,7 @@ pub fn to_rgba8(buf: Vec<u8>, w: u32, h: u32, pf: u32, _bit_depth: u32) -> Resul
                     u16::from_le_bytes([lo as u8, hi as u8]) as f32
                 })
                 .collect();
-            Ok(normalize_to_rgba(&samples, n, ch))
+            Ok(normalize_to_rgba(&samples, n, ch, 65_535.0))
         }
         PF_GRAY_F32 | PF_RGBA_F32 => {
             let ch = channels_of(pf);
@@ -250,7 +250,7 @@ pub fn to_rgba8(buf: Vec<u8>, w: u32, h: u32, pf: u32, _bit_depth: u32) -> Resul
                     f32::from_le_bytes([b[0], b[1], b[2], b[3]])
                 })
                 .collect();
-            Ok(normalize_to_rgba(&samples, n, ch))
+            Ok(normalize_to_rgba(&samples, n, ch, 1.0))
         }
         other => Err(format!("不支持的像素格式 {other}")),
     }
@@ -297,8 +297,12 @@ pub fn channels_of(pf: u32) -> usize {
     }
 }
 
-/// 多通道浮点样本 → RGBA8：逐通道 min-max 归一化。非有限值当 0。
-pub fn normalize_to_rgba(samples: &[f32], n: usize, ch: usize) -> Vec<u8> {
+/// 多通道浮点样本 → RGBA8：RGB 逐通道 min-max 归一化；alpha 按**满量程**线性缩。
+///
+/// ★ alpha 不能也走 min-max：RGBA16 / RGBA_F32 的 alpha 经常是常量（全 65535 /
+///   全 1.0），`max-min < ε` 会把整张图归一成 alpha=0（全透明）。`alpha_scale`
+///   由调用方按源格式给（16 位 65535、浮点 1.0）。
+pub fn normalize_to_rgba(samples: &[f32], n: usize, ch: usize, alpha_scale: f32) -> Vec<u8> {
     let mut mins = [f32::INFINITY; 4];
     let mut maxs = [f32::NEG_INFINITY; 4];
     for i in 0..n {
@@ -318,11 +322,27 @@ pub fn normalize_to_rgba(samples: &[f32], n: usize, ch: usize) -> Vec<u8> {
         for c in 0..ch {
             let v = samples[i * ch + c];
             let v = if v.is_finite() { v } else { 0.0 };
-            let (lo, hi) = (mins[c], maxs[c]);
-            let norm = if (hi - lo).abs() < f32::EPSILON {
-                0.0
+            let norm = if ch == 4 && c == 3 {
+                // alpha 是覆盖率：有变化时仍按 min-max（保持既有像素断言）；
+                // **常量场**不能归零——RGBA16/F32 常见全 65535/1.0，会被整图透明。
+                // 常量时按满量程缩，至少保留「不透明」这个事实。
+                let (lo, hi) = (mins[c], maxs[c]);
+                if (hi - lo).abs() < f32::EPSILON {
+                    if alpha_scale > 0.0 {
+                        (v / alpha_scale).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    (v - lo) / (hi - lo)
+                }
             } else {
-                (v - lo) / (hi - lo)
+                let (lo, hi) = (mins[c], maxs[c]);
+                if (hi - lo).abs() < f32::EPSILON {
+                    0.0
+                } else {
+                    (v - lo) / (hi - lo)
+                }
             };
             out[i * 4 + c] = (norm * 255.0).clamp(0.0, 255.0) as u8;
         }
@@ -658,7 +678,15 @@ pub fn plugin_sample_step(w: u32, h: u32, cap: u64) -> u32 {
 /// ★ 采样点按**对角错位**铺（见循环里的注释），不是整齐的网格：整齐网格在周期纹理上
 ///   会漏掉整个相位。位置仍是确定的，同一张图两次抽样逐字节相同。
 pub fn sample_strided(rgba: &[u8], w: u32, h: u32, step: u32) -> (u32, u32, Vec<u8>) {
-    if step <= 1 || w == 0 || h == 0 || rgba.len() < w as usize * h as usize * 4 {
+    // `step > h` 时 `y % step` 的纵向错位会越过最后一行（`oh` 已经被夹成 1，
+    // 但偏移仍按 step 取），切片越界 panic；这种长条图原样返回，由调用方按
+    // "抽了没变小"回退成不发（2026-11-24 审计 M21）。
+    if step <= 1
+        || w == 0
+        || h == 0
+        || step > h
+        || rgba.len() < (w as usize).saturating_mul(h as usize).saturating_mul(4)
+    {
         return (w, h, rgba.to_vec());
     }
     let ow = (w / step).max(1);

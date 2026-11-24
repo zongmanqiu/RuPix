@@ -318,7 +318,7 @@ fn key_input(vk: u32) -> Option<crate::core::hotkey::KeyInput> {
 
 /// 预览窗里的翻页键：命中 `Action::Prev/Next` 就派发一次导航。
 /// 长按自重复（lParam bit 30）忽略：一张一张按，避免把解码队列打满。
-fn preview_nav_key(vk: u32, lparam: usize) -> bool {
+fn preview_nav_key(vk: u32, lparam: usize, ignore_alt: bool) -> bool {
     use crate::core::hotkey::Action;
     if lparam & (1 << 30) != 0 {
         return false;
@@ -326,10 +326,20 @@ fn preview_nav_key(vk: u32, lparam: usize) -> bool {
     let Some(ev) = key_input(vk) else {
         return false;
     };
-    let action = NAV_HOTKEYS
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().and_then(|h| h.match_action(&ev)));
+    let lookup = |ev: &crate::core::hotkey::KeyInput| {
+        NAV_HOTKEYS
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|h| h.match_action(ev)))
+    };
+    let mut action = lookup(&ev);
+    // WM_SYSKEYDOWN 下 Alt 必然是按下的；默认翻页键不带修饰键，精确比对永远不中。
+    // 先按原样试一次（用户可能真绑了 Alt+方向键），不中再剥掉 Alt 试默认键。
+    if action.is_none() && ignore_alt && ev.alt {
+        let mut no_alt = ev;
+        no_alt.alt = false;
+        action = lookup(&no_alt);
+    }
     match action {
         Some(Action::Next) => {
             dispatch_navigate(1);
@@ -874,24 +884,29 @@ unsafe fn on_close_space() {
 fn dispatch_pick_and_decode() {
     let gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let ctrl = CTRL_HWND.load(Ordering::SeqCst);
-    std::thread::spawn(move || {
-        // 准入判据在 `formats` 一处：已知可预览后缀（内置 SVG ∪ 解码器自述）直接放行；
-        // 空后缀 / 未认领后缀读前 64 字节看魔数（m331：无后缀或错后缀的 PNG/JPEG/GIF/
-        // BMP/WebP 也能空格预览）。★ 裸像素（`rgb`/`uyvy`/`yuv`…）仍走后缀表：它们能不能
-        // 出图取决于"参数推不推得出"，那是**文件级**事实，不在后缀表上预判。
-        let allowed = |p: &std::path::Path| crate::core::formats::is_previewable_path(p);
-        let Some(path) = crate::platform::shell_selection::foreground_selected_file(&allowed)
-        else {
-            // 按了空格却没出窗的两类原因，日志里要能分开：前台不是资源管理器（取不到
-            // 选中项）／ 选中项的后缀不在清单里（`allowed` 判否）。否则现场只剩
-            // "按了没反应"，与"钩子没挂上"混在一起分不清。
-            log::debug!(
-                "spacehook：没取到可预览的选中项（前台非资源管理器，或后缀未认领且魔数不匹配）"
-            );
-            return;
-        };
-        decode_and_post(path, gen, ctrl);
-    });
+    let spawned = std::thread::Builder::new()
+        .name("space-preview".into())
+        .spawn(move || {
+            // 准入判据在 `formats` 一处：已知可预览后缀（内置 SVG ∪ 解码器自述）直接放行；
+            // 空后缀 / 未认领后缀读前 64 字节看魔数（m331：无后缀或错后缀的 PNG/JPEG/GIF/
+            // BMP/WebP 也能空格预览）。★ 裸像素（`rgb`/`uyvy`/`yuv`…）仍走后缀表：它们能不能
+            // 出图取决于"参数推不推得出"，那是**文件级**事实，不在后缀表上预判。
+            let allowed = |p: &std::path::Path| crate::core::formats::is_previewable_path(p);
+            let Some(path) = crate::platform::shell_selection::foreground_selected_file(&allowed)
+            else {
+                // 按了空格却没出窗的两类原因，日志里要能分开：前台不是资源管理器（取不到
+                // 选中项）／ 选中项的后缀不在清单里（`allowed` 判否）。否则现场只剩
+                // "按了没反应"，与"钩子没挂上"混在一起分不清。
+                log::debug!(
+                    "spacehook：没取到可预览的选中项（前台非资源管理器，或后缀未认领且魔数不匹配）"
+                );
+                return;
+            };
+            decode_and_post(path, gen, ctrl);
+        });
+    if let Err(e) = spawned {
+        log::warn!("spacehook：预览线程起不来：{e}");
+    }
 }
 
 /// 预览态翻页：从当前预览文件出发，按主窗同一套排序取上一张/下一张，
@@ -906,22 +921,27 @@ fn dispatch_navigate(delta: isize) {
     };
     let gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let ctrl = CTRL_HWND.load(Ordering::SeqCst);
-    std::thread::spawn(move || {
-        let cfg = crate::core::config::Config::load();
-        let Ok(mut gallery) = crate::core::gallery::Gallery::from_file(&from, cfg.sort_spec())
-        else {
-            log::debug!("spacehook：预览翻页建清单失败: {}", from.display());
-            return;
-        };
-        // 与主窗翻页同口径：永远循环（3/3 再下一张回 1/3）。
-        if !gallery.step_looped(delta) {
-            return;
-        }
-        let Some(path) = gallery.current().cloned() else {
-            return;
-        };
-        decode_and_post(path, gen, ctrl);
-    });
+    let spawned = std::thread::Builder::new()
+        .name("space-nav".into())
+        .spawn(move || {
+            let cfg = crate::core::config::Config::load();
+            let Ok(mut gallery) = crate::core::gallery::Gallery::from_file(&from, cfg.sort_spec())
+            else {
+                log::debug!("spacehook：预览翻页建清单失败: {}", from.display());
+                return;
+            };
+            // 与主窗翻页同口径：永远循环（3/3 再下一张回 1/3）。
+            if !gallery.step_looped(delta) {
+                return;
+            }
+            let Some(path) = gallery.current().cloned() else {
+                return;
+            };
+            decode_and_post(path, gen, ctrl);
+        });
+    if let Err(e) = spawned {
+        log::warn!("spacehook：翻页线程起不来：{e}");
+    }
 }
 
 /// 单张解码 + 成品回投。调用方保证 `path` 是预览清单认领的图片；
@@ -1341,14 +1361,15 @@ unsafe extern "system" fn preview_wnd_proc(
                 return LRESULT(0);
             }
             // 预览态翻页：只认用户绑定的 Prev/Next；其余键保持旧行为（吞掉）。
-            if preview_nav_key(wparam.0 as u32, lparam.0 as usize) {
+            if preview_nav_key(wparam.0 as u32, lparam.0 as usize, false) {
                 return LRESULT(0);
             }
             LRESULT(0)
         }
         WM_SYSKEYDOWN => {
             // Alt+方向键也可作为翻页键；其余系统键（Alt+F4 等）交给默认过程。
-            if preview_nav_key(wparam.0 as u32, lparam.0 as usize) {
+            // 第三个参数让判据在精确匹配失败后剥掉 Alt 再试默认键。
+            if preview_nav_key(wparam.0 as u32, lparam.0 as usize, true) {
                 return LRESULT(0);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }

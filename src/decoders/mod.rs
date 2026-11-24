@@ -168,6 +168,10 @@ pub fn is_disabled(id: &str) -> bool {
 pub fn add_disabled(id: &str) {
     let mut g = disabled_guard();
     g.insert(id.to_string());
+    drop(g);
+    // 禁用集变了，`declared_exts` 的缓存必须作废：否则熔断/停用之后，图库仍把
+    // 该格式列成可打开，点开才报「无人认领」（2026-11-24 审计 L52）。
+    request_rescan();
 }
 
 /// 各扩展名的**用户显式首选**解码器（`扩展名 → 解码器 id` 稀疏表；全局：UI 线程写、
