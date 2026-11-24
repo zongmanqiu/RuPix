@@ -4,7 +4,8 @@
  ｜ **[⬇️ 下载 0.4.1 (GitHub)](https://github.com/zongmanqiu/RuPix/releases/download/0.4.1/RuPix_0.4.1.zip)**
 
 > 发布包已带 `classic` / `common` / `modern` / `pro` / `raw` 5 枚基础解码器；`doc`（PDF/PS/AI/DXF）、
-> `texture`、`doc-legacy` 仍可在 设置 → 解码器 里按需下载。已有旧版的用户可直接在「关于」页更新。
+> `texture`、`doc-legacy` 仍可在 设置 → 解码器 里按需下载。0.4.x 暂停自动更新（旧更新器只接受
+> 四文件包）：请从发布页手动下载本包覆盖，下一版恢复。
 
 > 宿主仓库（本仓）: [Gitee](https://gitee.com/qiuzongman/RuPix) | [GitHub](https://github.com/zongmanqiu/RuPix)
 
