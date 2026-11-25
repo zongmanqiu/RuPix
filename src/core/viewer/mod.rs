@@ -324,7 +324,13 @@ pub struct Viewer {
     pub(super) band: Option<crate::core::reading::continuous::Band>,
     /// 连续阅读的已解码位图驻留池（按像素量 LRU，见 `BandCache`）。
     /// 单页模式下空置（不驻留、不增长）。
+    /// ★ m351 Phase C（canvas 绘制接线）落地前暂无读者。
+    #[allow(dead_code)]
     pub(super) band_cache: crate::core::reading::continuous::BandCache,
+    /// 页带在途请求登记（seq → (路径, 帧号)）：`Done` 不带帧号，回包按 seq 认领。
+    /// ★ m351 Phase C（canvas 绘制接线）落地前暂无读者。
+    #[allow(dead_code)]
+    pub(super) band_inflight: std::collections::HashMap<u64, (PathBuf, u32)>,
     /// 已应用的编辑覆盖（path → 覆盖），见 [`edited`] 模块；只存内存，会话级。
     edited: std::collections::HashMap<PathBuf, edited::EditedKeep>,
     pub(super) error: Option<ViewFailure>,
@@ -555,6 +561,7 @@ pub(super) fn dir_trace() -> bool {
     *ON.get_or_init(|| std::env::var_os("RUPIX_DIR_TRACE").is_some())
 }
 
+mod band;
 mod edited;
 mod nav;
 mod overlay;

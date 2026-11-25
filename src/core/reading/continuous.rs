@@ -10,7 +10,7 @@
 //! （锚定项在屏幕上的相对位置不动，用户就感知不到"跳变"）。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// 滚动轴：纵向从上到下，横向从左到右。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,8 +208,8 @@ pub const BAND_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// 池里一张已解码页。
 pub struct CachedImg {
-    /// 预乘 sRGBA8（与单页 `Loaded::base_rgba` 同一像素口径）。
-    pub rgba: Vec<u8>,
+    /// 预乘 sRGBA8（与单页 `Loaded::base_rgba` 同一像素口径；Arc 共享避免整幅拷贝）。
+    pub rgba: std::sync::Arc<Vec<u8>>,
     pub w: u32,
     pub h: u32,
     last_use: u64,
@@ -236,17 +236,22 @@ impl BandCache {
         self.bytes
     }
 
+    /// 是否已驻留某项（**不续命**——探测与续命分开，窗口刷新每帧跑）。
+    pub fn contains(&self, path: &Path, page: u32) -> bool {
+        self.map.contains_key(&(path.to_path_buf(), page))
+    }
+
     /// 取一份拷贝视图（命中即续命）。借用冲突的折衷：调用方拿到的是快照引用计数外的
     /// 克隆——位图克隆一次的代价远小于重复解码。
-    pub fn get(&mut self, path: &PathBuf, page: u32) -> Option<&CachedImg> {
+    pub fn get(&mut self, path: &Path, page: u32) -> Option<&CachedImg> {
         let clock = self.tick();
-        let img = self.map.get_mut(&(path.clone(), page))?;
+        let img = self.map.get_mut(&(path.to_path_buf(), page))?;
         img.last_use = clock;
         Some(img)
     }
 
     /// 插入；超限时按最旧逐出（可能包含刚插入项——调用方无须特判）。
-    pub fn insert(&mut self, path: PathBuf, page: u32, rgba: Vec<u8>, w: u32, h: u32) {
+    pub fn insert(&mut self, path: PathBuf, page: u32, rgba: std::sync::Arc<Vec<u8>>, w: u32, h: u32) {
         let cost = (w as u64) * (h as u64) * 4;
         let key = (path, page);
         if let Some(old) = self.map.remove(&key) {
@@ -399,13 +404,13 @@ mod tests {
         // 8 MiB/张，40 张必然超 256 MiB。
         for i in 0..40 {
             let n = (8 * 1024 * 1024) as usize; // 8 MiB
-            c.insert(p(&format!("f{i}")), 0, vec![0u8; n], 1024, 2048);
+            c.insert(p(&format!("f{i}")), 0, std::sync::Arc::new(vec![0u8; n]), 1024, 2048);
         }
         assert!(c.bytes() <= BAND_CACHE_BYTES);
         assert!(c.len() < 40);
         // 命中续命后，旧项先被逐出。
         assert!(c.get(&p("f8"), 0).is_some());
-        c.insert(p("x"), 0, vec![0u8; 8 * 1024 * 1024], 1024, 2048);
+        c.insert(p("x"), 0, std::sync::Arc::new(vec![0u8; 8 * 1024 * 1024]), 1024, 2048);
         assert!(c.get(&p("f8"), 0).is_some(), "刚续命的项不应被逐出");
     }
 
@@ -413,7 +418,7 @@ mod tests {
     fn evict_outside_keeps_window() {
         let mut c = BandCache::new();
         for i in 0..4 {
-            c.insert(p(&format!("f{i}")), 0, vec![0u8; 16], 2, 2);
+            c.insert(p(&format!("f{i}")), 0, std::sync::Arc::new(vec![0u8; 16]), 2, 2);
         }
         c.evict_outside(&[(p("f1"), 0), (p("f2"), 0)]);
         assert!(c.get(&p("f1"), 0).is_some());

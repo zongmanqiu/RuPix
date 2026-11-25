@@ -30,6 +30,7 @@ impl Viewer {
             loaded: None,
             band: None,
             band_cache: crate::core::reading::continuous::BandCache::new(),
+            band_inflight: std::collections::HashMap::new(),
             edited: std::collections::HashMap::new(),
             error: None,
             preview_meta: None,
