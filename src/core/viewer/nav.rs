@@ -28,6 +28,8 @@ impl Viewer {
             config,
             gallery: None,
             loaded: None,
+            band: None,
+            band_cache: crate::core::reading::continuous::BandCache::new(),
             edited: std::collections::HashMap::new(),
             error: None,
             preview_meta: None,
@@ -485,6 +487,8 @@ impl Viewer {
             fit: self.fit,
             scale: self.scale(),
             pan: self.pan,
+            // 连续阅读模式下记忆带内滚动位置；单页模式恒 None。
+            scroll: self.band.as_ref().map(|b| b.scroll),
         })
     }
 

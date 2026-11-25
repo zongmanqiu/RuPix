@@ -150,6 +150,7 @@ fn pending_reading_restore_applies_view_and_page_once() {
         fit: false,
         scale: 2.0,
         pan: (10.0, -5.0),
+        scroll: None,
     });
     v.apply_pending_reading_restore(&pa);
 
@@ -177,6 +178,7 @@ fn saved_directory_item_is_found_or_dropped() {
         fit: true,
         scale: 1.0,
         pan: (0.0, 0.0),
+        scroll: None,
     };
     assert!(v.jump_to_saved_item(&m), "清单里还在的项要能找到");
     assert_eq!(

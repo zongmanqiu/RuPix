@@ -319,6 +319,12 @@ pub struct Viewer {
     pub(super) config: Rc<RefCell<Config>>,
     pub(super) gallery: Option<Gallery>,
     pub(super) loaded: Option<Loaded>,
+    /// 连续阅读模式（m351）：`Some` = 模式开着（带布局 + 滚动状态 + 当前项）；
+    /// `None` = 单页模式，一切行为与现状逐字节一致。
+    pub(super) band: Option<crate::core::reading::continuous::Band>,
+    /// 连续阅读的已解码位图驻留池（按像素量 LRU，见 `BandCache`）。
+    /// 单页模式下空置（不驻留、不增长）。
+    pub(super) band_cache: crate::core::reading::continuous::BandCache,
     /// 已应用的编辑覆盖（path → 覆盖），见 [`edited`] 模块；只存内存，会话级。
     edited: std::collections::HashMap<PathBuf, edited::EditedKeep>,
     pub(super) error: Option<ViewFailure>,

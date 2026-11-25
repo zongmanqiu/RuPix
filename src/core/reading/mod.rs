@@ -20,6 +20,8 @@
 //! 都会变，路径不可比）。找不到 `item` 就整条作废，不按旧下标硬套——文件删了
 //! 还按旧位置翻，用户会落在完全无关的一张上。
 
+pub mod continuous;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -30,8 +32,11 @@ pub const MAX: usize = 200;
 /// 文件名（exe 同级）。路径由 [`crate::core::paths::reading_path`] 给出。
 pub const FILE: &str = "reading.txt";
 
-/// 盘上格式版本。改字段含义时递增，老文件整份忽略（不猜、不迁移）。
-const SCHEMA: &str = "v1";
+/// 盘上格式版本。改字段含义时递增；**追加字段**（m351 的 `scroll`）保持向后
+/// 兼容：v1 行按缺省值补齐继续读，写盘统一用新版本。
+const SCHEMA: &str = "v2";
+/// 旧版本头（读兼容）。
+const SCHEMA_V1: &str = "v1";
 
 /// 一条阅读记忆。
 #[derive(Debug, Clone, PartialEq)]
@@ -51,6 +56,9 @@ pub struct Memento {
     pub scale: f32,
     /// 手动档平移（`fit == true` 时忽略）。
     pub pan: (f32, f32),
+    /// 连续阅读模式（m351）的带内滚动位置（`None` = 单页模式，无此概念）。
+    /// v1 行没有这个字段，按 `None` 补齐。
+    pub scroll: Option<f64>,
 }
 
 impl Memento {
@@ -221,8 +229,10 @@ fn unescape(s: &str) -> String {
 }
 
 fn render_memento(m: &Memento) -> String {
+    // v2：追加第 9 列 scroll（连续阅读带内位置；单页模式写空串）。
+    let scroll = m.scroll.map(|s| s.to_string()).unwrap_or_default();
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         escape(&m.key),
         escape(&m.item),
         m.index,
@@ -230,13 +240,14 @@ fn render_memento(m: &Memento) -> String {
         u8::from(m.fit),
         m.scale,
         m.pan.0,
-        m.pan.1
+        m.pan.1,
+        scroll
     )
 }
 
 fn parse_memento(line: &str) -> Option<Memento> {
     let f: Vec<&str> = line.split('\t').collect();
-    if f.len() != 8 {
+    if f.len() != 8 && f.len() != 9 {
         return None;
     }
     let key = unescape(f[0]);
@@ -249,6 +260,22 @@ fn parse_memento(line: &str) -> Option<Memento> {
     if !scale.is_finite() || !pan.0.is_finite() || !pan.1.is_finite() {
         return None;
     }
+    // v2 的第 9 列：空串 = 单页模式；有值 = 连续阅读滚动位置（负数作废）。
+    let scroll = match f.len() {
+        8 => None,
+        _ => {
+            if f[8].is_empty() {
+                None
+            } else {
+                let s: f64 = f[8].parse().ok()?;
+                if s.is_finite() && s >= 0.0 {
+                    Some(s)
+                } else {
+                    return None;
+                }
+            }
+        }
+    };
     Some(Memento {
         key,
         item: unescape(f[1]),
@@ -261,6 +288,7 @@ fn parse_memento(line: &str) -> Option<Memento> {
         },
         scale,
         pan,
+        scroll,
     })
 }
 
@@ -271,7 +299,9 @@ fn parse(text: &str) -> Vec<Memento> {
         return Vec::new();
     };
     // 手改 / 某些编辑器会带 UTF-8 BOM：版本头不能被它顶掉。
-    if version.trim_start_matches('\u{feff}').trim() != SCHEMA {
+    // v1（m333）缺 scroll 列，按缺省值补齐继续读（m351 追加字段向后兼容）。
+    let head = version.trim_start_matches('\u{feff}').trim();
+    if head != SCHEMA && head != SCHEMA_V1 {
         return Vec::new();
     }
     let mut out: Vec<Memento> = Vec::new();
@@ -369,6 +399,7 @@ mod tests {
             fit: true,
             scale: 1.0,
             pan: (0.0, 0.0),
+            scroll: None,
         }
     }
 
@@ -434,7 +465,7 @@ mod tests {
     fn escapes_keep_tabs_newlines_and_backslashes_in_one_field() {
         let m = m("f:c:\\a\\b.png", "a\tb\nc\\d", 0, 0);
         let line = render_memento(&m);
-        assert_eq!(line.matches('\t').count(), 7, "字段分隔符不能被内容污染");
+        assert_eq!(line.matches('\t').count(), 8, "字段分隔符不能被内容污染");
         assert_eq!(parse_memento(&line), Some(m));
         assert_eq!(escape(r"a\b"), r"a\\b");
         assert_eq!(unescape(r"a\\b"), r"a\b");
@@ -444,7 +475,7 @@ mod tests {
     #[test]
     fn parse_rejects_wrong_version_and_junk_lines() {
         assert!(
-            parse("v2\nf:c:\\a.png\tx\t0\t0\t1\t1\t0\t0\n").is_empty(),
+            parse("v9\nf:c:\\a.png\tx\t0\t0\t1\t1\t0\t0\n").is_empty(),
             "未知版本整份忽略"
         );
         let text = "v1\n\nf:c:\\a.png\tx\t0\t0\t1\t1\t0\t0\nbad line\n\
