@@ -47,9 +47,8 @@ python build\release_pack.py --version 0.4.1
 - 解码器许可文件夹从 `.temp/decoder-packages/<id>_<ver>.stage/<id>_<ver>/` 取；缺任何
   一枚，`release_pack.py` 直接中止，不会生成"少一个文件夹"的包。
 - 打包固定 7-Zip 标准 ZIP/Deflate（`-mx=9 -mtm=off -mta=off -mtc=off`）。
-- **0.4.x 自动更新暂停**：0.3.x 更新器只接受四文件包，遇到 `decoders/` 会拒绝；本版不
-  发布新的 `update.json`，0.3.x 用户手动下载。下一版先把更新器改成接受这个单包，再恢复
-  自动更新；不再另造"更新信封"。
+- **无自动更新（2026-11-25 用户裁决，永久）**：不做自动更新，不再造更新信封；用户从
+  release 页手动下载覆盖升级。0.3.x 的四文件更新器与 `update.json` 发布链就此终结。
 
 ## 两条静态体检（只读，可单独跑）
 
