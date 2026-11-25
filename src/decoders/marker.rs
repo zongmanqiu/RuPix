@@ -111,8 +111,27 @@ impl Drop for LoadingGuard {
 }
 
 /// 在 `LoadLibrary` 之前写标记。写失败返回 `None`（加载照常，只是没有面包屑）。
+///
+/// ★ **原子落盘（m349）**：先写完整内容到临时名，再 `rename` 成正式标记名。
+///   旧实现 `File::create` → `write_all` 两步之间有一段"文件已在、内容还是空"的
+///   窗口——多车道（m349 T1）或多窗口（m211）并发起 worker 时，另一台 worker 的
+///   `stale()` 恰好在这段窗口里读到**没有 nonce 行的空文件**，按"无 nonce = 残留"
+///   判真，把这枚 DLL 从**那台 worker 的目录里永久跳过**（本次会话它解不了任何
+///   该 DLL 认领的格式，全部落进"无人认领"兜底）。真机证据：T3 复测一次 5 worker
+///   并发启动，一台 worker 缺 common，一半预读解码全报嗅探兜底，`[dll-serial]`
+///   留下 7 枚 DLL × 每笔的嗅探风暴。rename 在 NTFS 上原子：读者要么看不到文件、
+///   要么看到完整内容，空窗结构性消失。
+///
+///   崩溃保护语义不变：临时文件阶段（`LoadLibrary` **之前**）崩溃不留正式标记——
+///   那时还没进 DLL，无需保护；`rename` 成功后才进 `LoadLibrary`，此后崩溃照旧
+///   留下完整标记。临时文件不叫 `*.dll`，目录扫描不会把它当解码器；进程在写入
+///   中被硬杀只会留一个无害的临时残留。
 pub(super) fn begin(dll: &Path) -> Option<LoadingGuard> {
     let path = path_for(dll);
+    // 临时名带进程 nonce：同进程并发 begin 互不覆盖；跨进程 nonce 必不同。
+    let mut tmp = path.clone().into_os_string();
+    tmp.push(format!(".tmp{}", process_nonce()));
+    let tmp = PathBuf::from(tmp);
     let body = format!(
         "nonce={}\npid={}\nstarted={:?}\n",
         process_nonce(),
@@ -120,23 +139,29 @@ pub(super) fn begin(dll: &Path) -> Option<LoadingGuard> {
         std::time::SystemTime::now()
     );
     let staged = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&path)?;
+        let mut f = std::fs::File::create(&tmp)?;
         f.write_all(body.as_bytes())?;
         // 不 sync 的话，进程在 `LoadLibrary` 里崩掉时这枚文件可能还留在页缓存里。
         f.sync_all()?;
         Ok(())
     })();
-    match staged {
-        Ok(()) => Some(LoadingGuard { path }),
-        Err(e) => {
-            log::warn!(
-                "解码器加载标记写入失败 {}：{e}（本次无面包屑保护）",
-                path.display()
-            );
-            let _ = std::fs::remove_file(&path);
-            None
-        }
+    if let Err(e) = staged {
+        log::warn!(
+            "解码器加载标记写入失败 {}：{e}（本次无面包屑保护）",
+            path.display()
+        );
+        let _ = std::fs::remove_file(&tmp);
+        return None;
     }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        log::warn!(
+            "解码器加载标记落盘失败 {}：{e}（本次无面包屑保护）",
+            path.display()
+        );
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
+    Some(LoadingGuard { path })
 }
 
 #[cfg(test)]
@@ -184,5 +209,68 @@ mod tests {
     fn marker_path_keeps_the_dll_extension() {
         let p = path_for(Path::new(r"C:\x\common.dll"));
         assert_eq!(p.file_name().unwrap(), "common.dll.loading");
+    }
+
+    /// ★ m349：标记必须**原子可见**——并发的 `stale()` 读侧在任何时刻都只能看到
+    /// "无文件"或"完整内容"，绝不许看到半截/空文件（空文件无 nonce 行会被判成
+    /// 崩溃残留，那台 worker 的目录就永久缺这枚 DLL——T3 真机复测抓到的启动竞态）。
+    ///
+    /// 写侧循环 begin→持住→drop，读侧同时高频 hammer `stale()`；守卫存活期间
+    /// `stale()` 必须恒为 false。修复前的 create→write 空窗被 hammer 抓到过才会
+    /// 有这条钉子（窗口极窄，这条测试主要是**回归防倒退**——把 begin 改回两步写
+    /// 不一定每次都红，所以另有一条结构断言：`begin` 存活期间盘上若有标记，内容
+    /// 必须带 nonce 行）。
+    #[test]
+    fn marker_is_never_seen_half_written_by_concurrent_stale() {
+        let (dir, dll) = scratch("atomic");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let dll2 = dll.clone();
+        let reader = std::thread::spawn(move || {
+            let mut seen = 0;
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                if std::fs::exists(path_for(&dll2)).unwrap_or(false) {
+                    seen += 1;
+                    // 标记一旦可见就必须是完整的（nonce 行在）——空窗即红。
+                    // 读到 NotFound = 写侧恰在此刻 drop 清掉，不算数（读侧自己的
+                    // TOCTOU，不是被测窗口）。
+                    match std::fs::read_to_string(path_for(&dll2)) {
+                        Ok(body) => assert!(
+                            body.contains("nonce="),
+                            "读到了半截标记（原子性被破坏）：{body:?}"
+                        ),
+                        // NotFound = 写侧恰在此刻 drop 清掉；AccessDenied = Windows
+                        // 的 delete-pending 瞬态（删除句柄还没关，读打开被拒）——两者
+                        // 都是"标记正在消失"，不是被测的半截窗口。生产路径 `stale()`
+                        // 读失败同样按"无标记"放行，无害。
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::NotFound
+                                || e.raw_os_error() == Some(5) => {}
+                        Err(e) => panic!("读标记出现非预期错误：{e}"),
+                    }
+                }
+            }
+            seen
+        });
+        for _ in 0..50 {
+            let guard = begin(&dll).expect("标记必须建得出来");
+            assert!(!stale(&dll), "守卫存活期间不算残留");
+            drop(guard);
+            assert!(!stale(&dll), "drop 之后标记必须清掉");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let seen = reader.join().expect("读线程不该崩");
+        assert!(
+            seen > 0,
+            "读侧至少要真实观察到一次标记存在，否则测试没量到东西"
+        );
+        // 没有任何临时残留：begin 成功即 rename 走人。
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "临时文件不许残留：{leftovers:?}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

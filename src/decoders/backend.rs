@@ -42,6 +42,10 @@ pub fn install_format_source() {
 // **缩略图快路径（2026-11-13）**：`thumbnail` 只在 `ReqKind::Thumb` 为真，与
 // `CAP_THUMB` 求与后落成 `REQ_THUMBNAIL`；`common` 0.2.7 的 JPEG 成员用它读 EXIF IFD1。
 // 两条位互不替代：主画面首屏不会带 `REQ_THUMBNAIL`，缩略图也不靠 `CAP_SCALED` 冒充。
+// **并发豁免（m349 P2，2026-11-25）**：`CAP_PARALLEL` 声明者（common 0.2.8 /
+// classic 0.1.1 / texture 0.1.1 / modern 0.3.5 / pro 0.4.4 / raw 0.5.5——m349 复审
+// 后六档全声明，doc/doc-legacy 留锁）在 `decode_with` 里跳过同一枚 DLL 的串行锁；
+// 未声明者照旧持锁，行为与今天逐字节一致。
 
 impl crate::core::decode::DecodeBackend for Host {
     /// 后台预取标志：只改排队档位，不动解码行为（见 `Host::bg`）。

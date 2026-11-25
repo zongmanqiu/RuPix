@@ -507,6 +507,10 @@ mod tests {
             !t.slots.contains_key(&p),
             "取消不能记成 Failed，否则这张永远不再重试"
         );
+        // ★ m349 T4：回包消费口的完整语义 = `take` + `decoder.note_done`（后者在
+        // `Viewer::apply` 入口统一做，释放该 seq 的去重键与在飞字节账）。这里镜像
+        // 生产路径：不销账的话，同键重发会被去重理赔，格子重发不出去。
+        d.note_done(seq);
         t.ensure(&d, &[p.as_path()], true);
         assert_eq!(
             crate::core::decode::tests::pending_reqs(&d).len(),

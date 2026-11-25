@@ -21,7 +21,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
-    NIM_MODIFY, NOTIFYICONDATAW,
+    NIM_MODIFY, NIN_BALLOONHIDE, NIN_BALLOONTIMEOUT, NIN_BALLOONUSERCLICK, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos,
@@ -85,6 +85,11 @@ pub(crate) enum ClickKind {
 pub(crate) enum TrayEvent {
     Click(ClickKind),
     RightClick,
+    /// 用户点了气泡通知（`NIN_BALLOONUSERCLICK`）。
+    NotificationClick,
+    /// 气泡消失（`NIN_BALLOONTIMEOUT` 超时 / `NIN_BALLOONHIDE` 被收起）：之后再点
+    /// 操作中心里的旧项不该拿到这条通知的标签。
+    NotificationGone,
     Other,
 }
 
@@ -94,6 +99,8 @@ pub(crate) fn classify(lparam: LPARAM) -> TrayEvent {
         WM_LBUTTONUP => TrayEvent::Click(ClickKind::Left),
         WM_LBUTTONDBLCLK => TrayEvent::Click(ClickKind::Double),
         WM_RBUTTONUP => TrayEvent::RightClick,
+        NIN_BALLOONUSERCLICK => TrayEvent::NotificationClick,
+        NIN_BALLOONTIMEOUT | NIN_BALLOONHIDE => TrayEvent::NotificationGone,
         _ => TrayEvent::Other,
     }
 }
@@ -118,6 +125,13 @@ pub(crate) struct TrayState {
     /// ② shell 重启后的 `readd` 必须**跳过**已被应用藏起来的图标——否则用户关掉开关、
     /// 之后 explorer 重启一次，图标又自己冒出来了。
     visible: bool,
+    /// 最近一条通知的标签。Shell 气泡同一时间只有一条，新的顶掉旧的，故只记一份；
+    /// 点击（`NIN_BALLOONUSERCLICK`）时取走交给 `on_notification_click`，气泡消失
+    /// （`NIN_BALLOONTIMEOUT` / `NIN_BALLOONHIDE`）时清空。
+    ///
+    /// 局限：点击一条已被后续通知顶掉、却仍留在操作中心的旧通知，拿到的是**最新**那条的
+    /// 标签（Shell 不告诉我们点的是哪条）；故回调只应激活界面，不做破坏性动作。
+    notify_tag: Option<String>,
 }
 
 impl Drop for TrayState {
@@ -165,6 +179,7 @@ pub(crate) fn install(hwnd: HWND, tray: Tray) -> Option<TrayState> {
         hicon,
         owns_icon,
         tooltip: tray.tooltip.clone(),
+        notify_tag: None,
         tray,
         visible,
     })
@@ -181,6 +196,18 @@ pub(crate) fn run_click(state: &mut TrayState, kind: ClickKind) -> Vec<TrayActio
         ClickKind::Double => state.tray.on_double_click.as_mut(),
     };
     invoke(cb)
+}
+
+/// 气泡消失：清掉记着的标签，之后再点旧项只会得到 `None`。
+pub(crate) fn clear_notify_tag(state: &mut TrayState) {
+    state.notify_tag = None;
+}
+
+/// 跑通知点击回调（标签取自最近一条通知），取回它声明的意图队列。
+/// 与 `run_click` 同理：回调只写意图不碰 OS，可在借用期间就地跑。
+pub(crate) fn run_notification_click(state: &mut TrayState) -> Vec<TrayAction> {
+    let tag = state.notify_tag.take();
+    state.tray.notification_click(tag)
 }
 
 /// 右键菜单句柄的 RAII 包装：drop 即 `DestroyMenu`。
@@ -255,6 +282,12 @@ impl TrayState {
     /// 气泡通知的投递目标。取出后即可释放借用，由自由函数 `notify` 执行。
     pub(crate) fn notify_target(&self) -> (HWND, u32) {
         (self.hwnd, self.uid)
+    }
+
+    /// 记下刚发出的那条通知的标签（顶掉上一条；无标签的通知也要顶掉，免得点它时
+    /// 误报上一条的标签）。**在 OS 调用之后才借宿主**，理由同 `remember_tooltip`。
+    pub(crate) fn remember_notify_tag(&mut self, tag: Option<String>) {
+        self.notify_tag = tag;
     }
 
     /// 重新登记所需的全部素材。与 [`notify_target`] 同理：取完即可释放借用，
@@ -526,9 +559,11 @@ pub(super) unsafe fn hicon_from_rgba(w: i32, h: i32, rgba: &[u8]) -> Option<HICO
 
 #[cfg(test)]
 mod tests {
-    use super::{add_nid, is_taskbar_created, WM_TRAYICON};
+    use super::{add_nid, classify, is_taskbar_created, TrayEvent, WM_TRAYICON};
     use windows::Win32::Foundation::HWND;
+    use windows::Win32::Foundation::LPARAM;
     use windows::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP};
+    use windows::Win32::UI::Shell::{NIN_BALLOONHIDE, NIN_BALLOONTIMEOUT, NIN_BALLOONUSERCLICK};
     use windows::Win32::UI::WindowsAndMessaging::HICON;
 
     /// 登记数据必须三要素齐全。
@@ -544,11 +579,16 @@ mod tests {
             HICON(std::ptr::null_mut()),
             "提示",
         );
-        assert_eq!(nid.uFlags, NIF_ICON | NIF_MESSAGE | NIF_TIP);
-        assert_eq!(nid.uCallbackMessage, WM_TRAYICON, "漏了它则图标点了没反应");
-        assert_eq!(nid.uID, 1);
-        let tip: String = nid
-            .szTip
+        // `NOTIFYICONDATAW` 在 32 位 x86 上按 1 字节打包：`assert_eq!` 与 `.iter()` 会取字段
+        // 引用，未对齐即 E0793。先按值拷出再断言。
+        let flags = nid.uFlags;
+        let callback_message = nid.uCallbackMessage;
+        let id = nid.uID;
+        let tip_buffer = nid.szTip;
+        assert_eq!(flags, NIF_ICON | NIF_MESSAGE | NIF_TIP);
+        assert_eq!(callback_message, WM_TRAYICON, "漏了它则图标点了没反应");
+        assert_eq!(id, 1);
+        let tip: String = tip_buffer
             .iter()
             .take_while(|c| **c != 0)
             .map(|c| char::from_u32(*c as u32).unwrap())
@@ -568,9 +608,10 @@ mod tests {
             HICON(std::ptr::null_mut()),
             &long,
         );
-        let n = nid.szTip.len();
-        assert_eq!(nid.szTip[n - 1], 0, "定长缓冲必须以 NUL 收尾");
-        assert!(nid.szTip[..n - 1].iter().all(|c| *c != 0), "截断前应写满");
+        let tip_buffer = nid.szTip;
+        let n = tip_buffer.len();
+        assert_eq!(tip_buffer[n - 1], 0, "定长缓冲必须以 NUL 收尾");
+        assert!(tip_buffer[..n - 1].iter().all(|c| *c != 0), "截断前应写满");
     }
 
     /// 注册成功时按消息号精确匹配。
@@ -585,5 +626,29 @@ mod tests {
     fn 注册失败时一律不匹配() {
         assert!(!is_taskbar_created(0, 0), "WM_NULL 不该被当成 shell 重启");
         assert!(!is_taskbar_created(0xC123, 0));
+    }
+
+    /// 气泡被点击（`NIN_BALLOONUSERCLICK`）要被认出来，且与左键单击互不混淆。
+    #[test]
+    fn 气泡点击被识别为通知点击() {
+        assert!(matches!(
+            classify(LPARAM(NIN_BALLOONUSERCLICK as isize)),
+            TrayEvent::NotificationClick
+        ));
+        assert!(matches!(
+            classify(LPARAM(0x0202)), // WM_LBUTTONUP
+            TrayEvent::Click(_)
+        ));
+    }
+
+    /// 气泡超时 / 被收起要被认出来，用来清掉记着的标签。
+    #[test]
+    fn 气泡消失被识别为通知消失() {
+        for code in [NIN_BALLOONTIMEOUT, NIN_BALLOONHIDE] {
+            assert!(matches!(
+                classify(LPARAM(code as isize)),
+                TrayEvent::NotificationGone
+            ));
+        }
     }
 }

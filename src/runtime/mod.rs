@@ -330,7 +330,13 @@ fn drain_decode(v: &mut Viewer, done_rx: &Receiver<Done>, meta_rx: &Receiver<Met
         // 看门狗销账（P1.1 C1）：回包到了，这笔就不算"卡住了"。
         // 过期早退的空串 Err Done 也走这里——它同样是回包，同样销账。
         crate::core::decode_watchdog::note_done(done.seq);
+        // m349：慢帧取证——单笔回包消费超 50 ms 点名（哪一笔回包吃掉了主循环）。
+        let t0 = Instant::now();
         arrived |= v.apply(done);
+        let ms = t0.elapsed().as_millis();
+        if ms >= 50 {
+            log::warn!("[slow-frame] viewer::apply took {ms}ms");
+        }
     }
     // 查询事件同帧一起收：先 Meta 后 Frame 是常态；Meta 落在 Frame 之后
     // 是解码器时序异常，`apply_meta` 会因 `loaded.is_some()` 忽略它。
@@ -348,7 +354,13 @@ fn drain_decode(v: &mut Viewer, done_rx: &Receiver<Done>, meta_rx: &Receiver<Met
 fn advance(v: &mut Viewer, visible: bool) -> bool {
     let mut arrived = false;
     if visible {
+        // m349：慢帧取证——状态机推进超 100 ms 点名（tick 里有换档 / 重解 / 预读）。
+        let t0 = Instant::now();
         arrived |= v.tick();
+        let ms = t0.elapsed().as_millis();
+        if ms >= 100 {
+            log::warn!("[slow-frame] viewer::tick took {ms}ms");
+        }
     }
     arrived |= v.poll_levels();
     arrived
@@ -699,6 +711,24 @@ impl WinRt {
 
     /// 16ms 主循环：先全局段（只在活动窗口跑），再窗口段。
     fn tick(self: &Rc<Self>, ctx: &mut EventCtx) {
+        // m349 停顿取证：相邻两拍的真实间隔。泵/present/定时器停摆会在这里现形——
+        // slow-frame 只看得到本拍内部的耗时，看不到拍与拍之间；m349 排查"翻页时秒级
+        // 卡顿"靠的就是这一条（结论：present 被 GPU 争用阻塞，见 .plan m349 §停顿）。
+        // 阈值 150ms：正常节拍 16ms，超过即点名。
+        static LAST_TICK_START: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let prev_ms = LAST_TICK_START.swap(now_ms, std::sync::atomic::Ordering::Relaxed);
+        if prev_ms > 0 {
+            let gap = now_ms.saturating_sub(prev_ms);
+            if gap >= 150 {
+                log::warn!("[tick-gap] {gap}ms");
+            }
+        }
+        // m349：慢帧取证——整拍超过 200 ms 点名（正常一拍 < 2 ms）。
+        let t0 = Instant::now();
         // 兜底：进程里第一个跑起来的窗口就是"用户在看的那扇"（`on_window_activated`
         // 只在**变化**时回调，新窗口刚建出来那一下不一定有这一声）。
         if self.shared.active.get() == 0 {
@@ -708,6 +738,10 @@ impl WinRt {
             self.global_tick(ctx);
         }
         self.window_tick(ctx);
+        let ms = t0.elapsed().as_millis();
+        if ms >= 200 {
+            log::warn!("[slow-frame] 16ms tick took {ms}ms");
+        }
     }
 
     /// 全局段：跨窗口只该做一次的事，而且要有 `ctx`（会弹提示的）。
@@ -1291,7 +1325,16 @@ impl WinRt {
         let mut dir_changed = false;
         {
             let mut v = self.viewer.borrow_mut();
+            // m349：慢帧取证——单笔回包的消费超过 50 ms 就点名（16 ms 一拍的主循环里，
+            // 一笔回包吃掉 50 ms 就是可感知的掉帧）。平时零输出。
+            let apply_t0 = Instant::now();
             arrived |= drain_decode(&mut v, &self.done_rx.borrow(), &self.meta_rx.borrow());
+            let apply_ms = apply_t0.elapsed().as_millis();
+            if apply_ms >= 50 {
+                log::warn!(
+                    "[slow-frame] drain_decode took {apply_ms}ms（本拍收到的回包数见上一行 debug）"
+                );
+            }
             // 目录监控重臂：看图目录变了就换 watcher（新开图 / 参数窗确认 / 空格预览开图
             // 后，当前目录都变了）。比对放在收变化信号之前，保证新 watcher 装上后下一波
             // 变化能被收到。★ 借出来比（m106）：这一格每 16 ms 走一次，而目录几乎从不真变。
@@ -1656,6 +1699,12 @@ pub fn run(initial: Option<PathBuf>) {
     crate::decoders::set_disabled(config.borrow().decoders_disabled.clone());
     // 单笔解码超时（挂死恢复，2026-11-04）：0 = 关掉恢复机制（无限等，老行为）。
     crate::core::decode::set_decode_timeout(config.borrow().decode_timeout_s);
+    // 后台解码车道（m349 T1）：预读 / 缩略图与主画面并行的线程数。
+    // 必须在任何 Decoder 起线程**之前**灌入——spawn_with_sink 读的就是这组静态量。
+    crate::core::decode::set_lane_workers(
+        config.borrow().decode_prefetch_workers,
+        config.borrow().decode_thumb_workers,
+    );
     // 各扩展名的用户首选解码器同样灌进全局表（解码线程会读它；失效条目
     // 由 candidate_for_ext 静默回退自动，见 crate::decoders::preferred_candidate）。
     crate::decoders::set_preferred(config.borrow().decoders_preferred.clone());

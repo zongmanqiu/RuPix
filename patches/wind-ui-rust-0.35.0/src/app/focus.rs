@@ -3,7 +3,7 @@
 //! 「焦点该在谁身上」是一个独立于绘制与浮层的裁决：布局稳定后刷新可聚焦集合、
 //! 模态作用域变化的那一帧移交、结构变更后把失效焦点归一化掉。
 
-use crate::core::NodeId;
+use crate::core::{FocusSelect, NodeId};
 
 use super::UiHost;
 
@@ -68,7 +68,14 @@ impl UiHost {
         // 顺序是承重的：这是用户动作（点了一行）直接引发的请求，而 autofocus 是
         // 「没人要焦点时给个归宿」的兜底。反过来的话，兜底会先把焦点安给查询框，
         // 这条请求再把它抢走——白抢一次，且 `autofocus_select_all` 的全选也白做了。
+        // on_update 里交出的焦点在转移之前落地：同一轮里别处要了焦点，那边胜出。
+        // 不通知失焦，理由同 `apply_pending_focus`。
+        let release = self.tree.take_pending_release();
+        self.apply_release(&release);
         self.apply_pending_focus();
+        // 定向送焦点排在控件请求之后、autofocus 之前：它是应用明确点名的目标。
+        self.apply_focus_triggers();
+        self.apply_reveal_triggers();
         // 声明式初始焦点：在归一化**之后**兑现——归一化可能刚把失效焦点抹成 None，
         // 那正是"此刻没有焦点"该由 autofocus 接手的时机。
         self.honor_autofocus();
@@ -102,6 +109,24 @@ impl UiHost {
         }
     }
 
+    /// 落地 `EventCtx::release_focus`：焦点仍在某个请求者（或其子孙）上才清空。焦点已经
+    /// 被别处拿走时什么都不做——请求者交出的是**自己的**焦点，不是谁的都清。
+    ///
+    /// 返回被清掉焦点的节点（失焦通知由调用方决定发不发）。整窗重画：焦点环画在节点框外
+    /// 1px，局部脏区擦不干净。焦点环一并熄灭：没有焦点就没有环可亮，留着 `visible` 的话
+    /// 下一个程序性聚焦会凭空亮环。
+    pub(super) fn apply_release(&mut self, requesters: &[NodeId]) -> Option<NodeId> {
+        let f = self.focus.current?;
+        if !requesters.iter().any(|&r| self.tree.is_within(f, r)) {
+            return None;
+        }
+        self.tree.set_focused(None, Some(f));
+        self.focus.current = None;
+        self.focus.visible = false;
+        self.damage.needs_full = true;
+        Some(f)
+    }
+
     /// 落地 on_update 相位攒下的焦点转移请求（见 `Tree::pending_focus`）。
     ///
     /// 请求的目标必须仍在焦点环里——它是上一帧的节点 id，而这中间可能刚重建过子树。
@@ -120,6 +145,63 @@ impl UiHost {
         // 定时器 / 通道消息而非用户；且这里在 render 中途，回调写的信号赶不上本帧重排。
         // 不点亮焦点环：这条路径的触发者是鼠标点击，沿用 `:focus-visible` 的判据
         // ——环显不显示取决于用户最近一次交互用的什么设备。理由同 `honor_autofocus`。
+    }
+
+    /// 兑现 `Element::focus_when` 一族：触发信号变了值的节点夺取焦点，按需全选 / 选中区间；
+    /// `select_without_focus_when` 只摆选区、焦点不动。
+    fn apply_focus_triggers(&mut self) {
+        for (id, select) in self.tree.take_fired_focus_triggers(&self.focus.order) {
+            let old = self.focus.current;
+            if select.takes_focus() && old != Some(id) {
+                self.tree.set_focused(Some(id), old);
+                self.focus.current = Some(id);
+                // 焦点在两个控件间转移：旧的要擦掉光标与焦点环（同指针聚焦那条的理由）。
+                self.damage.needs_full = true;
+            }
+            // 不要焦点的也滚过去：亮出当前这一处，正是它存在的理由。
+            if self.tree.scroll_into_view(id) {
+                self.damage.needs_relayout = true;
+                self.damage.needs_full = true;
+            }
+            // 不通知失焦、不点亮焦点环：程序性移交，理由同 `apply_pending_focus`。
+            match select {
+                FocusSelect::Keep => {}
+                FocusSelect::All => self.select_all_in(id),
+                // 区间信号已回收：只送焦点、不动选区——猜一个 (0, 0) 会把光标无端挪到开头。
+                FocusSelect::Range(range) | FocusSelect::RangeNoFocus(range) => {
+                    if let Some(r) = range.try_get() {
+                        self.select_range_in(id, r);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 兑现 `Element::reveal_when`：触发信号变了值的节点滚进视口，焦点不动。
+    fn apply_reveal_triggers(&mut self) {
+        for id in self.tree.take_fired_reveal_triggers() {
+            if self.tree.scroll_into_view(id) {
+                self.damage.needs_relayout = true;
+                self.damage.needs_full = true;
+            }
+        }
+    }
+
+    /// 兑现 `Element::select_when`：直接改输入框的选区（不像全选那样借合成按键——没有
+    /// 「选中某一段」的按键）。
+    ///
+    /// 末尾的 `needs_full` 是**兜底**：能走到 `refresh_focus` 的两条路（重排分支、整窗帧）
+    /// 本帧都已画整窗，焦点没变时也不缺这一笔；留着是防将来有局部帧路径也调焦点刷新，
+    /// 选区高亮与多行框的滚动却画不出来。
+    fn select_range_in(&mut self, id: NodeId, (start, end): (usize, usize)) {
+        let Some(node) = self.tree.get_mut(id) else {
+            return;
+        };
+        let Some(ti) = node.widget.as_any_mut().and_then(crate::ui::text_input_of) else {
+            return;
+        };
+        ti.select_now(start, end);
+        self.damage.needs_full = true;
     }
 
     /// 兑现 [`Autofocus`]：节点首次进入焦点环那一帧把焦点交给它，只做一次。
@@ -300,6 +382,652 @@ mod tests {
     use crate::event::Key;
     use crate::geometry::Size;
     use crate::ui::Element;
+
+    /// `focus_select_all_when`：点「新建」让计数加一 → 焦点送进常驻输入框并全选；初值不
+    /// 触发、用户点走后不抢回、再加一能再触发；隐藏期间触发的等它显示那一帧兑现。
+    /// 触发都经按钮回调（事件期写信号），与真实用法同一条路。
+    #[test]
+    fn focus_when_counter_drives_focus_into_resident_input() {
+        use crate::event::{MouseButton, PointerEvent, PointerKind};
+        use crate::geometry::Point;
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        use crate::signal::signal;
+        use tiny_skia::Pixmap;
+        let title = signal(String::from("旧名"));
+        let trigger = signal(0u64);
+        let shown = signal(true);
+        let app = App::new("t", 400, 200).content(
+            Element::col()
+                .padding(10)
+                .child(
+                    Element::text_input(title, "")
+                        .width(200)
+                        .height(30)
+                        .focus_select_all_when(trigger)
+                        .visible_signal(shown),
+                )
+                .child(
+                    Element::row()
+                        .child(
+                            Element::button("新建")
+                                .width(80)
+                                .height(30)
+                                .on_click(move |_| trigger.update(|n| *n += 1)),
+                        )
+                        .child(Element::button("其它").width(80).height(30))
+                        .child(Element::button("藏起并新建").width(80).height(30).on_click(
+                            move |_| {
+                                shown.set(false);
+                                trigger.update(|n| *n += 1);
+                            },
+                        ))
+                        .child(
+                            Element::button("显示")
+                                .width(80)
+                                .height(30)
+                                .on_click(move |_| shown.set(true)),
+                        ),
+                ),
+        );
+        let mut h = app.into_handler_for_test();
+        h.set_scale(1.0);
+        let mut pm = Pixmap::new(400, 200).unwrap();
+        let mut frame =
+            |h: &mut UiHost| h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(400, 200));
+        frame(&mut h);
+        let input = h.focus.order[0];
+        let btn = |h: &UiHost, i: usize| {
+            let r = h.tree.abs_bounds(h.focus.order[i]);
+            Point::new(r.x + r.w / 2, r.y + r.h / 2)
+        };
+        let (new_btn, other_btn, hide_btn) = (btn(&h, 1), btn(&h, 2), btn(&h, 3));
+        let mut click = |h: &mut UiHost, p: Point| {
+            h.on_pointer(PointerEvent::single(
+                PointerKind::Down,
+                p,
+                MouseButton::Left,
+            ));
+            h.on_pointer(PointerEvent::single(PointerKind::Up, p, MouseButton::Left));
+            frame(h);
+        };
+        assert_eq!(h.focus.current, None, "初值不触发");
+
+        click(&mut h, new_btn);
+        assert_eq!(h.focus.current, Some(input), "计数变了值 → 焦点进输入框");
+        h.on_key(key_ev()(Key::Char('x')));
+        assert_eq!(title.get(), "x", "送焦点时已全选，打字覆盖旧内容");
+
+        click(&mut h, other_btn);
+        assert_ne!(h.focus.current, Some(input), "前提：用户点到了别的控件");
+        click(&mut h, other_btn);
+        assert_ne!(h.focus.current, Some(input), "计数没变，不把焦点抢回来");
+
+        click(&mut h, new_btn);
+        assert_eq!(h.focus.current, Some(input), "再加一能再触发");
+
+        click(&mut h, hide_btn);
+        assert_ne!(h.focus.current, Some(input), "隐藏中不送焦点");
+        // 输入框藏起后「显示」按钮在焦点环里的位置变了，按当前环重新取。
+        let show_btn = btn(&h, h.focus.order.len() - 1);
+        click(&mut h, show_btn);
+        assert_eq!(h.focus.current, Some(input), "显示出来那一帧兑现");
+    }
+
+    /// 输入框在 `on_commit` 里 `release_focus`：回车提交后焦点清空；失焦通知照发一次，
+    /// 而提交不会因此再跑一遍。
+    #[test]
+    fn release_focus_after_commit_clears_focus_once() {
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use tiny_skia::Pixmap;
+        let commits = Rc::new(Cell::new(0));
+        let c = commits.clone();
+        let blurs = Rc::new(Cell::new(0));
+        let b = blurs.clone();
+        let text = crate::signal::signal(String::new());
+        let app = App::new("t", 300, 200).content(
+            Element::col().padding(10).child(
+                Element::text_input(text, "")
+                    .width(200)
+                    .autofocus()
+                    .on_commit(move |ctx| {
+                        c.set(c.get() + 1);
+                        ctx.release_focus();
+                    })
+                    .on_blur(move |_| b.set(b.get() + 1)),
+            ),
+        );
+        let mut h = app.into_handler_for_test();
+        h.set_scale(1.0);
+        let mut pm = Pixmap::new(300, 200).unwrap();
+        let mut frame =
+            |h: &mut UiHost| h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        frame(&mut h);
+        assert!(h.focus.current.is_some(), "前提：autofocus 已兑现");
+        let k = key_ev();
+        h.on_key(k(Key::Char('5')));
+        h.on_key(k(Key::Enter));
+        assert_eq!(h.focus.current, None, "提交回调里交出焦点后应无焦点");
+        assert!(h.damage.needs_full, "焦点环画在框外，须整窗重画");
+        frame(&mut h);
+        assert_eq!(h.focus.current, None, "下一帧不被 autofocus 抢回");
+        assert_eq!(blurs.get(), 1, "交出焦点照常通知失焦，恰好一次");
+        assert_eq!(
+            commits.get(),
+            1,
+            "只提交一次：Enter 与失焦共用一个出口，提交过就不再提交"
+        );
+    }
+
+    /// on_update 相位里交出焦点：该相位丢弃整个 outcome，请求经树上的暂存位在
+    /// `refresh_focus` 落地，且不被同帧的 autofocus 抢回。
+    #[test]
+    fn release_focus_from_on_update_lands() {
+        use crate::core::Widget;
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        use crate::signal::{signal, Signal};
+        use tiny_skia::Pixmap;
+        struct Releaser(Signal<bool>);
+        impl Widget for Releaser {
+            fn on_update(&mut self, ctx: &mut crate::core::EventCtx) {
+                if self.0.get() {
+                    ctx.release_focus();
+                }
+            }
+        }
+        let go = signal(false);
+        let text = signal(String::new());
+        let app = App::new("t", 300, 200).content(
+            Element::col()
+                .padding(10)
+                .widget(Releaser(go))
+                .reactive()
+                .child(
+                    Element::text_input(text, "")
+                        .width(200)
+                        .height(30)
+                        .autofocus(),
+                )
+                .child(
+                    Element::button("交出")
+                        .width(80)
+                        .height(30)
+                        .on_click(move |_| go.set(true)),
+                ),
+        );
+        let mut h = app.into_handler_for_test();
+        h.set_scale(1.0);
+        let mut pm = Pixmap::new(300, 200).unwrap();
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        assert!(h.focus.current.is_some(), "前提：autofocus 已兑现");
+        // 点按钮写信号（与真实用法同一条路）：按下时焦点先转到按钮，随后的 on_update 里
+        // 容器交出子树焦点——没有这条通道，焦点会停在按钮上。
+        let r = h.tree.abs_bounds(h.focus.order[1]);
+        let p = crate::geometry::Point::new(r.x + r.w / 2, r.y + r.h / 2);
+        use crate::event::{MouseButton, PointerEvent, PointerKind};
+        h.on_pointer(PointerEvent::single(
+            PointerKind::Down,
+            p,
+            MouseButton::Left,
+        ));
+        h.on_pointer(PointerEvent::single(PointerKind::Up, p, MouseButton::Left));
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        assert_eq!(h.focus.current, None, "on_update 里交出的焦点应在本帧落地");
+    }
+
+    /// 一次点击里既让计数加一、又让输入框所在子树重建：新节点不得吞掉这次触发。
+    #[test]
+    fn focus_when_survives_rebuild_in_the_same_click() {
+        use crate::event::{MouseButton, PointerEvent, PointerKind};
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        use crate::signal::signal;
+        use tiny_skia::Pixmap;
+        let trigger = signal(0u64);
+        let docs = signal(vec![0u32]);
+        let title = signal(String::new());
+        let app = App::new("t", 300, 200).content(
+            Element::col()
+                .padding(10)
+                .child(Element::host_signal(docs, move |_| {
+                    Element::text_input(title, "")
+                        .width(200)
+                        .height(30)
+                        .focus_when(trigger)
+                }))
+                .child(
+                    Element::button("新建")
+                        .width(80)
+                        .height(30)
+                        .on_click(move |_| {
+                            docs.update(|d| d[0] += 1);
+                            trigger.update(|n| *n += 1);
+                        }),
+                ),
+        );
+        let mut h = app.into_handler_for_test();
+        h.set_scale(1.0);
+        let mut pm = Pixmap::new(300, 200).unwrap();
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        let old_input = h.focus.order[0];
+        let r = h.tree.abs_bounds(h.focus.order[1]);
+        let p = crate::geometry::Point::new(r.x + r.w / 2, r.y + r.h / 2);
+        h.on_pointer(PointerEvent::single(
+            PointerKind::Down,
+            p,
+            MouseButton::Left,
+        ));
+        h.on_pointer(PointerEvent::single(PointerKind::Up, p, MouseButton::Left));
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        let input = h.focus.order[0];
+        assert_ne!(input, old_input, "前提：输入框被重建成了新节点");
+        assert_eq!(
+            h.focus.current,
+            Some(input),
+            "重建后的新输入框仍应拿到这次触发的焦点"
+        );
+    }
+
+    /// 同一时刻只有焦点框显示选区：A 自动聚焦并全选，点进 B 之后 A 的选区收起。
+    #[test]
+    fn selection_collapses_when_focus_moves_to_another_input() {
+        use crate::event::{MouseButton, PointerEvent, PointerKind};
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        use crate::signal::signal;
+        use tiny_skia::Pixmap;
+        let app = App::new("t", 300, 200).content(
+            Element::col()
+                .padding(10)
+                .spacing(10)
+                .child(
+                    Element::text_input(signal(String::from("hello")), "")
+                        .width(200)
+                        .height(30)
+                        .autofocus_select_all(),
+                )
+                .child(
+                    Element::text_input(signal(String::from("world")), "")
+                        .width(200)
+                        .height(30),
+                ),
+        );
+        let mut h = app.into_handler_for_test();
+        h.set_scale(1.0);
+        let mut pm = Pixmap::new(300, 200).unwrap();
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        let (a, b) = (h.focus.order[0], h.focus.order[1]);
+        let sel = |h: &crate::app::UiHost, id| h.tree.get(id).unwrap().widget.selection_range();
+        assert_eq!(sel(&h, a), Some((0, 5)), "前提：A 聚焦并全选");
+        let r = h.tree.abs_bounds(b);
+        let p = crate::geometry::Point::new(r.x + r.w / 2, r.y + r.h / 2);
+        h.on_pointer(PointerEvent::single(
+            PointerKind::Down,
+            p,
+            MouseButton::Left,
+        ));
+        h.on_pointer(PointerEvent::single(PointerKind::Up, p, MouseButton::Left));
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        assert_eq!(h.focus.current, Some(b));
+        let (s, e) = sel(&h, a).unwrap();
+        assert_eq!(s, e, "失焦的 A 不应再有选区");
+    }
+
+    /// `reveal_when`：点按钮让计数加一 → 滚动区里视口外的那一行被滚进来，焦点不动；
+    /// 建节点时的初值不触发。
+    #[test]
+    fn reveal_when_scrolls_row_into_view() {
+        use crate::event::{MouseButton, PointerEvent, PointerKind};
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        use crate::signal::signal;
+        use tiny_skia::Pixmap;
+        let trigger = signal(0u64);
+        let mut list = Element::col().width_match();
+        for i in 0..10 {
+            let mut row = Element::leaf().width(100).height(40);
+            if i == 9 {
+                row = row.reveal_when(trigger);
+            }
+            list = list.child(row);
+        }
+        let app = App::new("t", 300, 200).content(
+            Element::col()
+                .child(
+                    Element::button("定位")
+                        .width(80)
+                        .height(30)
+                        .on_click(move |_| trigger.update(|n| *n += 1)),
+                )
+                .child(Element::scroll().width(200).height(100).child(list)),
+        );
+        let mut h = app.into_handler_for_test();
+        h.set_scale(1.0);
+        let mut pm = Pixmap::new(300, 200).unwrap();
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        let scroll = h
+            .tree
+            .scroll_node_at(crate::geometry::Point::new(50, 60))
+            .expect("按钮下方是滚动区");
+        assert_eq!(h.tree.get(scroll).unwrap().scroll_y, 0, "初值不触发");
+        let button = h.focus.order[0];
+        let r = h.tree.abs_bounds(button);
+        let p = crate::geometry::Point::new(r.x + r.w / 2, r.y + r.h / 2);
+        h.on_pointer(PointerEvent::single(
+            PointerKind::Down,
+            p,
+            MouseButton::Left,
+        ));
+        h.on_pointer(PointerEvent::single(PointerKind::Up, p, MouseButton::Left));
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        assert_eq!(
+            h.tree.get(scroll).unwrap().scroll_y,
+            400 - 100,
+            "末行应被滚到视口底边"
+        );
+    }
+
+    /// `select_when`：点「下一处」先写区间再加计数 → 焦点进框、选中那一段，打字即替换那段；
+    /// 用户自己点进框里挪了光标，下一帧不被按回去；再触发换一段照样生效。不设宽（Wrap 宽）
+    /// 与显式宽各跑一遍——选区落在正文上的那一步与宽度无关，但点进框里挪光标走命中测试。
+    #[test]
+    fn select_when_places_selection_on_trigger() {
+        for fixed_width in [true, false] {
+            select_when_case(fixed_width);
+        }
+    }
+
+    fn select_when_case(fixed_width: bool) {
+        use crate::event::{MouseButton, PointerEvent, PointerKind};
+        use crate::geometry::Point;
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        use crate::signal::signal;
+        use tiny_skia::Pixmap;
+        let body = signal(String::from("甲乙甲丙甲"));
+        let (jump, hit) = (signal(0u64), signal((0usize, 0usize)));
+        let next = signal(0usize);
+        let input = Element::text_input(body, "")
+            .height(30)
+            .select_when(jump, hit);
+        let input = if fixed_width { input.width(200) } else { input };
+        let app = App::new("t", 300, 200).content(
+            Element::col().padding(10).child(input).child(
+                Element::button("下一处")
+                    .width(80)
+                    .height(30)
+                    .on_click(move |_| {
+                        // 命中表：「甲」在 0、2、4（字符索引）。
+                        let k = next.get();
+                        hit.set((k * 2, k * 2 + 1));
+                        next.set(k + 1);
+                        jump.update(|n| *n += 1);
+                    }),
+            ),
+        );
+        let mut h = app.into_handler_for_test();
+        h.set_scale(1.0);
+        let mut pm = Pixmap::new(300, 200).unwrap();
+        let mut frame =
+            |h: &mut UiHost| h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        frame(&mut h);
+        let input = h.focus.order[0];
+        let center = |h: &UiHost, i: usize| {
+            let r = h.tree.abs_bounds(h.focus.order[i]);
+            Point::new(r.x + r.w / 2, r.y + r.h / 2)
+        };
+        let next_btn = center(&h, 1);
+        let mut click = |h: &mut UiHost, p: Point| {
+            h.on_pointer(PointerEvent::single(
+                PointerKind::Down,
+                p,
+                MouseButton::Left,
+            ));
+            h.on_pointer(PointerEvent::single(PointerKind::Up, p, MouseButton::Left));
+            frame(h);
+        };
+        assert_eq!(h.focus.current, None, "初值不触发");
+
+        click(&mut h, next_btn); // 第 0 处
+        click(&mut h, next_btn); // 第 1 处：[2, 3)
+        assert_eq!(h.focus.current, Some(input), "触发 → 焦点进输入框");
+        h.on_key(key_ev()(Key::Char('X')));
+        assert_eq!(body.get(), "甲乙X丙甲", "选中的正是第 1 处，打字替换它");
+
+        // 用户自己点进框里（落在正文末尾之后）：光标归用户，下一帧不被按回去。
+        let r = h.tree.abs_bounds(input);
+        click(&mut h, Point::new(r.x + r.w - 4, r.y + r.h / 2));
+        assert_eq!(h.focus.current, Some(input), "前提：点的是输入框本身");
+        h.on_key(key_ev()(Key::Char('!')));
+        assert_eq!(body.get(), "甲乙X丙甲!", "计数没变，不把选区按回去");
+
+        click(&mut h, next_btn); // 第 2 处：[4, 5)
+        h.on_key(key_ev()(Key::Char('Y')));
+        assert_eq!(body.get(), "甲乙X丙Y!", "再触发换一段照样生效");
+    }
+
+    /// 焦点**本来就在**框里时再触发（查找替换的「替换并跳下一处」常这样）：焦点不变、
+    /// 选区照样摆上，且本帧画面与整窗重画一致——没有焦点转移那一笔整窗重绘兜着。
+    /// 触发经多行框的 Ctrl+Enter（`on_submit`），与真实按键同一条路。
+    #[test]
+    fn select_when_while_already_focused() {
+        use crate::event::KeyEvent;
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        use crate::signal::signal;
+        use tiny_skia::Pixmap;
+        // 关动画：光标会从旧位置滑行到选区末端，逐像素比的两帧落在滑行的不同相位上。
+        crate::anim::set_enabled(false);
+        let body = signal(String::from("abcdef"));
+        let (jump, hit) = (signal(0u64), signal((0usize, 0usize)));
+        let app = App::new("t", 300, 200).content(
+            Element::col().padding(10).child(
+                Element::text_input(body, "")
+                    .multiline()
+                    .width(200)
+                    .height(60)
+                    .select_when(jump, hit)
+                    .on_submit(move |_| {
+                        hit.set((1, 3));
+                        jump.update(|n| *n += 1);
+                    }),
+            ),
+        );
+        let mut h = app.into_handler_for_test();
+        h.set_scale(1.0);
+        let mut pm = Pixmap::new(300, 200).unwrap();
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        h.on_key(key_ev()(Key::Tab));
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        let input = h.focus.order[0];
+        assert_eq!(h.focus.current, Some(input), "前提：焦点已在框里");
+        h.on_key(KeyEvent {
+            ctrl: true,
+            ..key_ev()(Key::Enter)
+        });
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        assert_eq!(h.focus.current, Some(input), "焦点没动");
+        h.damage.needs_full = true;
+        let mut want = Pixmap::new(300, 200).unwrap();
+        h.render(&mut PixmapTarget { pixmap: &mut want }, Size::new(300, 200));
+        assert!(pm.data() == want.data(), "选区这一帧应与整窗重画一致");
+        h.on_key(key_ev()(Key::Char('X')));
+        assert_eq!(body.get(), "aXdef", "选中的正是 [1,3)，打字替换它");
+        crate::anim::set_enabled(true);
+    }
+
+    /// `select_without_focus_when`：查找栏惯例——焦点一直在查询框，Enter 一次跳一处，
+    /// 正文框只亮出当前这一处；连按 Enter 不会把命中字换成换行。最后 Tab 进正文框打字，
+    /// 验证选中的正是最后跳到的那一处；画面与整窗重画一致（选区不看焦点照常画）。
+    #[test]
+    fn select_without_focus_keeps_focus_in_query() {
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        use crate::signal::signal;
+        use tiny_skia::Pixmap;
+        crate::anim::set_enabled(false);
+        let body = signal(String::from("甲乙甲丙甲"));
+        let query = signal(String::new());
+        let (jump, hit, next) = (signal(0u64), signal((0usize, 0usize)), signal(0usize));
+        let app = App::new("t", 300, 200).content(
+            Element::col()
+                .padding(10)
+                .child(
+                    Element::text_input(query, "查找")
+                        .width(200)
+                        .height(30)
+                        .on_submit(move |_| {
+                            let k = next.get();
+                            hit.set((k * 2, k * 2 + 1));
+                            next.set(k + 1);
+                            jump.update(|n| *n += 1);
+                        }),
+                )
+                .child(
+                    Element::text_input(body, "")
+                        .multiline()
+                        .width(200)
+                        .height(60)
+                        .select_without_focus_when(jump, hit),
+                ),
+        );
+        let mut h = app.into_handler_for_test();
+        h.set_scale(1.0);
+        let mut pm = Pixmap::new(300, 200).unwrap();
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        h.on_key(key_ev()(Key::Tab));
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        let q = h.focus.order[0];
+        assert_eq!(h.focus.current, Some(q), "前提：焦点在查询框");
+        for _ in 0..2 {
+            h.on_key(key_ev()(Key::Enter));
+            h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+            assert_eq!(h.focus.current, Some(q), "跳转不夺焦点");
+        }
+        assert_eq!(body.get(), "甲乙甲丙甲", "连按 Enter 不改正文");
+        h.damage.needs_full = true;
+        let mut want = Pixmap::new(300, 200).unwrap();
+        h.render(&mut PixmapTarget { pixmap: &mut want }, Size::new(300, 200));
+        assert!(pm.data() == want.data(), "选区这一帧应与整窗重画一致");
+        h.on_key(key_ev()(Key::Tab));
+        h.on_key(key_ev()(Key::Char('X')));
+        assert_eq!(body.get(), "甲乙X丙甲", "选中的是第 2 处 [2,3)");
+        crate::anim::set_enabled(true);
+    }
+
+    /// 不夺焦点的触发器互不冲突：同一个计数驱动两个框（词典面板里多框同时亮出命中），
+    /// 同一轮两个都兑现——不能沿用「要焦点的只取第一个」把第二个记成已兑现吞掉。
+    #[test]
+    fn select_without_focus_fires_for_every_box() {
+        use crate::event::{MouseButton, PointerEvent, PointerKind};
+        use crate::geometry::Point;
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        use crate::signal::signal;
+        use tiny_skia::Pixmap;
+        let (a, b) = (signal(String::from("abcd")), signal(String::from("wxyz")));
+        let jump = signal(0u64);
+        let (ra, rb) = (signal((1usize, 2usize)), signal((2usize, 3usize)));
+        let field = |t, r| {
+            Element::text_input(t, "")
+                .width(200)
+                .height(30)
+                .select_without_focus_when(jump, r)
+        };
+        let app = App::new("t", 300, 200).content(
+            Element::col()
+                .padding(10)
+                .child(field(a, ra))
+                .child(field(b, rb))
+                .child(
+                    Element::button("跳")
+                        .width(80)
+                        .height(30)
+                        .on_click(move |_| jump.update(|n| *n += 1)),
+                ),
+        );
+        let mut h = app.into_handler_for_test();
+        h.set_scale(1.0);
+        let mut pm = Pixmap::new(300, 200).unwrap();
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        let r = h.tree.abs_bounds(h.focus.order[2]);
+        let p = Point::new(r.x + r.w / 2, r.y + r.h / 2);
+        h.on_pointer(PointerEvent::single(
+            PointerKind::Down,
+            p,
+            MouseButton::Left,
+        ));
+        h.on_pointer(PointerEvent::single(PointerKind::Up, p, MouseButton::Left));
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        assert_eq!(h.focus.current, Some(h.focus.order[2]), "焦点仍在按钮上");
+        // Shift+Tab 回到第二个框、再回到第一个，各打一个字：替换的正是各自的区间。
+        let back = crate::event::KeyEvent {
+            shift: true,
+            ..key_ev()(Key::Tab)
+        };
+        h.on_key(back);
+        h.on_key(key_ev()(Key::Char('_')));
+        assert_eq!(b.get(), "wx_z", "第二个框也兑现了");
+        h.on_key(back);
+        h.on_key(key_ev()(Key::Char('_')));
+        assert_eq!(a.get(), "a_cd", "第一个框兑现了");
+    }
+
+    /// 交出的是**自己的**焦点：A 改完后点 B，A 失焦触发提交，回调里 `release_focus`
+    /// 时焦点已在 B 上，不得把 B 的焦点清掉。
+    #[test]
+    fn release_focus_leaves_someone_elses_focus_alone() {
+        use crate::event::{MouseButton, PointerEvent, PointerKind};
+        use crate::geometry::Point;
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        use tiny_skia::Pixmap;
+        let (a, b) = (
+            crate::signal::signal(String::new()),
+            crate::signal::signal(String::new()),
+        );
+        let commits = std::rc::Rc::new(std::cell::Cell::new(0));
+        let c = commits.clone();
+        let app = App::new("t", 300, 200).content(
+            Element::col()
+                .padding(10)
+                .child(
+                    Element::text_input(a, "")
+                        .width(200)
+                        .height(30)
+                        .autofocus()
+                        .on_commit(move |ctx| {
+                            c.set(c.get() + 1);
+                            ctx.release_focus();
+                        }),
+                )
+                .child(Element::text_input(b, "").width(200).height(30)),
+        );
+        let mut h = app.into_handler_for_test();
+        h.set_scale(1.0);
+        let mut pm = Pixmap::new(300, 200).unwrap();
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        let first = h.focus.current.expect("前提：A 已聚焦");
+        h.on_key(key_ev()(Key::Char('x')));
+        let pb = Point::new(50, 55);
+        h.on_pointer(PointerEvent::single(
+            PointerKind::Down,
+            pb,
+            MouseButton::Left,
+        ));
+        h.on_pointer(PointerEvent::single(PointerKind::Up, pb, MouseButton::Left));
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        let now = h
+            .focus
+            .current
+            .expect("焦点应在 B 上，不被 A 的 release_focus 清掉");
+        assert_ne!(now, first, "前提：焦点确实转到了 B");
+        assert_eq!(commits.get(), 1, "前提：A 失焦时提交并调了 release_focus");
+    }
 
     /// 点控件外的空白应清空焦点（网页 blur 语义）：否则聚焦边框会一直亮到
     /// 下一个可聚焦控件接手为止。同时校验两条不该误清的边界。
@@ -1036,6 +1764,62 @@ mod tests {
             text.get(),
             "新",
             "收回焦点还不够，全选也要跟着重新兑现——否则打字是追加不是覆盖"
+        );
+    }
+
+    /// 快捷键回调能问到焦点在哪、是不是文字输入框——「焦点在输入框里时快捷键让路」的判据。
+    ///
+    /// 借 Tab 驱动：Tab 先过快捷键回调（回调不要就轮到焦点导航），于是每按一次既记下
+    /// 当时的焦点，又把焦点挪到下一格，一条路径走完三种控件。
+    #[test]
+    fn shortcut_sees_focused_node_and_whether_it_takes_text() {
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let s = seen.clone();
+        let app = App::new("t", 300, 200)
+            .on_shortcut(move |ctx, ev| {
+                if ev.key == Key::Tab {
+                    s.borrow_mut()
+                        .push((ctx.focused_node(), ctx.focus_accepts_text()));
+                }
+                false
+            })
+            .content(
+                Element::col()
+                    .child(
+                        Element::text_input(crate::signal::signal(String::new()), "可编辑")
+                            .autofocus(),
+                    )
+                    .child(
+                        Element::text_input(crate::signal::signal("只读".to_string()), "")
+                            .read_only(),
+                    )
+                    .child(Element::button("按钮")),
+            );
+        let mut h = app.into_handler_for_test();
+        h.set_scale(1.0);
+        let mut pm = tiny_skia::Pixmap::new(300, 200).unwrap();
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        let order = h.focus.order.clone();
+        assert_eq!(order.len(), 3, "前提：三格都在 Tab 环里");
+        assert_eq!(
+            h.focus.current,
+            Some(order[0]),
+            "前提：autofocus 落在可编辑框"
+        );
+        let k = key_ev();
+        for _ in 0..3 {
+            h.on_key(k(Key::Tab));
+        }
+        assert_eq!(
+            *seen.borrow(),
+            vec![
+                (Some(order[0]), true),
+                (Some(order[1]), false),
+                (Some(order[2]), false),
+            ],
+            "可编辑框算文字输入；只读框不收字、按钮不是文本框，都不算"
         );
     }
 

@@ -131,7 +131,7 @@ python build\hygiene_scan.py      # 硬编路径 / 调试残留 / TODO 真标记
 | 随源码的文档（`*.md` / `docs/`） | 一次性诊断脚本（→ `.temp/`） |
 | 构建脚本（`build/full.bat` 及编号步骤脚本） | 未在文档体系登记的临时文档（→ `.temp/`） |
 
-> 第三方依赖 `windui` 位于仓库根 `.3rd/wind-ui-rust-0.23.0`（本地 path 依赖）；
+> 第三方依赖 `windui` 位于仓库根 `.3rd/wind-ui-rust-0.35.0`（本地 path 依赖）；
 > `usvg` 0.48.1 位于 `.3rd/usvg-0.48.1`（经 `Cargo.toml` 的 `[patch.crates-io]` 接入，
 > 补丁登记在 `patches/usvg-0.48.1/PATCHES.md`，归档逐字节由 j13 守）。
 > **禁止**把 `main/` 文件复制到 `.3rd/`；反向也不允许（第三方库的修改要先登记补丁再重放：

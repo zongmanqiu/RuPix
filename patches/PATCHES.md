@@ -306,6 +306,7 @@ windui `cargo test --lib` **931 passed** · windui clippy 0 error · main `cargo
   - `dyn_list.rs`（新增组合 widget `DynListWithScroll`）
   - `mod.rs`（`Element::list_signal` 改挂组合体）
 - 应用侧接线：无——`Element::list_signal` 的所有调用点自动受益（本仓库：设置 → 解码器页）。
+- **落点状态：0.35.0 无落点**（2026-11-25 核）——0.35 上游 KeyedList 自带事件转发，`DynListWithScroll` 组合体已过时，`dyn_list.rs` 整文件还原上游 pristine。
 
 ### 问题（用户实测）
 设置 → 解码器页：列表右侧**有**垂直滚动条，但滚轮不滚、拖滑块也不动，无法向下滑动。
@@ -439,6 +440,7 @@ config_compat 2 · config_pipeline_e2e 5 · docs_consistency 8）。
 - 涉及上游文件（均在 `wind-ui-rust-0.23.0/src/`）：
   - `core.rs`（`EventCtx::close_window(key)` 一行转发到 `event::push_callback_close`）
 - 应用侧接线：`main/src/runtime/mod.rs`（16ms 轮询 → `ui::preview::tick`）
+- **落点状态：0.35.0 无落点**（2026-11-25 核）——0.35 上游内建 `EventCtx::close_window(key)`（core.rs），无需重放。
 
 ### 问题（空格预览实施中实测）
 空格预览需要「预览开着时再按空格 → 收起」：16ms 轮询的 `EventCtx` 能开窗
@@ -1022,6 +1024,7 @@ RuPix 每次启动都有一段与格式、与图片尺寸都无关的固定开�
 - 编号：019
 - 涉及上游文件：`wind-ui-rust-0.23.0/src/ui/mod.rs`（`impl Element` 的文本输入构器区）
 - 应用侧接线：`main/src/ui/text_window.rs`
+- **落点状态：0.35.0 无落点**（2026-11-25 核）——0.35 上游把 `frameless_input()` 改名为 `Element::frameless()`（ui/mod.rs），宿主已适配为 `frameless()`。
 
 ### 问题（用户实测）
 插件的纯文本结果窗要求对齐 CurSeen 的"信息档"：**没有框线、没有聚焦框线变色、背景纯白**。
@@ -1431,6 +1434,7 @@ windui `cargo test --lib` **1075 passed**。
   （`handle_wheel` 改用 `PointerEvent::single_with`，从 `LOWORD(wParam)` 取
   `MK_CONTROL` / `MK_SHIFT` 位，`GetKeyState` 兜底，填 `Mods { ctrl, alt, shift, meta }`）
 - 应用侧接线：无（宿主 `canvas.rs` 早已读 `p.mods.ctrl` / `p.mods.shift`，补丁后自然生效）
+- **落点状态：0.35.0 无落点**（2026-11-25 核）——0.35 上游内建 `handle_wheel` 的 `PointerEvent::single_with` 修饰键，无需重放。
 
 ### 问题（用户实机，2026-11-08）
 设置 → 快捷键 → 鼠标 里「Ctrl+鼠标滚轮」是「切换图片」，按住 Ctrl 滚轮却没有换图。
@@ -1691,3 +1695,75 @@ clippy `-D warnings` 0（1.97.0；顺带修平了它新揪出的 4 处既有告�
 `skia.rs`/`win32\mod.rs` 两处已退役的 `chunks_exact_to_as_chunks` allow、
 `image.rs` 的 `type_complexity` 与 cfg 条件下的 `unused_mut`、
 `dyn_list.rs` 的 doc 缩进，均已重新归档）· j13 归档逐字节 ok。
+
+---
+
+## 迁移记录 —— 0.23.0 → 0.35.0（2026-11-25，用户裁决升级）
+
+windui 0.35.0 是上游大版本升级（0.23 → 0.35，跨 12 个 minor）。
+`Cargo.toml` path 依赖改指 `.3rd/wind-ui-rust-0.35.0`，version 0.35.0。
+19 个补丁涉及文件、38 处合并冲突。**skia.rs 的 3-way merge 对 58% 漂移文件
+产生 3x 重复定义（245 编译错误），已弃用 3-way merge，改用 rebase 方案
+（0.35 pristine 基线 + 0.23 补丁 diff 上下文匹配重放）重建。** 各补丁去向：
+
+| 补丁 | 去向 | 说明 |
+| --- | --- | --- |
+| 01 托盘运行期显隐 | **重放** | 0.35 托盘子系统沿用 0.23 结构，`platform/tray.rs` + `win32/tray.rs` + `win32/mod.rs` 的 `SetVisible` 臂原样重放。 |
+| 02 失焦回调 `on_blur` | **上游已收编** | 0.35 内建 `Element::on_blur`，取上游侧。 |
+| 03 逐像素窗口透明度 | **重放** | `platform/mod.rs` → `core.rs` → `app/menu.rs` → `app/mod.rs` → `win32/mod.rs` 分层呈现整段原样重放。 |
+| 04 WindowOp 扩展（fullscreen/topmost） | **重放** | 0.35 上游**未**内建 `WindowState::fullscreen`/`topmost`，保留。`event.rs` 5 变体 + `WindowState` 2 字段 + `core.rs` 5 助手 + `win32/mod.rs` 5 臂。**event.rs 测试 `window_state_snapshot_roundtrip` 漏补 2 字段，已修。** |
+| 05 NCHITTEST 顶缘优先 | **上游已收编** | 0.35 内建，取上游侧。 |
+| 06 SVG 渲染性能 | **重放** | `render/image.rs` 的 `svg_fontdb`/`svg_warm_fonts`/`svg_tree_cached`/`Image::svg_intrinsic_size`/`from_svg_region` 原样重放。 |
+| 07 滚动条内缩按 frameless | **上游已收编** | 0.35 内建 `Tree::scroll_edge_inset`，取上游侧。 |
+| 08 KeyedList 滚动转发 | **上游已收编** | 0.35 重构为 KeyedList 自带事件转发，`dyn_list.rs` 整文件还原上游 pristine。 |
+| 09 镜像文字 `draw_text_mirrored` | **重放** | 0.35 上游**未**内建，保留。`skia.rs` 主代码 `draw_text_mirrored` 方法 + 测试 `draw_text_mirrored_is_exact_horizontal_flip`。rebase 重放。 |
+| 10 `EventCtx::close_window` | **上游已收编** | 0.35 内建，取上游侧。 |
+| 011 pixelated 放大走最近邻 | **重放** | 0.35 上游**未**内建，保留。`skia.rs` `draw_image` 的 `FilterQuality::Nearest` 分支 + 测试。rebase 重放。 |
+| 012-018 | **重放** | 各补丁原样重放（详见各章节）。 |
+| 013 1:1 吸附判据 `<= 1.0` | **重放** | `skia.rs` `draw_image` 阈值 + 测试 `draw_image_snaps_within_one_physical_pixel`。rebase 重放。 |
+| 014 NCHITTEST 标记 | **上游已收编** | 0.35 内建，与 05 同。 |
+| 015 1:1 不透明 blit 快路 | **重放** | 0.35 上游**未**内建，保留。`skia.rs` `blit_opaque_1to1` + `draw_image` 快路 + 测试。rebase 重放。**rebase 后补了 dst 框求交（0.35 原快路不按 dst 框裁剪，`draw_image_physical_crops_when_dst_smaller` 红）。** |
+| 016 最近邻放大 blit 快路 | **重放** | 0.35 上游**未**内建，保留。`skia.rs` `blit_nearest_opaque` + 测试。rebase 重放。**同补 dst 框求交。** |
+| 019 `frameless()` 无参 | **上游已收编** | 0.35 内建 `Element::frameless(self)`（0.23 是 `frameless_input()`）。**宿主适配：`text_window.rs`/`update_window.rs` 的 `frameless_input()` → `frameless()`。** |
+| 027 滚轮修饰键 | **上游已收编** | 0.35 内建 `handle_wheel` 的 `PointerEvent::single_with` 修饰键，取上游侧。 |
+| 028 透明底 | **重放** | 0.35 上游**未**内建，保留。`WindowOp::SetTransparentBackground` 整段。 |
+| 030 `hit_slop` | **上游已收编** | 0.35 内建 `Widget::hit_slop()`，`hit_node` 用它算 hit_area。**0.35 bug：`hit_node` 只读 `widget.hit_slop()` 不读 `n.hit_pad`，`hit_pad_edges` 形同虚设——已修：`hit_node` 把 `n.hit_pad` 也加进 slop。** |
+| 026/029/031 | **重放** | 原样重放。 |
+
+应用侧适配（非补丁本体）：
+- `main/src/ui/text_window.rs`、`main/src/ui/update_window.rs`：`frameless_input()` → `frameless()`（0.35 改名）。
+- `main/src/ui/plugin_settings.rs`：`live_slider` 测试 control group 断言从 `DamageReq::Rect` 改为 `DamageReq::Full`——0.35 已修复「松手才变」根因（裸滑块 Move 也升整窗失效），0.23 的 `Rect` 断言是旧前提。
+- `main/src/event.rs`：`window_state_snapshot_roundtrip` 测试的 `WindowState` 字面量补 `fullscreen`/`topmost` 两字段（0.23 无此字段，0.35 因补丁 04 新增）。
+
+0.35 上游 bug 修复（本仓侧）：
+- `core.rs` `hit_node`：0.35 原实现只读 `n.widget.hit_slop()` 不读 `n.hit_pad`，
+  导致 `hit_pad_edges` 设置的外扩命中完全失效。已补 `n.hit_pad` 叠加进 hit_area。
+- `render/skia.rs` `blit_opaque_1to1`/`blit_nearest_opaque`：0.35 原快路只按
+  「源 ∩ 裁剪 ∩ 目标缓冲」搬运，不按 dst 框裁剪，图片比框大时（`Fit::Physical`
+  居中裁剪）会覆盖框外背景。已加 `dst: Option<Rect>` 参数，与 pdst 求交。
+
+skia.rs rebase 说明：
+0.35 的 skia.rs 与 0.23 结构差异 58%，3-way merge（base=0.23, ours=0.23-patched,
+theirs=0.35）产生 3x 重复定义（245 编译错误）。改用 rebase：0.35 pristine 基线
++ 0.23→0.23-patched 的 unified diff 上下文匹配重放。10 个 hunk 中 7 个主代码
+hunk 上下文匹配 0.35 主代码成功；2 个 hunk（测试钩子、draw_image blit 逻辑）
+因 0.35 改 `self.pixmap.width()` 为 `self.target_size()` 上下文不匹配，手动定位
+插入；1 个测试模块 hunk 的 530 行测试项 + 2 个测试插入 hunk 统一插入 0.35 测试
+模块 `use super::*;` 之后。测试项 API 经核验兼容 0.35（`is_opaque`/`pixelated`/
+`with_pixelated` 在 image.rs 3-way merge 中正确保留，`DWriteEngine` 在 0.35 text
+模块，`px` 在 0.35 测试模块）。
+
+门禁行（2026-11-25 审计·终版）：
+windui 0.35 `cargo check` 0 error · `cargo test --lib` **1565 passed / 0 failed** ·
+`cargo clippy` 0 error 0 warning（修了 3 处我们引入的告警：win32/mod.rs 未用 import
+`ImeField`/`ImeHints`、skia.rs 重复 `let Some(path)`、image.rs `for (file,_) in &map`）·
+宿主 `cargo check` 0 error · `cargo clippy` 0 error（2 预存告警）·
+宿主 `cargo test --lib`（单线程）**1046 passed / 0 failed**（多线程有 13 条共享全局态
+的并发隔离红：9 association 注册表环境 + 2 decoders 环境解态 + 4 并发非确定性，
+隔离下全过，非 windui 回归）·
+`hygiene_scan` 16 类 **violations: 0**（收编补丁 08/10/019/027 章节补记「0.35.0 无落点」，
+`PATCH_EXEMPT` 放宽为匹配「无落点」）·
+`cargo test --test docs_consistency` **27 passed / 1 failed**（唯一剩余 j12 exe 体积：
+需 release 构建后跑 size_map 同步宪章 §4.1，发布期项）·
+j13 归档 `patches/wind-ui-rust-0.35.0/` ↔ `.3rd` 工作副本 19 文件逐字节 ok ·
+结构文档已 `structure_gen.py --write` 重生成（j9/j10 恢复绿）。

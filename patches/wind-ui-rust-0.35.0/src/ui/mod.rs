@@ -5,6 +5,7 @@
 
 pub mod caret;
 pub mod color_picker;
+pub mod combo;
 pub mod containers;
 pub mod dyn_list;
 pub mod image;
@@ -14,17 +15,20 @@ pub mod list;
 pub mod menubar;
 pub mod nav;
 pub mod pager;
+pub mod presence;
 pub mod progress;
 pub mod reorder;
 pub mod rich;
 pub mod row_source;
 pub mod segmented;
 pub mod select;
+pub mod slide_highlight;
 pub mod sortable_table;
 pub mod split;
 pub mod stepper;
+mod table_cols;
 pub mod text_content;
-mod text_fit;
+pub(crate) mod text_fit;
 pub mod virtual_list;
 pub mod window_buttons;
 
@@ -35,7 +39,7 @@ use std::rc::Rc;
 use crate::anim::{Easing, Transition};
 use crate::core::{ClickFn, DropFn, EmptyWidget, EventCtx, Layout, Node, NodeId, Tree, Widget};
 use crate::event::{Event, Key, PointerKind};
-use crate::geometry::{Color, Insets, Point, Rect, Size};
+use crate::geometry::{Color, Corners, Insets, Point, Rect, Size};
 use crate::render::image::{Fit, Image, VisualState};
 use crate::render::{Canvas, Paint};
 use crate::signal::Signal;
@@ -49,13 +53,17 @@ pub use caret::{CaretOpts, CaretState, CaretStyle};
 // `default_presets` 供在默认色之上增删、`ColorTrigger` 有公开的 `hex_text()` 供 downcast。
 // 面板内那四个 widget 的构造器要 crate 私有的 `PickerState`，外部拿到类型名也无事可做。
 pub use color_picker::{default_presets, ColorPickerOpts, ColorTrigger, Hsva};
+pub use combo::ComboField;
 pub use image::{ImageContent, ImageView};
-pub use inputs::{CheckBox, CheckBoxSize, RadioButton, Slider, Switch, SwitchSize, TextInput};
+pub use inputs::{
+    CheckBox, CheckBoxSize, RadioButton, Slider, Switch, SwitchSize, TextInput, TextMark,
+};
 pub use link::Link;
 pub use list::ListRow;
 pub use menubar::{MenuBar, MenuBarEntry};
 pub use nav::{AccordionHeader, CollapsibleHeader, ExpandState, NavRow};
 pub use pager::page_count;
+pub use presence::Presence;
 pub use progress::ProgressBar;
 pub use reorder::{CommitMode, DragHandle, ReorderList};
 pub use rich::{Para, RichColor, RichDoc, RichText, SelectionScope, SpanStyle};
@@ -69,13 +77,14 @@ pub use window_buttons::{WindowButton, WindowButtonKind};
 
 /// 图标与文字之间的间距（Button 等）。
 const ICON_GAP: i32 = 6;
+/// 标签页切换时内容横向滑动的距离（逻辑 px）。
+const TAB_SLIDE: i32 = 24;
 
 /// 表格单元格内边距（横/纵，px）与可点击单元格高亮圆角。内边距在单元格内部，
 /// 使可点击单元格填满整格、hover 高亮覆盖整格（而非仅贴着文字）。
 const TABLE_CELL_PAD_X: i32 = 14;
 const TABLE_CELL_PAD_Y: i32 = 9;
 const TABLE_HEADER_PAD_Y: i32 = 10;
-const TABLE_CELL_CORNER: f32 = 4.0;
 
 /// 文本溢出时的省略方式。对 [`Label`] 生效（静态文案与绑信号的一并适用）；
 /// 配合 `.max_lines(1)` 使用最为常见。
@@ -96,6 +105,23 @@ pub enum SortOrder {
     Asc,
     /// 降序。
     Desc,
+}
+
+/// 取出控件里的 `TextInput`：本身就是，或是包着它的 [`combo::ComboField`]。
+///
+/// text_input 的修饰符（`on_commit` / `on_submit` / `numeric` …）与宿主的
+/// `select_when` 都经它找文本框，组合框因此不必把这些修饰符再抄一遍。
+pub(crate) fn text_input_of(any: &mut dyn std::any::Any) -> Option<&mut TextInput> {
+    if any.is::<TextInput>() {
+        return any.downcast_mut::<TextInput>();
+    }
+    if any.is::<stepper::NumberField>() {
+        return any
+            .downcast_mut::<stepper::NumberField>()
+            .map(|n| n.inner_mut());
+    }
+    any.downcast_mut::<combo::ComboField>()
+        .map(|c| c.inner_mut())
 }
 
 /// 文本控件（[`Label`]）前景色：启用取样式解析色；禁用统一降为 `text_disabled`，
@@ -257,6 +283,9 @@ impl Widget for Label {
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
     }
+    fn display_text(&self) -> Option<String> {
+        Some(self.text.resolve().into_owned())
+    }
     fn text_truncated(&self) -> Option<bool> {
         // 不限行时交回 None 表示"这个问题对我不适用"。固定高度配多行文本时 paint 也会
         // 裁，但那只是不让字画出 bounds 的视觉兜底，不算截断语义——报 Some 会让宿主拿
@@ -301,11 +330,17 @@ pub enum ButtonSize {
 }
 
 impl ButtonSize {
-    /// (横向总内边距, 纵向总内边距)（px）。
-    fn padding(self) -> (i32, i32) {
+    /// `(横向总内边距, 纵向最小总内边距, 高度下限)`（px）。
+    ///
+    /// 高度取 `max(高度下限, 文字高 + 纵向最小内边距)`：默认字号下落在主题的
+    /// `control_h` / `control_h_sm`，与输入框、下拉框同高；字号调大时随文字自然增高。
+    fn metrics(self, m: &crate::theme::Metrics, font: f32) -> (i32, i32, i32) {
         match self {
-            ButtonSize::Small => (20, 10),
-            ButtonSize::Medium => (32, 18),
+            ButtonSize::Small => (2 * m.space_md, 6, m.control_h_sm),
+            // 下限与输入框、下拉框同一个公式：任何字号下都与它们等高。纵向留白取 4 只防
+            // 极端字号溢出——按"实测行高 + 10"算的话，真实字体（行高 ≈ 1.4× 字号）下
+            // 大字号的按钮会比输入框高出几像素。
+            ButtonSize::Medium => (2 * m.space_lg, 4, m.control_height(font)),
         }
     }
 }
@@ -388,6 +423,10 @@ impl Button {
 }
 
 impl Widget for Button {
+    fn frame_corner(&self, _bounds: Rect) -> Option<f32> {
+        let th = crate::theme::current();
+        Some(th.button.corner(&th.metrics))
+    }
     fn measure(&self, _avail: Size, style: &Style, text: &mut dyn TextEngine) -> Size {
         // 绑了信号的按钮在这里现取当前文案，故换字必然改变按钮宽度——点击已把本帧
         // 顶成整窗帧（`DamageReq::Layout`），整窗帧必先 layout_root 重新 measure。
@@ -402,9 +441,11 @@ impl Widget for Button {
         } else {
             0
         };
-        // 按尺寸变体取内边距（Medium 左右16/上下9，Small 左右10/上下5）。
-        let (pad_w, pad_h) = self.size.padding();
-        Size::new(s.w + pad_w + icon_extra, s.h + pad_h)
+        let (pad_w, pad_h, min_h) = self
+            .size
+            .metrics(&crate::theme::current().metrics, style.font_size());
+        // 高度以下限为准（理由见 `ButtonSize::metrics`）；`s.h + pad_h` 只在下限装不下文字时起作用。
+        Size::new(s.w + pad_w + icon_extra, min_h.max(s.h + pad_h))
     }
     fn paint(
         &self,
@@ -435,6 +476,15 @@ impl Widget for Button {
         } else {
             self.intent.colors(pal)
         };
+        // Outline 的文字/描边色（hover 淡叠层也取它）：
+        // - Primary 用 `accent_text`——它是"强调色当前景"的那一档，暗色主题下比 accent 亮；
+        // - Neutral 的填充色是文字色的半透明叠层，当线条/文字太淡，改用 text_muted；
+        // - 其余意图用意图主色（红/绿/琥珀/自定义）。
+        let outline_col = match self.intent {
+            Intent::Primary => pal.accent_text(),
+            Intent::Neutral => pal.text_muted,
+            _ => ic.bg,
+        };
         // 背景：
         // - Outline：透明底，hover/press 用意图色的淡色叠层（禁用恒透明）。
         // - Solid：禁用用置灰底；Primary 下 style.bg 单点覆盖优先；否则按三态取 intent 色。
@@ -443,8 +493,8 @@ impl Widget for Button {
                 VisualState::Disabled => Color::TRANSPARENT,
                 _ => match self.state {
                     BtnState::Normal => Color::TRANSPARENT,
-                    BtnState::Hover => ic.bg.scale_alpha(0.10),
-                    BtnState::Press => ic.bg.scale_alpha(0.18),
+                    BtnState::Hover => outline_col.scale_alpha(0.10),
+                    BtnState::Press => outline_col.scale_alpha(0.18),
                 },
             }
         } else {
@@ -470,13 +520,6 @@ impl Widget for Button {
         }
         let color = anim.animate();
         self.bg_anim.set(anim);
-        // Outline 的文字/描边色：Primary/Danger 用意图主色（蓝/红）；Neutral 的意图主色是
-        // p.border（分割线色，过淡，启用态会比禁用态还不可见），改用 text_muted 保证可读对比。
-        let outline_col = if matches!(self.intent, Intent::Neutral) {
-            pal.text_muted
-        } else {
-            ic.bg
-        };
         // 文字色：禁用用 text_disabled；Outline 用意图主色（蓝/红/灰）作文字；
         // 显式 .fg(color) 覆盖优先；显式 .fg_role(非默认角色) 次之；否则填充按钮用意图对比
         // 前景 ic.fg（on_accent，跟随主题，保证蓝底白字）。
@@ -683,8 +726,6 @@ pub struct Element {
     // ★ RuPix 补丁 030
     hit_pad: Insets,
     /// 同级绘制 / 命中提升（见 [`crate::core::Node::raised`]）。
-    // ★ RuPix 补丁 030
-    raised: bool,
     align: Option<Align>,
     /// 纵轴对齐覆盖（仅 stack），见 [`Element::align_xy`]。
     align_v: Option<Align>,
@@ -702,24 +743,50 @@ pub struct Element {
     vis_cond: Option<Box<dyn Fn() -> bool>>,
     /// 运行期权重，见 [`Element::weight_when`]。
     weight_fn: Option<Box<dyn Fn() -> f32>>,
+    place: Option<crate::core::Placement>,
     clip_children: bool,
+    /// 按自身圆角外形裁子树，见 [`Element::clip`]。
+    clip_outline: bool,
+    /// 先于普通兄弟受测、后于它们绘制（见 `Node::raised`）。crate 内部用（列宽手柄）。
+    raised: bool,
+    scroll_axis: crate::spec::ScrollAxis,
     click: Option<ClickFn>,
     blur: Option<ClickFn>,
     on_drop: Option<DropFn>,
+    /// 滚动容器的跟随底部 / 头部锚定 / 边缘回调（见 [`Element::stick_to_bottom`] 等）。
+    scroll_ext: Option<Box<crate::core::ScrollExt>>,
     context_menu: Option<crate::core::MenuFn>,
     window_drag: bool,
     /// 声明式初始焦点（见 [`Element::autofocus`]）。
     autofocus: Option<crate::core::Autofocus>,
+    /// 定向送焦点（见 [`Element::focus_when`] / [`Element::select_when`]）：触发信号与
+    /// 兑现时对选区做什么。
+    focus_when: Option<(Signal<u64>, crate::core::FocusSelect)>,
+    /// 滚进可视区的触发信号（见 [`Element::reveal_when`]）。
+    reveal_when: Option<Signal<u64>>,
     focusable: Option<bool>,
     enabled_static: bool,
     enabled: Option<Signal<bool>>,
     en_cond: Option<Box<dyn Fn() -> bool>>,
-    tooltip: Option<String>,
+    tooltip: Option<TextContent>,
+    cursor: Option<crate::event::CursorShape>,
     /// 注册为响应式节点：build 后自动调用 `Tree::register_reactive`，
     /// 框架在每次 layout 前向其 widget 调用 `on_update`。
     reactive: bool,
     /// 锚定浮层的展开信号（见 [`Node::overlay`]）。由 [`Element::popup`] 设置。
     overlay: Option<Signal<bool>>,
+    /// 见 [`Node::overlay_swallow`]。由 [`Element::dismiss_swallows_click`] 设置。
+    dismiss_swallow: bool,
+    presence: Option<presence::Presence>,
+    /// 进出场滑动方向（标签页切换用）：显隐翻转时问一次，返回滑动量的符号。
+    presence_dir: Option<Rc<dyn Fn(bool) -> i32>>,
+    animate_height: bool,
+    bg_cond: Option<Box<dyn Fn() -> Color>>,
+    opacity_cond: Option<Box<dyn Fn() -> f32>>,
+    animate_style: bool,
+    animate_layout: bool,
+    slide_highlight: bool,
+    slide_target: Option<Box<dyn Fn() -> Option<slide_highlight::HighlightSpec>>>,
 }
 
 impl Element {
@@ -733,7 +800,6 @@ impl Element {
             padding: Insets::default(),
             margin: Insets::default(),
             hit_pad: Insets::default(),
-            raised: false,
             align: None,
             align_v: None,
             weight: None,
@@ -746,20 +812,38 @@ impl Element {
             vis_signal: None,
             vis_cond: None,
             weight_fn: None,
+            place: None,
             clip_children: false,
+            clip_outline: false,
+            raised: false,
+            scroll_axis: crate::spec::ScrollAxis::Vertical,
             click: None,
             blur: None,
             on_drop: None,
+            scroll_ext: None,
             context_menu: None,
             window_drag: false,
             autofocus: None,
+            focus_when: None,
+            reveal_when: None,
             focusable: None,
             enabled_static: true,
             enabled: None,
             en_cond: None,
             tooltip: None,
+            cursor: None,
             reactive: false,
             overlay: None,
+            dismiss_swallow: false,
+            presence: None,
+            presence_dir: None,
+            animate_height: false,
+            bg_cond: None,
+            opacity_cond: None,
+            animate_style: false,
+            animate_layout: false,
+            slide_highlight: false,
+            slide_target: None,
         }
     }
 
@@ -777,6 +861,50 @@ impl Element {
             axis: Axis::Horizontal,
             spacing: 0,
             cross: Align::Start,
+        })
+    }
+    /// **带默认间距的横排**：子项间距取主题 `metrics.space_sm`（默认 8），纵向居中。
+    ///
+    /// 拼按钮组、图标 + 文字、标签 + 徽章这类"一排小东西"的日常写法——不设任何参数就是
+    /// 主流的间距。需要精确控制（贴紧、自定间距、顶对齐）时用 [`row`](Self::row)，
+    /// 它默认间距 0、顶对齐，是不带任何主张的原语。两者可以随意混用，后链的
+    /// `.spacing(..)` / `.cross(..)` 照常覆盖。
+    ///
+    /// ```
+    /// use windui::prelude::*;
+    /// let actions = Element::hstack()
+    ///     .child(Element::button("保存"))
+    ///     .child(Element::button("取消").neutral());
+    /// ```
+    pub fn hstack() -> Self {
+        let m = &crate::theme::current().metrics;
+        Self::row().spacing(m.space_sm).cross(Align::Center)
+    }
+    /// **带默认间距的竖排**：子项间距取主题 `metrics.space_md`（默认 12），左对齐。
+    ///
+    /// 页面里一块接一块地往下排（标题、说明、表单、按钮行）时的日常写法；与
+    /// [`hstack`](Self::hstack) 成对。不带主张的原语是 [`col`](Self::col)（间距 0）。
+    pub fn vstack() -> Self {
+        let m = &crate::theme::current().metrics;
+        Self::col().spacing(m.space_md)
+    }
+    /// 横向流式容器：子节点从左往右排，放不下就折到下一行；行内默认纵向居中。
+    /// 用 [`Element::spacing`] 设同行间距、[`Element::run_spacing`] 设行间距。
+    ///
+    /// ```no_run
+    /// # use windui::prelude::*;
+    /// Element::flow()
+    ///     .width_match()
+    ///     .spacing(6)
+    ///     .run_spacing(4)
+    ///     .child(Element::badge("APK"))
+    ///     .child(Element::badge("v2 · v3"));
+    /// ```
+    pub fn flow() -> Self {
+        Self::base(Layout::Flow {
+            spacing: 0,
+            run_spacing: 0,
+            cross: Align::Center,
         })
     }
     /// 叠层容器（FrameLayout）。
@@ -836,11 +964,13 @@ impl Element {
             .cross(Align::Center)
             .padding_xy(9, 3)
             .corner(999.0);
-        let label = Element::label(text).font_size(12.0).font_weight(600);
+        let label = Element::label(text)
+            .font_size(crate::theme::current().metrics.font_xs)
+            .font_weight(600);
         match intent {
             Intent::Primary => shell
                 .bg_role_alpha(Role::Accent, 0.15)
-                .child(label.fg_role(Role::Accent)),
+                .child(label.fg_role(Role::AccentText)),
             // Neutral 前景用 text_muted（够深可读）——不能用浅灰 border 当字色，
             // 灰字灰底几乎看不清（badge_colors 已修过的同一个坑，此处对齐）。
             Intent::Neutral => shell
@@ -926,6 +1056,15 @@ impl Element {
 
     /// 点击/激活回调（按钮等交互控件）。
     ///
+    /// 支持的控件：`button` / `icon_button` / `checkbox` / `radio` / `switch` / `link` /
+    /// `text_input` / `number_input` / `combo_box` / `nav_row` 与 `clickable()` 容器。**其余一律不支持**——
+    /// 包括没加 `.clickable()` 的 `col` / `row` / `stack`、`label`、`dropdown`、`slider`、
+    /// `stepper` 等：debug 下 `debug_assert` 失败，不会静默丢弃（release 仍丢弃）。
+    /// 想让容器可点，写 `.clickable().on_click(..)`。
+    ///
+    /// 用在 [`Element::radio`] / [`Element::switch`] 上时同样是**旁路通知**：选中 / 翻转
+    /// 已经发生，回调里读绑定信号拿到的是新值。
+    ///
     /// 用在 [`Element::text_input`] 上时语义是**旁路通知**而非激活：输入框照常聚焦、
     /// 定位光标、起拖选，回调只是让宿主知道「这个框被点了」——例如重新展开一个被
     /// Escape 收起的补全/结果浮层。**仅左键**：右键（弹上下文菜单）、中键、
@@ -957,7 +1096,8 @@ impl Element {
     /// 让**任意容器**（`col`/`row`/`stack`）成为可点击面板：补上 hover/press 视觉反馈
     /// （主题自适应半透明叠层）、键盘可聚焦 + 回车/空格激活、悬停手型光标。
     /// 配合 `.on_click(...)` 设回调，`.bg()`/`.corner()`/`.border()` 设外观即得卡片。
-    /// 注意：会替换该节点的占位 widget，故不可与叶子控件（label/button 等）叠加使用。
+    /// 注意：会替换该节点的占位 widget，故不可与叶子控件（label/button 等）叠加使用，
+    /// 也不能用在 `scroll()` 上（会顶掉处理滚轮的 `ScrollWidget`，debug 下断言报错）。
     #[track_caller]
     pub fn clickable(mut self) -> Self {
         debug_assert!(
@@ -1065,6 +1205,74 @@ impl Element {
     /// 别处」。配合 [`select_range`](Self::select_range) 可只选主名。
     pub fn autofocus_take(mut self) -> Self {
         self.autofocus = Some(crate::core::Autofocus::Take);
+        self
+    }
+
+    /// **定向送焦点**：`trigger` 的值每变一次，就把焦点交给本元素（夺取已有焦点）。
+    /// 给常驻的输入框用——它们的 [`autofocus`](Self::autofocus) 在开机时就用掉了，而
+    /// `ctx.request_focus()` 只能聚焦自己、应用又拿不到框架控件的 `NodeId`。
+    ///
+    /// ```
+    /// use windui::prelude::*;
+    ///
+    /// let title = signal(String::new());
+    /// let focus_title = signal(0u64);
+    /// let ui = Element::col()
+    ///     .child(Element::text_input(title, "标题").focus_select_all_when(focus_title))
+    ///     .child(Element::button("新建").on_click(move |_| focus_title.update(|n| *n += 1)));
+    /// ```
+    ///
+    /// 用**计数器**而非布尔：布尔为真期间用户自己点了别处，本框不该再把焦点抢回来；
+    /// 而下一次触发要能再生效。建节点时的初值不触发。元素此刻不在焦点环里（隐藏、禁用、
+    /// 被对话框遮住）时，等它进环那一帧再兑现。
+    #[track_caller]
+    pub fn focus_when(self, trigger: Signal<u64>) -> Self {
+        self.set_focus_when(trigger, crate::core::FocusSelect::Keep, "focus_when()")
+    }
+
+    /// [`focus_when`](Self::focus_when) + 全选已有内容：改名被拒后回到框里，接着打字
+    /// 就覆盖。
+    #[track_caller]
+    pub fn focus_select_all_when(self, trigger: Signal<u64>) -> Self {
+        self.set_focus_when(
+            trigger,
+            crate::core::FocusSelect::All,
+            "focus_select_all_when()",
+        )
+    }
+
+    /// 计数信号的值一变，就把本元素滚进祖先滚动容器的视口（不动焦点）。
+    ///
+    /// 典型用途：列表里新加的、或被程序选中的那一行要让用户看得到。规则同
+    /// [`focus_when`](Self::focus_when)：建节点时的初值不触发；同一次事件里加了计数又重建了
+    /// 这一行，新建的行照样认这次触发；此刻不可见的等它出现那一帧再滚。
+    ///
+    /// ```no_run
+    /// # use windui::prelude::*;
+    /// let reveal = signal(0u64);
+    /// let row = Element::label("刚打开的文件").reveal_when(reveal);
+    /// // 打开文件后：reveal.update(|n| *n += 1);
+    /// ```
+    pub fn reveal_when(mut self, trigger: Signal<u64>) -> Self {
+        self.reveal_when = Some(trigger);
+        self
+    }
+
+    /// 三种定向送焦点共用一个槽：后挂的会顶掉先挂的，debug 构建下断言提示。
+    #[track_caller]
+    fn set_focus_when(
+        mut self,
+        trigger: Signal<u64>,
+        select: crate::core::FocusSelect,
+        what: &str,
+    ) -> Self {
+        debug_assert!(
+            self.focus_when.is_none(),
+            "{what} 与 focus_when() / focus_select_all_when() / select_when() / \
+             select_without_focus_when() 互斥：\
+             同一元素只能挂一个定向送焦点触发器，后挂的会顶掉先挂的"
+        );
+        self.focus_when = Some((trigger, select));
         self
     }
 
@@ -1401,8 +1609,23 @@ impl Element {
     /// ⚠️ 行数**不设上限**：浮层高到放不下时只能贴边（见 `app::tooltip`），一屏铺满
     /// 的提示没人看得完。要列很多条时由调用方截断（列前几条 + "等 N 项"），
     /// 别把整份清单塞进来。
-    pub fn tooltip(mut self, text: impl Into<String>) -> Self {
+    ///
+    /// 收 `impl Into<TextContent>`：传 [`t!`](crate::t) 时每次弹出都按当前语言取译文，
+    /// 换语言即跟随；`String`/`&str` 照旧是定格文本。
+    pub fn tooltip(mut self, text: impl Into<TextContent>) -> Self {
         self.tooltip = Some(text.into());
+        self
+    }
+
+    /// 悬停在本元素（及其内部未自行声明光标的子控件）上时的鼠标光标形状。
+    /// **适用于任意控件/容器**，不改变命中测试。
+    ///
+    /// 框架自带的按钮悬停是箭头——Win32 / WinUI / macOS 原生按钮都是如此，手型是网页的
+    /// 惯例。想要网页手感时自己挂上：`Element::button("保存").cursor(CursorShape::Hand)`。
+    /// 设成 `Arrow` 可压掉祖先（如 `clickable()` 卡片）给的手型；子控件自己声明的形状
+    /// （输入框的 I 形）仍然优先。禁用时恒为箭头。
+    pub fn cursor(mut self, shape: crate::event::CursorShape) -> Self {
+        self.cursor = Some(shape);
         self
     }
 
@@ -1506,7 +1729,34 @@ impl Element {
             .and_then(|a| a.downcast_mut::<Slider>())
         {
             Some(s) => f(s),
-            None => debug_assert!(false, "show_value() 只能用于 Element::slider(..)"),
+            None => debug_assert!(
+                false,
+                "show_value() / dragging_signal() 只能用于 Element::slider(..)"
+            ),
+        }
+        self
+    }
+
+    /// 分段控件选中变化后的副作用钩子。仅 `Element::segmented(..)` 可用。
+    ///
+    /// 回调收到**已生效的新下标**，不必自己再 `set`；点同一段（选中没变）不触发。
+    /// 典型用途是选项即时生效——换主题配置、切换视图模式。
+    ///
+    /// ```
+    /// # use windui::prelude::*;
+    /// let mode = signal(0usize);
+    /// let ui = Element::segmented(vec!["列表", "网格"], mode)
+    ///     .on_segment_change(|ctx, i| ctx.toast_ok(format!("切到第 {} 种视图", i + 1)));
+    /// ```
+    #[track_caller]
+    pub fn on_segment_change(mut self, f: impl Fn(&mut EventCtx, usize) + 'static) -> Self {
+        match self
+            .widget
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<segmented::SegmentedControl>())
+        {
+            Some(s) => s.set_on_change(Box::new(f)),
+            None => debug_assert!(false, "on_segment_change() 只能用于 Element::segmented(..)"),
         }
         self
     }
@@ -1534,32 +1784,58 @@ impl Element {
         self.config_slider(|s| s.set_show_value(on))
     }
 
+    /// 把滑块「正在被鼠标拖动」镜像到一个信号：按下置 `true`，抬起置 `false`。仅
+    /// `Element::slider(..)` 可用。
+    ///
+    /// 用来做「抓住才显示」之类的交互——比如拖动时才在旁边亮出百分比：把信号交给标签的
+    /// [`visible_signal`](Self::visible_signal) 即可。**但标签的位置要常驻**：隐藏的节点不占
+    /// 布局，标签直接显隐会让滑块在按下那一刻被缩窄、旋钮跳离指针；给标签套一个定宽容器、
+    /// 只显隐里面的文字（见 `fullshowcase` 的音量行）。
+    ///
+    /// 只反映**指针拖动**；键盘调值是瞬发动作，没有「正在」可言。信号的初值由调用方给
+    /// （通常是 `signal(false)`），控件构造时不会去写它。滑块被隐藏、禁用或节点被回收时拖动
+    /// 随之作废，信号回到 `false`。
+    ///
+    /// ```
+    /// # use windui::prelude::*;
+    /// let volume = signal(0.5);
+    /// let grabbed = signal(false);
+    /// let ui = Element::row()
+    ///     .child(Element::slider(volume).dragging_signal(grabbed))
+    ///     .child(Element::label("音量").visible_signal(grabbed));
+    /// ```
+    #[track_caller]
+    pub fn dragging_signal(self, dragging: Signal<bool>) -> Self {
+        self.config_slider(|s| s.set_drag_signal(dragging))
+    }
+
     /// 单行文本输入（绑定 `Signal<String>`）。
     /// 可链式 `.password()` / `.multiline()` / `.wrap(bool)` / `.read_only()` 配置行为。
-    pub fn text_input(text: Signal<String>, placeholder: impl Into<String>) -> Self {
-        Self::base(Layout::None).widget(TextInput::new(text, placeholder.into()))
+    ///
+    /// 占位提示收 [`TextContent`]，与 `label`/`button` 的文案同一套：传 `&str`/`String` 是
+    /// 固定提示；传 `Signal<String>` 则提示随信号变（"第 3 页：输入关键词"这类随状态变的
+    /// 提示，`set` 即生效）；传 `t!(..)` 则随语言切换。
+    pub fn text_input(text: Signal<String>, placeholder: impl Into<TextContent>) -> Self {
+        Self::base(Layout::None).widget(TextInput::new(text, placeholder))
     }
 
     /// 配置内含的 TextInput。`password()/multiline()/wrap()` 是 text_input 专属修饰符；
     /// 链到其他控件属误用——debug 构建下 panic 提示，release 下静默忽略（无类型分裂代价）。
     #[track_caller]
     fn config_text_input(mut self, f: impl FnOnce(&mut inputs::TextConfig)) -> Self {
-        match self
-            .widget
-            .as_any_mut()
-            .and_then(|a| a.downcast_mut::<TextInput>())
-        {
+        match self.widget.as_any_mut().and_then(text_input_of) {
             Some(ti) => f(ti.config_mut()),
             None => debug_assert!(
                 false,
-                "password()/multiline()/wrap()/read_only() 只能用于 Element::text_input(..)"
+                "password()/multiline()/wrap()/read_only()/pad_x()/pad_y() 等 text_input 专属修饰符只能用于 Element::text_input(..)"
             ),
         }
         self
     }
     /// 密码输入：显示掩码圆点、禁止复制/剪切明文。强制单行（密码不应多行）。
     #[track_caller]
-    pub fn password(self) -> Self {
+    pub fn password(mut self) -> Self {
+        self.reject_on_number_field("password()");
         self.config_text_input(|c| {
             c.password = true;
             c.multiline = false;
@@ -1567,12 +1843,47 @@ impl Element {
     }
     /// 多行输入（编辑/换行行为见 P4）。
     #[track_caller]
-    pub fn multiline(self) -> Self {
+    pub fn multiline(mut self) -> Self {
+        self.reject_on_number_field("multiline()");
         self.config_text_input(|c| c.multiline = true)
+    }
+    /// 多行输入的 Enter 提交：开启后 Enter 触发 [`on_submit`](Self::on_submit)（不插入
+    /// 换行），Shift+Enter 插入换行；输入法组字（preedit）期间的 Enter 只交给输入法确认
+    /// 候选，不提交。聊天输入框的标准键位。仅 `text_input(..).multiline()` 有意义；
+    /// 链到别处 debug 下 panic、release 下忽略。
+    #[track_caller]
+    pub fn submit_on_enter(mut self, on: bool) -> Self {
+        self.reject_on_number_field("submit_on_enter()");
+        self.config_text_input(|c| c.submit_on_enter = on)
+    }
+    /// 输入框文字区的**左右内距**（逻辑 px，默认 12，负值按 0）。仅 `Element::text_input(..)`
+    /// 可用。
+    ///
+    /// 想让框更紧凑别用负外边距去顶——外边距会连命中区域一起改，点边缘会落到框外。这里改的
+    /// 只是文字区离框边的距离，命中、光标、选区、水平滚动都跟着同一个值走。
+    #[track_caller]
+    pub fn pad_x(self, px: i32) -> Self {
+        let mut el = self.config_text_input(|c| c.pad_x = px.max(0));
+        // 组合框的文字区右沿要让开下拉箭头，`trail` 依赖 `pad_x`，须随之重算。
+        if let Some(cf) = el
+            .widget
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<combo::ComboField>())
+        {
+            cf.keep_text_clear_of_chevron();
+        }
+        el
+    }
+    /// 多行输入框文字区的**上下内距**（逻辑 px，默认 12，负值按 0）。**单行忽略**——
+    /// 单行文字在框内垂直居中。仅 `Element::text_input(..)` 可用。
+    #[track_caller]
+    pub fn pad_y(self, px: i32) -> Self {
+        self.config_text_input(|c| c.pad_y = px.max(0))
     }
     /// 多行软换行开关（仅 multiline 生效）。
     #[track_caller]
-    pub fn wrap(self, on: bool) -> Self {
+    pub fn wrap(mut self, on: bool) -> Self {
+        self.reject_on_number_field("wrap()");
         self.config_text_input(|c| c.wrap = on)
     }
     /// 只读：内容可看、可选、可复制，不可改。可与 `.multiline()` / `.wrap(..)` 组合，
@@ -1600,13 +1911,18 @@ impl Element {
         self.config_text_input(|c| c.read_only = true)
     }
 
-    /// 无边框文本输入：不画自身背景与边框，外框由容器（例如纯文本窗）负责。
+    /// **无框**：不画底与边框，只留文字 / 光标 / 选区，底色由外层容器给。
+    /// 配合 [`read_only`](Self::read_only) 就是「可选中、可复制的纯文本」——字段值、
+    /// 文件路径这类既要像 label 一样排在版面里、又要能局部复制的展示文本；单行时过长
+    /// 的内容随光标横向滚动，不会把布局撑破。仅 `Element::text_input(..)` 可用。
     ///
-    /// ★ RuPix 补丁 019：上游 0.23 只有 `TextConfig.frameless` 字段、没有公开构器；
-    ///   宿主的纯文本窗需要一片可选中 / 可编辑、无框线的白色文本区（对齐 CurSeen
-    ///   的 `script_dialog` 信息档）。
+    /// ```
+    /// # use windui::prelude::*;
+    /// let path = signal(String::from("C:/very/long/path/to/app.apk"));
+    /// let ui = Element::text_input(path, "").read_only().frameless();
+    /// ```
     #[track_caller]
-    pub fn frameless_input(self) -> Self {
+    pub fn frameless(self) -> Self {
         self.config_text_input(|c| c.frameless = true)
     }
 
@@ -1615,6 +1931,25 @@ impl Element {
     #[track_caller]
     pub fn leading_icon(self, glyph: char) -> Self {
         self.config_text_input(|c| c.leading = Some(glyph))
+    }
+
+    /// **只允许输入数字**：ASCII 数字、打头的一个 `-`、一个小数点，与
+    /// [`Element::stepper`] 的数值框同一把尺子。键入与粘贴都按它放行，不合格的改动整次
+    /// 丢弃。只管「能打进去什么」，不做范围钳制与格式规整——那些放 `on_commit` 里做。
+    /// 仅 `Element::text_input(..)` / `Element::combo_box(..)` 可用。
+    ///
+    /// ```
+    /// # use windui::prelude::*;
+    /// let port = signal(String::from("8080"));
+    /// let ui = Element::text_input(port, "端口").numeric();
+    /// ```
+    #[track_caller]
+    pub fn numeric(mut self) -> Self {
+        self.reject_on_number_field("numeric()");
+        self.config_text_input_widget(
+            |ti| ti.set_filter(|s| stepper::accepts_number(s, true, true)),
+            "numeric()",
+        )
     }
 
     /// 前置图标字形的**水平镜像**版：以图标区水平中轴翻转字形绘制，布局占位与
@@ -1636,7 +1971,8 @@ impl Element {
     /// 那个是真冒泡）。于是「不消费」的后果不是「传给外层」而是**事件消失**：想在外层
     /// 容器挂 Widget 接 Enter 的写法编译通过、逻辑正确、永远不触发。
     ///
-    /// **多行输入不触发**：那里 Enter 是插入换行，编辑器的固有语义不该被应用截走。
+    /// **多行输入默认不触发**：那里 Enter 是插入换行，编辑器的固有语义不该被应用截走；
+    /// 开启 [`submit_on_enter(true)`](Self::submit_on_enter) 后才触发（Shift+Enter 换行）。
     ///
     /// 仅 `Element::text_input(..)` 可用（链到别处 debug 下 panic、release 下静默忽略）。
     ///
@@ -1648,13 +1984,40 @@ impl Element {
     ///     .on_submit(move |ctx| ctx.toast_ok(format!("查 {}", q.get())));
     /// ```
     #[track_caller]
-    pub fn on_submit(self, f: impl FnMut(&mut crate::core::EventCtx) + 'static) -> Self {
+    pub fn on_submit(mut self, f: impl FnMut(&mut crate::core::EventCtx) + 'static) -> Self {
+        self.reject_on_number_field("on_submit()");
         self.config_text_input_widget(|ti| ti.set_on_submit(f), "on_submit()")
+    }
+
+    /// 粘贴图片回调：用户粘贴（Ctrl+V / Cmd+V / 右键菜单"粘贴"）时，若剪贴板里有图片且
+    /// **没有**文本，调用 `f` 并跳过文本粘贴；有文本时照常粘贴文本、不触发本回调。
+    /// 只读输入框不响应粘贴，也不触发。
+    ///
+    /// 图片为非预乘 RGBA8（[`DecodedImage`](crate::render::DecodedImage)）。支持范围：
+    /// Windows（`"PNG"` / `CF_DIBV5` / `CF_DIB`）与 Linux X11（`image/png`）；原生 Wayland
+    /// 与 macOS 暂不支持（剪贴板读不出图片，回调永不触发）。
+    ///
+    /// 仅 `Element::text_input(..)` 可用（链到别处 debug 下 panic、release 下静默忽略）。
+    ///
+    /// ```
+    /// # use windui::prelude::*;
+    /// let q = signal(String::new());
+    /// let ui = Element::text_input(q, "").on_paste_image(|ctx, img| {
+    ///     ctx.toast_ok(format!("粘贴了 {}×{} 的图片", img.width, img.height));
+    /// });
+    /// ```
+    #[track_caller]
+    pub fn on_paste_image(
+        mut self,
+        f: impl FnMut(&mut crate::core::EventCtx, crate::render::DecodedImage) + 'static,
+    ) -> Self {
+        self.reject_on_number_field("on_paste_image()");
+        self.config_text_input_widget(|ti| ti.set_on_paste_image(f), "on_paste_image()")
     }
 
     /// **"改完即提交"的出口**：用户改过内容后按 Enter、或焦点离开时触发一次——网页
     /// `<input>` 的 `change` 事件。文档改名、设置面板里一行行的输入框用它。
-    /// （`Element::stepper` 的数值框不支持：它自带"失焦即规整"的提交语义。）
+    /// （`Element::stepper` 的数值框与 `Element::number_input` 不支持：它们自带"失焦即规整"的提交语义。）
     ///
     /// 三条保证，都是"自己拿失焦拼"时最容易踩的坑：
     ///
@@ -1683,7 +2046,8 @@ impl Element {
     ///     .on_commit(move |ctx| ctx.toast_ok(format!("已改名为 {}", title.get())));
     /// ```
     #[track_caller]
-    pub fn on_commit(self, f: impl FnMut(&mut crate::core::EventCtx) + 'static) -> Self {
+    pub fn on_commit(mut self, f: impl FnMut(&mut crate::core::EventCtx) + 'static) -> Self {
+        self.reject_on_number_field("on_commit()");
         self.config_text_input_widget(|ti| ti.set_on_commit(f), "on_commit()")
     }
 
@@ -1714,6 +2078,96 @@ impl Element {
              后者会合成 Ctrl+A 覆盖预置选区"
         );
         self.config_text_input_widget(|ti| ti.set_selection(start, end), "select_range()")
+    }
+
+    /// **按区间挂底色**：查找替换把整框里所有命中涂黄。区间是字符索引（与
+    /// [`select_range`](Self::select_range) / [`select_when`](Self::select_when) 同一单位，
+    /// 见 [`TextMark::range`]），越界钳到正文长度——命中表比正文旧一拍也不会 panic。
+    ///
+    /// 画在文字与选区**下面**：被 `select_when` 选中的那一处叠着选区色，一眼看出是
+    /// 「当前这一处」。不接事件、不影响命中与选区；空表不画任何东西。改表即重绘，
+    /// 不重排。密码框不画（掩码上标出命中位置等于泄露正文结构）。
+    /// 正在输入合成串时，跨过插入点的标记会把合成串一并盖住。
+    ///
+    /// 仅 `Element::text_input(..)` 可用。
+    ///
+    /// ```
+    /// # use windui::prelude::*;
+    /// let body = signal("甲乙甲丙甲".to_string());
+    /// let hits = signal(vec![TextMark::new(0..1), TextMark::new(2..3), TextMark::new(4..5)]);
+    /// let ui = Element::text_input(body, "").multiline().marks(hits);
+    /// ```
+    #[track_caller]
+    pub fn marks(self, marks: Signal<Vec<TextMark>>) -> Self {
+        self.config_text_input_widget(|ti| ti.set_marks(marks), "marks()")
+    }
+
+    /// **运行期设选区**：`trigger` 计数一变值，就把焦点送进本框并选中 `range` 当时的
+    /// `[start, end)`（字符索引，与 [`select_range`](Self::select_range) 同一单位）。
+    /// 查找替换的「跳到第 k 处」：先写 `range`、再给 `trigger` 加一。
+    ///
+    /// 触发语义与 [`focus_when`](Self::focus_when) 完全相同——计数器而非布尔、初值不触发、
+    /// 用户点走后不抢回、元素不在焦点环里时等它进环再兑现、同一次事件里重建了节点也
+    /// 不丢不重。区间在**兑现那一刻**才读，越界钳到正文长度，`start == end` 只放光标；
+    /// 多行框会滚到选区末端。
+    ///
+    /// 与 `focus_when` / `focus_select_all_when` 互斥（同一个触发器槽，debug 构建下断言）。
+    /// 仅 `Element::text_input(..)` 可用。
+    ///
+    /// ```
+    /// # use windui::prelude::*;
+    /// let body = signal("甲乙甲丙甲".to_string());
+    /// let (jump, hit) = (signal(0u64), signal((0usize, 0usize)));
+    /// let ui = Element::col()
+    ///     .child(Element::text_input(body, "").multiline().select_when(jump, hit))
+    ///     .child(Element::button("下一处").on_click(move |_| {
+    ///         hit.set((2, 3));
+    ///         jump.update(|n| *n += 1);
+    ///     }));
+    /// ```
+    #[track_caller]
+    pub fn select_when(self, trigger: Signal<u64>, range: Signal<(usize, usize)>) -> Self {
+        self.config_text_input_widget(|_| {}, "select_when()")
+            .set_focus_when(
+                trigger,
+                crate::core::FocusSelect::Range(range),
+                "select_when()",
+            )
+    }
+
+    /// [`select_when`](Self::select_when) 的**不夺焦点**版：计数一变，就在本框里选中 `range`
+    /// 当时的区间并滚过去，焦点留在原处。查找栏的惯例——焦点一直在查询框里，Enter 一次
+    /// 跳一处，正文框只负责亮出「当前这一处」（选区不看焦点照常画）。若焦点也在正文框，
+    /// 用 `select_when`：用户以为还在查询框里再按 Enter，选中的命中字会被换成换行。
+    ///
+    /// 触发语义、单位、钳制与 `select_when` 相同；同一轮里多个本修饰符可同时兑现（不抢
+    /// 焦点，互不冲突）。目标框同样要**在焦点环里**才兑现：`.focusable(false)`、禁用、被
+    /// 对话框遮住期间不兑现，等它回到环里那一帧再兑现（模态查找框高亮背后的正文，要等
+    /// 对话框关掉）。与 `focus_when` 一族共用一个触发器槽。仅 `Element::text_input(..)` 可用。
+    ///
+    /// ```
+    /// # use windui::prelude::*;
+    /// let (body, query) = (signal("甲乙甲".to_string()), signal("甲".to_string()));
+    /// let (jump, hit) = (signal(0u64), signal((0usize, 0usize)));
+    /// let ui = Element::col()
+    ///     .child(Element::text_input(query, "查找").on_submit(move |_| {
+    ///         hit.set((2, 3));
+    ///         jump.update(|n| *n += 1);
+    ///     }))
+    ///     .child(Element::text_input(body, "").multiline().select_without_focus_when(jump, hit));
+    /// ```
+    #[track_caller]
+    pub fn select_without_focus_when(
+        self,
+        trigger: Signal<u64>,
+        range: Signal<(usize, usize)>,
+    ) -> Self {
+        self.config_text_input_widget(|_| {}, "select_without_focus_when()")
+            .set_focus_when(
+                trigger,
+                crate::core::FocusSelect::RangeNoFocus(range),
+                "select_without_focus_when()",
+            )
     }
 
     /// **本控件未处理的导航键的出口**：候选列表游标用（↑↓ 在候选间移动，配合
@@ -1769,23 +2223,44 @@ impl Element {
     /// ```
     #[track_caller]
     pub fn on_nav_key(
-        self,
+        mut self,
         f: impl FnMut(&mut crate::core::EventCtx, crate::event::KeyEvent) -> bool + 'static,
     ) -> Self {
+        self.reject_on_number_field("on_nav_key()");
         self.config_text_input_widget(|ti| ti.set_on_nav_key(f), "on_nav_key()")
+    }
+
+    /// 本元素是不是 [`number_input`](Self::number_input) 的数值框。
+    fn is_number_field(&mut self) -> bool {
+        self.widget
+            .as_any_mut()
+            .is_some_and(|a| a.is::<stepper::NumberField>())
+    }
+
+    /// 数值框不适用的 `text_input` 修饰符：debug 下报错，而不是静默装上又从不生效。
+    ///
+    /// `text_input_of` 认得 `NumberField`，所以这些修饰符**能**落到内部输入框上、不会触发
+    /// 「只能用于 text_input」的断言——但数值框的 Enter / 失焦 / 方向键由它自己接管，
+    /// 回调永远不会触发（`on_submit` / `on_commit`），或与数值语义冲突（`numeric` 会覆盖
+    /// 它的准入过滤、`password` / `multiline` / `wrap` 与单行数值框无关）。
+    #[track_caller]
+    fn reject_on_number_field(&mut self, what: &str) {
+        debug_assert!(
+            !self.is_number_field(),
+            "{what} 不适用于 Element::number_input(..)：数值框自带 Enter / 失焦规整与准入过滤"
+        );
     }
 
     /// 直接配置内含的 `TextInput`（回调类修饰符用；`TextConfig` 是 `Copy` 的纯数据，
     /// 装不了闭包）。误用的处理同 [`config_text_input`](Self::config_text_input)。
     #[track_caller]
     fn config_text_input_widget(mut self, f: impl FnOnce(&mut TextInput), what: &str) -> Self {
-        match self
-            .widget
-            .as_any_mut()
-            .and_then(|a| a.downcast_mut::<TextInput>())
-        {
+        match self.widget.as_any_mut().and_then(text_input_of) {
             Some(ti) => f(ti),
-            None => debug_assert!(false, "{what} 只能用于 Element::text_input(..)"),
+            None => debug_assert!(
+                false,
+                "{what} 只能用于 Element::text_input(..) / Element::combo_box(..)"
+            ),
         }
         self
     }
@@ -1804,6 +2279,136 @@ impl Element {
         self
     }
 
+    /// 进出场过渡：本节点（经 `visible_*` 或 `popup`）显示时淡入/滑入，隐藏时先淡出/滑出
+    /// 再消失。离场期间继续占位、但已点不到也拿不到焦点；播完才把空间让给同级。
+    ///
+    /// 祖先离场时，子孙里声明了过渡的节点会一起离场——对话框可以"遮罩淡出、面板同时下沉"。
+    /// 首次出现不回放进场（构建时已可见的节点直接落定）。
+    ///
+    /// ```
+    /// use windui::prelude::*;
+    /// let saved = signal(false);
+    /// let toast = Element::label("已保存")
+    ///     .visible_signal(saved)
+    ///     .transition(Presence::fade().slide(0, -6));
+    /// ```
+    pub fn transition(mut self, presence: presence::Presence) -> Self {
+        self.presence = Some(presence);
+        self
+    }
+
+    /// 运行期背景色：闭包返回本帧的背景色，压过 `bg` / `bg_role` 与事件里的 `ctx.set_bg`。
+    /// 读信号即可随状态变色（选中、告警、拖放悬停）；配合 [`animate_style`](Self::animate_style)
+    /// 平滑过渡。要跟随主题就在闭包里读 `windui::theme::current().palette`。
+    ///
+    /// 闭包须为纯函数（每帧绘制与结构签名都会求值）。值的变化会使整窗重绘——与
+    /// `fg_role_signal` 同一做法，读者节点不在事件的脏区里也会刷新。
+    pub fn bg_when(mut self, f: impl Fn() -> Color + 'static) -> Self {
+        self.bg_cond = Some(Box::new(f));
+        self
+    }
+
+    /// 运行期子树不透明度（0..=1，NaN 当 1）：闭包返回本帧的值，压过 `opacity`。约束同
+    /// [`bg_when`](Self::bg_when)。为 0 时节点仍可点、可聚焦（同 CSS），要隐藏用 `visible_when`。
+    pub fn opacity_when(mut self, f: impl Fn() -> f32 + 'static) -> Self {
+        self.opacity_cond = Some(Box::new(f));
+        self
+    }
+
+    /// 样式过渡（CSS `transition` 的对应物）：背景色与不透明度变化时平滑过渡，不论变化来自
+    /// [`bg_when`](Self::bg_when) / [`opacity_when`](Self::opacity_when) 还是事件里的
+    /// `ctx.set_bg`。时长与曲线取主题 `anim.normal()` / `anim.easing()`；渐变背景直接切换。
+    /// 颜色与透明度不是位移，减弱动效档位下照常过渡。
+    ///
+    /// ```
+    /// use windui::prelude::*;
+    /// let alert = signal(false);
+    /// let card = Element::col()
+    ///     .bg_when(move || if alert.get() { Color::hex(0xFDECEA) } else { Color::WHITE })
+    ///     .animate_style();
+    /// ```
+    pub fn animate_style(mut self) -> Self {
+        self.animate_style = true;
+        self
+    }
+
+    /// 高度过渡：内容的自然高度变化（换了一段文字、子项增删、内部展开）时，占位高度
+    /// 平滑跟过去，同级随之让位，而不是一帧跳变（Compose `animateContentSize` 的高度版）。
+    /// 过渡期子树按新的自然尺寸排布、裁到当前高度。
+    ///
+    /// 只管高度：宽度一动，子树里的文字就重新折行、反过来改变自然高度。过渡期每帧重排一次，
+    /// 用在面板、卡片这类子树上，别挂在长列表的每一行。减弱动效档位下瞬时到位。
+    ///
+    /// 高度由父级决定（`height_match` / 权重）的节点别用：拖动窗口改尺寸时它也会被当成
+    /// "自然高度变了"而滞后跟随，像橡皮筋。
+    pub fn animate_height(mut self) -> Self {
+        self.animate_height = true;
+        self
+    }
+
+    /// 布局过渡（FLIP）：布局位置变了——前面的兄弟增删、显隐，列表重排，换行布局重新
+    /// 折行——就从旧位置平滑滑到新位置，而不是一帧跳过去（Framer Motion `layout`、
+    /// Compose `animateItem` 的位移部分）。
+    ///
+    /// 只管位置，尺寸变化照常一帧到位（高度用 [`animate_height`](Self::animate_height)）。
+    /// 过渡中命中与焦点按**最终**布局：点下去落到的是终点位置上的节点，不会点错行。
+    /// 以下位移不过渡：滚动、窗口改尺寸、展开 / 高度过渡推着走的位移（前面的兄弟展开、
+    /// 居中容器里别的项展开——那本身已是平滑的）、`offset`（拖拽让位）；这些发生在过渡途中时，正在播的那段照常收尾。
+    /// 父子都声明时，子只过渡相对父的那部分。减弱动效档位下瞬时到位。
+    ///
+    /// 别挂在逐帧改布局位置的节点上（`place_fn` 跟指针拖动的画布元素）：每帧都会起一段
+    /// 新过渡，拖在指针后面。过渡途中挂在它上面的下拉浮层、提示按最终位置定位。
+    ///
+    /// 节点要**活过**这次布局变化才有旧位置可比：`list_signal` 按键复用行节点，挂在行上
+    /// 有效（见 [`animate_item`](Self::animate_item)）；`host_signal` 每次整批重建，无效。
+    pub fn animate_layout(mut self) -> Self {
+        self.animate_layout = true;
+        self
+    }
+
+    /// 滑动选中高亮：容器在子节点**之前**画一块选中底，选中行换了时它从旧行**滑**到新行
+    /// （时长与曲线取主题 `anim.normal()` / `anim.easing()`），而不是旧行淡出、新行淡入。
+    ///
+    /// 选中行由后代控件自报（[`Widget::slide_highlight`](crate::core::Widget::slide_highlight)），
+    /// 容器深度优先找第一个；目前 [`list_pill`](Self::list_pill) 的行会报；自己用元素拼的行用
+    /// [`slide_target`](Self::slide_target) 自报（同一节点两者都有时控件的回答优先）。选中的行自己不再
+    /// 画选中底，所以只给**报了的**行用——否则选中行没有底色。
+    ///
+    /// 同一行因布局变化（手风琴展开、窗口缩放）挪位置时瞬时跟随，不补间；减弱动效档位下
+    /// 瞬时到位。嵌套时最近的声明容器负责；容器与选中行之间别夹裁剪 / 透明度 / 进出场层。
+    /// 已知限制：容器被隐藏期间选中变了，重新显示时会补播一段滑动。
+    pub fn slide_highlight(mut self) -> Self {
+        self.slide_highlight = true;
+        self
+    }
+
+    /// 让**任意元素**充当 [`slide_highlight`](Self::slide_highlight) 容器里的"行"：闭包在选中
+    /// 时返回高亮样式、否则 `None`。内置 `list` 行自带这层回答，自己拼的导航行（图标 + 文字）
+    /// 用它。闭包每帧求值，须是纯函数；颜色请在闭包里读 `theme::current()`，这样运行期换主题
+    /// 照常跟随。契约同 [`Widget::slide_highlight`](crate::core::Widget::slide_highlight)：
+    /// 选中时本行**不要自己再画底**，行的身份是节点，重建即视为换行。
+    pub fn slide_target(
+        mut self,
+        f: impl Fn() -> Option<slide_highlight::HighlightSpec> + 'static,
+    ) -> Self {
+        self.slide_target = Some(Box::new(f));
+        self
+    }
+
+    /// 列表项动效（Compose `animateItem`）：挂在 [`list_signal`](Self::list_signal) 的行上，
+    /// 新增的行淡入展开、删除的行淡出收起（播完才真正移除）、重排时滑到新位置。
+    ///
+    /// 等价于 `.transition(Presence::reveal()).animate_layout()`；已经声明了
+    /// [`transition`](Self::transition) 的保留原样，只补布局过渡。首批行不播进场。
+    /// 要挂在 `row_fn` 返回的根元素上；增删动画期间每帧重排整个列表，几千行以内没问题。
+    pub fn animate_item(mut self) -> Self {
+        if self.presence.is_none() {
+            self.presence = Some(presence::Presence::reveal());
+        }
+        self.animate_layout = true;
+        self
+    }
+
     /// 运行期可见条件：闭包返回 false 时该节点本帧不显示/不命中。
     ///
     /// 契约：闭包**必须是纯函数**（仅读状态、无副作用）。它在每帧的
@@ -1817,16 +2422,21 @@ impl Element {
     /// 分段控制器（绑定 `Signal<usize>` 选中索引 + 段标签）：连体多段单选，
     /// 选中段高亮。语义同 `radio` 组，外观更紧凑——适合"二/三选一"切换。
     /// 点击选段、悬停逐段高亮、聚焦后左右方向键移动选中。
+    ///
+    /// 段标签收 `impl Into<TextContent>`：传 [`t!`](crate::t) 时换语言自动跟随。
     #[track_caller]
-    pub fn segmented(options: Vec<impl Into<String>>, selected: Signal<usize>) -> Self {
-        let opts: Vec<String> = options.into_iter().map(|o| o.into()).collect();
+    pub fn segmented(options: Vec<impl Into<TextContent>>, selected: Signal<usize>) -> Self {
+        let opts: Vec<TextContent> = options.into_iter().map(|o| o.into()).collect();
         debug_assert!(!opts.is_empty(), "Element::segmented 至少需要一段");
         Self::base(Layout::None).widget(segmented::SegmentedControl::new(opts, selected))
     }
 
     /// 下拉选择（绑定 `Signal<usize>` 选中索引 + 选项标签）。
-    pub fn dropdown(options: Vec<impl Into<String>>, selected: Signal<usize>) -> Self {
-        let opts: Vec<String> = options.into_iter().map(|o| o.into()).collect();
+    ///
+    /// 选项收 `impl Into<TextContent>`：传 [`t!`](crate::t) 时收起态文字、测量宽度与
+    /// 展开的列表都按当前语言现取，换语言自动跟随。
+    pub fn dropdown(options: Vec<impl Into<TextContent>>, selected: Signal<usize>) -> Self {
+        let opts: Vec<TextContent> = options.into_iter().map(|o| o.into()).collect();
         Self::base(Layout::None).widget(select::Dropdown::new(opts, selected))
     }
 
@@ -1871,6 +2481,85 @@ impl Element {
         Self::dropdown_items_signal(items, selected)
     }
 
+    /// **可输入的下拉框**（combobox）：文本框右端带下拉箭头，既能直接输入，也能从
+    /// 列表里选——选中后把那一项的文字写进 `text`。
+    ///
+    /// - 点箭头或按 ↓ 展开全部选项，当前值在列表里就高亮并打勾；↑↓ 移动高亮，
+    ///   Enter 选中高亮项，Esc 收起。
+    /// - 打字时按**前缀**（不区分大小写）过滤并自动展开，没有匹配就收起。打字不预选任何
+    ///   一项，所以 Enter 提交的是框里打的字；只有用 ↑↓ / 指针挑中了一项，Enter 才取它。
+    /// - 列表开着时 Enter / Esc 先用来收起列表；列表收起后它们与 `text_input` 完全一致
+    ///   （Enter 提交并交给 `on_submit` / 对话框默认按钮，Esc 上达宿主）。
+    /// - 选中一项算一次用户修改：挂了 [`on_commit`](Self::on_commit) 会立刻触发。
+    ///
+    /// text_input 的修饰符照常可用：[`on_commit`](Self::on_commit)、
+    /// [`on_submit`](Self::on_submit)、[`numeric`](Self::numeric)、`read_only` 等。
+    /// 选项会变化时链 [`options_signal`](Self::options_signal)。
+    ///
+    /// 选项收 `impl Into<TextContent>`：传 [`t!`](crate::t) 时换语言自动跟随。
+    ///
+    /// ```
+    /// # use windui::prelude::*;
+    /// let size = signal(String::from("12"));
+    /// let ui = Element::combo_box(size, vec!["9", "10", "12", "14", "18", "24"])
+    ///     .numeric()
+    ///     .width(120)
+    ///     .on_commit(move |ctx| ctx.toast_ok(format!("字号 {}", size.get())));
+    /// ```
+    pub fn combo_box(text: Signal<String>, options: Vec<impl Into<TextContent>>) -> Self {
+        combo::build(text, options.into_iter().map(Into::into).collect())
+    }
+
+    /// 组合框的选项改为绑定信号：写入新 `Vec` 即生效（展开着也会跟着刷新）。
+    /// 覆盖构造时给的静态选项。仅 `Element::combo_box(..)` 可用。
+    ///
+    /// ```
+    /// # use windui::prelude::*;
+    /// let fonts = signal(vec![String::from("宋体")]);
+    /// let font = signal(String::new());
+    /// let ui = Element::combo_box(font, Vec::<String>::new()).options_signal(fonts);
+    /// // 异步加载完再写：fonts.set(list);
+    /// ```
+    #[track_caller]
+    pub fn options_signal(mut self, options: Signal<Vec<String>>) -> Self {
+        match self
+            .widget
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<combo::ComboField>())
+        {
+            Some(c) => c.set_options_signal(options),
+            None => debug_assert!(false, "options_signal() 只能用于 Element::combo_box(..)"),
+        }
+        self
+    }
+
+    /// 组合框选中列表项后**全选**正文（默认是光标落到末尾、不留选区）。
+    ///
+    /// 默认与网页 / WAI-ARIA 组合框一致：选完接着打字是续写。全选是经典 Win32 组合框的
+    /// 做法，适合「选一个值、多半整体换掉」的字段——字号、缩放比例这类：选了 12 想改 14，
+    /// 直接打字即可，不必先删。仅 `Element::combo_box(..)` 可用。
+    ///
+    /// ```
+    /// # use windui::prelude::*;
+    /// let zoom = signal(String::from("100%"));
+    /// let ui = Element::combo_box(zoom, vec!["50%", "100%", "200%"]).select_all_on_pick();
+    /// ```
+    #[track_caller]
+    pub fn select_all_on_pick(mut self) -> Self {
+        match self
+            .widget
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<combo::ComboField>())
+        {
+            Some(c) => c.set_select_all_on_pick(true),
+            None => debug_assert!(
+                false,
+                "select_all_on_pick() 只能用于 Element::combo_box(..)"
+            ),
+        }
+        self
+    }
+
     /// 下拉式复选菜单：外观同 `dropdown`，面板是菜单，项可单独开关。
     /// 项支持开关 / 动作 / 分隔线混排，见 [`select::CheckMenuItem`]。
     ///
@@ -1886,7 +2575,7 @@ impl Element {
     ///     CheckMenuItem::action("全部展开", |_ctx| {}),
     /// ]).width(132);
     /// ```
-    pub fn check_menu(title: impl Into<String>, items: Vec<select::CheckMenuItem>) -> Self {
+    pub fn check_menu(title: impl Into<TextContent>, items: Vec<select::CheckMenuItem>) -> Self {
         Self::base(Layout::None).widget(select::CheckMenu::new(title, items))
     }
 
@@ -1911,6 +2600,21 @@ impl Element {
     pub fn menu_bar(entries: Vec<MenuBarEntry>) -> Self {
         Self::base(Layout::None)
             .widget(MenuBar::new(entries))
+            .width_match()
+    }
+
+    /// 同 [`menu_bar`](Self::menu_bar)，并把"菜单栏此刻是否被激活"（单击 Alt / F10 待命、
+    /// Alt+助记键或点击展开了菜单）同步进 `active`。
+    ///
+    /// 给"平时把菜单栏让给别的内容、需要时才露出来"的布局用（IDE 式紧凑标题栏）：
+    /// 菜单栏本身留在树里、保持可见（宿主只认可见的菜单栏，藏起来 Alt 就失效了），
+    /// 应用拿这个信号决定盖在它上面的那层什么时候撤开。
+    pub fn menu_bar_tracked(
+        entries: Vec<MenuBarEntry>,
+        active: crate::signal::Signal<bool>,
+    ) -> Self {
+        Self::base(Layout::None)
+            .widget(MenuBar::new(entries).with_active(active))
             .width_match()
     }
 
@@ -1991,38 +2695,87 @@ impl Element {
         stepper::build(value, min, max, step)
     }
 
+    /// **数值输入框**：单个输入框，绑定 `Signal<f64>`，没有 ± 按钮。
+    ///
+    /// 数值语义与 [`stepper`](Self::stepper) 的中部输入框是同一份实现：只放行数字（`min < 0`
+    /// 时允许负号，步长带小数时允许小数点）；失焦或 Enter 时规整并钳进 `[min, max]`；
+    /// 编辑途中的半成品（空串、`-`、`1.`）不改 `value`；↑ / ↓ 按 `step` 步进；Esc 撤销本轮
+    /// 键入。小数位默认由步长推断，要显式指定用 [`decimals`](Self::decimals)。
+    ///
+    /// 与 `text_input(..).numeric()` 的分工：后者只管「能打进去什么」，绑定的是
+    /// `Signal<String>`，范围与规整要自己写；这里直接给出已钳制的 `f64`。
+    ///
+    /// 外观同 `text_input`，文字左对齐；右对齐用 [`text_align`](Self::text_align)，
+    /// 内距用 [`pad_x`](Self::pad_x)，单位后缀用 [`unit`](Self::unit)。默认宽 120。
+    ///
+    /// ```
+    /// # use windui::prelude::*;
+    /// let width = signal(1280.0);
+    /// let ui = Element::number_input(width, 100.0, 7680.0, 1.0)
+    ///     .unit("px")
+    ///     .text_align(Align::End);
+    /// ```
+    pub fn number_input(value: Signal<f64>, min: f64, max: f64, step: f64) -> Self {
+        stepper::build_input(value, min, max, step)
+    }
+
+    #[track_caller]
+    fn config_number_field(
+        mut self,
+        what: &str,
+        f: impl FnOnce(&mut stepper::NumberField),
+    ) -> Self {
+        match self
+            .widget
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<stepper::NumberField>())
+        {
+            Some(n) => f(n),
+            None => debug_assert!(false, "{what} 只能用于 Element::number_input(..)"),
+        }
+        self
+    }
+
+    /// 数值框的显示小数位（覆盖由步长推断的值，上限 10）。步长 1、显示两位小数这类组合
+    /// 只能靠它。`0` 表示只收整数。仅 `Element::number_input(..)` 可用。
+    #[track_caller]
+    pub fn decimals(self, n: usize) -> Self {
+        self.config_number_field("decimals()", |f| f.set_decimals(n))
+    }
+
+    /// 数值框的单位后缀（`"px"`、`"%"`）：画在框内右侧，弱化色，不参与编辑与取值。
+    /// 文字区随之让出相应宽度。仅 `Element::number_input(..)` 可用。
+    #[track_caller]
+    pub fn unit(self, unit: impl Into<String>) -> Self {
+        self.config_number_field("unit()", |f| f.set_unit(unit.into()))
+    }
+
     /// 单选列表（绑定 `Signal<usize>` 选中索引 + 行标签）。可滚动；
     /// 外观（背景/圆角/边框）由调用方在返回的滚动容器上设置。
     ///
     /// 已知限制：每行均可聚焦，长列表会拉长 Tab 焦点链（用户需多次 Tab 跨过）。
     /// 后续可改为整列表单一 tab-stop + 方向键内部移动。
-    pub fn list(items: Vec<impl Into<String>>, selected: Signal<usize>) -> Self {
+    ///
+    /// 行标签收 `impl Into<TextContent>`：传 [`t!`](crate::t) 时换语言自动跟随。
+    pub fn list(items: Vec<impl Into<TextContent>>, selected: Signal<usize>) -> Self {
         let mut scroll = Self::scroll().fill();
         for (i, it) in items.into_iter().enumerate() {
-            let row = list::ListRow::new(it.into(), selected, i);
-            scroll = scroll.child(
-                Self::base(Layout::None)
-                    .widget(row)
-                    .width_match()
-                    .height(list::ROW_H),
-            );
+            let row = list::ListRow::new(it, selected, i);
+            scroll = scroll.child(Self::base(Layout::None).widget(row).width_match());
         }
         scroll
     }
 
     /// 同 `list`，但选中/悬停为内缩圆角 pill 底（无左缘强调条）。侧栏导航等现代样式用。
-    pub fn list_pill(items: Vec<impl Into<String>>, selected: Signal<usize>) -> Self {
+    /// 选中底在行间**滑动**（见 [`slide_highlight`](Self::slide_highlight)）。
+    pub fn list_pill(items: Vec<impl Into<TextContent>>, selected: Signal<usize>) -> Self {
         let mut scroll = Self::scroll().fill();
         for (i, it) in items.into_iter().enumerate() {
-            let row = list::ListRow::new(it.into(), selected, i).pill();
-            scroll = scroll.child(
-                Self::base(Layout::None)
-                    .widget(row)
-                    .width_match()
-                    .height(list::ROW_H),
-            );
+            let row = list::ListRow::new(it, selected, i).pill().sliding();
+            scroll = scroll.child(Self::base(Layout::None).widget(row).width_match());
         }
-        scroll
+        // 选中底由容器统一画并在行间滑动；行只管悬停底与文字色。
+        scroll.slide_highlight()
     }
 
     /// 标记为响应式节点：build 后注册到框架，每次 layout 前收到 `Widget::on_update`。
@@ -2032,45 +2785,107 @@ impl Element {
         self
     }
 
-    /// 响应式动态列表：数据源绑定 `Signal<Vec<T>>`，信号变化时框架自动重建行元素。
+    /// 响应式动态列表：数据源绑定 `Signal<Vec<T>>`，信号变化时按键更新行。
     ///
     /// - `data`：数据源信号；写入新 Vec 即触发列表刷新（排序/过滤均可）。
-    /// - `_key_fn`：预留 diff 优化用，当前版本做全量重建，传 `|_| ()` 即可。
+    /// - `key_fn`：每条数据的唯一键（id 之类）。键在、数据没变的行**原样保留节点**（焦点、
+    ///   控件内部状态都留着），只按新顺序重排；键在但数据变了的行重建；新键建新行，消失的
+    ///   键删行。新数据里键有重复时退回整批重建。数据相等的行不重建，`row_fn` 在构建时读的
+    ///   外部状态也就不会因为重新 `set` 而刷新——这类依赖放进 `T` 或在行内绑信号。
+    ///   子节点只能由数据生成，别再 `.child(..)` 追加。
     /// - `row_fn`：每行的构建函数，接收数据条目返回 `Element`。
+    ///
+    /// 行上挂 [`animate_item`](Self::animate_item) 即得增删淡入淡出、重排滑动；删除时行先
+    /// 留在原处播离场（不在数据里，点不到），播完才移除。
     ///
     /// # 示例
     /// ```ignore
-    /// let items = signal(vec!["苹果", "香蕉", "橙子"]);
-    /// Element::list_signal(items, |_| (), |s| Element::label(s))
+    /// let items = signal(vec![Task { id: 1, .. }, Task { id: 2, .. }]);
+    /// Element::list_signal(items, |t| t.id, |t| Element::label(t.title).animate_item())
     /// ```
     pub fn list_signal<T, K>(
         data: Signal<Vec<T>>,
-        _key_fn: impl Fn(&T) -> K + 'static,
+        key_fn: impl Fn(&T) -> K + 'static,
         row_fn: impl Fn(T) -> Self + 'static,
     ) -> Self
     where
-        T: Clone + 'static,
-        K: Eq + std::hash::Hash,
+        T: Clone + PartialEq + 'static,
+        K: Eq + std::hash::Hash + Clone + 'static,
     {
-        let row_fn = std::rc::Rc::new(row_fn);
-        // 构建初始子元素。圈进作用域交给 widget：首批行的构建期信号（`row_fn` 里现造的、
-        // 或行内控件内部造的）才能在第一次重建时随旧行一起回收，否则永久漏一代。
-        let mut rows = crate::signal::SignalScope::new();
-        let initial: Vec<Self> =
-            rows.collect(|| data.get().into_iter().map(|item| row_fn(item)).collect());
-        // DynList widget 持有 Rc 副本，信号变更时重建子节点
-        let row_fn_clone = row_fn.clone();
-        let widget = dyn_list::DynList::with_scope(data, move |item: T| row_fn_clone(item), rows);
-        let mut container = Self::scroll().fill();
-        // ★ RuPix 补丁 08：容器仍是 `scroll()`，但 widget 槽只有**一个**——直接挂
-        // `DynList` 会把 `scroll()` 自带的 `ScrollWidget` 静默覆盖掉，滚动条照画、
-        // 却没人处理滚轮与拖动（`scroll_y` 恒 0）。改挂组合体：重建行走 DynList，
-        // 事件走 ScrollWidget。详见 `dyn_list::DynListWithScroll` 的文档注释。
-        container.set_widget(Box::new(dyn_list::DynListWithScroll::new(widget)));
-        container.reactive = true;
-        for el in initial {
-            container.children.push(el);
+        Self::keyed(Self::scroll().fill(), data, key_fn, row_fn)
+    }
+
+    /// 内容切换（Flutter `AnimatedSwitcher` / Compose `AnimatedContent`）：`key` 变了就用
+    /// `build` 建出新内容，旧内容淡出、新内容淡入，两者在同一处交叠播放，旧的播完才回收。
+    ///
+    /// 典型用法是分页、向导步骤这类"同一块区域按状态换一份内容"的场景——内容按需构建，
+    /// 不像 [`tabs`](Self::tabs) 那样所有页常驻。`build` 返回的元素自己声明了
+    /// [`transition`](Self::transition) 的照用（比如 `Presence::fade().slide(0, 8)`），没有就淡入淡出。
+    /// 切换期间新旧两份内容同时存在，大块内容会短暂占双份内存。按内容取尺寸、不强加撑满：
+    /// 要占满一块区域就给 switcher 与内容各自设 `fill` / `weight`。新旧内容大小不一时，旧内容
+    /// 回收那一帧 switcher 会缩到新内容的尺寸，下方兄弟跟着一跳——这种场合给它定个尺寸。
+    ///
+    /// `key` 写入相同的值不会重建；内容的构建期信号随那份内容一起回收。
+    ///
+    /// ```ignore
+    /// let page = signal(0usize);
+    /// Element::switcher(page, |p| page_view(p))   // 配合 Element::pager 翻页
+    /// ```
+    pub fn switcher<K>(key: Signal<K>, build: impl Fn(K) -> Self + 'static) -> Self
+    where
+        K: Clone + Eq + std::hash::Hash + 'static,
+    {
+        let data = key.map(|k| vec![k.clone()]);
+        // 层叠容器按内容取尺寸（新旧内容交叠时取两者之大），不强加撑满：放进自适应高度的
+        // 父容器里不会塌成 0，内容自己设的尺寸也不被覆盖。要撑满就给 switcher 与内容各设。
+        Self::keyed(
+            Self::stack(),
+            data,
+            |k: &K| k.clone(),
+            move |k: K| {
+                let mut el = build(k);
+                if el.presence.is_none() {
+                    el.presence = Some(presence::Presence::fade());
+                }
+                el
+            },
+        )
+    }
+
+    /// 按键复用子节点的响应式容器（[`list_signal`](Self::list_signal) /
+    /// [`switcher`](Self::switcher) 共用）：`container` 决定子节点怎么排。
+    fn keyed<T, K>(
+        mut container: Self,
+        data: Signal<Vec<T>>,
+        key_fn: impl Fn(&T) -> K + 'static,
+        row_fn: impl Fn(T) -> Self + 'static,
+    ) -> Self
+    where
+        T: Clone + PartialEq + 'static,
+        K: Eq + std::hash::Hash + Clone + 'static,
+    {
+        // 首批行各自在自己的作用域里构建：行被删除或重建时，它构建期创建的信号（`row_fn`
+        // 里现造的、或行内控件内部造的）随之回收，否则永久漏一代。
+        let mut elements = Vec::new();
+        let initial: Vec<_> = data
+            .get()
+            .into_iter()
+            .map(|item| {
+                let mut scope = crate::signal::SignalScope::new();
+                elements.push(scope.collect(|| row_fn(item.clone())));
+                (key_fn(&item), item, scope)
+            })
+            .collect();
+        let mut widget = dyn_list::KeyedList::new(data, key_fn, row_fn, initial);
+        // 容器自带的 widget（滚动容器的 `ScrollWidget`）交给列表转发事件，不能直接顶掉。
+        if container.has_widget {
+            let own = std::mem::replace(&mut container.widget, Box::new(crate::core::EmptyWidget));
+            container.has_widget = false;
+            widget = widget.with_inner(own);
         }
+        container.set_widget(Box::new(widget));
+        container.reactive = true;
+        container.children = elements;
         container
     }
 
@@ -2237,18 +3052,13 @@ impl Element {
     /// 带前置图标的单选列表：`items` 为 (标签, 图标内容) 列表。其余同 `list`。
     /// 图标用 `ImageContent`，可链 `.fit()`/状态换图等；行图标随选中/悬停状态调制。
     pub fn list_icons(
-        items: Vec<(impl Into<String>, ImageContent)>,
+        items: Vec<(impl Into<TextContent>, ImageContent)>,
         selected: Signal<usize>,
     ) -> Self {
         let mut scroll = Self::scroll().fill();
         for (i, (label, icon)) in items.into_iter().enumerate() {
-            let row = list::ListRow::new(label.into(), selected, i).icon_content(icon);
-            scroll = scroll.child(
-                Self::base(Layout::None)
-                    .widget(row)
-                    .width_match()
-                    .height(list::ROW_H),
-            );
+            let row = list::ListRow::new(label, selected, i).icon_content(icon);
+            scroll = scroll.child(Self::base(Layout::None).widget(row).width_match());
         }
         scroll
     }
@@ -2259,22 +3069,30 @@ impl Element {
         Self::base(Layout::None)
             .widget(nav::NavRow::new(label))
             .width_match()
-            .height(nav::NAV_ROW_H)
     }
 
     /// 可折叠分组：点击标题行展开 / 收起 `body`。`expanded` 绑定展开状态，
     /// body 经 `visible_when(expanded)` 显隐——收起时不占布局、不参与命中。
     /// 标题行右侧三角随状态翻转（展开向下 / 收起向右）。
-    pub fn collapsible(title: impl Into<String>, expanded: Signal<bool>, body: Element) -> Self {
+    pub fn collapsible(
+        title: impl Into<TextContent>,
+        expanded: Signal<bool>,
+        body: Element,
+    ) -> Self {
         let header = Self::base(Layout::None)
-            .widget(nav::CollapsibleHeader::new(title.into(), expanded))
-            .width_match()
-            .height(nav::NAV_ROW_H);
+            .widget(nav::CollapsibleHeader::new(title, expanded))
+            .width_match();
         let show = expanded;
         Element::col()
             .width_match()
             .child(header)
-            .child(body.visible_when(move || show.get()))
+            .child(Self::reveal_body(body).visible_when(move || show.get()))
+    }
+
+    /// 折叠内容的默认进出场：未自带过渡时淡入 + 高度展开（`Presence::reveal()`）。
+    fn reveal_body(body: Element) -> Element {
+        let p = body.presence.unwrap_or(presence::Presence::reveal());
+        body.transition(p)
     }
 
     /// 手风琴（多面板折叠卡片）：带边框/圆角的卡片，逐面板「标题头 + 可折叠内容」，
@@ -2285,7 +3103,7 @@ impl Element {
     /// 手风琴可以全收起。
     pub fn accordion(
         selected: Signal<Option<usize>>,
-        panels: Vec<(impl Into<String>, Element)>,
+        panels: Vec<(impl Into<TextContent>, Element)>,
     ) -> Self {
         Self::accordion_impl(panels, |i| nav::ExpandState::Single {
             sel: selected,
@@ -2294,7 +3112,7 @@ impl Element {
     }
 
     /// 手风琴**多开**版：各面板独立展开/收起、互不影响（初始全部收起）。
-    pub fn accordion_multi(panels: Vec<(impl Into<String>, Element)>) -> Self {
+    pub fn accordion_multi(panels: Vec<(impl Into<TextContent>, Element)>) -> Self {
         Self::accordion_impl(panels, |_| {
             nav::ExpandState::Multi(crate::signal::signal(false))
         })
@@ -2303,7 +3121,7 @@ impl Element {
     /// 手风琴共用组装：外层卡片 + 逐面板（首面板前不加分隔线）头与显隐 body。
     /// `make_state(i)` 决定第 i 个面板的展开模型（单开共享索引 / 多开独立布尔）。
     fn accordion_impl(
-        panels: Vec<(impl Into<String>, Element)>,
+        panels: Vec<(impl Into<TextContent>, Element)>,
         make_state: impl Fn(usize) -> nav::ExpandState,
     ) -> Self {
         // 四色改用主题角色延迟解析（运行期换主题自动跟随）；corner 为度量，构建期取值即可
@@ -2329,14 +3147,13 @@ impl Element {
             }
             let state = make_state(i);
             let header = Self::base(Layout::None)
-                .widget(nav::AccordionHeader::new(title.into(), state.clone()))
+                .widget(nav::AccordionHeader::new(title, state.clone()))
                 .width_match()
-                .height(nav::NAV_ROW_H)
                 .bg_role(Role::AccordionHeaderBg);
             let show = state.clone();
             card = card
                 .child(header)
-                .child(body.visible_when(move || show.is_expanded()));
+                .child(Self::reveal_body(body).visible_when(move || show.is_expanded()));
         }
         card
     }
@@ -2355,6 +3172,120 @@ impl Element {
         let mut e = Self::base(Layout::Scroll).widget(containers::ScrollWidget::default());
         e.clip_children = true;
         e
+    }
+
+    /// 滚动容器可滚动的方向，默认 [`ScrollAxis::Vertical`](crate::spec::ScrollAxis)。
+    ///
+    /// 子节点仍纵向堆叠；可滚的方向上子节点按内容长度测量（`Match` 视同 `Wrap`），
+    /// 超出视口的部分可滚动。只横向滚动时，`height_match()` 的子节点取视口高。
+    ///
+    /// ```no_run
+    /// # use windui::prelude::*;
+    /// let strip = Element::scroll()
+    ///     .scroll_axis(ScrollAxis::Horizontal)
+    ///     .width_match()
+    ///     .child(Element::row().spacing(8).children((0..20).map(|i| Element::button(format!("卡片 {i}")))));
+    /// ```
+    ///
+    /// 只能用于 [`Element::scroll`]，链到别的元素上 debug 期 panic。
+    #[track_caller]
+    pub fn scroll_axis(mut self, axis: crate::spec::ScrollAxis) -> Self {
+        debug_assert!(
+            matches!(self.layout, Layout::Scroll),
+            "scroll_axis() 只能用于 Element::scroll()"
+        );
+        self.scroll_axis = axis;
+        self
+    }
+
+    /// 跟随底部（聊天 / 日志视图）：首次布局滚到底；之后每次布局，若上一帧视口底边距内容
+    /// 底边 ≤ 4 逻辑像素（"在底部"），内容变高后仍保持在底部；用户向上翻看后保持 `scroll_y`
+    /// 不变，翻回底部即恢复跟随。
+    ///
+    /// 只能用于滚动容器（[`Element::scroll`] 与 [`Element::list_signal`]），链到别的元素上
+    /// debug 期 panic。
+    #[track_caller]
+    pub fn stick_to_bottom(mut self, on: bool) -> Self {
+        debug_assert!(
+            matches!(self.layout, Layout::Scroll),
+            "stick_to_bottom() 只能用于滚动容器（Element::scroll / list_signal）"
+        );
+        self.scroll_ext
+            .get_or_insert_with(Default::default)
+            .stick_to_bottom = on;
+        self
+    }
+
+    /// 把滚动位置双向绑定到信号（`scroll_y`，`i32` 直绑，与 `Node.scroll_y` 同形）：
+    /// - 容器侧变化（滚轮 / 触摸平移 / 惯性 / 钳制 / `stick_to_bottom` 的改写）→ 下一帧
+    ///   布局前写回信号；
+    /// - 外部写信号 → 下一次布局的同步相位消费（arrange 钳制后生效）。
+    ///
+    /// 消费与写回都做值/版本比较防抖：无事即不标脏。多个容器绑同一个信号 = 等偏移联动
+    /// （同帧收敛）。初始位置请**先 `set` 再 build**——首帧按「外部写入」消费，预设值生效。
+    ///
+    /// 只能用于**纵向**滚动容器（[`Element::scroll`] 与 [`Element::list_signal`]），
+    /// 链到别的元素上 debug 期 panic。钳制不在绑定层做：越界值由 arrange 钳回、下一帧
+    /// 写回真值（晚 1-2 帧对齐，无正确性问题）。与 `stick_to_bottom` / `preserve_on_prepend`
+    /// 正交可同开——那些是容器自洽行为，绑定是容器↔应用的双向通道。
+    ///
+    /// **绑定期间信号须保持存活**：容器节点活着而信号被 `dispose`（手动或
+    /// `SignalScope` 早收），每次布局读到死句柄会 panic——症状离因很远，别提前回收。
+    #[track_caller]
+    pub fn scroll_position(mut self, s: Signal<i32>) -> Self {
+        debug_assert!(
+            matches!(self.layout, Layout::Scroll),
+            "scroll_position() 只能用于滚动容器（Element::scroll / list_signal）"
+        );
+        debug_assert!(
+            !s.is_derived(),
+            "scroll_position() 需要可写信号；Signal::map 的派生信号只读"
+        );
+        debug_assert!(
+            self.scroll_axis.vertical(),
+            "scroll_position() 一期仅支持纵向滚动容器"
+        );
+        self.scroll_ext
+            .get_or_insert_with(Default::default)
+            .scroll_bound = Some(crate::core::ScrollBind::new(s));
+        self
+    }
+
+    /// 头部插入锚定（聊天"加载更早消息"）：数据更新后若在原第一个可见行**之前**插入了新行，
+    /// `scroll_y` 随之增加，使原第一个可见行在视口中的位置不变。与 `stick_to_bottom` 同开时，
+    /// 在底部以跟随为准。锚点行靠键复用的节点认：该行本身被重建或删除则不调整。
+    ///
+    /// 只能用于 [`Element::list_signal`] 生成的滚动列表，链到别的元素上 debug 期 panic。
+    #[track_caller]
+    pub fn preserve_on_prepend(mut self, on: bool) -> Self {
+        debug_assert!(
+            matches!(self.layout, Layout::Scroll) && self.reactive,
+            "preserve_on_prepend() 只能用于 Element::list_signal(..)"
+        );
+        self.scroll_ext
+            .get_or_insert_with(Default::default)
+            .preserve_on_prepend = on;
+        self
+    }
+
+    /// 滚动边缘回调：到达顶部（`scroll_y == 0`）或底部（距底 ≤ 4 逻辑像素）时触发一次；
+    /// 离开该边缘超过 16 逻辑像素后重新武装。内容不足一屏不触发；初始就停在边缘不算"到达"
+    /// （首次看到可滚动内容只记基线）。回调在布局之后调用，其 `EventCtx` 副作用（toast 等）
+    /// 不上交，请在回调里改信号。
+    ///
+    /// 只能用于滚动容器（[`Element::scroll`] 与 [`Element::list_signal`]），链到别的元素上
+    /// debug 期 panic。
+    #[track_caller]
+    pub fn on_scroll_edge(
+        mut self,
+        f: impl FnMut(&mut EventCtx, crate::core::ScrollEdge) + 'static,
+    ) -> Self {
+        debug_assert!(
+            matches!(self.layout, Layout::Scroll),
+            "on_scroll_edge() 只能用于滚动容器（Element::scroll / list_signal）"
+        );
+        self.scroll_ext.get_or_insert_with(Default::default).on_edge = Some(Box::new(f));
+        self
     }
 
     /// 水平分隔线。背景用主题角色，运行期换主题自动跟随。
@@ -2402,14 +3333,15 @@ impl Element {
 
     /// 标签页：顶部标签条切换、下方内容区按选中项显隐。
     /// `selected` 绑定当前选中索引，`pages` 为 (标题, 页面) 列表。
-    /// 标题接受 `impl Into<String>`，与 `dropdown`/`list` 的选项类型一致。
-    pub fn tabs(selected: Signal<usize>, pages: Vec<(impl Into<String>, Element)>) -> Self {
+    /// 标题接受 `impl Into<TextContent>`，与 `dropdown`/`list` 的选项类型一致：传
+    /// [`t!`](crate::t) 时换语言自动跟随。
+    pub fn tabs(selected: Signal<usize>, pages: Vec<(impl Into<TextContent>, Element)>) -> Self {
         let mut items = Vec::new();
-        let mut content = Element::stack().fill().weight(1.0);
+        let mut content = Self::tab_content();
+        let motion = Self::tab_motion(selected);
         for (i, (title, page)) in pages.into_iter().enumerate() {
-            items.push(containers::TabItem::new(title.into()));
-            let sel2 = selected;
-            content = content.child(page.fill().visible_when(move || sel2.get() == i));
+            items.push(containers::TabItem::new(title));
+            content = content.child(Self::tab_page(page, selected, i, &motion));
         }
         Self::tabs_frame(items, selected, content, containers::TabStyle::Underline)
     }
@@ -2418,27 +3350,30 @@ impl Element {
     /// 标签图标随选中/悬停状态调制。
     pub fn tabs_icons(
         selected: Signal<usize>,
-        pages: Vec<(impl Into<String>, ImageContent, Element)>,
+        pages: Vec<(impl Into<TextContent>, ImageContent, Element)>,
     ) -> Self {
         let mut items = Vec::new();
-        let mut content = Element::stack().fill().weight(1.0);
+        let mut content = Self::tab_content();
+        let motion = Self::tab_motion(selected);
         for (i, (title, icon, page)) in pages.into_iter().enumerate() {
-            items.push(containers::TabItem::new(title.into()).icon_content(icon));
-            let sel2 = selected;
-            content = content.child(page.fill().visible_when(move || sel2.get() == i));
+            items.push(containers::TabItem::new(title).icon_content(icon));
+            content = content.child(Self::tab_page(page, selected, i, &motion));
         }
         Self::tabs_frame(items, selected, content, containers::TabStyle::Underline)
     }
 
     /// 胶囊式标签页：选中项为 accent 实底圆角胶囊、白字，胶囊在标签间滑动；无基线。
     /// 签名与 [`tabs`](Self::tabs) 一致，仅视觉风格不同。
-    pub fn tabs_pill(selected: Signal<usize>, pages: Vec<(impl Into<String>, Element)>) -> Self {
+    pub fn tabs_pill(
+        selected: Signal<usize>,
+        pages: Vec<(impl Into<TextContent>, Element)>,
+    ) -> Self {
         let mut items = Vec::new();
-        let mut content = Element::stack().fill().weight(1.0);
+        let mut content = Self::tab_content();
+        let motion = Self::tab_motion(selected);
         for (i, (title, page)) in pages.into_iter().enumerate() {
-            items.push(containers::TabItem::new(title.into()));
-            let sel2 = selected;
-            content = content.child(page.fill().visible_when(move || sel2.get() == i));
+            items.push(containers::TabItem::new(title));
+            content = content.child(Self::tab_page(page, selected, i, &motion));
         }
         Self::tabs_frame(items, selected, content, containers::TabStyle::Pill)
     }
@@ -2459,9 +3394,9 @@ impl Element {
     /// Element::tabs_items(
     ///     sel,
     ///     vec![
-    ///         (TabItem::new("释义".into()), a),
+    ///         (TabItem::new("释义"), a),
     ///         // 本次查询没有例句：留在原位置灰，而不是把这一项摘掉
-    ///         (TabItem::new("例句".into()).enabled(has_examples), b),
+    ///         (TabItem::new("例句").enabled(has_examples), b),
     ///     ],
     ///     TabStyle::Underline,
     /// );
@@ -2476,13 +3411,57 @@ impl Element {
         style: containers::TabStyle,
     ) -> Self {
         let mut items = Vec::new();
-        let mut content = Element::stack().fill().weight(1.0);
+        let mut content = Self::tab_content();
+        let motion = Self::tab_motion(selected);
         for (i, (item, page)) in pages.into_iter().enumerate() {
             items.push(item);
-            let sel2 = selected;
-            content = content.child(page.fill().visible_when(move || sel2.get() == i));
+            content = content.child(Self::tab_page(page, selected, i, &motion));
         }
         Self::tabs_frame(items, selected, content, style)
+    }
+
+    /// 标签页内容区：各页叠放在同一处，切换时旧页离场、新页进场交叠播放。不裁剪：
+    /// 滑动只有 24px 且同时在淡，短暂越出一点比把贴边控件的焦点环、投影常年裁掉好。
+    fn tab_content() -> Self {
+        Element::stack().fill().weight(1.0)
+    }
+
+    /// 标签页切换方向：选中下标变大，新页从右侧滑入、旧页向左滑出；变小反之。
+    ///
+    /// 各页在显隐翻转那一帧各自来问一次。第一个来问的发现选中值变了，记下方向；后来的
+    /// 读到同一个方向——同一次切换里进场页与离场页方向必然一致。自己声明了过渡的页面不来问，
+    /// 只在这类页面之间切换时记录会落后，下一次方向可能取旧值（只差 24px 的滑向，不另处理）。
+    fn tab_motion(selected: Signal<usize>) -> Rc<dyn Fn(bool) -> i32> {
+        let prev = Cell::new(selected.get());
+        let dir = Cell::new(1);
+        Rc::new(move |entering| {
+            let cur = selected.get();
+            if cur != prev.get() {
+                dir.set(if cur > prev.get() { 1 } else { -1 });
+                prev.set(cur);
+            }
+            if entering {
+                dir.get()
+            } else {
+                -dir.get()
+            }
+        })
+    }
+
+    /// 一页内容：只在选中时显示，切换时淡入淡出并按方向横向滑动（减弱动效档只淡入淡出）。
+    /// 页面自己声明了过渡的保留原样。
+    fn tab_page(
+        page: Element,
+        selected: Signal<usize>,
+        i: usize,
+        motion: &Rc<dyn Fn(bool) -> i32>,
+    ) -> Self {
+        let mut page = page.fill().visible_when(move || selected.get() == i);
+        if page.presence.is_none() {
+            page.presence = Some(presence::Presence::fade().slide(TAB_SLIDE, 0));
+            page.presence_dir = Some(motion.clone());
+        }
+        page
     }
 
     /// `tabs` / `tabs_icons` / `tabs_pill` 的共同骨架：整条标签条是**一个**
@@ -2498,7 +3477,8 @@ impl Element {
         let bar = Element::base(Layout::None)
             .widget(containers::TabBar::new(items, selected).style(style))
             .width_match();
-        Element::col().fill().spacing(16).child(bar).child(content)
+        let gap = crate::theme::current().metrics.space_md;
+        Element::col().fill().spacing(gap).child(bar).child(content)
     }
 
     /// 模态对话框：全窗半透明遮罩 + 居中内容，遮罩吞掉指针事件实现模态。
@@ -2550,7 +3530,7 @@ impl Element {
                     .fg_role(crate::style::Role::TextMuted)
                     // 右上角：stack 里一个 align 管两轴、End 只能是右下，故分轴给值。
                     .align_xy(Align::End, Align::Start)
-                    .margin(th.metrics.spacing)
+                    .margin(th.metrics.space_sm)
                     .on_click(click);
                 Element::stack().child(content).child(close)
             }
@@ -2561,13 +3541,24 @@ impl Element {
         //
         // `reactive()` 是拖动位移的复位钩子：每次 layout 前调 `ModalScrim::on_update`，
         // 在那里识别"重新弹出"并把位移清零。
+        //
+        // 进出场：遮罩连同面板整体淡入淡出，面板另外从 0.96 倍放大（只缩放不再淡，否则透明度相乘）。
+        // 面板的过渡初值按"遮罩未弹出"落定（见 `build_in`），故第一次弹出也会进场。
         Element::stack()
             .fill()
             .widget(containers::ModalScrim::new(show))
-            .bg(Color::rgba(0, 0, 0, 120))
+            // 走角色而非构建期取色：运行期换主题（亮→暗换一档遮罩浓度）要跟得上。
+            .bg_role(crate::style::Role::Scrim)
             .visible_when(move || show.get())
+            .transition(presence::Presence::fade())
             .reactive()
-            .child(panel.align(Align::Center))
+            .child({
+                // 面板自己声明了过渡就尊重它（与 `popup` 同口径）。
+                let p = panel
+                    .presence
+                    .unwrap_or(presence::Presence::default().scale(0.96));
+                panel.align(Align::Center).transition(p)
+            })
     }
 
     /// 带标题栏 + 关闭按钮 + 底栏的对话框面板（在 `dialog` 遮罩之上居中）。
@@ -2576,7 +3567,7 @@ impl Element {
     /// 用 `Element::flex_spacer()` 把按钮推到右侧）。
     pub fn dialog_panel(
         show: Signal<bool>,
-        title: impl Into<String>,
+        title: impl Into<TextContent>,
         width: i32,
         on_close: impl FnMut(&mut EventCtx) + 'static,
         body: Element,
@@ -2587,12 +3578,14 @@ impl Element {
             .width_match()
             .cross(Align::Center)
             .child(
-                Element::label(title.into())
-                    .font_size(18.0)
-                    .font_weight(700)
+                // 单行：标题行高度要落在拖动带（`DIALOG_DRAG_BAND_H`）内，折行会把下半截
+                // 挤出带外、按住拖不动。
+                Element::label(title)
+                    .font_size(th.metrics.font_lg)
+                    .font_weight(crate::text::WEIGHT_SEMIBOLD)
+                    .max_lines(1)
                     .fg_role(crate::style::Role::Text)
-                    .weight(1.0)
-                    .height(26),
+                    .weight(1.0),
             )
             .child(
                 Element::icon_button("\u{2715}")
@@ -2604,12 +3597,29 @@ impl Element {
             .width(width)
             .bg_role(crate::style::Role::Surface)
             .corner(th.metrics.corner_lg)
-            .padding(20)
-            .spacing(16)
+            .padding(th.metrics.space_xl)
+            .spacing(th.metrics.space_lg)
             .child(header)
             .child(body)
-            .child(footer);
+            .child(Self::button_row_spacing(footer, th.metrics.space_sm));
         Element::dialog(show, panel)
+    }
+
+    /// 底部按钮行没设间距（仍是 `row()` 的默认 0）时补上 `gap`：footer 在语义上就是一排
+    /// 按钮，贴在一起没有任何场景是想要的。显式设过非 0 间距的保持原样。
+    ///
+    /// 只认**横排**（`row` / `flow`）：竖排的 footer 是别的结构，不替它做主。`spacing(0)` 与
+    /// "没设"分不出来，故显式要贴紧的横排 footer 请用 `spacing(1)` 或再包一层。
+    fn button_row_spacing(footer: Element, gap: i32) -> Element {
+        match footer.layout {
+            Layout::Linear {
+                axis: Axis::Horizontal,
+                spacing: 0,
+                ..
+            }
+            | Layout::Flow { spacing: 0, .. } => footer.spacing(gap),
+            _ => footer,
+        }
     }
 
     /// **锚定浮层**：把 `content` 挂成本元素的浮层子节点，展开时贴在本元素正下方
@@ -2631,9 +3641,9 @@ impl Element {
     /// - **`content` 的可见性由 `open` 独占**：本方法会覆盖 `content` 上已有的
     ///   `visible_signal` / `visible`。浮层的「展开」与「可见」是同一件事，留两个开关
     ///   只会制造出「登记为浮层却看不见」和「看得见却关不掉」两种半开状态。
-    /// - **`content` 要给出确定宽度**（`.width(px)`）。浮层脱离了父容器的布局流，
-    ///   量它时可用宽是**整个窗口**；写 `.width_match()` 会得到一块窗口那么宽的面板，
-    ///   而不是「跟锚点一样宽」。要跟随锚点宽度，请自行把锚点的宽度传进来。
+    /// - **`content` 的宽度**：`.width(px)` 给定宽；`.width_match()` 与**锚点**（`self`）
+    ///   同宽——下拉列表那种「跟触发器一样宽」的面板就写它。不设宽（Wrap）时按内容测量，
+    ///   可用宽是整个窗口。
     ///
     /// # 示例
     /// ```
@@ -2647,15 +3657,47 @@ impl Element {
     ///     .on_click(move |_| open.set(!open.get()))
     ///     .popup(open, panel);
     /// ```
+    ///
+    /// # 点在浮层外收起时，这一击要不要继续点到底下的控件
+    ///
+    /// 默认**继续**：同一击里既收起面板、又按到下面的按钮，一次操作办两件事。要「只收起、
+    /// 不误触」（面板盖在一排按钮上、点空白处只想关面板）就在 `content` 上写
+    /// [`dismiss_swallows_click(true)`](Self::dismiss_swallows_click)。
     pub fn popup(self, open: Signal<bool>, content: Element) -> Self {
         // 可见性直接绑 `open`：浮层的「展开」与「可见」是同一件事，分成两个开关只会
         // 制造出「登记为浮层却看不见」和「看得见却关不掉」两种半开状态。
+        // 未声明过渡的浮层默认淡入 + 轻落（与菜单、下拉同一观感）；要瞬显瞬隐就自己声明
+        // `.transition(Presence::default())`。
+        let presence = content.presence.or(Some(presence::Presence::popover()));
         let content = Element {
             overlay: Some(open),
+            presence,
             ..content
         }
         .visible_signal(open);
         self.child(content)
+    }
+
+    /// 浮层的收起策略：在浮层与锚点之外按下而收起它时，这一击**到此为止**，不再命中底下的
+    /// 控件（配对的抬起同样被吃掉）。默认 `false`——同一击里既关面板又按到下层控件。
+    ///
+    /// 写在传给 [`popup`](Self::popup) 的 `content` 上；用在没经 `popup` 登记的元素上无效。
+    /// 只管「点外面收起」这一条路：点锚点本身仍交给触发器控件自己 toggle，ESC 收起本就不涉及
+    /// 点击。
+    ///
+    /// ```
+    /// # use windui::prelude::*;
+    /// let open = signal(false);
+    /// let panel = Element::col()
+    ///     .child(Element::label("面板"))
+    ///     .dismiss_swallows_click(true);
+    /// let _ = Element::button("展开")
+    ///     .on_click(move |_| open.set(!open.get()))
+    ///     .popup(open, panel);
+    /// ```
+    pub fn dismiss_swallows_click(mut self, on: bool) -> Self {
+        self.dismiss_swallow = on;
+        self
     }
 
     /// **颜色选择器**：一枚当前色的色块，点开是浮在内容之上的取色面板。
@@ -2759,7 +3801,7 @@ impl Element {
                     .spacing(8)
                     .child(
                         Element::label("HEX")
-                            .font_size(12.0)
+                            .font_size(crate::theme::current().metrics.font_xs)
                             .fg_role(crate::style::Role::TextMuted),
                     )
                     // 提示串跟着 alpha 走：开着透明度时 `Color::to_hex_string`
@@ -2853,14 +3895,14 @@ impl Element {
     /// ```
     ///
     /// [`FormTheme`]: crate::theme::FormTheme
-    pub fn field(label: impl Into<String>, control: Element) -> Self {
+    pub fn field(label: impl Into<TextContent>, control: Element) -> Self {
         let th = crate::theme::current();
         let f = &th.form;
         Element::row()
             .width_match()
             .height(f.row_height())
             .cross(Align::Center)
-            .spacing(f.gap())
+            .spacing(f.gap(&th.metrics))
             .child(Self::form_label(label, f, &th.metrics).width(f.label_width()))
             .child(control)
     }
@@ -2885,7 +3927,7 @@ impl Element {
     /// ```
     ///
     /// [`FormTheme::row_height`]: crate::theme::FormTheme::row_height
-    pub fn setting_row(label: impl Into<String>, control: Element) -> Self {
+    pub fn setting_row(label: impl Into<TextContent>, control: Element) -> Self {
         Self::setting_row_inner(label.into(), None, control)
     }
 
@@ -2894,7 +3936,7 @@ impl Element {
     /// 这一种**不定高**：高度由内容加 [`FormTheme::row_pad_y`](crate::theme::FormTheme::row_pad_y)
     /// 撑出来。副标题长短不一，定高只会把它挤出去。
     ///
-    /// 做成独立构造器而非给 `setting_row` 加一个 `Option` 参数：`Option<impl Into<String>>`
+    /// 做成独立构造器而非给 `setting_row` 加一个 `Option` 参数：`Option<impl Into<TextContent>>`
     /// 的 `None` 推断不出类型（调用方得写 `None::<&str>`），而退成 `Option<&str>` 又会让
     /// 这一个参数破例不收 `String`。两个各自说得清的签名比一个别扭的签名好，
     /// 也免得没有副标题的行——占多数——为此多写一个 `None`。
@@ -2910,15 +3952,15 @@ impl Element {
     /// );
     /// ```
     pub fn setting_row_desc(
-        label: impl Into<String>,
-        desc: impl Into<String>,
+        label: impl Into<TextContent>,
+        desc: impl Into<TextContent>,
         control: Element,
     ) -> Self {
         Self::setting_row_inner(label.into(), Some(desc.into()), control)
     }
 
     /// `setting_row` / `setting_row_desc` 的共同骨架。
-    fn setting_row_inner(label: String, desc: Option<String>, control: Element) -> Self {
+    fn setting_row_inner(label: TextContent, desc: Option<TextContent>, control: Element) -> Self {
         let th = crate::theme::current();
         let f = &th.form;
         // 左块吃掉剩余宽度，控件因此被推到右缘——比「标签定宽 + flex_spacer」少一个
@@ -2930,7 +3972,7 @@ impl Element {
         let mut row = Element::row()
             .width_match()
             .cross(Align::Center)
-            .spacing(f.gap());
+            .spacing(f.gap(&th.metrics));
         match desc {
             // 带副标题：高度按内容撑开（副标题长短不一，定高会把它挤出去）。
             Some(d) => {
@@ -2941,8 +3983,8 @@ impl Element {
                     .font_size(f.desc_size(&th.metrics))
                     .fg_role(crate::style::Role::TextSubtle)
                     .width_match();
-                left = left.child(Self::clamp_lines(desc, f.desc_max_lines(), &d));
-                row = row.padding_xy(0, f.row_pad_y());
+                left = left.child(Self::clamp_lines(desc, f.desc_max_lines(), d));
+                row = row.padding_xy(0, f.row_pad_y(&th.metrics));
             }
             // 单行：定高，与 `field` 同一档，整列才对得齐。
             None => row = row.height(f.row_height()),
@@ -2952,7 +3994,7 @@ impl Element {
 
     /// 表单族共用的标签：字号/字重/文字色统一走 [`FormTheme`](crate::theme::FormTheme)。
     fn form_label(
-        text: impl Into<String>,
+        text: impl Into<TextContent>,
         f: &crate::theme::FormTheme,
         m: &crate::theme::Metrics,
     ) -> Self {
@@ -2961,7 +4003,7 @@ impl Element {
             .font_size(f.label_size(m))
             .font_weight(f.label_weight())
             .fg_role(crate::style::Role::Text);
-        Self::clamp_lines(el, f.label_max_lines(), &text)
+        Self::clamp_lines(el, f.label_max_lines(), text)
     }
 
     /// 表单族的行数限制：`None` 原样返回；`Some(n)` 加末尾省略并挂上看全文的 tooltip。
@@ -2973,7 +4015,10 @@ impl Element {
     /// 含换行的文本一样挂 tooltip：`Element::tooltip` 收多行之后，这里不再需要绕开它。
     /// 此前那条特例是为躲 `debug_assert` 而设的，代价是**多行说明被限行截断后连兜底
     /// 都没有**——恰恰是最需要看全文的那一类。
-    fn clamp_lines(el: Element, max_lines: Option<usize>, full_text: &str) -> Self {
+    ///
+    /// 全文以 [`TextContent`] 原样挂上 tooltip（不在构建时 resolve）：传 `t!` 进来时，
+    /// 换语言后悬停看到的全文与 label 显示的译文同步。
+    fn clamp_lines(el: Element, max_lines: Option<usize>, full_text: TextContent) -> Self {
         let Some(n) = max_lines else { return el };
         el.max_lines(n)
             .truncate(crate::ui::Truncate::End)
@@ -2984,8 +4029,9 @@ impl Element {
     ///
     /// 分组内容的默认外壳。标题**不设固定高**，长标题在卡片宽度内换行、分隔线随之下移。
     ///
-    /// 底色/圆角/内边距/标题字号取自 [`CardTheme`]。想要描边卡片就在返回值上链
-    /// `.border_role(Role::Border, 1)`——那是样式修饰符，对这种组合容器有效
+    /// 底色/圆角/内边距/标题字号取自 [`CardTheme`]。默认画 `Divider` 色 1px 描边：
+    /// 整套主题关掉用 `theme.card.bordered = Some(false)`，单张卡片换色或去掉就在返回值上
+    /// 链 `.border_role(..)` / `.border(c, 0)`——样式修饰符对这种组合容器有效
     /// （可用/不可用的修饰符同 [`field`](Self::field)）。
     ///
     /// # 示例
@@ -2998,28 +4044,33 @@ impl Element {
     ///         .width_match()
     ///         .child(Element::field("推送", Element::switch(notify))),
     /// )
-    /// .border_role(Role::Border, 1); // 样式修饰符可以链
+    /// .border_role(Role::Border, 1); // 样式修饰符可以链：描边换深一档
     /// ```
     ///
     /// [`CardTheme`]: crate::theme::CardTheme
-    pub fn card(title: impl Into<String>, body: Element) -> Self {
+    pub fn card(title: impl Into<TextContent>, body: Element) -> Self {
         let th = crate::theme::current();
         let c = &th.card;
-        Element::col()
+        let card = Element::col()
             .width_match()
             .bg_role(crate::style::Role::Surface)
             .corner(c.corner(&th.metrics))
-            .padding(c.pad())
-            .spacing(c.gap())
-            .child(
-                Element::label(title.into())
-                    .font_size(c.title_size(&th.metrics))
-                    .font_weight(c.title_weight())
-                    .fg_role(crate::style::Role::Text)
-                    .width_match(),
-            )
-            .child(Element::divider())
-            .child(body)
+            .padding(c.pad(&th.metrics))
+            .spacing(c.gap(&th.metrics));
+        let card = if c.bordered() {
+            card.border_role(crate::style::Role::Divider, 1)
+        } else {
+            card
+        };
+        card.child(
+            Element::label(title)
+                .font_size(c.title_size(&th.metrics))
+                .font_weight(c.title_weight())
+                .fg_role(crate::style::Role::Text)
+                .width_match(),
+        )
+        .child(Element::divider())
+        .child(body)
     }
 
     /// 等宽网格：把 `items` 按每行 `cols` 个排布，行/列间距 `gap`，列按权重均分等宽；
@@ -3059,7 +4110,10 @@ impl Element {
 
     /// 可删除标签（chip）：意图色淡底 pill + 文字 + 右侧 × 删除按钮。点 × 触发 `on_remove`。
     /// 纯展示标签（不可删）用 [`Element::badge`]。多值字段见 [`Element::tag_field`]。
-    pub fn chip(text: impl Into<String>, on_remove: impl FnMut(&mut EventCtx) + 'static) -> Self {
+    pub fn chip(
+        text: impl Into<TextContent>,
+        on_remove: impl FnMut(&mut EventCtx) + 'static,
+    ) -> Self {
         // 颜色走主题角色延迟解析：运行期换主题自动跟随。
         use crate::style::Role;
         Element::row()
@@ -3069,16 +4123,16 @@ impl Element {
             .corner(999.0)
             .bg_role_alpha(Role::Accent, 0.14)
             .child(
-                Element::label(text.into())
-                    .font_size(12.5)
-                    .fg_role(Role::Accent)
+                Element::label(text)
+                    .font_size(crate::theme::current().metrics.font_xs)
+                    .fg_role(Role::AccentText)
                     .height(18),
             )
             .child(
                 Element::icon_button("\u{2715}")
                     .size(16, 16)
                     .font_size(11.0)
-                    .fg_role(Role::Accent)
+                    .fg_role(Role::AccentText)
                     .on_click(on_remove),
             )
     }
@@ -3086,7 +4140,7 @@ impl Element {
     /// 标签字段：仿输入框的带边框容器，内含一组 chip（多值展示）。`chips` 用
     /// [`Element::chip`] 生成；为空时显示 `placeholder`。新增值由 app 驱动
     /// （维护值列表 Signal，变化后重建 chips 列表）。
-    pub fn tag_field(placeholder: impl Into<String>, chips: Vec<Element>) -> Self {
+    pub fn tag_field(placeholder: impl Into<TextContent>, chips: Vec<Element>) -> Self {
         // 颜色走 InputBg/InputBorder/Placeholder 角色延迟解析（换主题自动跟随）；
         // corner 为度量，构建期取值即可（换主题不改圆角，同 accordion 先例）。
         use crate::style::Role;
@@ -3105,7 +4159,7 @@ impl Element {
         if chips.is_empty() {
             row = row.child(
                 Element::label(placeholder.into())
-                    .font_size(13.0)
+                    .font_size(crate::theme::current().metrics.font_sm)
                     .fg_role(Role::Placeholder)
                     .weight(1.0)
                     .height(20),
@@ -3130,7 +4184,12 @@ impl Element {
             .into_iter()
             .map(|r| {
                 r.into_iter()
-                    .map(|c| Self::table_cell_pad(Element::label(c.into()).font_size(13.0)))
+                    .map(|c| {
+                        Self::table_cell_pad(
+                            Element::label(c.into())
+                                .font_size(crate::theme::current().metrics.font_sm),
+                        )
+                    })
                     .collect()
             })
             .collect();
@@ -3148,10 +4207,16 @@ impl Element {
     /// 由绘制层精确裁到 `lines` 行（内容不足则更矮，超出裁切不溢出邻行）。
     fn table_cell_pad_lines(content: Element, lines: usize) -> Self {
         if lines <= 1 {
-            // 单行：锁定 20px 单行盒（现状不变）。
+            // 单行：锁定 20px 单行盒。行被同行的按钮 / 徽章等高控件撑高时
+            // 文本盒竖直居中——贴顶会与同行居中的控件错开。
+            let mut content = content.width_match().height(20);
+            // 纵轴未设时跟随 `align`（见 `Node::align_v`），两者都没设才补居中。
+            if content.align.is_none() && content.align_v.is_none() {
+                content.align_v = Some(Align::Center);
+            }
             Element::stack()
                 .padding_xy(TABLE_CELL_PAD_X, TABLE_CELL_PAD_Y)
-                .child(content.width_match().height(20))
+                .child(content)
         } else {
             // 多行：行随同行最高单元格拉伸；文本竖直居中，内容不足一行时不再顶部对齐。
             // 用 row + cross(Center) 与自定义单元格（action_cell）保持一致的竖直居中。
@@ -3167,33 +4232,58 @@ impl Element {
     /// 由 [`table_custom`](Self::table_custom) 与 [`table_virtual`](Self::table_virtual)
     /// 共用——两者正文的构建方式完全不同（全量 vs 虚拟），表头却必须逐像素一致，
     /// 否则列宽会与正文错开。
-    fn table_header(columns: &[(String, f32)]) -> Self {
+    fn table_header(titles: &[String], cols: &table_cols::TableCols) -> Self {
         let mut header = Element::row()
             .width_match()
             .cross(Align::Stretch)
             .bg_role(Role::SurfaceAlt);
-        for (title, w) in columns {
-            header = header.child(
-                Element::stack()
-                    .weight(*w)
-                    .padding_xy(TABLE_CELL_PAD_X, TABLE_HEADER_PAD_Y)
-                    .child(
-                        Element::label(title.clone())
-                            .font_size(13.0)
-                            .font_weight(600)
-                            .fg_role(Role::TextMuted)
-                            .width_match()
-                            .height(18),
-                    ),
-            );
+        let n = titles.len();
+        for (ci, title) in titles.iter().enumerate() {
+            let cell = Element::stack()
+                .padding_xy(TABLE_CELL_PAD_X, TABLE_HEADER_PAD_Y)
+                .child(
+                    Element::label(title.clone())
+                        .font_size(crate::theme::current().metrics.font_sm)
+                        .font_weight(600)
+                        .fg_role(Role::TextMuted)
+                        .max_lines(1)
+                        .truncate(Truncate::End)
+                        .width_match()
+                        .height(18),
+                );
+            header = header.child(cols.header_cell(cell, ci));
+            // 两列之间插零宽拖动手柄（不占布局，见 `TableCols::handle`）。
+            if ci + 1 < n {
+                header = header.child(cols.handle(ci));
+            }
         }
         header
+    }
+
+    /// 表格骨架 `col[ 表头, 分隔线, 正文 ]`，根节点挂 [`table_cols::TableRoot`]——构建后链上的
+    /// 列宽修饰符（[`column_weights`](Self::column_weights) 等）靠它找到列句柄。
+    /// 八种表格共用，`actions` / `sort_indicator` 等修饰符据此结构按下标定位表头与正文。
+    fn table_frame(header: Element, body: Element, cols: table_cols::TableCols) -> Self {
+        let mut root = Element::col()
+            .width_match()
+            .child(header)
+            .child(Element::divider())
+            .child(body.weight(1.0));
+        root.set_widget(Box::new(table_cols::TableRoot { cols }));
+        root
+    }
+
+    /// 拆出列标题与列宽句柄。
+    fn table_cols(columns: Vec<(String, f32)>) -> (Vec<String>, table_cols::TableCols) {
+        let (titles, weights): (Vec<String>, Vec<f32>) = columns.into_iter().unzip();
+        (titles, table_cols::TableCols::new(weights))
     }
 
     /// 数据表格（自定义单元格）：同 [`Element::table`]，但每个单元格是任意 `Element`
     /// （可放 `clickable`/`text_input` 等实现选中/编辑）。`columns` 为 (列标题, 权重)。
     pub fn table_custom(columns: Vec<(String, f32)>, rows: Vec<Vec<Element>>) -> Self {
-        let header = Self::table_header(&columns);
+        let (titles, cols) = Self::table_cols(columns);
+        let header = Self::table_header(&titles, &cols);
         // 正文：逐行，斑马纹 + 行下分隔线。`cross(Stretch)` 让单元格撑满行高（便于整格高亮）；
         // 行本身不设内边距——内边距在各单元格内部（见 table_cell_pad / table_editable）。
         let mut scroll = Element::scroll().fill();
@@ -3203,8 +4293,7 @@ impl Element {
                 tr = tr.bg_role(Role::SurfaceAlt);
             }
             for (ci, cell) in cells.into_iter().enumerate() {
-                let w = columns.get(ci).map(|c| c.1).unwrap_or(1.0);
-                tr = tr.child(cell.weight(w));
+                tr = tr.child(cols.weigh(cell, ci));
             }
             // 整行悬停轻微高亮（叠层在斑马纹之上、单元格之下；可编辑单元格的 clickable 叠层叠加其上）。
             tr.set_widget(Box::new(sortable_table::HoverRow::new()));
@@ -3215,11 +4304,7 @@ impl Element {
                     .child(Element::divider()),
             );
         }
-        Element::col()
-            .width_match()
-            .child(header)
-            .child(Element::divider())
-            .child(scroll.weight(1.0))
+        Self::table_frame(header, scroll, cols)
     }
 
     /// 可编辑数据表格：单元格数据用 `Signal<String>` 承载（显示自动跟随），点单元格触发
@@ -3247,11 +4332,11 @@ impl Element {
                         Element::stack()
                             .clickable()
                             .on_click(move |ctx| (cb.borrow_mut())(ctx, r, c))
-                            .corner(TABLE_CELL_CORNER)
+                            .corner(crate::theme::current().metrics.corner_sm)
                             .padding_xy(TABLE_CELL_PAD_X, TABLE_CELL_PAD_Y)
                             .child(
                                 Element::label_signal(sig)
-                                    .font_size(13.0)
+                                    .font_size(crate::theme::current().metrics.font_sm)
                                     .fg_role(crate::style::Role::Text)
                                     .width_match()
                                     .height(20),
@@ -3283,12 +4368,12 @@ impl Element {
         rows: Vec<Vec<impl Into<String>>>,
         sort: Signal<Option<SortKey>>,
     ) -> Self {
-        let cols: Vec<(String, f32)> = columns.into_iter().map(|(t, w)| (t.into(), w)).collect();
+        let (titles, cols) =
+            Self::table_cols(columns.into_iter().map(|(t, w)| (t.into(), w)).collect());
         let data: Vec<Vec<String>> = rows
             .into_iter()
             .map(|r| r.into_iter().map(Into::into).collect())
             .collect();
-        let weights: Vec<f32> = cols.iter().map(|c| c.1).collect();
 
         // 表头：响应式。单元格由 SortableHeader 首次布局时构建（见其 on_update），
         // 故 .sort_indicator(..) 覆盖能在 build 前设入并被采纳。客户端模式无回调。
@@ -3297,7 +4382,10 @@ impl Element {
             .cross(Align::Stretch)
             .bg_role(Role::SurfaceAlt);
         header.set_widget(Box::new(sortable_table::SortableHeader::new(
-            cols, sort, None,
+            titles,
+            cols.clone(),
+            sort,
+            None,
         )));
         header.reactive = true;
 
@@ -3307,20 +4395,17 @@ impl Element {
         let mut body = Element::col().width_match();
         for (disp, &ri) in order.iter().enumerate() {
             body = body.child(sortable_table::body_row(
-                disp, ri, &data[ri], &weights, None, None, 1, None, None,
+                disp, ri, &data[ri], &cols, None, None, 1, None, None,
             ));
         }
         body.set_widget(Box::new(sortable_table::SortableBody::new(
-            data, weights, sort,
+            data,
+            cols.clone(),
+            sort,
         )));
         body.reactive = true;
         let scroll = Element::scroll().fill().child(body);
-
-        Element::col()
-            .width_match()
-            .child(header)
-            .child(Element::divider())
-            .child(scroll.weight(1.0))
+        Self::table_frame(header, scroll, cols)
     }
 
     /// 服务端排序表格（受控数据 + 排序意图回调）：适合大数据集分页——**前端不排序**，
@@ -3348,8 +4433,8 @@ impl Element {
         sort: Signal<Option<SortKey>>,
         on_sort: impl FnMut(&mut EventCtx, Option<SortKey>) + 'static,
     ) -> Self {
-        let cols: Vec<(String, f32)> = columns.into_iter().map(|(t, w)| (t.into(), w)).collect();
-        let weights: Vec<f32> = cols.iter().map(|c| c.1).collect();
+        let (titles, cols) =
+            Self::table_cols(columns.into_iter().map(|(t, w)| (t.into(), w)).collect());
         let on_sort: sortable_table::OnSort = Rc::new(RefCell::new(on_sort));
 
         // 表头：响应式，单元格由 SortableHeader 首次布局构建（透传排序意图回调）。
@@ -3358,7 +4443,8 @@ impl Element {
             .cross(Align::Stretch)
             .bg_role(Role::SurfaceAlt);
         header.set_widget(Box::new(sortable_table::SortableHeader::new(
-            cols,
+            titles,
+            cols.clone(),
             sort,
             Some(on_sort),
         )));
@@ -3370,18 +4456,13 @@ impl Element {
         let mut body = Element::col().width_match();
         for (disp, row) in initial.iter().enumerate() {
             body = body.child(sortable_table::body_row(
-                disp, disp, row, &weights, None, None, 1, None, None,
+                disp, disp, row, &cols, None, None, 1, None, None,
             ));
         }
-        body.set_widget(Box::new(sortable_table::PagedBody::new(rows, weights)));
+        body.set_widget(Box::new(sortable_table::PagedBody::new(rows, cols.clone())));
         body.reactive = true;
         let scroll = Element::scroll().fill().child(body);
-
-        Element::col()
-            .width_match()
-            .child(header)
-            .child(Element::divider())
-            .child(scroll.weight(1.0))
+        Self::table_frame(header, scroll, cols)
     }
 
     /// 虚拟滚动列表：只构建**视口内**的行，容量与行数无关——十万行与一百行的每帧成本
@@ -3460,7 +4541,7 @@ impl Element {
     ///
     /// 只有一处要自己把关：**行高**。虚拟滚动要求行高固定，行会被强制设成 `row_height`，
     /// 而 `TABLE_ROW_H` 是按纯文本行给的（单行文本盒 20px），装不下按钮。行里放控件时按
-    /// `控件高 + TABLE_CELL_PAD_Y×2 + 1` 自己算大（`.small()` 按钮约 30px，即 49），
+    /// `控件高 + TABLE_CELL_PAD_Y×2 + 1` 自己算大（`.small()` 按钮 28px，即 47），
     /// 短了内容会溢出到邻行。
     ///
     /// 不支持的只有 [`sort_indicator`](Self::sort_indicator)：表头是静态行、不重建，
@@ -3470,21 +4551,18 @@ impl Element {
         rows: Signal<Vec<Vec<String>>>,
         row_height: i32,
     ) -> Self {
-        let cols: Vec<(String, f32)> = columns.into_iter().map(|(t, w)| (t.into(), w)).collect();
-        let weights: Vec<f32> = cols.iter().map(|c| c.1).collect();
-        let header = Self::table_header(&cols);
+        let (titles, cols) =
+            Self::table_cols(columns.into_iter().map(|(t, w)| (t.into(), w)).collect());
+        let header = Self::table_header(&titles, &cols);
 
         let mut body = Self::col().width_match();
         body.set_widget(Box::new(sortable_table::VirtualTableBody::new(
-            rows, weights, row_height,
+            rows,
+            cols.clone(),
+            row_height,
         )));
         body.reactive = true;
-
-        Self::col()
-            .width_match()
-            .child(header)
-            .child(Self::divider())
-            .child(Self::scroll().fill().child(body).weight(1.0))
+        Self::table_frame(header, Self::scroll().fill().child(body), cols)
     }
 
     /// 虚拟滚动 + **服务端分页**表格：整份数据在后端，前端只按滚动位置按段取。
@@ -3539,8 +4617,8 @@ impl Element {
         row_height: i32,
         on_need: impl FnMut(&mut EventCtx, row_source::RowRequest) + 'static,
     ) -> Self {
-        let cols: Vec<(String, f32)> = columns.into_iter().map(|(t, w)| (t.into(), w)).collect();
-        let weights: Vec<f32> = cols.iter().map(|c| c.1).collect();
+        let (titles, cols) =
+            Self::table_cols(columns.into_iter().map(|(t, w)| (t.into(), w)).collect());
 
         // 表头：响应式，绑定行源自己的排序信号。这里不传 on_sort——点表头只改信号，
         // 作废缓存与按新排序重新请求由正文接手（见 VirtualServerBody::on_update）。
@@ -3549,7 +4627,8 @@ impl Element {
             .cross(Align::Stretch)
             .bg_role(Role::SurfaceAlt);
         header.set_widget(Box::new(sortable_table::SortableHeader::new(
-            cols,
+            titles,
+            cols.clone(),
             source.sort(),
             None,
         )));
@@ -3557,15 +4636,13 @@ impl Element {
 
         let mut body = Self::col().width_match();
         body.set_widget(Box::new(sortable_table::VirtualServerBody::new(
-            source, weights, row_height, on_need,
+            source,
+            cols.clone(),
+            row_height,
+            on_need,
         )));
         body.reactive = true;
-
-        Self::col()
-            .width_match()
-            .child(header)
-            .child(Self::divider())
-            .child(Self::scroll().fill().child(body).weight(1.0))
+        Self::table_frame(header, Self::scroll().fill().child(body), cols)
     }
 
     /// 分页操作栏：条目总数 + 当前页 + 首/上/下/末页 + 跳转框。
@@ -3671,7 +4748,7 @@ impl Element {
             .child(Self::leaf().weight(1.0))
             .child(
                 Self::label_signal(page_text)
-                    .font_size(12.5)
+                    .font_size(crate::theme::current().metrics.font_sm)
                     .fg_role(Role::Text),
             )
             .child(Self::leaf().weight(1.0));
@@ -3682,7 +4759,7 @@ impl Element {
             .spacing(6)
             .child(
                 Self::label_signal(count_text)
-                    .font_size(12.5)
+                    .font_size(crate::theme::current().metrics.font_sm)
                     .fg_role(Role::TextMuted),
             )
             .child(Self::leaf().weight(1.0))
@@ -3693,7 +4770,7 @@ impl Element {
             .child(last)
             .child(
                 Self::label("跳至")
-                    .font_size(12.5)
+                    .font_size(crate::theme::current().metrics.font_sm)
                     .fg_role(Role::TextMuted)
                     .padding_xy(6, 0),
             )
@@ -3738,12 +4815,12 @@ impl Element {
         selected: Vec<Signal<bool>>,
         sort: Signal<Option<SortKey>>,
     ) -> Self {
-        let cols: Vec<(String, f32)> = columns.into_iter().map(|(t, w)| (t.into(), w)).collect();
+        let (titles, cols) =
+            Self::table_cols(columns.into_iter().map(|(t, w)| (t.into(), w)).collect());
         let data: Vec<Vec<String>> = rows
             .into_iter()
             .map(|r| r.into_iter().map(Into::into).collect())
             .collect();
-        let weights: Vec<f32> = cols.iter().map(|c| c.1).collect();
         let scw = sortable_table::select_col_w();
 
         // 表头：[全选列] + [可排序数据列子行]，与正文的 [复选框列] + [数据列] 逐列对齐
@@ -3753,7 +4830,10 @@ impl Element {
             .widget(sortable_table::SelectAllCheck::new(selected.clone()));
         let mut subrow = Element::row().weight(1.0).cross(Align::Stretch);
         subrow.set_widget(Box::new(sortable_table::SortableHeader::new(
-            cols, sort, None,
+            titles,
+            cols.clone(),
+            sort,
+            None,
         )));
         subrow.reactive = true;
         let header = Element::row()
@@ -3766,16 +4846,149 @@ impl Element {
         // 正文：滚动容器保留内置 ScrollWidget；SelectableBody 挂在其内部 col 上，首次布局构建行。
         let mut body = Element::col().width_match();
         body.set_widget(Box::new(sortable_table::SelectableBody::new(
-            data, weights, selected, sort,
+            data,
+            cols.clone(),
+            selected,
+            sort,
         )));
         body.reactive = true;
         let scroll = Element::scroll().fill().child(body);
+        Self::table_frame(header, scroll, cols)
+    }
 
-        Element::col()
+    /// 服务端分页 + 可多选表格：[`table_sortable_server`](Self::table_sortable_server) 加上
+    /// [`table_selectable`](Self::table_selectable) 的首列复选框与表头三态全选。
+    ///
+    /// - `selected`：**当前页**每行一个勾选位（按页内显示下标），行复选框与表头全选都读写它。
+    ///   应用换页 / 重载写回 `rows` 时，也应按自己的跨页选中集把它重填成新页的勾选态
+    ///   （长度不足的按未选处理）；只改它不改 `rows` 时只同步复选框，不重建行。
+    /// - `on_select(ctx, 当前页勾选向量)`：**用户**点了行复选框或表头全选后触发（应用自己
+    ///   `set` 不触发），应用据此维护跨页选中集。
+    /// - 表头全选只管当前页：全选 / 半选 / 未选三态按当前页算。
+    ///
+    /// 其余同 `table_sortable_server`：`.actions` / `.cell_render` / `.cell_lines` /
+    /// `.on_row_activate` / `.on_row_context_menu` 照常可用，回调收到的是页内显示下标。
+    ///
+    /// # 示例
+    /// ```ignore
+    /// let rows = signal(vec![vec!["a".to_string()], vec!["b".to_string()]]);
+    /// let selected = signal(vec![false; 2]);
+    /// let sort = signal(None);
+    /// Element::table_selectable_server(vec![("名称", 1.0)], rows, selected, sort,
+    ///     |_ctx, _sort| { /* 重新拉取 */ },
+    ///     |_ctx, page| println!("本页勾选 {page:?}"))
+    /// ```
+    pub fn table_selectable_server(
+        columns: Vec<(impl Into<String>, f32)>,
+        rows: Signal<Vec<Vec<String>>>,
+        selected: Signal<Vec<bool>>,
+        sort: Signal<Option<SortKey>>,
+        on_sort: impl FnMut(&mut EventCtx, Option<SortKey>) + 'static,
+        on_select: impl FnMut(&mut EventCtx, &[bool]) + 'static,
+    ) -> Self {
+        let (titles, cols) =
+            Self::table_cols(columns.into_iter().map(|(t, w)| (t.into(), w)).collect());
+        let on_sort: sortable_table::OnSort = Rc::new(RefCell::new(on_sort));
+        let on_select: sortable_table::OnSelect = Rc::new(RefCell::new(on_select));
+        let page_sel = sortable_table::PageSel {
+            sel: selected,
+            on_select,
+            rows,
+        };
+        let scw = sortable_table::select_col_w();
+
+        // 表头：[全选列] + [可排序数据列子行]，结构同 table_selectable（`.actions` 据此找子行）。
+        let selectall = Element::leaf()
+            .width(scw)
+            .widget(sortable_table::SelectAllCheck::page(page_sel.clone()));
+        let mut subrow = Element::row().weight(1.0).cross(Align::Stretch);
+        subrow.set_widget(Box::new(sortable_table::SortableHeader::new(
+            titles,
+            cols.clone(),
+            sort,
+            Some(on_sort),
+        )));
+        subrow.reactive = true;
+        let header = Element::row()
             .width_match()
-            .child(header)
-            .child(Element::divider())
-            .child(scroll.weight(1.0))
+            .cross(Align::Stretch)
+            .bg_role(Role::SurfaceAlt)
+            .child(selectall)
+            .child(subrow);
+
+        let mut body = Element::col().width_match();
+        body.set_widget(Box::new(sortable_table::PagedBody::selectable(
+            rows,
+            cols.clone(),
+            page_sel,
+        )));
+        body.reactive = true;
+        let scroll = Element::scroll().fill().child(body);
+        Self::table_frame(header, scroll, cols)
+    }
+
+    /// 取表格的列宽句柄；不是表格元素时 debug 期 panic（链错了元素）。
+    #[track_caller]
+    fn table_cols_or_panic(&mut self, who: &str) -> Option<table_cols::TableCols> {
+        let cols = table_cols::cols_of(self);
+        debug_assert!(
+            cols.is_some(),
+            "{who}() 只能用于 Element::table*(..) 构造的表格"
+        );
+        cols
+    }
+
+    /// 把表格的列宽绑定到应用持有的信号——**持久化列宽**用这个。
+    ///
+    /// 列宽是权重（与构造器里 `(标题, 权重)` 同语义），与窗口尺寸、DPI 无关，可原样存盘。
+    /// 用户拖动表头分界时信号随之改写；应用也可随时 `set` 新权重（如「恢复默认列宽」）。
+    /// 信号里已有的值**优先**——那是上次存下的列宽；长度与列数不符（首次运行的空 `Vec`、
+    /// 升级后增减了列）或含非正值时，先写回构造器给的默认权重，避免列宽错位到别的列。
+    ///
+    /// 拖动过程中信号每帧都在变；要在**松手时**落盘，配 [`on_columns_resized`](Self::on_columns_resized)。
+    ///
+    /// 外部改写须在事件回调里（点击、按键、`on_interval` 等宿主会随之重排的路径）；在其它
+    /// 线程或事件之外直接 `set` 只触发重绘、不重排，列宽要到下一次重排才生效——契约同
+    /// [`weight_when`](Self::weight_when)。
+    ///
+    /// ```no_run
+    /// # use windui::prelude::*;
+    /// # fn load_saved_widths() -> Vec<f32> { Vec::new() }
+    /// let widths = signal(load_saved_widths()); // 首次运行为空 Vec，会被填成默认权重
+    /// Element::table(vec![("名称", 3.0), ("大小", 1.0)], vec![vec!["a.txt", "12"]])
+    ///     .column_weights(widths)
+    ///     .on_columns_resized(|_ctx, w| println!("存盘: {w:?}"))
+    ///     .height(240);
+    /// ```
+    #[track_caller]
+    pub fn column_weights(mut self, weights: Signal<Vec<f32>>) -> Self {
+        if let Some(cols) = self.table_cols_or_panic("column_weights") {
+            cols.bind(weights);
+        }
+        self
+    }
+
+    /// 用户拖动表头分界、**松手**时回调一次，参数为调整后的整组列权重——落盘的时机。
+    /// 单击手柄没拖动不触发。拖动中的实时值请读 [`column_weights`](Self::column_weights)
+    /// 绑定的信号。
+    #[track_caller]
+    pub fn on_columns_resized(mut self, f: impl FnMut(&mut EventCtx, &[f32]) + 'static) -> Self {
+        if let Some(cols) = self.table_cols_or_panic("on_columns_resized") {
+            cols.set_on_resized(Rc::new(RefCell::new(f)));
+        }
+        self
+    }
+
+    /// 是否允许拖动表头分界调整列宽（默认 `true`）。关掉后分界上的手柄不参与命中与绘制，
+    /// 表头单元格边缘的点击（排序）也就不会被手柄吞掉。
+    ///
+    /// 只有数据列之间可拖；多选表的复选框列、[`actions`](Self::actions) 操作列宽度固定。
+    #[track_caller]
+    pub fn resizable_columns(mut self, on: bool) -> Self {
+        if let Some(cols) = self.table_cols_or_panic("resizable_columns") {
+            cols.set_resizable(on);
+        }
+        self
     }
 
     /// 覆盖排序表格的排序指示器样式（字形/字号/颜色/槽宽/间距/位置）。仅对
@@ -4053,6 +5266,12 @@ impl Element {
     /// 组合构造器把 widget 挂到自己刚建的容器上时用它——那是构造器自己的节点，
     /// 不是调用方误挂。
     fn set_widget(&mut self, w: Box<dyn Widget>) {
+        // 滚动容器的滚轮 / 拖滚动条都在 `ScrollWidget` 里：直接顶掉就成了"有滚动条、滚不动"。
+        // 要挂别的 widget 先把它取走转交（见 `keyed`）。
+        debug_assert!(
+            !(self.has_widget && matches!(self.layout, Layout::Scroll)),
+            "滚动容器的 ScrollWidget 不能被替换，否则滚轮失效"
+        );
         self.widget = w;
         self.has_widget = true;
     }
@@ -4214,17 +5433,72 @@ impl Element {
         self.align_v = Some(v);
         self
     }
+    /// **自由摆放**（仅 [`stack`](Self::stack) 的直接子节点）：左上角落在父内容区的
+    /// `(x, y)`，尺寸照常由 `width`/`height` 决定（`width_match` 取到父右缘的剩余宽）。
+    ///
+    /// 设了它，`align`/`margin` 不再参与定位；stack 不设宽高时会撑到包住所有摆放子节点
+    /// 的右下角。层叠顺序即子节点顺序，后加的在上。几何要随数据变时用
+    /// [`place_fn`](Self::place_fn)。
+    ///
+    /// 摆到 stack 矩形**之外**的部分照常绘制、但点不到（命中先判父矩形）：给 stack 定了
+    /// 尺寸时别让子节点越界，或干脆不设尺寸让它自动包住。链到非 stack 的子节点上
+    /// debug 构建下 panic 提示。
+    pub fn place(mut self, x: i32, y: i32) -> Self {
+        self.place = Some(crate::core::Placement::At(Point::new(x, y)));
+        self
+    }
+    /// **自由摆放，几何由闭包算出**（仅 [`stack`](Self::stack) 的直接子节点）：闭包收父
+    /// 内容区尺寸，返回本节点相对父内容区左上角的矩形（位置与宽高都由它定，`width`/
+    /// `height` 不再起作用）。CSS 的 `position: absolute`、Flutter 的 `Positioned`。
+    ///
+    /// 闭包在测量期调用（stack 被父容器测了几遍就跑几遍），排布期复用最后一次的矩形。
+    /// **读信号即运行期可变**——拖动改高、按内容长高、窗口变窄时换算宽度，都是改一个信号。契约同
+    /// [`weight_when`](Self::weight_when)：纯函数、帧内值不变；在事件回调之外写信号的
+    /// 一方要记得 `ctx.mark_layout_dirty()`（事件路径宿主自会重排）。
+    ///
+    /// ```no_run
+    /// # use windui::prelude::*;
+    /// let card_h = signal(120);
+    /// Element::stack().width_match().child(
+    ///     Element::col()
+    ///         .bg(Color::rgb(250, 250, 250))
+    ///         // 占右半幅，最窄 140；高度随信号。
+    ///         .place_fn(move |avail| {
+    ///             let w = (avail.w / 2 - 16).max(140);
+    ///             Rect::new(avail.w - w, 24, w, card_h.get())
+    ///         }),
+    /// );
+    /// ```
+    ///
+    /// `avail` 是 stack 在测量期拿到的可用量（扣过 padding）。某一轴父尺寸不定（stack 放在
+    /// 滚动容器里、自己又没设高）时那一轴为 **0**——那种界面的尺寸本就该由子节点撑出来，
+    /// 闭包只按另一轴算即可。stack 不设宽高时它会收缩到包住子节点，此时 `avail` 是父给的
+    /// 上限而不是 stack 最终的尺寸；要「占 stack 一半宽」这种语义请给 stack 显式宽
+    /// （`width_match`/`width`）。
+    pub fn place_fn(mut self, f: impl Fn(Size) -> Rect + 'static) -> Self {
+        self.place = Some(crate::core::Placement::Rect(Box::new(f)));
+        self
+    }
     /// 线性容器主轴子间距。
     pub fn spacing(mut self, s: i32) -> Self {
-        if let Layout::Linear { spacing, .. } = &mut self.layout {
-            *spacing = s;
+        match &mut self.layout {
+            Layout::Linear { spacing, .. } | Layout::Flow { spacing, .. } => *spacing = s,
+            _ => {}
+        }
+        self
+    }
+    /// 流式容器（[`Element::flow`]）的行间距；其他容器上无效。
+    pub fn run_spacing(mut self, s: i32) -> Self {
+        if let Layout::Flow { run_spacing, .. } = &mut self.layout {
+            *run_spacing = s;
         }
         self
     }
     /// 线性容器交叉轴默认对齐。
     pub fn cross(mut self, a: Align) -> Self {
-        if let Layout::Linear { cross, .. } = &mut self.layout {
-            *cross = a;
+        match &mut self.layout {
+            Layout::Linear { cross, .. } | Layout::Flow { cross, .. } => *cross = a,
+            _ => {}
         }
         self
     }
@@ -4303,6 +5577,51 @@ impl Element {
     }
     pub fn corner(mut self, r: f32) -> Self {
         self.style.corner_radius = r;
+        // 统一半径与四角半径后写者胜：不清的话 `.corners(..).corner(4.0)` 里的 4 不生效。
+        self.style.corner_radii = None;
+        self
+    }
+    /// 四角各自的圆角半径（CSS `border-radius` 四值形式）：本节点的背景、边框与
+    /// 焦点环按此绘制（投影按最大半径近似）。典型用途是让一侧的角切成直角，与相邻图形无缝拼接：
+    ///
+    /// ```no_run
+    /// # use windui::prelude::*;
+    /// Element::col()
+    ///     .bg(Color::rgb(250, 250, 250))
+    ///     .border(Color::rgb(220, 220, 220), 1)
+    ///     .corners(Corners { bottom_left: 0.0, ..Corners::all(10.0) });
+    /// ```
+    ///
+    /// 与 [`corner`](Self::corner) 后写者胜。只作用于节点**自身**的背景层，以下几处仍按
+    /// 四角中最大的半径画统一圆角：投影（带模糊时看不出；零模糊加偏移的硬投影在直角处会
+    /// 露出一点圆角缺口）、图片控件的圆角裁剪、按钮与输入框这类自绘背景的控件。`clip`
+    /// 裁剪子节点仍是直角矩形。
+    pub fn corners(mut self, c: Corners) -> Self {
+        // 统一半径记最大值：读 `corner_radius` 做外扩估算的路径（投影、脏区余量）宁大勿小。
+        self.style.corner_radius = c.max();
+        self.style.corner_radii = Some(c);
+        self
+    }
+    /// 把子树裁剪到本节点的**外形**：描边内侧、带圆角（CSS `overflow: hidden`）。
+    ///
+    /// 贴边内容放进圆角容器时用：表头底色、斑马纹、图片都是直角的，不裁就会盖出容器
+    /// 的圆角与描边。裁剪区是边框内侧（不扣 padding），四角半径随 [`corner`](Self::corner)
+    /// / [`corners`](Self::corners) 并收小一个线宽，与描边内缘同心。
+    ///
+    /// ```no_run
+    /// # use windui::prelude::*;
+    /// // 无内边距的圆角卡片里放表格：表头与斑马纹顺着卡片的圆角收边。
+    /// Element::col()
+    ///     .corner(10.0)
+    ///     .border_role(Role::Border, 1)
+    ///     .clip()
+    ///     .child(Element::table(vec![("名称", 2.0), ("大小", 1.0)], vec![vec!["a", "1"]]).height(160));
+    /// ```
+    ///
+    /// 代价：软件后端每帧为裁剪区建一块整窗 mask（与滚动容器同量级），只给真需要的容器加。
+    /// 文字按外框矩形裁剪、不扣圆角——内容有内边距时字落不进四角，故不影响常规布局。
+    pub fn clip(mut self) -> Self {
+        self.clip_outline = true;
         self
     }
     pub fn fg(mut self, c: Color) -> Self {
@@ -4350,7 +5669,7 @@ impl Element {
     /// 换色靠"生效角色进布局签名、重排后签名不等即升整窗"生效（同 `enabled_signal` 的
     /// 置灰）。而重排只在宿主置了 `needs_relayout` 的帧发生——指针 `Move` **刻意不置**
     /// （hover 高频）。所以在自定义 `Widget` 的 Move 分支里改别的节点的颜色信号不会自动
-    /// 升整窗，那一帧只重画悬停节点；这种写法请自行 `ctx.mark_dirty()`。
+    /// 升整窗，那一帧只重画悬停节点；这种写法请自行 `ctx.mark_dirty_all()`（`mark_dirty()` 只失效本节点）。
     /// 按键、点击、菜单、`App::channel` 这些路径都置了 `needs_relayout`，无需额外处理。
     pub fn fg_role_signal(mut self, role: Signal<crate::style::Role>) -> Self {
         self.style.fg_role_signal = Some(role);
@@ -4367,7 +5686,7 @@ impl Element {
         self
     }
     pub fn font_size(mut self, s: f32) -> Self {
-        self.style.font_size = s;
+        self.style.font_size = Some(s);
         self
     }
     /// 字重（400=常规、500=中、600=半粗、700=粗）。标题/强调文字加粗更接近设计稿。
@@ -4411,8 +5730,14 @@ impl Element {
         self
     }
     /// 文字水平对齐。
+    ///
+    /// 作用于 `Element::text_input(..)`（含 `combo_box` 的输入框）时即单行输入框的对齐（`Start`/`Center`/`End`），
+    /// 只在整行放得下时生效，放不下交回水平滚动；多行忽略。
     pub fn text_align(mut self, a: Align) -> Self {
         self.style.text_align = a;
+        if let Some(ti) = self.widget.as_any_mut().and_then(text_input_of) {
+            ti.config_mut().align = a;
+        }
         self
     }
 
@@ -4427,12 +5752,19 @@ impl Element {
     }
 
     /// 递归落入 arena，返回根 NodeId。
-    pub fn build(mut self, tree: &mut Tree) -> NodeId {
+    pub fn build(self, tree: &mut Tree) -> NodeId {
+        self.build_in(tree, crate::core::PresenceFlags::ROOT)
+    }
+
+    /// `parent_shown`：祖先链是否全部逻辑可见。进出场过渡据此落定初值——藏在未弹出的
+    /// 对话框里的面板，初值得是"隐藏"，否则对话框第一次弹出时它不会进场。
+    fn build_in(mut self, tree: &mut Tree, pf: crate::core::PresenceFlags) -> NodeId {
         let is_reactive = self.reactive;
         let my_axis = match self.layout {
             Layout::Linear { axis, .. } => Some(axis),
             _ => None,
         };
+        let is_stack = matches!(self.layout, Layout::Frame);
         let children = std::mem::take(&mut self.children);
         // 把 Builder 上的点击回调注入控件（仅交互控件接收）。
         let mut widget = self.widget;
@@ -4441,7 +5773,11 @@ impl Element {
         }
         // 在 widget 被移进 Node 之前问一次：对话框遮罩要把显示信号登记到树上。
         let modal = widget.modal_signal();
-        let node = Node {
+        let focus_when = self
+            .focus_when
+            .map(|(s, select)| tree.focus_trigger(s, select));
+        let reveal_when = self.reveal_when.map(|s| tree.reveal_trigger(s));
+        let mut node = Node {
             parent: None,
             children: Vec::new(),
             bounds: Default::default(),
@@ -4454,9 +5790,10 @@ impl Element {
             padding: self.padding,
             margin: self.margin,
             hit_pad: self.hit_pad,
-            raised: self.raised,
             align: self.align,
             align_v: self.align_v,
+            place: self.place,
+            place_cache: None,
             layout: self.layout,
             widget,
             style: self.style,
@@ -4472,27 +5809,68 @@ impl Element {
             on_blur: self.blur,
             window_drag: self.window_drag,
             autofocus: self.autofocus,
+            focus_when,
+            reveal_when,
+            scroll_ext: self.scroll_ext,
             autofocus_done: false,
             focusable: self.focusable,
             tooltip: self.tooltip,
+            cursor: self.cursor,
             focused: false,
             clip_children: self.clip_children,
+            clip_outline: self.clip_outline,
+            scroll_axis: self.scroll_axis,
             scroll_y: 0,
             content_h: 0,
+            scroll_x: 0,
+            content_w: 0,
             over_scroll: 0,
+            over_scroll_x: 0,
+            scroll_bars: Size::ZERO,
             prev_visible: Cell::new(true),
             offset: Point::new(0, 0),
+            raised: self.raised,
             overlay: self.overlay,
+            overlay_swallow: self.dismiss_swallow,
+            presence: None,
+            height_anim: self
+                .animate_height
+                .then(|| Box::new(presence::HeightAnim::new())),
+            bg_cond: self.bg_cond,
+            opacity_cond: self.opacity_cond,
+            style_anim: self
+                .animate_style
+                .then(|| Box::new(presence::StyleAnim::new())),
+            layout_anim: self
+                .animate_layout
+                .then(|| Box::new(presence::LayoutAnim::new())),
+            slide_target: self.slide_target,
+            slide_hl: self
+                .slide_highlight
+                .then(|| Box::new(slide_highlight::SlideHighlight::new())),
         };
+        // 带方向的过渡（标签页）只认自身显隐，初值同理，见 `PresenceState::own_only`。
+        let shown = (pf.shown || self.presence_dir.is_some()) && node.effective_visible();
+        node.presence = self
+            .presence
+            .map(|p| Box::new(presence::PresenceState::new(p, shown).with_dir(self.presence_dir)));
+        let child_pf = pf.child(&node);
         let id = tree.insert(node);
         if is_reactive {
             tree.register_reactive(id);
         }
+        // 滚动位置绑定：登记进同步相位注册表（Tree::sync_scroll_bindings 每帧两遍扫描）。
+        tree.register_scroll_bound(id);
         // 对话框遮罩登记到树上（先序：父在前、子在后，故嵌套对话框中最内层落在栈顶）。
         if let Some(show) = modal {
-            tree.register_modal(show);
+            tree.register_modal(id, show);
         }
         for mut ce in children {
+            // 自由摆放只有 stack 认：row/col/scroll 按自己的流排布，静默忽略会让人以为坐标写错了。
+            debug_assert!(
+                ce.place.is_none() || is_stack,
+                "place()/place_fn() 只对 Element::stack() 的直接子节点生效"
+            );
             // 父为线性容器时，把请求的 weight 落到主轴维度
             if let (Some(axis), Some(w)) = (my_axis, ce.weight) {
                 match axis {
@@ -4500,7 +5878,7 @@ impl Element {
                     Axis::Vertical => ce.height = Dimension::Weight(w),
                 }
             }
-            let cid = ce.build(tree);
+            let cid = ce.build_in(tree, child_pf);
             tree.add_child(id, cid);
         }
         id
@@ -4510,6 +5888,7 @@ impl Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ScrollEdge;
     use crate::event::{KeyEvent, MouseButton, PointerEvent};
     use crate::geometry::Point;
     use crate::signal::signal;
@@ -4561,6 +5940,126 @@ mod tests {
         tree.root = Some(root);
         tree.layout_root(Size::new(200, 200), &mut crate::text::NullTextEngine);
         tree
+    }
+
+    /// 同一行里的按钮、输入框、下拉框、分段控件、图标按钮在**不设任何尺寸**时等高，
+    /// 且就是主题的 `control_h`。此前按钮 ≈37、分段 ≈33、输入框 30，并排时高低不齐。
+    #[test]
+    fn standard_controls_share_one_height_by_default() {
+        let row = Element::row()
+            .child(Element::button("保存"))
+            .child(Element::text_input(signal(String::new()), "名称"))
+            .child(Element::dropdown(vec!["甲", "乙"], signal(0usize)))
+            .child(Element::segmented(vec!["快", "慢"], signal(0usize)))
+            .child(Element::icon_button("⚙"));
+        let mut tree = Tree::new();
+        let root = row.build(&mut tree);
+        tree.root = Some(root);
+        tree.layout_root(Size::new(800, 200), &mut crate::text::NullTextEngine);
+        let want = crate::theme::current().metrics.control_h;
+        let kids = tree.get(root).unwrap().children.clone();
+        assert_eq!(kids.len(), 5);
+        for (i, k) in kids.into_iter().enumerate() {
+            assert_eq!(
+                tree.abs_bounds(k).h,
+                want,
+                "第 {i} 个控件高度应为 control_h"
+            );
+        }
+    }
+
+    /// 改主题的 `font_md` / `control_h`，没显式设字号、高度的控件全部跟着变——
+    /// token 不是摆设。此前 `Style` 默认字号写死 14，改 `font_md` 毫无效果。
+    #[test]
+    fn metrics_tokens_drive_default_font_and_control_height() {
+        let _restore = ThemeRestore(crate::theme::current());
+        let mut th = crate::theme::Theme::default();
+        th.metrics.font_md = 18.0;
+        th.metrics.control_h = 40;
+        crate::theme::set_current(Rc::new(th));
+        assert_eq!(Style::default().font_size(), 18.0, "默认字号取 font_md");
+        assert_eq!(
+            Element::label("x").font_size(12.0).style.font_size(),
+            12.0,
+            "显式字号优先"
+        );
+        let mut tree = Tree::new();
+        let root = Element::row()
+            .child(Element::button("保存"))
+            .child(Element::text_input(signal(String::new()), ""))
+            .build(&mut tree);
+        tree.root = Some(root);
+        tree.layout_root(Size::new(800, 200), &mut crate::text::NullTextEngine);
+        for k in tree.get(root).unwrap().children.clone() {
+            assert_eq!(tree.abs_bounds(k).h, 40, "control_h 改了，控件高度跟着变");
+        }
+        // 字号大到 control_h 装不下时按文字增高（字号 + 16），而不是死守下限把字挤出框。
+        let mut th = crate::theme::Theme::default();
+        th.metrics.font_md = 28.0;
+        crate::theme::set_current(Rc::new(th));
+        let mut tree = Tree::new();
+        let root = Element::row()
+            .child(Element::button("保存"))
+            .child(Element::text_input(signal(String::new()), ""))
+            .child(Element::dropdown(vec!["甲"], signal(0usize)))
+            .build(&mut tree);
+        tree.root = Some(root);
+        tree.layout_root(Size::new(800, 200), &mut crate::text::NullTextEngine);
+        for k in tree.get(root).unwrap().children.clone() {
+            assert_eq!(tree.abs_bounds(k).h, 44, "大字号下按文字增高且彼此等高");
+        }
+    }
+
+    /// 卡片默认带 1px 分隔线色描边（白卡片放在 slate-50 窗口底上，没有描边边界几乎看不出），
+    /// 主题关掉后不画。
+    #[test]
+    fn card_is_bordered_by_default_and_theme_can_turn_it_off() {
+        let c = Element::card("标题", Element::col());
+        assert!(c.style.border.is_some(), "默认应有描边");
+        let _restore = ThemeRestore(crate::theme::current());
+        let mut th = crate::theme::Theme::default();
+        th.card.bordered = Some(false);
+        crate::theme::set_current(Rc::new(th));
+        let c = Element::card("标题", Element::col());
+        assert!(c.style.border.is_none(), "主题关掉后不画描边");
+    }
+
+    /// `hstack` / `vstack` 不设参数就带主题间距（`col` / `row` 仍是 0 的原语），且后链可覆盖。
+    #[test]
+    fn stacks_carry_theme_spacing_and_stay_overridable() {
+        let lin = |e: &Element| match e.layout {
+            Layout::Linear { spacing, cross, .. } => (spacing, cross),
+            _ => unreachable!(),
+        };
+        let m = crate::theme::current().metrics.clone();
+        assert_eq!(lin(&Element::hstack()), (m.space_sm, Align::Center));
+        assert_eq!(lin(&Element::vstack()).0, m.space_md);
+        assert_eq!(lin(&Element::row()).0, 0, "原语不变");
+        assert_eq!(lin(&Element::hstack().spacing(2)).0, 2, "后链覆盖");
+    }
+
+    /// 对话框底部按钮行：没设间距的补上 `space_sm`，显式设过的不动。
+    #[test]
+    fn dialog_footer_gets_default_spacing_only_when_unset() {
+        let spacing = |e: &Element| match e.layout {
+            Layout::Linear { spacing, .. } => spacing,
+            _ => unreachable!(),
+        };
+        let gap = crate::theme::current().metrics.space_sm;
+        let f = Element::button_row_spacing(Element::row(), gap);
+        assert_eq!(spacing(&f), gap);
+        let f = Element::button_row_spacing(Element::row().spacing(20), gap);
+        assert_eq!(spacing(&f), 20);
+        let f = Element::button_row_spacing(Element::col(), gap);
+        assert_eq!(spacing(&f), 0, "竖排不替它做主");
+    }
+
+    /// 测试里临时换主题后复位（panic 也复位，理由同 [`AnimOff`]）。
+    struct ThemeRestore(Rc<crate::theme::Theme>);
+    impl Drop for ThemeRestore {
+        fn drop(&mut self) {
+            crate::theme::set_current(self.0.clone());
+        }
     }
 
     // ---- 拖拽重排（reorder_list）：全部经真实 dispatch_pointer / layout_root 驱动 ----
@@ -5116,10 +6615,214 @@ mod tests {
         );
     }
 
+    /// 根因回归：`list_signal` 的容器是 `Element::scroll()`，`keyed` 曾直接用 `KeyedList`
+    /// 换掉它的 `ScrollWidget`——布局仍是 `Layout::Scroll`（照样裁剪、画滚动条），处理
+    /// 滚轮与拖动滚动条的控件却没了：看得见滚动条，滚不动。
+    #[test]
+    fn list_signal_scrolls_with_wheel() {
+        use crate::event::PointerKind;
+        let data = signal((0..10).collect::<Vec<u8>>());
+        let mut tree = Tree::new();
+        let list = Element::list_signal(data, |n| *n, |_| Element::leaf().width_match().height(30))
+            .width(100)
+            .height(100);
+        let root = list.build(&mut tree);
+        tree.root = Some(root);
+        let mut te = crate::text::NullTextEngine;
+        tree.layout_root(Size::new(100, 100), &mut te);
+        assert_eq!(tree.get(root).unwrap().content_h, 300);
+
+        let wheel = PointerEvent::single(
+            PointerKind::Wheel(-120),
+            Point::new(50, 50),
+            MouseButton::Left,
+        );
+        let (mut h, mut cap) = (None, None);
+        tree.dispatch_pointer(wheel, &mut h, &mut cap);
+        tree.layout_root(Size::new(100, 100), &mut te);
+        assert!(tree.get(root).unwrap().scroll_y > 0, "滚轮向下应滚动列表");
+    }
+
+    // ---- 滚动容器：跟随底部 / 头部插入锚定 / 边缘回调 ----
+
+    fn scroll_wheel(tree: &mut Tree, notches: i32) {
+        use crate::event::PointerKind;
+        // Wheel 正=向上；每格 120 → 48px。
+        let ev = PointerEvent::single(
+            PointerKind::Wheel(notches * 120),
+            Point::new(50, 50),
+            MouseButton::Left,
+        );
+        let (mut h, mut cap) = (None, None);
+        tree.dispatch_pointer(ev, &mut h, &mut cap);
+    }
+
+    /// 视口 200 高、`n` 个 50 高子项的滚动容器。
+    fn scroll_with_rows(n: usize, configure: impl FnOnce(Element) -> Element) -> (Tree, NodeId) {
+        let mut sc = Element::scroll().width(100).height(200);
+        for _ in 0..n {
+            sc = sc.child(Element::leaf().width_match().height(50));
+        }
+        let mut tree = Tree::new();
+        let root = configure(sc).build(&mut tree);
+        tree.root = Some(root);
+        let mut te = crate::text::NullTextEngine;
+        tree.layout_root(Size::new(100, 200), &mut te);
+        (tree, root)
+    }
+
+    fn append_rows(tree: &mut Tree, root: NodeId, n: usize) {
+        for _ in 0..n {
+            let c = Element::leaf().width_match().height(50).build(tree);
+            tree.add_child(root, c);
+        }
+        let mut te = crate::text::NullTextEngine;
+        tree.layout_root(Size::new(100, 200), &mut te);
+    }
+
+    #[test]
+    fn sticks_to_bottom_when_content_grows() {
+        let (mut tree, root) = scroll_with_rows(10, |e| e.stick_to_bottom(true));
+        assert_eq!(tree.get(root).unwrap().scroll_y, 300, "首次布局应滚到底");
+        append_rows(&mut tree, root, 2);
+        assert_eq!(
+            tree.get(root).unwrap().scroll_y,
+            400,
+            "在底部时内容变高应跟随"
+        );
+    }
+
+    #[test]
+    fn does_not_follow_when_scrolled_up() {
+        let (mut tree, root) = scroll_with_rows(10, |e| e.stick_to_bottom(true));
+        scroll_wheel(&mut tree, 1); // 向上 48px
+        let mut te = crate::text::NullTextEngine;
+        tree.layout_root(Size::new(100, 200), &mut te);
+        let y = tree.get(root).unwrap().scroll_y;
+        assert_eq!(y, 252);
+        append_rows(&mut tree, root, 2);
+        assert_eq!(tree.get(root).unwrap().scroll_y, y, "离开底部后不应被拽回");
+    }
+
+    #[test]
+    fn follows_again_after_returning_to_bottom() {
+        let (mut tree, root) = scroll_with_rows(10, |e| e.stick_to_bottom(true));
+        scroll_wheel(&mut tree, 1);
+        let mut te = crate::text::NullTextEngine;
+        tree.layout_root(Size::new(100, 200), &mut te);
+        scroll_wheel(&mut tree, -1); // 回到底部
+        tree.layout_root(Size::new(100, 200), &mut te);
+        append_rows(&mut tree, root, 1);
+        assert_eq!(tree.get(root).unwrap().scroll_y, 350);
+    }
+
+    #[test]
+    fn stick_to_bottom_stays_within_four_px_tolerance() {
+        let (mut tree, root) = scroll_with_rows(10, |e| e.stick_to_bottom(true));
+        tree.get_mut(root).unwrap().scroll_y = 297; // 距底 3px，仍算"在底部"
+        append_rows(&mut tree, root, 1);
+        assert_eq!(tree.get(root).unwrap().scroll_y, 350);
+    }
+
+    fn prepend_list() -> (Tree, NodeId, Signal<Vec<u32>>) {
+        let data = signal((100..150).collect::<Vec<u32>>());
+        let mut tree = Tree::new();
+        let list = Element::list_signal(data, |n| *n, |_| Element::leaf().width_match().height(40))
+            .preserve_on_prepend(true)
+            .width(100)
+            .height(200);
+        let root = list.build(&mut tree);
+        tree.root = Some(root);
+        let mut te = crate::text::NullTextEngine;
+        tree.layout_root(Size::new(100, 200), &mut te);
+        (tree, root, data)
+    }
+
+    #[test]
+    fn prepend_keeps_first_visible_row_anchored() {
+        let (mut tree, root, data) = prepend_list();
+        let mut te = crate::text::NullTextEngine;
+        assert!(tree.set_scroll_y(root, 400), "第 10 行在顶");
+        tree.layout_root(Size::new(100, 200), &mut te);
+        let row10 = tree.get(root).unwrap().children[10];
+        let before = tree.abs_bounds(row10);
+        assert_eq!(before.y, 0);
+
+        let mut next: Vec<u32> = (0..5).collect();
+        next.extend(100..150);
+        data.set(next);
+        tree.layout_root(Size::new(100, 200), &mut te);
+
+        assert_eq!(tree.get(root).unwrap().scroll_y, 600);
+        let node = tree.get(root).unwrap().children[15];
+        assert_eq!(node, row10, "原行节点按键复用");
+        assert_eq!(tree.abs_bounds(row10), before, "原第一个可见行位置不变");
+    }
+
+    #[test]
+    fn append_does_not_move_scroll_when_preserving() {
+        let (mut tree, root, data) = prepend_list();
+        let mut te = crate::text::NullTextEngine;
+        tree.set_scroll_y(root, 400);
+        tree.layout_root(Size::new(100, 200), &mut te);
+        let mut next: Vec<u32> = (100..150).collect();
+        next.push(999);
+        data.set(next);
+        tree.layout_root(Size::new(100, 200), &mut te);
+        assert_eq!(tree.get(root).unwrap().scroll_y, 400);
+    }
+
+    #[test]
+    fn scroll_edge_fires_once_and_rearms() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let log: Rc<RefCell<Vec<ScrollEdge>>> = Rc::default();
+        let sink = log.clone();
+        let (mut tree, _root) = scroll_with_rows(10, move |e| {
+            e.on_scroll_edge(move |_ctx, edge| sink.borrow_mut().push(edge))
+        });
+        let mut te = crate::text::NullTextEngine;
+        let mut step = |tree: &mut Tree, notches: i32| {
+            scroll_wheel(tree, notches);
+            tree.layout_root(Size::new(100, 200), &mut te);
+        };
+        assert!(log.borrow().is_empty(), "初始就在顶部不算\"到达\"");
+        step(&mut tree, -2); // 离开顶部 96px
+        assert!(log.borrow().is_empty());
+        step(&mut tree, 5); // 回顶
+        assert_eq!(*log.borrow(), [ScrollEdge::Top]);
+        step(&mut tree, 1); // 在顶部再滚
+        assert_eq!(*log.borrow(), [ScrollEdge::Top], "边缘上不重复触发");
+        step(&mut tree, -1); // 下滚 48 > 16，重新武装
+        step(&mut tree, 5);
+        assert_eq!(*log.borrow(), [ScrollEdge::Top, ScrollEdge::Top]);
+        step(&mut tree, -10); // 到底
+        assert_eq!(
+            *log.borrow(),
+            [ScrollEdge::Top, ScrollEdge::Top, ScrollEdge::Bottom]
+        );
+    }
+
+    #[test]
+    fn scroll_edge_ignores_content_shorter_than_viewport() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let n = Rc::new(Cell::new(0));
+        let sink = n.clone();
+        let (mut tree, _root) = scroll_with_rows(2, move |e| {
+            e.on_scroll_edge(move |_ctx, _edge| sink.set(sink.get() + 1))
+        });
+        scroll_wheel(&mut tree, -3);
+        let mut te = crate::text::NullTextEngine;
+        tree.layout_root(Size::new(100, 200), &mut te);
+        assert_eq!(n.get(), 0);
+    }
+
     #[test]
     fn list_signal_rebuild_reclaims_row_signals() {
         // 根因回归：`row_fn` 里创建的信号曾随每次数据变化永久累积（运行时 arena 只增不减）。
-        // 现在 DynList 持有一个 SignalScope，重建时先整批回收上一轮，再收集新一轮。
+        // 现在每行持有一个 SignalScope（`KeyedList`），删行 / 重建时随行回收；这里键全是 `()`，
+        // 走的是整批重建分支。
         use crate::signal::stats;
 
         let data = signal(vec![1u8, 2, 3]);
@@ -5413,6 +7116,25 @@ mod tests {
         assert_eq!(plain.text_truncated(), None);
     }
 
+    /// 截断门控只管"正文全文"型提示：单行省略的 Label 配一条**不同内容**的说明，
+    /// 没截断也要弹（曾一律压掉，摘要行上的版本说明因此永远看不到）。
+    #[test]
+    fn untruncated_label_still_shows_explanatory_tooltip() {
+        let tip_of = |el: Element| {
+            let mut tree = Tree::new();
+            let root = el.build(&mut tree);
+            tree.root = Some(root);
+            tree.layout_root(Size::new(400, 40), &mut crate::text::NullTextEngine);
+            tree.node_tooltip(root)
+        };
+        let clamped = |text: &str| Element::label(text).max_lines(1).truncate(Truncate::End);
+        assert_eq!(
+            tip_of(clamped("minSdk 24").tooltip("Android 7.0")).as_deref(),
+            Some("Android 7.0")
+        );
+        assert_eq!(tip_of(clamped("minSdk 24").tooltip("minSdk 24")), None);
+    }
+
     /// **多行**限行的截断状态同样要如实反映，否则 tooltip 会无条件弹。
     ///
     /// 多行路径只做高度裁剪、不重排文本，paint 期拿不到"完整排版有多高"，故判断落在
@@ -5546,7 +7268,11 @@ mod tests {
     #[test]
     fn field_lays_out_label_column_from_theme() {
         let th = crate::theme::current();
-        let (lw, gap, h) = (th.form.label_width(), th.form.gap(), th.form.row_height());
+        let (lw, gap, h) = (
+            th.form.label_width(),
+            th.form.gap(&th.metrics),
+            th.form.row_height(),
+        );
         // 套一层填充容器：`layout` 会把根拉满窗口，直接量根就量不到行的固有高度。
         let row_of = |el: Element| {
             let tree = layout(Element::col().fill().child(el));
@@ -5574,6 +7300,22 @@ mod tests {
         assert_eq!(row.h, 28);
         assert_eq!(kids[0].w, 60);
         crate::theme::set_current(std::rc::Rc::new(crate::theme::Theme::default()));
+    }
+
+    /// 组合框文字区右沿恒让开下拉箭头：`pad_x` 变了，`trail` 要反向补偿，两者之和不变。
+    /// 否则内距调小后文字与光标会压到箭头上。
+    #[test]
+    fn combo_box_text_stays_clear_of_the_chevron_when_pad_x_changes() {
+        let right_inset = |el: Element| {
+            let mut el = el;
+            let ti = text_input_of(el.widget.as_any_mut().unwrap()).unwrap();
+            let c = ti.config_mut();
+            c.pad_x + c.trail
+        };
+        let base = || Element::combo_box(signal(String::new()), vec!["a", "b"]);
+        let default = right_inset(base());
+        assert_eq!(right_inset(base().pad_x(2)), default, "pad_x(2) 后右沿不动");
+        assert_eq!(right_inset(base().pad_x(20)), default, "pad_x(20) 同理");
     }
 
     /// `setting_row` 的立身之本是「控件贴右缘」。左块靠 `weight(1.0)` 吃掉剩余宽度，
@@ -5611,7 +7353,7 @@ mod tests {
         );
         assert_eq!(
             h,
-            left_h + 2 * f.form.row_pad_y(),
+            left_h + 2 * f.form.row_pad_y(&f.metrics),
             "副标题行 = 内容 + 内边距"
         );
         assert!(h > f.form.row_height(), "两行文字应撑得比单行行高更高");
@@ -5633,7 +7375,7 @@ mod tests {
             "副标题应为三级弱化文字色"
         );
         assert!(
-            left.children[1].style.font_size < left.children[0].style.font_size,
+            left.children[1].style.font_size() < left.children[0].style.font_size(),
             "副标题字号应小于标签"
         );
         // 无副标题时左块只有标签，不留空节点占位。
@@ -5652,7 +7394,7 @@ mod tests {
             for i in path {
                 cur = &mut cur.children[*i];
             }
-            let tip = cur.tooltip.clone();
+            let tip = cur.tooltip.as_ref().map(|t| t.resolve().into_owned());
             let l = cur
                 .widget
                 .as_any_mut()
@@ -5749,6 +7491,56 @@ mod tests {
         assert_eq!(top.len(), 3, "表格 = 表头 + 分隔线 + 滚动正文");
         let scroll = top[2];
         assert_eq!(tree.get(scroll).unwrap().children.len(), 2, "正文应有 2 行");
+    }
+
+    /// `.clip()`：无内边距的圆角描边容器里，贴边的直角内容（表头底色这类）不得盖出
+    /// 圆角与描边。经真实 build → layout → paint，取四角与描边处的像素。
+    #[test]
+    fn clip_keeps_flush_content_inside_rounded_border() {
+        use crate::render::skia::SkiaCanvas;
+        const RED: Color = Color::rgb(255, 0, 0);
+        let render = |clip: bool| {
+            let inner = Element::col().width_match().weight(1.0).bg(RED);
+            let mut card = Element::col()
+                .width_match()
+                .weight(1.0)
+                .bg(Color::rgb(255, 255, 255))
+                .corner(16.0)
+                .border(Color::rgb(0, 0, 255), 2)
+                .child(inner);
+            if clip {
+                card = card.clip();
+            }
+            let root = Element::col()
+                .fill()
+                .bg(Color::rgb(0, 255, 0))
+                .padding(10)
+                .child(card);
+            let tree = layout(root);
+            let mut pm = tiny_skia::Pixmap::new(200, 200).unwrap();
+            {
+                let mut c = SkiaCanvas::new(&mut pm);
+                tree.paint(&mut c);
+            }
+            pm
+        };
+        let rgb = |pm: &tiny_skia::Pixmap, x, y| {
+            let p = pm.pixel(x, y).unwrap();
+            (p.red(), p.green(), p.blue())
+        };
+        // 对照组：不裁时红底盖住左上圆角外（应是外层绿）与左边描边（应是蓝）。
+        let raw = render(false);
+        assert_eq!(
+            rgb(&raw, 11, 11),
+            (255, 0, 0),
+            "对照组前提：不裁时红底应盖出圆角"
+        );
+        let pm = render(true);
+        assert_eq!(rgb(&pm, 11, 11), (0, 255, 0), "圆角外应露出外层底色");
+        assert_eq!(rgb(&pm, 188, 188), (0, 255, 0), "右下圆角外应露出外层底色");
+        assert_eq!(rgb(&pm, 10, 100), (0, 0, 255), "左边描边不得被内容盖住");
+        assert_eq!(rgb(&pm, 100, 189), (0, 0, 255), "底边描边不得被内容盖住");
+        assert_eq!(rgb(&pm, 100, 100), (255, 0, 0), "内容区照常绘制");
     }
 
     #[test]
@@ -6323,6 +8115,29 @@ mod tests {
         let _ = Element::scroll().widget(Probe);
     }
 
+    /// `scroll_position` 三条 debug 守卫的回归钉子（同 `widget_rejects_*` 惯例）：
+    /// 误用必须当场炸出来，而不是布局期才表现出「信号不动」之类的无声症状。
+    #[test]
+    #[should_panic(expected = "scroll_position() 只能用于滚动容器")]
+    fn scroll_position_rejects_non_scroll_container() {
+        let _ = Element::col().scroll_position(signal(0i32));
+    }
+
+    #[test]
+    #[should_panic(expected = "scroll_position() 需要可写信号")]
+    fn scroll_position_rejects_derived_signal() {
+        let src = signal(0i32);
+        let _ = Element::scroll().scroll_position(src.map(|v| *v));
+    }
+
+    #[test]
+    #[should_panic(expected = "scroll_position() 一期仅支持纵向滚动容器")]
+    fn scroll_position_rejects_horizontal_container() {
+        let _ = Element::scroll()
+            .scroll_axis(crate::spec::ScrollAxis::Horizontal)
+            .scroll_position(signal(0i32));
+    }
+
     /// 无静态 tooltip 的自绘控件，未命中时不应弹出空提示。
     #[test]
     fn widget_tooltip_absent_yields_none() {
@@ -6510,6 +8325,8 @@ mod tests {
             Box::new(RadioButton::new(caption, group, 0)),
             Box::new(nav::NavRow::new(caption)),
             Box::new(containers::IconButton::glyph(caption)),
+            // 空文本框画的是占位提示：随页号变的提示走的也是这条。
+            Box::new(TextInput::new(signal(String::new()), caption)),
         ];
         let painted = |w: &dyn Widget| {
             let mut cv = CaptureCanvas::default();
@@ -6532,6 +8349,164 @@ mod tests {
                 "改信号后应画出新文案，实得 {got:?}"
             );
         }
+    }
+
+    /// 装一份中 / 英两语的测试目录（固定从中文起步）。英文译文刻意更长，便于同时
+    /// 断言"量出来的宽度也变了"。
+    fn install_container_locales() {
+        crate::i18n::install(
+            crate::i18n::Locales::builder()
+                .embed(
+                    "[meta]\nlocale = \"zh-CN\"\n[w]\ncard = \"卡片\"\nrow = \"设置项\"\n\
+                     desc = \"说明\"\nfield = \"字段\"\nopt = \"甲\"\nopt2 = \"乙\"\n\
+                     tab = \"标签\"\nseg = \"分段\"\nitem = \"条目\"\nfold = \"折叠\"\n\
+                     acc = \"面板\"\nmenu = \"菜单\"\nchip = \"标记\"\ntip = \"提示\"\n",
+                )
+                .embed(
+                    "[meta]\nlocale = \"en\"\n[w]\ncard = \"Card\"\nrow = \"Setting\"\n\
+                     desc = \"Description\"\nfield = \"Field\"\nopt = \"A much longer option\"\n\
+                     opt2 = \"B\"\ntab = \"Tab\"\nseg = \"Segment\"\nitem = \"Item\"\n\
+                     fold = \"Fold\"\nacc = \"Panel\"\nmenu = \"Menu\"\nchip = \"Chip\"\n\
+                     tip = \"Tip\"\n",
+                )
+                .initial(crate::i18n::Initial::Fixed("zh-CN".into()))
+                .build(),
+        );
+    }
+
+    /// 容器 / 选项型构造器收 `t!`：**同一棵树**换语言后再 layout + paint，画出的是新语言
+    /// 文字，旧语言一个字都不剩；下拉的测量宽度随译文变长。
+    ///
+    /// 判据必须是同一棵树：构建期就把译文定格成 `String` 的实现，重建树也能画出新语言，
+    /// 只有不重建、仍画出新字才说明控件真的每帧现取。
+    #[test]
+    fn container_constructors_follow_language_switch() {
+        install_container_locales();
+        let sel = signal(0usize);
+        let open = signal(Some(0usize));
+        let ui = Element::col()
+            .child(Element::card(
+                crate::t!("w.card"),
+                Element::col()
+                    .width_match()
+                    .child(Element::setting_row(
+                        crate::t!("w.row"),
+                        Element::leaf().size(40, 20),
+                    ))
+                    .child(Element::setting_row_desc(
+                        crate::t!("w.row"),
+                        crate::t!("w.desc"),
+                        Element::leaf().size(40, 20),
+                    ))
+                    .child(Element::field(
+                        crate::t!("w.field"),
+                        Element::leaf().size(40, 20),
+                    )),
+            ))
+            .child(Element::dropdown(
+                vec![crate::t!("w.opt"), crate::t!("w.opt2")],
+                sel,
+            ))
+            .child(Element::tabs(sel, vec![(crate::t!("w.tab"), Element::col())]).height(60))
+            .child(Element::segmented(vec![crate::t!("w.seg")], sel))
+            .child(Element::list(vec![crate::t!("w.item")], sel).height(40))
+            .child(Element::collapsible(
+                crate::t!("w.fold"),
+                signal(false),
+                Element::col(),
+            ))
+            .child(Element::accordion(
+                open,
+                vec![(crate::t!("w.acc"), Element::col())],
+            ))
+            .child(Element::check_menu(crate::t!("w.menu"), vec![]))
+            .child(Element::chip(crate::t!("w.chip"), |_| {}));
+
+        let mut tree = Tree::new();
+        let root = ui.build(&mut tree);
+        tree.root = Some(root);
+        let mut eng = crate::text::NullTextEngine;
+        let mut frame = |tree: &mut Tree| {
+            tree.layout_root(Size::new(800, 1200), &mut eng);
+            let mut cv = CaptureCanvas::default();
+            tree.paint(&mut cv);
+            let dd = tree.get(root).unwrap().children[1];
+            (cv.texts.into_inner(), tree.abs_bounds(dd).w)
+        };
+
+        let zh = [
+            "卡片",
+            "设置项",
+            "说明",
+            "字段",
+            "甲",
+            "标签",
+            "分段",
+            "条目",
+            "折叠",
+            "面板",
+            "菜单",
+            "标记",
+        ];
+        let en = [
+            "Card",
+            "Setting",
+            "Description",
+            "Field",
+            "A much longer option",
+            "Tab",
+            "Segment",
+            "Item",
+            "Fold",
+            "Panel",
+            "Menu",
+            "Chip",
+        ];
+        let (before, dd_zh) = frame(&mut tree);
+        for want in zh {
+            assert!(
+                before.iter().any(|t| t == want),
+                "中文帧应画出 {want:?}：{before:?}"
+            );
+        }
+
+        assert!(crate::i18n::LocaleHandle::new().set("en"));
+        let (after, dd_en) = frame(&mut tree);
+        for want in en {
+            assert!(
+                after.iter().any(|t| t == want),
+                "换英文后应画出 {want:?}：{after:?}"
+            );
+        }
+        for stale in zh {
+            assert!(
+                !after.iter().any(|t| t == stale),
+                "换英文后不该再画旧译文 {stale:?}：{after:?}"
+            );
+        }
+        assert!(
+            dd_en > dd_zh,
+            "下拉按最宽选项测量：译文变长后同一控件应量得更宽（{dd_zh} → {dd_en}）"
+        );
+
+        crate::i18n::install(crate::i18n::Locales::default());
+    }
+
+    /// `.tooltip(t!(..))`：悬停提示在弹出时现取，换语言后同一节点给出新译文。
+    /// 表单行限行时挂的"看全文"提示走的也是这条（`clamp_lines` 不在构建期 resolve）。
+    #[test]
+    fn tooltip_follows_language_switch() {
+        install_container_locales();
+        let mut tree = Tree::new();
+        let root = Element::stack()
+            .size(40, 20)
+            .tooltip(crate::t!("w.tip"))
+            .build(&mut tree);
+        tree.root = Some(root);
+        assert_eq!(tree.node_tooltip(root).as_deref(), Some("提示"));
+        assert!(crate::i18n::LocaleHandle::new().set("en"));
+        assert_eq!(tree.node_tooltip(root).as_deref(), Some("Tip"));
+        crate::i18n::install(crate::i18n::Locales::default());
     }
 
     #[test]
@@ -7170,7 +9145,7 @@ b",
         let mut want = tiny_skia::Pixmap::new(200, 100).unwrap();
         want.fill(tiny_skia::Color::WHITE);
         let style = Style {
-            font_size: 13.0,
+            font_size: Some(13.0),
             ..Style::default()
         };
         let fg = style.resolved_fg(&crate::theme::current());

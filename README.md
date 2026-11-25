@@ -3,8 +3,8 @@
 **[⬇️ 下载 0.4.1 (Gitee)](https://gitee.com/qiuzongman/RuPix/releases/download/0.4.1/RuPix_0.4.1.zip)**
  ｜ **[⬇️ 下载 0.4.1 (GitHub)](https://github.com/zongmanqiu/RuPix/releases/download/0.4.1/RuPix_0.4.1.zip)**
 
-> 发布包已带 `classic` / `common` / `modern` / `pro` / `raw` 5 枚基础解码器；`doc`（PDF/PS/AI/DXF）、
-> `texture`、`doc-legacy` 仍可在 设置 → 解码器 里按需下载。0.4.x 暂停自动更新（旧更新器只接受
+> 发布包已带 `classic` / `common` / `modern` / `pro` / `texture` 5 枚基础解码器；`doc`（PDF/PS/AI/DXF）、
+> `raw`、`doc-legacy` 仍可在 设置 → 解码器 里按需下载。0.4.x 暂停自动更新（旧更新器只接受
 > 四文件包）：请从发布页手动下载本包覆盖，下一版恢复。
 
 > 宿主仓库（本仓）: [Gitee](https://gitee.com/qiuzongman/RuPix) | [GitHub](https://github.com/zongmanqiu/RuPix)
@@ -44,8 +44,8 @@ Windows 10/11 上的小巧极速看图器。**宿主只做「看图」，位图�
 
 - **可下载档位并集**：[`docs/格式覆盖.md`](docs/格式覆盖.md)（生成物，源是解码器仓的
   `decoders.json` 与宿主内置登记表）。
-- **发布包实际覆盖**：随包带 `classic` / `common` / `modern` / `pro` / `raw` 5 枚；
-  `doc` / `texture` / `doc-legacy` 按需下载。具体清单以本机 `--list-formats` 为准，
+- **发布包实际覆盖**：随包带 `classic` / `common` / `modern` / `pro` / `texture` 5 枚；
+  `doc` / `raw` / `doc-legacy` 按需下载。具体清单以本机 `--list-formats` 为准，
   包里不放手写/快照格式表。
 - **这台机器现在覆盖**：`rupix.exe --list-formats`，一行 JSON，含内置、各解码器自述与
   唯一扩展名总数；与设置页「解码器」三张卡同源。
@@ -122,10 +122,10 @@ Windows 10/11 上的小巧极速看图器。**宿主只做「看图」，位图�
 | --- | --- | --- |
 | Windows 10/11 x64 | 一键：`main\build\full.bat`（= `build.bat`，六步流水线：工具链体检 → **七道静态门禁**（分层 / 卫生 / `cargo fmt --check` / `cargo clippy -D warnings` / 结构文档新鲜度 / `dump_sym.py --selftest` / 注释断链）→ 解码器 DLL → 宿主 release → 测试门禁 → 部署） | `.build\rupix.exe [要打开的文件]` |
 | Rust 1.94+，host 必须 `x86_64-pc-windows-msvc`（windui/windows 需 MSVC） | 单步常用：`main\build\4_build.bat` 只编宿主；`3_build_ext.bat` 只编解码器 | 解码器自动取 **exe 同级 `decoders\`**（部署产物即 `.build\decoders\*.dll`，随 exe 拷走） |
-| Python 3 + PowerShell（构建脚本用）；工作区须带 `.3rd\wind-ui-rust-0.23.0` 与 `.3rd\usvg-0.48.1` **两份**本地副本（前者是 `windui` 的 path 依赖，后者经 `Cargo.toml` 的 `[patch.crates-io]` 接入，缺任一 cargo 解析期就失败） | 中间产物：宿主 `.temp\target`、解码器侧 target（源码仓库里不放 target），发布 exe 落 **`.build\rupix.exe`** | 开发期跑 example/探针：设 **`RUPIX_DECODERS_DIR`（绝对路径）指向 `.build\decoders`**，否则 example 旁的旧 DLL 拷贝会让基准数字全错 |
+| Python 3 + PowerShell（构建脚本用）；工作区须带 `.3rd\wind-ui-rust-0.35.0` 与 `.3rd\usvg-0.48.1` **两份**本地副本（前者是 `windui` 的 path 依赖，后者经 `Cargo.toml` 的 `[patch.crates-io]` 接入，缺任一 cargo 解析期就失败） | 中间产物：宿主 `.temp\target`、解码器侧 target（源码仓库里不放 target），发布 exe 落 **`.build\rupix.exe`** | 开发期跑 example/探针：设 **`RUPIX_DECODERS_DIR`（绝对路径）指向 `.build\decoders`**，否则 example 旁的旧 DLL 拷贝会让基准数字全错 |
 | 无需安装解码器/运行库（位图解码全在解码器 DLL 内，静态 CRT） | 测试门禁：`cargo test --release -- --test-threads=1` 与 `--lib` 同参（杀软会锁新链接的测试二进制，单线程防假死） | 无解码器时 SVG/SVGZ 仍可打开；其余格式不出现在目录清单（能力与清单不脱节） |
 
-> 第①步工具链体检**两份本地副本都查**：`.3rd\wind-ui-rust-0.23.0`（path 依赖）与
+> 第①步工具链体检**两份本地副本都查**：`.3rd\wind-ui-rust-0.35.0`（path 依赖）与
 > `.3rd\usvg-0.48.1`（`[patch.crates-io]`）。任一份缺失都在那一步报 ERROR 并停下，
 > 不会拖到第②步的 cargo 命令才变成一句更难懂的报错。
 
@@ -135,7 +135,7 @@ Windows 10/11 上的小巧极速看图器。**宿主只做「看图」，位图�
 RuPix\                  ← 工作区根（宿主文档只画宿主这一侧）
 ├─ main\                宿主 crate（rupix.exe + rupix_lib）——本 README 所在
 ├─ .build\              发布产物：rupix.exe + decoders\*.dll + plugins\<id>\ + docs\（随包清单与插件包）+ LICENSE + THIRD-PARTY-NOTICES.md（可分发目录）
-├─ .3rd\                第三方本地副本：wind-ui-rust-0.23.0 + usvg-0.48.1（两枚宿主 path 依赖，缺任一编不过）
+├─ .3rd\                第三方本地副本：wind-ui-rust-0.35.0 + usvg-0.48.1（两枚宿主 path 依赖，缺任一编不过）
 └─ .temp\               全部编译中间产物与临时文件（宿主 target 与解码器侧 target 都指到这里）
 ```
 
@@ -149,7 +149,7 @@ RuPix\                  ← 工作区根（宿主文档只画宿主这一侧）
 
 | 组件 | 用途 |
 | --- | --- |
-| windui 0.23.0（本地 path 依赖 `.3rd/wind-ui-rust-0.23.0`，features：svg / svg-text / d2d） | UI 框架 + 内置 resvg SVG 渲染（唯一内置解码例外） |
+| windui 0.35.0（本地 path 依赖 `.3rd/wind-ui-rust-0.35.0`，features：svg / svg-text / d2d） | UI 框架 + 内置 resvg SVG 渲染（唯一内置解码例外） |
 | usvg 0.48.1（`.3rd/usvg-0.48.1`，经 `[patch.crates-io]` 接入，不是直接依赖） | 把 windui 的 resvg 换成打了线程级排版缓存补丁的那一份（补丁登记见 `patches/usvg-0.48.1/PATCHES.md`） |
 | windows 0.62（Win32 绑定，`[target.'cfg(windows)'.dependencies]` 共 **28 条 feature**，下面已省掉各自的 `Win32_` 前缀：Foundation / Security / Security_Authorization / System_Pipes / Graphics_Gdi / System_DataExchange / System_Ole / System_Memory / System_ProcessStatus / System_Threading / System_RemoteDesktop / System_SystemInformation / UI_WindowsAndMessaging / UI_Input_KeyboardAndMouse / UI_HiDpi / System_LibraryLoader / UI_Shell / UI_Shell_Common / System_Com / System_Variant / System_Diagnostics_Debug / System_Kernel / System_Registry / Storage_FileSystem / System_IO / System_JobObjects / System_Time / Networking_WinHttp） | 剪贴板、崩溃错误框与转储、DPI 边框反算、DLL 搜索路径硬化、会话号（诊断头）、命名管道与共享内存（插件进程）、回收站、**注册表（唯一例外：文件关联，仅 HKCU 且只写不撤）**、WinHTTP 取清单。逐条用途写在 `Cargo.toml` 的行内注释里 |
 | libloading 0.8 | LoadLibrary 包装（解码器 DLL 装载） |

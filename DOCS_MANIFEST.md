@@ -40,6 +40,9 @@
 | `docs/superpowers/specs/2026-10-12-titlebar-topmost-lock-design.md` | 设计变更时（被 `src/ui/chrome.rs` 注释与 `HISTORY.md` 引用） | 自检（引用路径成立） |
 | `docs/superpowers/plans/2026-11-14-info-panel.md` | 已执行完毕的计划存档（m342；执行后不再更新，同类新工作另开新文件） | 自检（与同名 spec 成对存在；任务状态见该文件顶部状态行） |
 | `docs/superpowers/specs/2026-11-14-info-panel-design.md` | 设计变更时（被实现计划与 `HISTORY.md` 引用） | 自检（引用路径成立） |
+| `docs/superpowers/plans/2026-11-15-fullscreen-retire-plugin-refresh.md` | 已执行完毕的计划存档（执行后不再更新，同类新工作另开新文件） | 自检（与同名 spec 成对存在；任务状态见该文件顶部状态行） |
+| `docs/superpowers/specs/2026-11-15-fullscreen-retire-plugin-refresh-design.md` | 设计变更时（被实现计划与 `HISTORY.md` 引用） | 自检（引用路径成立） |
+| `docs/默认打开方式策略-UserChoice哈希.md` | 文件关联策略正本（自算 UserChoice 哈希）：判定链、哈希算法口径、注册表落点任一变化时；实现落点 `src/platform/association.rs` | 自检 + `cargo test --lib platform::association -- --test-threads=1` |
 | `docs/随包说明.txt` | 随包分发的纯文本快速上手说明（面向拿到发行包的人，不是仓库访客）。★ 真源放 `docs/` 而不是仓根：仓根已有 `README.md`，再摆一份 `.txt` 会让人当成同一份的两份拷贝。版本号**必须写 `{{VERSION}}`**，由 `build/deploy.py` 代入 `Cargo.toml` 的值后落地 `.build\README.txt`（落地名保持 README.txt，解压第一眼认得出）；标题目录、常用操作、源码与反馈地址变化时 | `python build/deploy.py --selftest`（含缺镜像地址 / 残留占位符 / 版本号写死 / 空壳四条红证）+ `6_deploy.bat` 落地字节同源 |
 | `docs/MCP接入指南.md` | 宿主五个无头动词的对外契约、任意 AI 客户端的接入与验收方式、外置解码器边界任一项变化；用户要换 AI 客户端来验时先读这一份 | `python build/deploy.py --selftest`（含「随包 docs 混入脚本会红」负向臂）+ `6_deploy.bat` 随包字节同源 |
 

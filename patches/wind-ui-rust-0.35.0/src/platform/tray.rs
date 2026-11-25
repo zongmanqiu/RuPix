@@ -32,7 +32,12 @@ pub enum TrayOp {
     /// 换鼠标悬停提示。
     SetTooltip(String),
     /// 弹出系统通知。与托盘回调的 [`TrayAction::Notify`] 走同一平台实现。
-    Notify { title: String, body: String },
+    /// `tag` 是点击该通知时原样交回 [`Tray::on_notification_click`] 的标签。
+    Notify {
+        title: String,
+        body: String,
+        tag: Option<String>,
+    },
     /// 换图标。像素口径同 [`Tray::icon_rgba`]：非预乘 RGBA8，`rgba.len() == w*h*4`。
     SetIcon { w: u32, h: u32, rgba: Vec<u8> },
     /// 显示 / 隐藏托盘图标（win32：`NIM_ADD` / `NIM_DELETE`）。★ RuPix 补丁 01。
@@ -40,6 +45,23 @@ pub enum TrayOp {
     /// **托盘本身不销毁**——图标、菜单、回调全留着，重新显示直接登记回去。
     /// 语义见 [`TrayHandle::set_visible`]。
     SetVisible(bool),
+    /// 退出应用。平台层执行与 [`TrayCtx::quit`] 完全相同的退出路径（销毁全部窗口、
+    /// 移除托盘图标、绕过 `hide_on_close`）；排在它**之后**的意图一律丢弃。
+    Quit,
+}
+
+/// 把意图队列在第一个 [`TrayOp::Quit`] 处切开：返回 `Quit` 之前的意图与「是否含 Quit」。
+///
+/// 各平台共用，保证「Quit 之后的意图丢弃」只有一份定义（与 `TrayAction::Quit` 之后 `break`
+/// 同义）。Quit 要在**没装托盘**时也生效，故各平台先切再按需取托盘目标。
+pub(crate) fn split_at_quit(mut ops: Vec<TrayOp>) -> (Vec<TrayOp>, bool) {
+    match ops.iter().position(|o| *o == TrayOp::Quit) {
+        Some(i) => {
+            ops.truncate(i);
+            (ops, true)
+        }
+        None => (ops, false),
+    }
 }
 
 thread_local! {
@@ -112,12 +134,35 @@ impl TrayHandle {
     /// 发起方：这里是**应用状态**变了（后台任务完成、同步失败），不必先有一次托盘交互。
     ///
     /// 通知挂在托盘图标上（Win32 的气泡本就是 `NOTIFYICONDATAW` 的一部分），故没装托盘时
-    /// 同样被丢弃；Linux 尚无托盘，也一并丢弃。
+    /// 同样被丢弃。Linux 上走 `org.freedesktop.Notifications`：装了托盘配置即可发送，
+    /// 即使桌面没有托盘宿主（无 StatusNotifierWatcher）通知也照常弹出。
     pub fn notify(&self, title: impl Into<String>, body: impl Into<String>) {
-        self.queue.borrow_mut().push(TrayOp::Notify {
-            title: title.into(),
-            body: body.into(),
-        });
+        self.push_notify(title.into(), body.into(), None);
+    }
+
+    /// 弹出带标签的系统通知：用户点击它时，[`Tray::on_notification_click`] 的回调收到该标签
+    /// （例如会话 id，用来打开对应窗口）。其余语义同 [`notify`](Self::notify)。
+    ///
+    /// `tag` 原样回传：空字符串得到 `Some("")`，不会变成 `None`。
+    ///
+    /// 点击回调的平台差异：Windows 只记**最近一条**通知的标签（Shell 气泡同一时间只有
+    /// 一条）——点击已被后续通知顶掉的旧通知（如操作中心残留项），回调拿到的是最新通知的
+    /// 标签，调用方不应假定 tag 一定对应被点的那条，点击只应激活界面并尽力定位，
+    /// 不做破坏性动作；气泡消失后再点旧项得到 `None`；Linux 按通知 id 各记各的（最多保留最近 64 条），守护进程不支持 actions 时
+    /// 点击不回调；macOS 目前不回调。
+    pub fn notify_tagged(
+        &self,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        tag: impl Into<String>,
+    ) {
+        self.push_notify(title.into(), body.into(), Some(tag.into()));
+    }
+
+    fn push_notify(&self, title: String, body: String, tag: Option<String>) {
+        self.queue
+            .borrow_mut()
+            .push(TrayOp::Notify { title, body, tag });
         // 踢一帧的理由同 `set_tooltip`：发起方多在后台状态回调里，之后未必再有事件。
         crate::anim::request_repaint();
     }
@@ -162,6 +207,33 @@ impl TrayHandle {
         crate::anim::request_repaint();
     }
 
+    /// 请求退出应用：让 [`App::run_resident`](crate::app::App::run_resident) 正常返回 `true`
+    /// （窗口模式下 `run` 同样结束），以便执行 Drop 清理、移除托盘图标。
+    ///
+    /// **macOS 例外**：退出走 `NSApp::terminate`，它不返回、直接结束进程，故 `run_resident()`
+    /// 不会返回 `true`，其后的 Drop 清理也不会执行；需要收尾的应用须在调用 `quit()` 之前完成。
+    ///
+    /// 与托盘菜单里的 [`TrayCtx::quit`] 走**同一条退出路径**（销毁全部窗口、移除托盘图标、
+    /// 绕过 `hide_on_close`），区别只在发起方：外部关闭请求（IPC 关闭命令、SIGTERM 的转发）
+    /// 而非用户点了菜单。排在它之后的托盘意图被丢弃。没装托盘时同样生效。
+    ///
+    /// **线程**：`TrayHandle` 内含 `Rc`、是 `!Send`，只能在 UI 线程调用——后台线程收到关闭
+    /// 请求后，经 [`App::channel`](crate::app::App::channel) 把消息送回 UI 线程，在其回调里
+    /// 调本方法（channel 回调跑在 UI 线程）。
+    ///
+    /// ```
+    /// # use windui::prelude::*;
+    /// use windui::platform::TrayOp;
+    /// let t = TrayHandle::detached();
+    /// t.quit();
+    /// assert_eq!(t.pending_ops(), vec![TrayOp::Quit]);
+    /// ```
+    pub fn quit(&self) {
+        self.queue.borrow_mut().push(TrayOp::Quit);
+        // 踢一帧的理由同 `set_tooltip`：常驻零窗口时之后未必再有事件，不踢就等不到消费。
+        crate::anim::request_repaint();
+    }
+
     /// 已排队、尚未被平台层消费的意图（按调用顺序）。**只读不取走**，故对真句柄
     /// 调用也是安全的，不会把宿主该执行的改动偷掉。
     pub fn pending_ops(&self) -> Vec<TrayOp> {
@@ -193,8 +265,12 @@ pub enum TrayAction {
     /// 退出应用。**刻意绕过 `hide_on_close`**——托盘退出是常驻工具的唯一真实出口，
     /// 若也转成隐藏，开了关闭转隐藏的应用将永远退不掉。
     Quit,
-    /// 弹出系统气泡通知。
-    Notify { title: String, body: String },
+    /// 弹出系统气泡通知。`tag` 同 [`TrayOp::Notify`]。
+    Notify {
+        title: String,
+        body: String,
+        tag: Option<String>,
+    },
     /// 新建一个窗口（[`TrayCtx::open_window`]）。
     ///
     /// **不带载荷**：窗口配置（[`WindowRequest`](crate::event::WindowRequest)）带闭包，
@@ -303,6 +379,7 @@ impl TrayCtx {
         self.actions.push(TrayAction::Notify {
             title: title.to_string(),
             body: body.to_string(),
+            tag: None,
         });
     }
     /// 取出累积的意图（平台层在**释放窗口状态借用之后**调用）。
@@ -312,6 +389,8 @@ impl TrayCtx {
 }
 
 pub(crate) type TrayFn = Box<dyn FnMut(&mut TrayCtx)>;
+pub(crate) type TrayAvailabilityFn = Box<dyn FnMut(&mut TrayCtx, bool)>;
+pub(crate) type TrayNotificationFn = Box<dyn FnMut(&mut TrayCtx, Option<String>)>;
 
 /// 借一个受控的 `TrayCtx` 跑回调，把它请求的意图交回来。
 ///
@@ -325,8 +404,6 @@ pub(crate) fn invoke(cb: Option<&mut TrayFn>) -> Vec<TrayAction> {
     ctx.take_actions()
 }
 
-// Linux 后端尚无托盘，菜单项的标签 / 勾选态与按下标取回调在那里无人读取。
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) enum ItemKind {
     Action {
         /// 标签。收 [`TextContent`] 而不是 `String`，于是它能是一条待翻译消息
@@ -421,6 +498,12 @@ pub struct Tray {
     /// 装配时不登记图标（★ RuPix 补丁 01）。之后由 [`TrayHandle::set_visible`]
     /// 在运行期放回来——典型用法：「关闭到托盘」开关关着时，通知区不出现图标。
     pub(crate) hidden_at_start: bool,
+    /// 仅 Linux 读取：Windows / macOS 的托盘可用性恒为 true，不会触发。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) on_availability: Option<TrayAvailabilityFn>,
+    /// macOS 暂不回调（见 [`TrayHandle::notify_tagged`]）。
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub(crate) on_notification_click: Option<TrayNotificationFn>,
 }
 
 impl Tray {
@@ -461,8 +544,46 @@ impl Tray {
         self.hidden_at_start = true;
         self
     }
+    /// 托盘可用性变化回调：`available` 为 `true` 表示托盘宿主（Linux 的
+    /// `org.kde.StatusNotifierWatcher`）已上线、登记已发起，`false` 表示宿主下线、
+    /// 图标不可见。在 UI 线程执行，`ctx` 的意图照常落地（例如宿主下线时 `open_window`
+    /// 保证用户仍有入口，上线时 `close_window` 收起）。
+    ///
+    /// 语义（**只报变化**）：
+    /// - **Linux**：托盘装好后，每次可用性相对上一次状态翻转触发一次；初始状态不触发——
+    ///   启动时用 [`tray_supported`](crate::platform::tray_supported) 取此刻快照。Watcher
+    ///   在两次之间直接换主人（重启）算仍可用，不触发，但图标会自动重新登记。
+    /// - **Windows / macOS**：托盘恒可用，**永不触发**。
+    pub fn on_availability_changed(mut self, f: impl FnMut(&mut TrayCtx, bool) + 'static) -> Self {
+        self.on_availability = Some(Box::new(f));
+        self
+    }
+    /// 用户点击通知时回调，参数是发送该通知时给的标签（[`TrayHandle::notify_tagged`]；
+    /// 普通 `notify` 发出的通知为 `None`）。回调里与其它托盘回调一样只能排意图
+    /// （如 `ctx.open_window(..)`）。
+    ///
+    /// Windows：点击气泡（`NIN_BALLOONUSERCLICK`），只认最近一条通知的标签，气泡消失后
+    /// 再点（如操作中心残留项）得到 `None`。**点击一条已被后续通知顶掉的旧通知，拿到的是
+    /// 最新通知的标签**，调用方不应假定 tag 一定对应被点的那条：回调只应激活界面并尽力
+    /// 定位，不做破坏性动作。Linux：点击通知（`default` action），需通知守护进程支持
+    /// actions，否则不回调。macOS：不回调。
+    pub fn on_notification_click(
+        mut self,
+        f: impl FnMut(&mut TrayCtx, Option<String>) + 'static,
+    ) -> Self {
+        self.on_notification_click = Some(Box::new(f));
+        self
+    }
+    /// 平台层在收到通知点击后调用：跑 `on_notification_click` 回调并取回它排的意图。
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub(crate) fn notification_click(&mut self, tag: Option<String>) -> Vec<TrayAction> {
+        let mut ctx = TrayCtx::default();
+        if let Some(cb) = self.on_notification_click.as_mut() {
+            cb(&mut ctx, tag);
+        }
+        ctx.take_actions()
+    }
     /// 取指定下标菜单项的回调（平台层在模态菜单关闭后分发用）。
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub(crate) fn item_callback(&mut self, idx: usize) -> Option<&mut TrayFn> {
         self.items.get_mut(idx)?.callback()
     }
@@ -509,7 +630,8 @@ mod tests {
             vec![
                 TrayAction::Notify {
                     title: "已同步".into(),
-                    body: "3 个词条".into()
+                    body: "3 个词条".into(),
+                    tag: None,
                 },
                 TrayAction::CloseWindow("main".into()),
             ],
@@ -594,7 +716,8 @@ mod tests {
             vec![
                 TrayAction::Notify {
                     title: "标题".into(),
-                    body: "正文".into()
+                    body: "正文".into(),
+                    tag: None,
                 },
                 TrayAction::Show,
             ]
@@ -620,9 +743,48 @@ mod tests {
                 TrayOp::Notify {
                     title: "同步完成".into(),
                     body: "已上传 3 个文件".into(),
+                    tag: None,
                 },
             ]
         );
+    }
+
+    /// `quit()` 入队 `TrayOp::Quit`；平台层按 `split_at_quit` 在它处截断，之后的意图丢弃。
+    #[test]
+    fn quit_is_queued_and_truncates_following_ops() {
+        let handle = TrayHandle::detached();
+        handle.set_tooltip("前");
+        handle.quit();
+        handle.set_tooltip("后");
+        let ops = handle.pending_ops();
+        assert_eq!(ops[1], TrayOp::Quit);
+        let (before, quit) = split_at_quit(ops);
+        assert!(quit);
+        assert_eq!(before, vec![TrayOp::SetTooltip("前".into())]);
+        let (all, quit) = split_at_quit(vec![TrayOp::SetTooltip("x".into())]);
+        assert!(!quit, "无 Quit 时不报退出");
+        assert_eq!(all.len(), 1);
+    }
+
+    /// Quit 在队首：之前没有意图，之后的全部丢弃；两个 Quit 只在第一个处切开。
+    #[test]
+    fn split_at_quit_handles_leading_and_repeated_quit() {
+        let (before, quit) = split_at_quit(vec![TrayOp::Quit, TrayOp::SetTooltip("后".into())]);
+        assert!(quit);
+        assert!(before.is_empty(), "Quit 在队首时之前没有意图");
+
+        let (before, quit) = split_at_quit(vec![
+            TrayOp::SetTooltip("前".into()),
+            TrayOp::Quit,
+            TrayOp::SetTooltip("中".into()),
+            TrayOp::Quit,
+            TrayOp::SetTooltip("后".into()),
+        ]);
+        assert!(quit);
+        assert_eq!(before, vec![TrayOp::SetTooltip("前".into())]);
+
+        let (before, quit) = split_at_quit(Vec::new());
+        assert!(!quit && before.is_empty());
     }
 
     /// 像素长度与尺寸对不上的换图标请求在入口就丢掉，不进队列——平台层按 i32 换算像素数，
@@ -636,6 +798,48 @@ mod tests {
         assert!(handle.pending_ops().is_empty());
         handle.set_icon_rgba(2, 2, &[0; 16]);
         assert_eq!(handle.pending_ops().len(), 1, "对照：长度对得上的照常排队");
+    }
+
+    #[test]
+    fn notify_tagged_queues_op_with_tag() {
+        let handle = TrayHandle::detached();
+        handle.notify_tagged("t", "b", "conv1");
+        handle.notify("t2", "b2");
+        assert_eq!(
+            handle.pending_ops(),
+            vec![
+                TrayOp::Notify {
+                    title: "t".into(),
+                    body: "b".into(),
+                    tag: Some("conv1".into()),
+                },
+                TrayOp::Notify {
+                    title: "t2".into(),
+                    body: "b2".into(),
+                    tag: None,
+                },
+            ],
+            "notify 的 tag 恒为 None，notify_tagged 带标签"
+        );
+    }
+
+    #[test]
+    fn notification_click_dispatches_tag_to_callback() {
+        let seen: Rc<RefCell<Vec<Option<String>>>> = Rc::new(RefCell::new(Vec::new()));
+        let s2 = seen.clone();
+        let mut tray = Tray::new().on_notification_click(move |ctx, tag| {
+            s2.borrow_mut().push(tag);
+            ctx.show_window();
+        });
+        assert_eq!(
+            tray.notification_click(Some("conv1".into())),
+            vec![TrayAction::Show],
+            "回调排下的意图原样取回"
+        );
+        tray.notification_click(None);
+        assert_eq!(*seen.borrow(), vec![Some("conv1".to_string()), None]);
+        // 没设回调：静默无意图。
+        assert!(Tray::new().notification_click(Some("x".into())).is_empty());
     }
 
     /// 没有回调时不该凭空产生意图（左键未绑定的托盘图标点了应当什么都不发生）。
@@ -662,7 +866,8 @@ mod tests {
             vec![
                 TrayAction::Notify {
                     title: "标题".into(),
-                    body: "正文".into()
+                    body: "正文".into(),
+                    tag: None,
                 },
                 TrayAction::OpenWindow,
             ],

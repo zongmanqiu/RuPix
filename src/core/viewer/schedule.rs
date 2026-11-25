@@ -680,6 +680,9 @@ impl Viewer {
 
     /// 收解码结果。**过期结果（`seq` 不等于当前期待的）一律丢弃。**
     pub fn apply(&mut self, done: Done) -> bool {
+        // m349 T4：回包已消费 = 这笔后台请求的在飞字节账要销（没有账就是 no-op）。
+        // 挂在 apply 入口而不是各分支：Main / 预读 / 缩略图 / 取消哨兵全部走这里。
+        self.decoder.note_done(done.seq);
         // 预读回包：入缓存即可，与上屏无关。
         if Some(done.seq) == self.prefetch_seq {
             self.prefetch_seq = None;

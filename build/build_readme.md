@@ -10,7 +10,7 @@
 
 | 步 | 脚本 | 干什么 | 失败行为 |
 |---|---|---|---|
-| ① | `1_check_env.bat` | 只读工具链体检：cargo/rustc host 必须 msvc；python/powershell 必须在；`.3rd\wind-ui-rust-0.23.0` 缺失 = ERROR（本地 path 依赖，无下载步可修复）；解码器 workspace 缺失 = ERROR。`.3rd\usvg-0.48.1` 缺失 = ERROR（`Cargo.toml` 的 `[patch.crates-io]` 那一份，同样没有下载步可修复） | ERROR → exit 1 |
+| ① | `1_check_env.bat` | 只读工具链体检：cargo/rustc host 必须 msvc；python/powershell 必须在；`.3rd\wind-ui-rust-0.35.0` 缺失 = ERROR（本地 path 依赖，无下载步可修复）；解码器 workspace 缺失 = ERROR。`.3rd\usvg-0.48.1` 缺失 = ERROR（`Cargo.toml` 的 `[patch.crates-io]` 那一份，同样没有下载步可修复） | ERROR → exit 1 |
 | ② | `2_scan.bat` | **七道静态门禁**，按 `[1/7]`…`[7/7]` 逐道打点：`layering_scan.py`（五层方向 + 各层禁引 crate + decoders/extensions 禁互引）→ `hygiene_scan.py`（15 查，见下）→ `cargo fmt --check` → `cargo clippy --all-targets --release -- -D warnings` → `structure_gen.py --check`（结构文档的数字与符号索引必须等于 `src/` 现状）→ `dump_sym.py --selftest`（崩溃取证解析器自己的断言：发布名 → CodeView pdb 名、报告解析）→ **注释断链**（`cargo doc -D rustdoc::broken_intra_doc_links`，m282 补——前六道都只读代码、不读 doc comment，54 处断链因此长期无人发现）。违规即红。★ 三条判据的牙齿各在何处：fmt 与 clippy 要的是 exit 0，而 **clippy 不带 `-D warnings` 时有 warning 照样退 0**（那就是假绿，见 K69）；结构文档这一步只读，漂移的正解是 `--write` 重生成、**不是手改数字**（手工计数漂过一截，所以这七道里它是唯一由生成器写文档的门）；`dump_sym.py --selftest` 不需要符号归档与崩溃夹具，一秒内跑完，为的是"最后一环的工具不能只靠信任" | exit 1 |
 | ③ | `3_build_ext.bat` | 调解码器仓库自己的 `build.ps1`：**fmt 检查** + 编译 + 测试 + 发布 DLL 到 `<项目>\.temp\decoder-dist\`（并同步 `.build\decoders`）（格式或测试失败不发布） | exit 1 |
 | ④ | `4_build.bat` | `cd main` + `CARGO_INCREMENTAL=0` + `cargo build --release`；不拷贝任何东西 | exit 1 |
@@ -38,9 +38,9 @@ python build\release_pack.py --version 0.4.1
 
 | 产物 | 内容 |
 |---|---|
-| `RuPix_<ver>.zip` | `rupix.exe` / `LICENSE` / `THIRD-PARTY-NOTICES.md` / `README.txt` + `classic` / `common` / `modern` / `pro` / `raw` 5 枚 DLL，**每枚都带同版本 `<id>_<version>/` 许可文件夹** + `docs/decoders.json` / `plugins.json` / `MCP接入指南.md` |
+| `RuPix_<ver>.zip` | `rupix.exe` / `LICENSE` / `THIRD-PARTY-NOTICES.md` / `README.txt` + `classic` / `common` / `modern` / `pro` / `texture` 5 枚 DLL，**每枚都带同版本 `<id>_<version>/` 许可文件夹** + `docs/decoders.json` / `plugins.json` / `MCP接入指南.md` |
 
-- `doc`（PDF/PS/AI/DXF，约 26.7 MB）**不进包**；`texture` / `doc-legacy` 也不进。
+- `doc`（PDF/PS/AI/DXF，约 26.7 MB）**不进包**；`raw` / `doc-legacy` 也不进（2026-11-25 用户裁决：随包集合由 classic/common/modern/pro/raw 调整为含 texture 不含 raw）。
   三者都在设置页「解码器 → 可下载」按需安装，包里的 `docs/decoders.json` 已经列全。
 - 不带 `rupix.ini` / `recent.txt` / `reading.txt` / `cache/` / `temp/` / `plugins/` /
   样本图；也不带 `formats.md|json`——格式覆盖需要时跑 `rupix.exe --list-formats`。
@@ -80,7 +80,7 @@ python build/hygiene_scan.py  [--json|--selftest]   # 十三查，逐类见下�
 | 4 | `boundary_doc` | FFI 边界（`unsafe fn` / `extern "C" fn` / `#[no_mangle]`）上方没有紧邻注释 | 同上 |
 | 5 | `panic_source` | 生产区 `unwrap` / `expect` / `panic!` / `todo!`（`AGENTS.md` §八.1 红线；就地豁免要写 `红线豁免:`） | 同上 |
 | 6 | `config_last_mile` | 每个 ini 键既要有 **UI 入口**、也要有**行为读者**；`CONFIG_ONLY_KEYS` 登记者只豁免"入口" | `src/**` |
-| 7 | `patch_parity` | 第三方补丁两问：`patches/PATCHES.md`（windui 卷）的每个 `## 补丁 NN` 章节 ↔ `.3rd/wind-ui-rust-0.23.0` 里的 `★ RuPix 补丁 NN` 标记对得上。★ 覆盖面：本查只认 windui 这一卷，`patches/usvg-0.48.1/PATCHES.md` 不在它的扫描范围里；"归档 ↔ 工作副本逐字节"那一格由集成门禁 j13 守 | `main/patches/PATCHES.md` + `.3rd/wind-ui-rust-0.23.0` |
+| 7 | `patch_parity` | 第三方补丁两问：`patches/PATCHES.md`（windui 卷）的每个 `## 补丁 NN` 章节 ↔ `.3rd/wind-ui-rust-0.35.0` 里的 `★ RuPix 补丁 NN` 标记对得上。★ 覆盖面：本查只认 windui 这一卷，`patches/usvg-0.48.1/PATCHES.md` 不在它的扫描范围里；"归档 ↔ 工作副本逐字节"那一格由集成门禁 j13 守 | `main/patches/PATCHES.md` + `.3rd/wind-ui-rust-0.35.0` |
 | 8 | `control_char` | 文本里的不可见控制字符（只放行 09/0a/0d）——脚本改文件时反斜杠转义会吃掉一个字母，锚点静默损坏 | `main/**` 的第一方文本 |
 | 9 | `ps1_ascii` | `.ps1` 必须纯 ASCII（PowerShell 5.1 按 ANSI 读无 BOM 文件，中文注释会坏到邻近语句上，K27） | `main/**/*.ps1` |
 | 10 | `literal_color` | 字面色值 `Color::rgb(` / `Color::rgba(` 只许出现在 `ui/tokens.rs` | `src/ui/**` |

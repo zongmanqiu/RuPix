@@ -65,7 +65,7 @@ fn content(latest: &str, notes: &str, plan: Plan) -> Element {
         .multiline()
         .wrap(true)
         // 无框线、聚焦也不变色；可拖选复制，也可以顺手改两笔（只留在本窗）。
-        .frameless_input()
+        .frameless()
         // 视图起点钉在 0：否则光标（默认在末尾）会把可视区滚到最后几行。
         .select_range(0, 0)
         .font_size(SIZE_BODY)

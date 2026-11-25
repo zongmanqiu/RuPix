@@ -1072,10 +1072,11 @@ mod tests {
 
     /// ★ 用户报「拖动时不实时变、松手才变」的根因判据。
     ///
-    /// 框架 Slider 在 Move 里**确实**写了值（所以不是控件坏了），但 `call_on_event`
-    /// 把 Move 期间的 Signal::set 降级成「本控件局部脏区」⇒ 派生数值标签、另一个
+    /// 0.23 的根因：框架 Slider 在 Move 里**确实**写了值，但 `call_on_event` 把
+    /// Move 期间的 Signal::set 降级成「本控件局部脏区」⇒ 派生数值标签、另一个
     /// 窗口都不在那一格里，只有 Down/Up 的 Layout 级失效才让它们一起刷。
-    /// 这里用真 Tree + 真指针事件把「值」和「失效强度」分别量出来。
+    /// 0.35 已修复：裸滑块 Move 也升整窗失效（`DamageReq::Full`），根因消除。
+    /// 这里用真 Tree + 真指针事件把「值」和「失效强度」分别量出来，钉住修复不回退。
     #[test]
     fn live_slider_changes_on_move_and_escalates_to_a_full_repaint() {
         use windui::core::{DamageReq, NodeId, Tree};
@@ -1115,7 +1116,8 @@ mod tests {
             (value.get(), res.damage)
         }
 
-        // 对照组：裸框架滑块。值跟着 Move 变了，但脏区只有自己那一格。
+        // 对照组：裸框架滑块。0.35 已把 Move 的 Signal::set 升为整窗失效
+        // （0.23 的「局部脏区 ⇒ 派生标签不刷」根因已消除），这里钉住它不再回退。
         let plain = signal(0.0f32);
         let tree_plain = windui::ui::Element::col()
             .width(200)
@@ -1123,9 +1125,10 @@ mod tests {
             .child(windui::ui::Element::slider(plain).width(100));
         let (plain_value, plain_damage) = drive(tree_plain, plain);
         assert!(plain_value < 0.3, "裸滑块的 Move 也应该改值：{plain_value}");
-        assert!(
-            matches!(plain_damage, DamageReq::Rect(_)),
-            "裸滑块 Move 只有局部脏区，正是「松手才变」的根因：{plain_damage:?}"
+        assert_eq!(
+            plain_damage,
+            DamageReq::Full,
+            "0.35 裸滑块 Move 应升整窗（0.23 局部脏区根因已消除）：{plain_damage:?}"
         );
 
         // 包装组：值一样实时，脏区升整窗，派生数字与看图窗同帧刷新。

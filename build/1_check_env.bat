@@ -90,10 +90,10 @@ if exist "%PS_EXE%" (
 )
 
 REM ---- third-party path dependency (hard error: nothing repairs it) ---------
-if exist "%PROJECT_ROOT%\.3rd\wind-ui-rust-0.23.0\Cargo.toml" (
-    echo   [OK] .3rd\wind-ui-rust-0.23.0
+if exist "%PROJECT_ROOT%\.3rd\wind-ui-rust-0.35.0\Cargo.toml" (
+    echo   [OK] .3rd\wind-ui-rust-0.35.0
 ) else (
-    echo   [ERROR] missing .3rd\wind-ui-rust-0.23.0 - main\Cargo.toml path
+    echo   [ERROR] missing .3rd\wind-ui-rust-0.35.0 - main\Cargo.toml path
     echo           dependency cannot resolve; restore it from a snapshot
     set "ENV_FAIL=1"
 )

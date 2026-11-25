@@ -6,6 +6,17 @@
 use super::transform::*;
 use super::*;
 
+/// m349 T4：解码侧的**在飞**预算与这里的**驻留**预算必须是同一个数——
+/// 两本账相加才是预读+缩略图的真实内存峰值，两边各自漂移就等于没有峰值上界。
+#[test]
+fn bg_inflight_budget_matches_prefetch_resident_budget() {
+    assert_eq!(
+        crate::core::decode::BG_INFLIGHT_BYTES,
+        PREFETCH_BYTES as u64,
+        "两个 256 MiB 必须同源：改一处必改另一处"
+    );
+}
+
 /// 显示 ↔ 图像的矩形映射在全部 rot/flip 组合下必须互逆。
 ///
 /// 这是 SVG 可视区域渲染的坐标基石：请求用的逆映射和绘制用的正映射只要错开

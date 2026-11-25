@@ -20,13 +20,13 @@
 
 | 项 | 实读值 |
 |---|---|
-| 依赖声明 | `windui = { path = "../.3rd/wind-ui-rust-0.23.0", version = "0.23.0", default-features = false, features = ["svg", "svg-text", "d2d"] }`（`main/Cargo.toml`） |
-| 位置 | 仓库根 `.3rd/wind-ui-rust-0.23.0`（**不在 `main/` 内**，禁止把 `main/` 文件复制进去，反向也不允许） |
-| name / version | `windui` / `0.23.0`（实读 `.3rd/wind-ui-rust-0.23.0/Cargo.toml`） |
-| **许可证** | **`MIT OR Apache-2.0`**（[实读字段] `.3rd/wind-ui-rust-0.23.0/Cargo.toml` 的 `license` 行） |
-| 许可文件 | **`LICENSE-MIT` 与 `LICENSE-APACHE` 两份原文均在** `.3rd/wind-ui-rust-0.23.0/` 目录内（实读目录清单）——无需标注「许可证文件未见」 |
+| 依赖声明 | `windui = { path = "../.3rd/wind-ui-rust-0.35.0", version = "0.35.0", default-features = false, features = ["svg", "svg-text", "d2d"] }`（`main/Cargo.toml`） |
+| 位置 | 仓库根 `.3rd/wind-ui-rust-0.35.0`（**不在 `main/` 内**，禁止把 `main/` 文件复制进去，反向也不允许） |
+| name / version | `windui` / `0.35.0`（实读 `.3rd/wind-ui-rust-0.35.0/Cargo.toml`） |
+| **许可证** | **`MIT OR Apache-2.0`**（[实读字段] `.3rd/wind-ui-rust-0.35.0/Cargo.toml` 的 `license` 行） |
+| 许可文件 | **`LICENSE-MIT` 与 `LICENSE-APACHE` 两份原文均在** `.3rd/wind-ui-rust-0.35.0/` 目录内（实读目录清单）——无需标注「许可证文件未见」 |
 | 上游 | `repository = "https://github.com/huanfeng/wind-ui-rust"`（[实读字段]），作者 `huanfeng <huanfengf@gmail.com>` |
-| 本地修改 | **已落补丁多枚，份数与逐枚说明以 [`patches/PATCHES.md`](patches/PATCHES.md) 的章节为准**（登记正本在那里，本行不抄第二份；01/03/04/05/06 于 2026-10-13 在 0.23.0 上重放，02/07 已被 0.23.0 上游收编）：修改后完整文件归档于 `main/patches/wind-ui-rust-0.23.0/`，机制与生命周期见 `patches/README.md`；今后任何修改仍须按该生命周期登记 |
+| 本地修改 | **已落补丁多枚，份数与逐枚说明以 [`patches/PATCHES.md`](patches/PATCHES.md) 的章节为准**（登记正本在那里，本行不抄第二份；0.23.0→0.35.0 迁移于 2026-11-25 完成，02/05/07/08/10/014/019/027/030 被 0.35 上游收编，余重放）：修改后完整文件归档于 `main/patches/wind-ui-rust-0.35.0/`，机制与生命周期见 `patches/README.md`；今后任何修改仍须按该生命周期登记 |
 
 > **「OR」的含义**：`MIT OR Apache-2.0` 是 SPDX 许可表达式，作者同时按两个许可证授权，使用者任选其一满足即可；
 > 不得自行删改成单一许可证。windui 由 path 依赖编进 `rupix.exe`，其许可义务随二进制分发。
@@ -62,7 +62,7 @@
 
 | 组件 | 声明 | 版本（lock） | 许可证 | 用途 |
 |---|---|---|---|---|
-| `windui` | path `../.3rd/wind-ui-rust-0.23.0` | 0.23.0 | MIT OR Apache-2.0 [实读字段] | UI 框架（详见第一节） |
+| `windui` | path `../.3rd/wind-ui-rust-0.35.0` | 0.35.0 | MIT OR Apache-2.0 [实读字段] | UI 框架（详见第一节） |
 | `rupix-abi` | path `vendor/rupix-abi`（上游 `RuPix-Decoder/abi` 的逐字节快照） | 0.5.0 | AGPL-3.0 [实读字段] | 解码器 ABI 契约；真源在解码器仓库，宿主用快照以便独立构建 |
 | `log` | `0.4` | 0.4.34 | MIT OR Apache-2.0 [实测] | 日志门面 |
 | `env_logger` | `0.11`，`default-features=false`，仅 `auto-color` | 0.11.11 | MIT OR Apache-2.0 [实测] | 日志输出 |

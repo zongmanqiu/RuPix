@@ -1,11 +1,17 @@
-//! 后台解码调度：**一个解码线程 + 世代令牌**。
+//! 后台解码调度：**主 lane 一条线程 + 可选后台 lane + 世代令牌**。
 //!
 //! 为什么解码必须离开 UI 线程：一张 4000×3000 的 JPEG 全解是几十毫秒级，同步做在
 //! 按键回调里会直接卡住翻页手感；而在看图器里翻页是最频繁的动作。
 //!
-//! 为什么只用一个线程：
-//! - 解码本身是单张串行的，多线程只在"批量生成缩略图"时才有收益，而我们一次只显示一张；
-//! - 多个线程会让「世代令牌」退化成多令牌，错序判定的复杂度白白翻倍。
+//! 为什么分 lane（m349，2026-11-25 T0 基线实测后动工）：
+//! - 主画面（Main）独占一条 lane。三类请求共用一条线程时，缩略图条 7.0 s 的填充
+//!   期间主图只能排队；idle 臂（一窗翻页、另一窗闲着预读）把用户翻页挡出
+//!   wait p95 189 ms，探针 C5 队列上界判定 FAIL——"异步"救不了"串行"。
+//! - Prefetch / Thumb 各有独立 lane，由 ini 隐藏键 `decode_prefetch_workers` /
+//!   `decode_thumb_workers` 控制（≥2 才起独立 lane；**0/1 = 与主图共线程的旧行为**，
+//!   一键逐字节回退）。每条 lane 自己的队列 + N 个「监督者 + 私有后端 worker」对，
+//!   挂死恢复（单笔超时 / 熔断 / 换 worker）按对独立生效，互不牵连。
+//! - 并发槽位与在飞字节预算（256 MiB 只记 background）在 T4 落地；本步只拆车道。
 //!
 //! 世代令牌（`seq`）的作用：**丢弃过期结果**。连按右方向键时，前几张的解码结果会在
 //! 用户已经翻过去之后才回来；没有令牌的话，旧图会把新图盖掉，表现为"翻页后画面跳回去"。
@@ -17,17 +23,17 @@
 //! 缩略图另有自己的作废判据：不在当前条上可见窗口里的 `Thumb` 出队即作废（见
 //! `ThumbView`），因为它和主画面的新旧无关，只和"这一格还在不在屏上"有关。
 //!
-//! 取队顺序：`Main` → `Prefetch` → `Thumb`（[`Queue::pop`]）。令牌只作废"还没开始解"
-//! 的过期请求，拦不住"排在前面那张正在解"，所以缩放重解必须能越过队首的缩略图与
-//! 预读——否则用户放大后要等一整排后台解码才拿到清晰图（2026-10-17 大图实测
-//! 0.37s → 1.98s）。预读排在缩略图之前（BROWSE-24）：用户刚翻过去的那一张比
-//! 条上还没填的格子更值钱，而且预读在途至多一枚，不会饿死缩略图。
+//! 取队顺序：回退模式（后台 lane 关闭）下同一队列保持 `Main` → `Prefetch` → `Thumb`
+//! （[`Queue::pop`]）；独立 lane 内各自 FIFO，优先级语义由"谁在哪条 lane"表达。
+//! 令牌只作废"还没开始解"的过期请求，拦不住"排在前面那张正在解"——插队语义在
+//! 回退模式下仍由 [`Queue::pop`] 承担。预读排在缩略图之前（BROWSE-24）：用户刚翻过去
+//! 的那一张比条上还没填的格子更值钱；预读在途至多一枚，不会饿死缩略图。
 
-use std::cell::Cell;
-use std::collections::{HashSet, VecDeque};
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender as StdSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -102,7 +108,7 @@ fn scaled_of(req: &Req) -> bool {
 /// 过期判定（seq 小于 `main_floor` 即作废），只有 `Main` 会推 `main_floor`。
 /// `Thumb` 与主画面解耦，**但**有自己的取消判据：不在条上可见窗口里的请求出队即作废
 /// （`ThumbView`）——主画面翻页不会整批作废缩略图，用户滚过去的那一格却该停。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReqKind {
     /// 主画面：用户当前看的那张（含 tick 的缩放/平移重解）。推 main_floor。
     Main,
@@ -147,7 +153,7 @@ pub fn is_raw_ext(ext: &str) -> bool {
 ///
 /// 定义在 core：`Config` 要记住「上次使用值」（跨会话），解码器层只消费不定义——
 /// 存储方永远不该依赖解码实现的类型布局。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RawParams {
     pub width: u32,
     pub height: u32,
@@ -460,7 +466,12 @@ pub struct DecodeSink {
 
 thread_local! {
     /// 本解码线程的回程（`decode_loop` 在进循环前装入）。非解码线程恒为 `None`。
-    static SINK: std::cell::RefCell<Option<DecodeSink>> = const { std::cell::RefCell::new(None) };
+    ///
+    /// ★ m349：一条 lane 可以有多个监督者（`decode_prefetch_workers`/`decode_thumb_workers`
+    ///   ≥2 时），它们共享同一扇窗的回程，所以装的是 `Arc<DecodeSink>`——`wake` 那半
+    ///   仍只归监督者线程，`meta` 那半随后转交给 worker。
+    static SINK: std::cell::RefCell<Option<std::sync::Arc<DecodeSink>>> =
+        const { std::cell::RefCell::new(None) };
     /// 本**解码 worker** 线程的 Meta 通道（2026-11-04）。
     ///
     /// Meta 是解码线程自己发的（`publish_meta_from_current_req` 在 `iv_render` 的查询
@@ -717,9 +728,97 @@ impl Queue {
 /// （窗口关掉时按 owner 一次销账，见 `decode_watchdog::forget_owner`）。
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 
+/// 一扇窗的三条车道（m349 T1）。
+///
+/// - `main`：常设。**回退模式**下它同时收三类请求（旧行为：一条线程、优先级插队）。
+/// - `prefetch` / `thumb`：对应隐藏键 ≥2 时才有 `Some`；请求按 [`ReqKind`] 路由进
+///   独立队列，与主图并行。
+/// - 三条 lane 共用同一份回程（`Done` 通道 + `DecodeSink`）与同一套令牌账
+///   （`main_floor` / `ThumbView` / 看门狗）——拆的是**车道**，不是**取消语义**。
+struct Lanes {
+    main: Arc<Queue>,
+    prefetch: Option<Arc<Queue>>,
+    thumb: Option<Arc<Queue>>,
+}
+
+impl Lanes {
+    /// 按请求类别选车道。lane 关闭（键 0/1）时回落主队列——旧行为。
+    fn queue_for(&self, kind: ReqKind) -> &Arc<Queue> {
+        match kind {
+            ReqKind::Main => &self.main,
+            ReqKind::Prefetch => self.prefetch.as_ref().unwrap_or(&self.main),
+            ReqKind::Thumb => self.thumb.as_ref().unwrap_or(&self.main),
+        }
+    }
+
+    /// 全部车道（`Decoder` 释放时逐条清账）。
+    fn all(&self) -> Vec<Arc<Queue>> {
+        let mut v = vec![self.main.clone()];
+        if let Some(q) = &self.prefetch {
+            v.push(q.clone());
+        }
+        if let Some(q) = &self.thumb {
+            v.push(q.clone());
+        }
+        v
+    }
+}
+
+/// 按 [`lane_workers`] 的当前值建车道。独立 lane 的判据是 `≥2`（0/1 = 共线程旧行为）。
+fn build_lanes() -> Lanes {
+    let main = Arc::new(Queue::new());
+    let prefetch = (PREFETCH_WORKERS.load(Ordering::Relaxed) >= 2).then(|| Arc::new(Queue::new()));
+    let thumb = (THUMB_WORKERS.load(Ordering::Relaxed) >= 2).then(|| Arc::new(Queue::new()));
+    Lanes {
+        main,
+        prefetch,
+        thumb,
+    }
+}
+
+/// 起一条 lane 的 `count` 个「监督者 + 私有后端 worker」对。
+///
+/// 每个监督者独立 [`Worker::spawn`]：**挂死恢复按对独立生效**——一个 worker 超时熔断，
+/// 同 lane 的其它对继续服务（与多窗口之间的隔离同一机制，2026-11-04）。
+#[allow(clippy::too_many_arguments)] // 8 参 = 一条车道的完整接线（命名×2 + 队列/条数/回执/地板/视图/汇），成结构体反而添一层
+fn spawn_supervisors(
+    supervisor_name: &str,
+    worker_name: &'static str,
+    q: Arc<Queue>,
+    count: usize,
+    done_tx: &StdSender<Done>,
+    main_floor: &Arc<AtomicU64>,
+    thumb_view: &Arc<ThumbView>,
+    sink: Option<std::sync::Arc<DecodeSink>>,
+) {
+    for i in 0..count {
+        let name = if count > 1 {
+            format!("{supervisor_name}{i}")
+        } else {
+            supervisor_name.to_string()
+        };
+        let q = q.clone();
+        let done_tx = done_tx.clone();
+        let main_floor = main_floor.clone();
+        let thumb_view = thumb_view.clone();
+        let sink = sink.clone();
+        thread::Builder::new()
+            .name(name)
+            .spawn(move || decode_loop(q, done_tx, main_floor, thumb_view, sink, worker_name))
+            // 红线豁免: 起线程失败 = 系统资源耗尽（OOM 级），没有可降级的第二种活法——
+            // 发送端还在只会让请求无限排队、图永远出不来，就地失败反而留下崩溃报告（§八.1 第三类例外）。
+            .unwrap_or_else(|e| panic!("启动解码线程失败：{e}"));
+    }
+}
+
+/// 后台请求的**同窗去重键**（m349 T4）：同文件、同目标框、同帧/页、同裸参数的
+/// Prefetch/Thumb 是同一份像素，解两遍纯属浪费。region 不进键：区域请求只服务
+/// 主画面/矢量的可视重渲（倍率每次都可能变），不在去重范围。
+type BgKey = (ReqKind, PathBuf, u32, u32, u32, Option<RawParams>);
+
 /// 解码器句柄（UI 线程侧）。廉价可克隆，放进 `Rc` 共享。
 pub struct Decoder {
-    queue: Arc<Queue>,
+    lanes: Lanes,
     /// 本句柄（= 本窗口）在看门狗账上的编号。
     owner: u64,
     next_seq: Cell<u64>,
@@ -729,14 +828,31 @@ pub struct Decoder {
     main_floor: Arc<AtomicU64>,
     /// 缩略图条当前可见且缺图的路径集（BROWSE-24）。`Thumb` 出队时不在其中即作废。
     thumb_view: Arc<ThumbView>,
+    /// 回程发送端的克隆（m349 T4）：重复请求 / 超预算不派发时的**就地理赔**要往
+    /// 同一条回程补一个取消哨兵回包，否则调用方的账（`prefetch_seq` / 缩略图
+    /// `inflight`）永远等不到销账。`Decoder` 活在 UI 线程的 `Rc` 里，RefCell 足够。
+    done_tx: RefCell<Option<StdSender<Done>>>,
+    /// 后台在飞账：seq → 预留字节。只有 Prefetch/Thumb 进账；主图不记账
+    /// （2026-11-25 裁决：预算满时撤销未开始 background，而不是掐主图）。
+    inflight_bg: RefCell<HashMap<u64, u64>>,
+    /// 在飞后台字节合计（对 [`BG_INFLIGHT_BYTES`] 比对）。
+    inflight_bytes: Cell<u64>,
+    /// 在飞 / 排队中的后台请求键 → 领队 seq（同窗去重，m349 T4）。
+    bg_keys: RefCell<HashMap<BgKey, u64>>,
 }
 
 impl Drop for Decoder {
     /// 句柄没了 = 不会再有人发请求，让解码线程从 `wait` 上醒来自收（否则它永远
     /// 挂着，线程与队列成进程内的僵尸）。**未开始的那几条一并丢掉**：窗口都关了，
     /// 解完也没人收，而同格式的其它窗口还要陪它们排队（m230 S3 实测）。
+    ///
+    /// ★ m349：三条 lane 每条都清——后台 lane 里的缩略图/预读同样没人收，
+    ///   漏一条就是"关窗后同格式其它窗口陪跑"的翻版。
     fn drop(&mut self) {
-        let dropped = self.queue.discard_pending();
+        let mut dropped = 0;
+        for q in self.lanes.all() {
+            dropped += q.discard_pending();
+        }
         // 还挂在账上的只剩**正在解的那一笔**：它的结果发给一个已经关掉的通道，没人
         // 收得着 `note_done`，所以按窗口销账（m232）。不摘它，看门狗 10 s 后就为一张
         // "窗口都关了的图"报警——纯噪声最坏的后果是教人学会忽略真告警。
@@ -761,34 +877,62 @@ impl Decoder {
     ///
     /// 每个看图窗口一条线程、一份回程（★ 多窗口，2026-11-04）。不带 sink 的旧入口照旧
     /// 可用：Meta 与唤醒落到进程级兜底槽，行为与单窗口时代一致。
+    ///
+    /// ★ m349：起的是**最多三条 lane**——主 lane 恒 1 个监督者；prefetch / thumb lane
+    ///   按隐藏键 ≥2 时各起 N 个。全部共享 `done_tx` 与回程；`sink` 改为 `Arc`
+    ///   共享（`DecodeSink` 本体不可克隆，`wake` 只归监督者线程）。
     pub fn spawn_with_sink(done_tx: StdSender<Done>, sink: Option<DecodeSink>) -> Self {
-        let queue = Arc::new(Queue::new());
+        let lanes = build_lanes();
         let main_floor = Arc::new(AtomicU64::new(0));
-        let floor_for_thread = main_floor.clone();
-        let q_for_thread = queue.clone();
         let thumb_view = Arc::new(ThumbView::default());
-        let view_for_thread = thumb_view.clone();
-        thread::Builder::new()
-            .name("sv-decode".into())
-            .spawn(move || {
-                decode_loop(
-                    q_for_thread,
-                    done_tx,
-                    floor_for_thread,
-                    view_for_thread,
-                    sink,
-                )
-            })
-            // 红线豁免: 起线程失败 = 系统资源耗尽（OOM 级），没有可降级的第二种活法——
-            // 发送端还在只会让请求无限排队、图永远出不来，那才是真的装死；就地失败反而
-            // 留下崩溃报告。这是 §八.1 的第三类例外，必须像这样写在违规行上方点名。
-            .unwrap_or_else(|e| panic!("启动解码线程失败：{e}"));
+        let sink = sink.map(std::sync::Arc::new);
+        // 主 lane：恒 1 个监督者。回退模式下它是唯一的车道（三类请求都走它）。
+        spawn_supervisors(
+            "sv-decode",
+            "sv-decode-w",
+            lanes.main.clone(),
+            1,
+            &done_tx,
+            &main_floor,
+            &thumb_view,
+            sink.clone(),
+        );
+        if let Some(q) = lanes.prefetch.as_ref() {
+            let n = PREFETCH_WORKERS.load(Ordering::Relaxed).max(2) as usize;
+            spawn_supervisors(
+                "sv-decode-pf",
+                "sv-decode-pfw",
+                q.clone(),
+                n,
+                &done_tx,
+                &main_floor,
+                &thumb_view,
+                sink.clone(),
+            );
+        }
+        if let Some(q) = lanes.thumb.as_ref() {
+            let n = THUMB_WORKERS.load(Ordering::Relaxed).max(2) as usize;
+            spawn_supervisors(
+                "sv-decode-th",
+                "sv-decode-thw",
+                q.clone(),
+                n,
+                &done_tx,
+                &main_floor,
+                &thumb_view,
+                sink.clone(),
+            );
+        }
         Self {
-            queue,
+            lanes,
             owner: NEXT_OWNER.fetch_add(1, Ordering::Relaxed),
             next_seq: Cell::new(1),
             main_floor,
             thumb_view,
+            done_tx: RefCell::new(Some(done_tx)),
+            inflight_bg: RefCell::new(HashMap::new()),
+            inflight_bytes: Cell::new(0),
+            bg_keys: RefCell::new(HashMap::new()),
         }
     }
 
@@ -930,9 +1074,39 @@ impl Decoder {
         // 解耦，后者只是"给下一次翻页让路"，让位由 Main 推的 floor 决定。
         if req.kind == ReqKind::Main {
             self.main_floor.fetch_max(seq, Ordering::Relaxed);
+            // m349 T5：新主图清**未开始**的预读（§6.3）。缩略图不清——它的作废
+            // 判据是 ThumbView 可见集合，主图翻页不整批作废缩略图。
+            self.purge_queued_prefetch();
+        }
+        // m349 T4：后台去重 + 字节预算。主图不记账、不设闸（2026-11-25 裁决）。
+        if req.kind != ReqKind::Main {
+            let key: BgKey = (
+                req.kind,
+                path.clone(),
+                req.max_w,
+                req.max_h,
+                req.frame_index,
+                req.raw,
+            );
+            if self.bg_keys.borrow().contains_key(&key) {
+                // 同键已有人解/排：就地理赔（取消哨兵回包），不派发第二笔。
+                self.ack_cancelled(seq, &path, kind, "同键去重");
+                return seq;
+            }
+            let est = bg_est_bytes(req.max_w, req.max_h);
+            if self.inflight_bytes.get() + est > BG_INFLIGHT_BYTES {
+                self.ack_cancelled(seq, &path, kind, "在飞字节预算已满");
+                return seq;
+            }
+            self.inflight_bytes.set(self.inflight_bytes.get() + est);
+            self.inflight_bg.borrow_mut().insert(seq, est);
+            self.bg_keys.borrow_mut().insert(key, seq);
         }
         // 入队失败只可能是队列已关（`Decoder` 正在释放）：那时发出去也没人收。
-        if !self.queue.push(req) {
+        // m349：按请求类别路由——后台 lane 关闭时回落主队列（旧行为）。
+        if !self.lanes.queue_for(req.kind).push(req) {
+            // 刚记的后台账要撤：回包永远不会来，`note_done` 释放不到它。
+            self.release_bg(seq);
             log::warn!("解码线程已退出，请求被丢弃：{}", path.display());
         } else {
             // 看门狗登记（P1.1 C1）：这笔在途要等一个回包，回包不到就是"卡住了"的
@@ -940,6 +1114,76 @@ impl Decoder {
             crate::core::decode_watchdog::note_sent(seq, kind, &path, self.owner);
         }
         seq
+    }
+
+    /// 后台在飞账销一笔：字节退还、去重键摘除（都只在账上有时才动）。
+    fn release_bg(&self, seq: u64) {
+        if let Some(est) = self.inflight_bg.borrow_mut().remove(&seq) {
+            self.inflight_bytes
+                .set(self.inflight_bytes.get().saturating_sub(est));
+            self.bg_keys.borrow_mut().retain(|_, v| *v != seq);
+        }
+    }
+
+    /// 回包已被消费（`Viewer::apply` 入口调用）：释放该 seq 的后台在飞账。
+    /// 主图 seq 与未记账 seq 是 no-op。
+    pub fn note_done(&self, seq: u64) {
+        self.release_bg(seq);
+    }
+
+    /// 就地理赔：不发解码，直接往回程补一个**取消哨兵**回包（空判词 Err）。
+    /// 调用方的账照常销：`prefetch_seq` 清位、缩略图格子摘掉（下次可见重发）、
+    /// 看门狗不记这笔（没进过账）。
+    fn ack_cancelled(&self, seq: u64, path: &Path, kind: ReqKind, reason: &str) {
+        log::debug!(
+            "[decode-ack] kind={:?} file={} seq={} reason={} verdict=理赔",
+            kind,
+            path.file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            seq,
+            reason
+        );
+        self.ack_cancelled_raw(seq, path);
+    }
+
+    fn ack_cancelled_raw(&self, seq: u64, path: &Path) {
+        let done = Done {
+            seq,
+            path: path.to_path_buf(),
+            out: Err(crate::core::error::ViewFailure::other("")),
+        };
+        if let Some(tx) = self.done_tx.borrow().as_ref() {
+            let _ = tx.send(done);
+        }
+    }
+
+    /// 新主图清**未开始**的预读（m349 T5，qimgv/geeqie 的 tryTake 语义，§6.3）：
+    /// 只摘队列里还没人动的 Prefetch；**正在解的不打断**（强行打断会破坏 DLL
+    /// 全局态，调研 §四.4/§四.10 的口径）。摘掉的就地理赔 + 看门狗销账。
+    /// 缩略图不清——它的作废判据是 ThumbView，主图翻页不整批作废缩略图。
+    fn purge_queued_prefetch(&self) {
+        for q in self.lanes.all() {
+            let purged: Vec<Req> = {
+                let mut guard = q.pending.lock().unwrap_or_else(|e| e.into_inner());
+                let mut rest = VecDeque::new();
+                let mut out = Vec::new();
+                for r in guard.drain(..) {
+                    if r.kind == ReqKind::Prefetch {
+                        out.push(r);
+                    } else {
+                        rest.push_back(r);
+                    }
+                }
+                *guard = rest;
+                out
+            };
+            for r in purged {
+                crate::core::decode_watchdog::note_done(r.seq);
+                self.release_bg(r.seq);
+                self.ack_cancelled_raw(r.seq, &r.path);
+            }
+        }
     }
 }
 
@@ -991,6 +1235,10 @@ pub trait DecodeBackend: Send {
     /// "用户正等的那张"前面，实测能多等一整笔（26.7 MP ≈ 0.95 s）。
     ///
     /// 默认实现什么都不做：这条只有解码器层（有跨窗共享 DLL 的那层）需要关心。
+    ///
+    /// ★ m349 P2：解码器若在 `iv_caps` 里声明了 `CAP_PARALLEL`（内部状态每调用/
+    /// 每线程隔离或内部同步、且过了并发压力验收），宿主在 `decode_with` 里跳过
+    /// 那把串行锁——这条排队档位对它就不再有对象（并发豁免见 `decoders::decode`）。
     fn set_background(&mut self, _on: bool) {}
 
     /// 区域渲染（**ABI v6**）：把文档的**指定区域**按目标密度直接光栅化。
@@ -1218,6 +1466,58 @@ pub fn decode_timeout() -> Option<Duration> {
     }
 }
 
+// ── 后台 lane 拆分（m349 T1，2026-11-25）────────────────────────────
+//
+// ini 隐藏键（CONFIG_ONLY_KEYS，`core::config`）：`decode_prefetch_workers` /
+// `decode_thumb_workers`。语义（§6.4）：
+// - `≥2`：该类请求走**独立 lane**（自己的队列 + N 个「监督者 + 私有后端 worker」对），
+//   与主画面解码并行；主图 lane 永不处理 Prefetch/Thumb，反之亦然。
+// - `0/1`：该类请求与主图**共线程**——与 m349 之前的旧行为逐字节一致，是一键回退路径。
+// - 上限 4：桌面看图不是"每图一线程"，无上限池是调研 §4.2 明令不照搬的。
+//
+// 默认值：prefetch=2、thumb=1（先保守，T6 复测后再调）。与 `Config` 的默认值、
+// ini 模板三处同源——这里只有运行期正本，配置侧改动必须同步这三处。
+//
+// 为什么读静态量而不是每窗读 `Config`：`spawn_with_sink` 起在窗口创建路径上，读一次
+// 静态量即可；键是 ini-only（启动读一次），运行期不会变。
+static PREFETCH_WORKERS: AtomicU32 = AtomicU32::new(2);
+static THUMB_WORKERS: AtomicU32 = AtomicU32::new(1);
+
+/// 灌入两个后台 lane 的 worker 数（`runtime` 启动时按 ini 调一次）。
+///
+/// 上限夹到 4；`< 2` 时该 lane 不起独立线程（请求与主图共线程，旧行为）。
+pub fn set_lane_workers(prefetch: u32, thumb: u32) {
+    PREFETCH_WORKERS.store(prefetch.min(4), Ordering::Relaxed);
+    THUMB_WORKERS.store(thumb.min(4), Ordering::Relaxed);
+}
+
+/// 当前 lane worker 数（诊断日志与单测用）。
+pub fn lane_workers() -> (u32, u32) {
+    (
+        PREFETCH_WORKERS.load(Ordering::Relaxed),
+        THUMB_WORKERS.load(Ordering::Relaxed),
+    )
+}
+
+/// 后台（Prefetch/Thumb）**在飞字节**预算（m349 T4）。
+///
+/// 与 viewer 侧的预读**驻留**预算是两个账本、同一个数（256 MiB）：那份管"缓存里
+/// 躺着的位图"，这份管"正在解 / 排着队还没解"的请求按目标档估出的瞬时字节——
+/// 两条账相加才是预读+缩略图的真实内存峰值（§十风险表的第一条防线）。
+/// 数值正本在 `viewer::PREFETCH_BYTES`（viewer 依赖本模块，测试在那里钉相等；
+/// 改一处不改另一处会当场红）。
+pub(crate) const BG_INFLIGHT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// 一笔后台请求的**在飞字节估值**：目标档 × 4 B/像素；目标未定（0）按预算的
+/// 1/4 估（§6.2：未知原图尺寸时不许按 0 记账）。主图不记账（2026-11-25 裁决）。
+fn bg_est_bytes(max_w: u32, max_h: u32) -> u64 {
+    if max_w == 0 || max_h == 0 {
+        BG_INFLIGHT_BYTES / 4
+    } else {
+        max_w as u64 * max_h as u64 * 4
+    }
+}
+
 /// 上报"下一步要进哪个解码器"。由各解码入口在拿到 id 后立刻调。
 ///
 /// `seq` 取解码线程自己的 `CURRENT_SEQ`：探针/直调路径没有 UI 在等（seq=0），
@@ -1306,13 +1606,15 @@ struct Worker {
 }
 
 impl Worker {
-    fn spawn(meta: Option<StdSender<MetaEvent>>) -> Self {
+    /// `worker_name` 进线程名：`[dll-serial] th=` 记的就是它，探针分析靠它区分
+    /// 主图 lane 与后台 lane 的持锁区间（m349）。
+    fn spawn(meta: Option<StdSender<MetaEvent>>, worker_name: &'static str) -> Self {
         let (job_tx, job_rx) = channel::<Req>();
         let (res_tx, res_rx) = channel::<JobDone>();
         // 句柄直接丢掉 = detach：超时之后我们**不再等**这条线程（也没有可靠的取消
         // 原语），它的栈与后端随进程退出才回收。见类型文档的遗留代价。
         let _ = thread::Builder::new()
-            .name("sv-decode-w".into())
+            .name(worker_name.into())
             // 红线豁免: 起线程失败 = 资源耗尽（OOM 级），没有第二种活法——不解码只会让
             // 画面永远停在"载入中"，就地失败反而留下崩溃报告（与 `spawn_with` 同一条）。
             .spawn(move || worker_main(job_rx, res_tx, meta))
@@ -1395,7 +1697,8 @@ fn decode_loop(
     done_tx: StdSender<Done>,
     main_floor: Arc<AtomicU64>,
     thumb_view: Arc<ThumbView>,
-    sink: Option<DecodeSink>,
+    sink: Option<std::sync::Arc<DecodeSink>>,
+    worker_name: &'static str,
 ) {
     // 本线程的回程（Meta 通道 + 主画面唤醒）。装在线程局部而不是每次调用都查一遍
     // 全局注册表：这条线程只服务一个窗口，回程在它活着期间不变（★ 多窗口，2026-11-04）。
@@ -1405,7 +1708,7 @@ fn decode_loop(
     // 监督者**自己不解码**：所有 FFI 都在 worker 里跑，这样"挂死"才有地方可逃
     //（见 `Worker` 与模块内「挂死恢复」小节的说明）。
     let timeout = decode_timeout();
-    let mut worker = Worker::spawn(meta_tx.clone());
+    let mut worker = Worker::spawn(meta_tx.clone(), worker_name);
     // 取证开关与 `decoders` 侧的 `[decode-trace]` 同名同闸（`RUPIX_DECODE_TRACE=1`）。
     // 为什么单加这一行：`[decode-trace]` 只说"解了一次"，说不出**是谁发起的**——
     // 主画面 / 预读 / 缩略图三条路混在同一个文件名的多条读数里，翻页命中率这类
@@ -1470,7 +1773,7 @@ fn decode_loop(
                         timeout.map(|t| t.as_secs()).unwrap_or(0),
                         current_phase()
                     );
-                    worker = Worker::spawn(meta_tx.clone());
+                    worker = Worker::spawn(meta_tx.clone(), worker_name);
                     Err(crate::core::error::ViewFailure::decode(hang_error(
                         &req,
                         hung.as_deref(),
@@ -1741,47 +2044,70 @@ pub fn probe_scaled_frame(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::cell::RefCell;
     use std::sync::mpsc::channel;
 
     use super::*;
 
     /// 测试专用：一条**不跑解码线程**的 `Decoder`，让别的模块能稳定读到入队的请求。
     /// 生产路径仍只有 `spawn_with` 一条真线程，这里只是同一个结构体的裸构造，
-    /// 不存在第二套发送行为。
+    /// 不存在第二套发送行为。车道结构与生产一致（`build_lanes` 读同一组静态量）。
     pub(crate) fn stub_decoder() -> Decoder {
         Decoder {
-            queue: Arc::new(Queue::new()),
+            lanes: build_lanes(),
             owner: NEXT_OWNER.fetch_add(1, Ordering::Relaxed),
             next_seq: Cell::new(1),
             main_floor: Arc::new(AtomicU64::new(0)),
             thumb_view: Arc::new(ThumbView::default()),
+            done_tx: RefCell::new(None),
+            inflight_bg: RefCell::new(HashMap::new()),
+            inflight_bytes: Cell::new(0),
+            bg_keys: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// 同 [`stub_decoder`]，但带上回程接收端：去重 / 预算 / 清预读的**就地理赔**
+    /// 测试要从这里收取消哨兵回包（m349 T4/T5）。
+    pub(crate) fn stub_decoder_with_tx(tx: StdSender<Done>) -> Decoder {
+        let d = stub_decoder();
+        *d.done_tx.borrow_mut() = Some(tx);
+        d
     }
 
     /// 队列快照（路径 / 裸数据参数 / 请求种类 / 目标框）：缩略图那侧靠它验「走的是哪条通道」，
     /// 而不是靠 `inflight.len()` 这种两种写法都绿的间接量。
+    /// ★ m349：聚合三条 lane，顺序 = 主 → 预读 → 缩略图；同 lane 内保持入队顺序。
     pub(crate) fn pending_reqs(
         d: &Decoder,
     ) -> Vec<(PathBuf, Option<RawParams>, ReqKind, u32, u32)> {
-        d.queue
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|r| (r.path.clone(), r.raw, r.kind, r.max_w, r.max_h))
-            .collect()
+        let mut out = Vec::new();
+        for q in d.lanes.all() {
+            out.extend(
+                q.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .map(|r| (r.path.clone(), r.raw, r.kind, r.max_w, r.max_h)),
+            );
+        }
+        out
     }
 
     /// 取走并清空队列里所有还没开始的请求（测试用）。stub decoder 没有 worker，
     /// 队列不会自己动；要把“滚动中”和“停手后”的新请求分开数，只能每段先清账。
+    /// ★ m349：三条 lane 一起清。
     pub(crate) fn drain_pending(d: &Decoder) -> Vec<(PathBuf, ReqKind)> {
-        d.queue
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain(..)
-            .map(|r| (r.path, r.kind))
-            .collect()
+        let mut out = Vec::new();
+        for q in d.lanes.all() {
+            out.extend(
+                q.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .drain(..)
+                    .map(|r| (r.path, r.kind)),
+            );
+        }
+        out
     }
 
     /// ★ 负向验证：有文件头的图不进裸数据通道，也不许被反推宽高。
@@ -1993,6 +2319,318 @@ pub(crate) mod tests {
         );
     }
 
+    // ── m349 T1：后台 lane 拆分 ─────────────────────────────
+
+    /// 测试后端：缩略图请求睡 `LANE_TEST_THUMB_DELAY_MS`（模拟"缩略图占着唯一解码线程"），
+    /// 其余请求立即失败（非空文案，同"后端未安装"时代的旧约定：空串 = 被作废）。
+    ///
+    /// 工厂只装一次（`install_backend_factory` 是 OnceLock）；装上之后，本测试**之后**
+    /// 运行的用例里凡是真解码都拿到这枚后端——它们的判据都是"非空 Err"或不看错误，
+    /// 不受影响（逐用例核对过：decode.rs 测试模块内无文案断言，thumbs/viewer 侧的
+    /// 真解码断言同样只看 Err 本身）。
+    struct LaneTestBackend;
+    impl DecodeBackend for LaneTestBackend {
+        fn decode(
+            &mut self,
+            path: &Path,
+            _ext: &str,
+            _max_w: u32,
+            _max_h: u32,
+            _frame_index: u32,
+            _raw: Option<RawParams>,
+            _allow_scaled: bool,
+            thumbnail: bool,
+        ) -> Result<Decoded, crate::core::error::ViewFailure> {
+            if thumbnail {
+                let ms = LANE_TEST_THUMB_DELAY_MS.load(Ordering::Relaxed);
+                if ms > 0 {
+                    thread::sleep(Duration::from_millis(ms as u64));
+                }
+            }
+            Err(crate::core::error::ViewFailure::decode(format!(
+                "lane-test-backend {}",
+                path.display()
+            )))
+        }
+    }
+
+    static LANE_TEST_THUMB_DELAY_MS: AtomicU32 = AtomicU32::new(0);
+
+    /// 装 lane 测试后端（幂等）。返回前不覆盖别人的工厂——OnceLock 首装即定。
+    fn ensure_lane_test_backend() {
+        install_backend_factory(|| -> Box<dyn DecodeBackend> { Box::new(LaneTestBackend) });
+    }
+
+    /// 车道路由：独立 lane 开启时三类请求各回各的队列；**0/1 回退时全部落主队列**
+    /// （与 m349 之前的旧行为逐字节一致——这条是 T1 的回归钉子）。
+    #[test]
+    fn lanes_route_by_kind_and_fallback_shares_the_main_queue() {
+        let saved = lane_workers();
+        set_lane_workers(2, 2);
+        let d = stub_decoder();
+        assert!(
+            d.lanes.prefetch.is_some() && d.lanes.thumb.is_some(),
+            "≥2 应起独立车道"
+        );
+        d.send(req(1, ReqKind::Main));
+        d.send(req(2, ReqKind::Prefetch));
+        d.send(req(3, ReqKind::Thumb));
+        let in_main: Vec<u64> = d
+            .lanes
+            .main
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.seq)
+            .collect();
+        let in_pf: Vec<u64> = d
+            .lanes
+            .prefetch
+            .as_ref()
+            .unwrap()
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.seq)
+            .collect();
+        let in_th: Vec<u64> = d
+            .lanes
+            .thumb
+            .as_ref()
+            .unwrap()
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.seq)
+            .collect();
+        assert_eq!(in_main, vec![1], "Main 永远走主车道");
+        assert_eq!(in_pf, vec![2], "Prefetch 走独立车道");
+        assert_eq!(in_th, vec![3], "Thumb 走独立车道");
+
+        // 回退：0/1 = 与主图共线程的旧行为（T1 验收判据的静态面）。
+        set_lane_workers(0, 0);
+        let d2 = stub_decoder();
+        assert!(
+            d2.lanes.prefetch.is_none() && d2.lanes.thumb.is_none(),
+            "0/1 不该起独立车道"
+        );
+        d2.send(req(4, ReqKind::Main));
+        d2.send(req(5, ReqKind::Prefetch));
+        d2.send(req(6, ReqKind::Thumb));
+        let all: Vec<u64> = d2
+            .lanes
+            .main
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.seq)
+            .collect();
+        assert_eq!(all, vec![4, 5, 6], "回退时三类请求全落主队列（旧行为）");
+        set_lane_workers(saved.0, saved.1);
+    }
+
+    /// worker 数上限：手改 ini 的天文数字不许变成天文数字条线程。
+    #[test]
+    fn lane_workers_clamp_to_four() {
+        let saved = lane_workers();
+        set_lane_workers(9, 9);
+        assert_eq!(lane_workers(), (4, 4));
+        set_lane_workers(0, 0);
+        assert_eq!(lane_workers(), (0, 0));
+        set_lane_workers(saved.0, saved.1);
+    }
+
+    /// 关窗销账覆盖**三条 lane**：后台 lane 里的请求同样没人收，漏一条就是
+    /// "关窗后同格式其它窗口陪跑"的翻版（m230 S3 的车道版）。
+    #[test]
+    fn discarding_the_decoder_drops_every_lane() {
+        let saved = lane_workers();
+        set_lane_workers(2, 2);
+        let before = crate::core::decode_watchdog::pending_count();
+        let d = stub_decoder();
+        d.send(req(1, ReqKind::Main));
+        d.send(req(2, ReqKind::Prefetch));
+        d.send(req(3, ReqKind::Thumb));
+        assert_eq!(
+            crate::core::decode_watchdog::pending_count(),
+            before + 3,
+            "三笔都要进看门狗账"
+        );
+        drop(d);
+        assert_eq!(
+            crate::core::decode_watchdog::pending_count(),
+            before,
+            "三条 lane 的未开始请求都要随句柄销账"
+        );
+        set_lane_workers(saved.0, saved.1);
+    }
+
+    /// T1 的**行为钉子**：缩略图车道忙（真睡 500 ms）时，主图请求不等它——
+    /// 这正是 T0 基线量出的痛点（单窗 107 笔全串行、缩略图条 7 s 填充期间主图排队）。
+    ///
+    /// 需要真文件（`decode_one` 在路由**之前**就 stat）：进得了后端才谈得上占线程。
+    #[test]
+    fn thumb_lane_busy_does_not_block_the_main_lane() {
+        ensure_lane_test_backend();
+        let saved = lane_workers();
+        set_lane_workers(2, 2); // thumb 独立车道（默认 1 = 共线程，那条路走旧行为）
+        LANE_TEST_THUMB_DELAY_MS.store(500, Ordering::Relaxed);
+
+        let root = crate::core::paths::test_scratch_root();
+        let thumb_path = root.join(format!("rupix_lane_thumb_{}.png", std::process::id()));
+        let main_path = root.join(format!("rupix_lane_main_{}.png", std::process::id()));
+        std::fs::write(&thumb_path, b"thumb").expect("写缩略图夹具");
+        std::fs::write(&main_path, b"main").expect("写主图夹具");
+
+        let (done_tx, done_rx) = channel::<Done>();
+        let d = Decoder::spawn_with_sink(done_tx, None);
+        // 缩略图的作废判据是 ThumbView 可见集合（BROWSE-24）：不登记可见路径，
+        // 请求出队即作废（空串 Err 秒回），根本到不了后端——先把它放进"可见集合"。
+        d.set_thumb_view(&[thumb_path.as_path()]);
+        // 缩略图**先发**：旧行为里它会占住唯一那条解码线程，主图只能排在后面。
+        d.request(&thumb_path, 240, 180);
+        d.request_frame(&main_path, 0, 0, 0, ReqKind::Main);
+
+        let t0 = std::time::Instant::now();
+        let first = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("主图应先回来");
+        let elapsed = t0.elapsed();
+        assert_eq!(
+            first.path, main_path,
+            "主图必须先于缩略图回来（缩略图还在车道里睡 500 ms）"
+        );
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "主图不该等缩略图：{elapsed:?}（缩略图睡了 500 ms）"
+        );
+        crate::core::decode_watchdog::note_done(first.seq);
+
+        let second = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("缩略图随后回来");
+        assert_eq!(second.path, thumb_path);
+        crate::core::decode_watchdog::note_done(second.seq);
+        assert!(
+            matches!(second.out, Err(ref e) if e.detail.contains("lane-test-backend")),
+            "缩略图走的是测试后端（真解码路径），实际 {:?}",
+            second.out
+        );
+
+        drop(d); // 关账，别把看门狗的账留给后面的用例
+        LANE_TEST_THUMB_DELAY_MS.store(0, Ordering::Relaxed);
+        set_lane_workers(saved.0, saved.1);
+        let _ = std::fs::remove_file(&thumb_path);
+        let _ = std::fs::remove_file(&main_path);
+    }
+
+    /// T4：同键后台请求不重复派发——第二笔就地理赔（取消哨兵回包），队列里只有领队。
+    /// 不同目标框不算同键，照常入队。
+    #[test]
+    fn duplicate_background_request_is_acked_not_duplicated() {
+        let (tx, rx) = channel::<Done>();
+        let d = stub_decoder_with_tx(tx);
+        let p = PathBuf::from("dup.png");
+        let mk = |seq: u64, w: u32, h: u32| Req {
+            seq,
+            path: p.clone(),
+            max_w: w,
+            max_h: h,
+            region: None,
+            frame_index: 0,
+            raw: None,
+            kind: ReqKind::Thumb,
+            allow_scaled: false,
+        };
+        d.send(mk(1, 240, 180));
+        d.send(mk(2, 240, 180)); // 同键 → 理赔
+        d.send(mk(3, 320, 240)); // 不同键 → 入队
+        let queued = pending_reqs(&d);
+        assert_eq!(queued.len(), 2, "同键第二笔不许入队：{queued:?}");
+        let ack = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("同键第二笔必须收到取消哨兵回包");
+        assert_eq!(ack.seq, 2);
+        assert!(
+            matches!(&ack.out, Err(e) if e.is_cancelled()),
+            "理赔回包必须是取消哨兵（空判词），实际 {ack:?}"
+        );
+        // 领队回包消费后，同键才放行新请求（账随回包释放）。
+        d.note_done(1);
+        d.send(mk(4, 240, 180));
+        assert_eq!(pending_reqs(&d).len(), 3, "领队离场后同键可再入队");
+    }
+
+    /// T4：后台在飞字节预算——目标未定（0×0）按预算 1/4 估，超预算的笔就地理赔；
+    /// 主图不记账不设闸（2026-11-25 裁决）；`note_done` 释放后恢复派发。
+    #[test]
+    fn background_dispatch_stops_at_inflight_byte_budget() {
+        let (tx, rx) = channel::<Done>();
+        let d = stub_decoder_with_tx(tx);
+        let mk = |seq: u64, path: &str, w: u32, h: u32, kind: ReqKind| Req {
+            seq,
+            path: PathBuf::from(path),
+            max_w: w,
+            max_h: h,
+            region: None,
+            frame_index: 0,
+            raw: None,
+            kind,
+            allow_scaled: false,
+        };
+        // 4 笔 0×0（各估 64 MiB）= 256 MiB，恰好贴顶；第 5 笔超预算 → 理赔。
+        for i in 1..=4u64 {
+            d.send(mk(i, &format!("bg{i}.png"), 0, 0, ReqKind::Thumb));
+        }
+        d.send(mk(5, "bg5.png", 0, 0, ReqKind::Thumb));
+        assert_eq!(pending_reqs(&d).len(), 4, "前四笔必须都派发");
+        let ack = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("第 5 笔必须理赔");
+        assert_eq!(ack.seq, 5);
+        assert!(matches!(&ack.out, Err(e) if e.is_cancelled()));
+        // 主图不计账：预算贴顶时主图照常派发。
+        d.send(mk(6, "main.png", 0, 0, ReqKind::Main));
+        assert_eq!(pending_reqs(&d).len(), 5, "主图不受后台预算约束");
+        // 领队回包消费 → 释放 64 MiB → 新后台笔可再入队。
+        d.note_done(1);
+        d.send(mk(7, "bg7.png", 0, 0, ReqKind::Thumb));
+        assert_eq!(pending_reqs(&d).len(), 6, "释放后恢复派发");
+    }
+
+    /// T5：新主图清**未开始**的预读（就地理赔），缩略图不动（ThumbView 管辖）；
+    /// 正在解的不打断在单测里由"队列里没有它"表达——已出队的本就不在队列。
+    #[test]
+    fn new_main_purges_queued_prefetch_but_not_thumb() {
+        let (tx, rx) = channel::<Done>();
+        let d = stub_decoder_with_tx(tx);
+        d.send(req(1, ReqKind::Thumb));
+        d.send(req(2, ReqKind::Prefetch));
+        d.send(req(3, ReqKind::Prefetch));
+        d.send(req(4, ReqKind::Main));
+        let left = drain_pending(&d);
+        assert_eq!(
+            left,
+            vec![
+                (PathBuf::from("p1.png"), ReqKind::Thumb),
+                (PathBuf::from("p4.png"), ReqKind::Main)
+            ],
+            "预读清掉、缩略图与主图保留：{left:?}"
+        );
+        // 两笔被清的预读各收到一个取消哨兵。
+        for want in [2u64, 3] {
+            let ack = rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("被清预读必须理赔");
+            assert_eq!(ack.seq, want);
+            assert!(matches!(&ack.out, Err(e) if e.is_cancelled()));
+        }
+    }
+
     /// 过期早退：`Main` / `Prefetch` 的 seq 已被更新的 Main 追过时，
     /// `decode_loop` 不发解码，直接以空串 Err 发 Done 让 UI 记账清位。
     /// 用空串而非"未装后端"错，是因为空串**不可能**是真解码的结果——
@@ -2008,6 +2646,7 @@ pub(crate) mod tests {
             floor,
             Arc::new(ThumbView::default()),
             None,
+            "sv-decode-w",
         );
 
         let d1 = done_rx.recv().expect("应有 50 号 Done");
@@ -2043,6 +2682,7 @@ pub(crate) mod tests {
             floor,
             view,
             None,
+            "sv-decode-w",
         );
 
         // 两条都必须走真解码：未装 backend 时是"解码后端未安装…"的非空 Err。
@@ -2066,6 +2706,7 @@ pub(crate) mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(ThumbView::default()),
             None,
+            "sv-decode-w",
         );
         let d = done_rx.recv().expect("应有 Done");
         assert_eq!(d.seq, 21);
@@ -2158,6 +2799,7 @@ pub(crate) mod tests {
             floor,
             view,
             None,
+            "sv-decode-w",
         );
         assert_eq!(
             WAKES.load(Ordering::SeqCst),

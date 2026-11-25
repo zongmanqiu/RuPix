@@ -707,7 +707,7 @@ fn assert_wheel_mods_forwarded(body: &str, what: &str) {
 fn j15_wheel_event_carries_modifier_keys() {
     let main = main_dir();
     let root = main.parent().expect("main 没有上级目录");
-    let p = root.join(".3rd/wind-ui-rust-0.23.0/src/platform/win32/mod.rs");
+    let p = root.join(".3rd/wind-ui-rust-0.35.0/src/platform/win32/mod.rs");
     let src = read(&p);
     let rest = src
         .split("unsafe fn handle_wheel")
@@ -800,7 +800,7 @@ fn assert_host_clear_goes_transparent(src: &str, what: &str) {
 fn j16_borderless_transparency_never_lets_mouse_through() {
     let main = main_dir();
     let root = main.parent().expect("main 没有上级目录");
-    let base = root.join(".3rd/wind-ui-rust-0.23.0/src");
+    let base = root.join(".3rd/wind-ui-rust-0.35.0/src");
     assert_transparent_bg_wired(&read(&base.join("platform/win32/mod.rs")), "现状");
     assert_host_clear_goes_transparent(&read(&base.join("app/mod.rs")), "现状");
 }

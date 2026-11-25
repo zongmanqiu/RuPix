@@ -13,9 +13,18 @@
 pub fn trim() -> bool {
     use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
     use windows::Win32::System::Threading::GetCurrentProcess;
+    // m349：计一下这一刀的真实耗时——工作集里有刚解出的大位图（脏页）时，
+    // EmptyWorkingSet 要把它们同步写进 pagefile，实测可到秒级（整个进程一起冻）。
+    let t0 = std::time::Instant::now();
     // SAFETY: `GetCurrentProcess` 返回进程伪句柄（无需关闭）；`EmptyWorkingSet` 仅读取 /
     // 归还页，不破坏进程状态、不改返回后行为。
     let ok = unsafe { EmptyWorkingSet(GetCurrentProcess()) }.is_ok();
+    let ms = t0.elapsed().as_millis();
+    if ms >= 200 {
+        log::warn!(
+            "[slow-frame] EmptyWorkingSet took {ms}ms（工作集里有大量脏页时这一刀是秒级阻塞）"
+        );
+    }
     if !ok {
         log::warn!("EmptyWorkingSet 裁剪工作集失败（仍按原内存运行，不影响功能）");
     }

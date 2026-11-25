@@ -4,8 +4,8 @@
 //! - `Image`：解码后的不可变资源（内部 `Rc<Pixmap>`，构建期一次性解码，paint 期零解码）。
 //! - 解码框架：`ImageDecoder` trait + thread-local 注册表。核心内置 `PngDecoder`
 //!   （零新依赖，走 tiny-skia 原生 PNG 解码）；启用 `svg` feature（默认开）再内置
-//!   `SvgDecoder`（resvg 光栅化）；JPEG/WebP 等由使用方 `register_decoder` 注入，
-//!   核心代码与公共 API 零破坏。
+//!   `SvgDecoder`（resvg 光栅化）；JPEG / GIF / WebP / BMP / ICO 各有一个可选 feature
+//!   （默认关，见 `render::formats`）；其它格式由使用方 `register_decoder` 注入。
 //!
 //! 注册表照搬 `theme` 的 thread-local 模式（UI 单线程，免加锁），PNG 预置，
 //! 保证 `from_png_bytes` 永远可用。
@@ -65,6 +65,10 @@ pub enum Fit {
     Fill,
     /// 原始像素 1:1（仍受 DPI 缩放）。
     None,
+    /// 1 图片像素 = 1 屏幕物理像素：图片按固有像素数占物理像素，不随 DPI 缩放，
+    /// 绘制走无插值直出。用于「图片按目标 DPI 预先光栅好」的调用方（如按窗口 DPI
+    /// 出图的预览图）：任何缩放倍率下都不经历重采样。
+    Physical,
 }
 
 /// 图片加载/解码错误。
@@ -119,7 +123,7 @@ pub trait ImageDecoder {
 }
 
 /// 内置 PNG 解码器：走 tiny-skia 原生 `decode_png`，再反预乘为 RGBA8 入 `DecodedImage`。
-struct PngDecoder;
+pub(crate) struct PngDecoder;
 
 /// PNG 文件头魔数。
 const PNG_MAGIC: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
@@ -427,7 +431,7 @@ fn svg_font_cache_store(db: &resvg::usvg::fontdb::Database, path: &Path) {
     }
 
     put_u32(&mut out, seen_files.len() as u32);
-    for (file, _) in &seen_files {
+    for file in seen_files.keys() {
         let m = match std::fs::metadata(file) {
             Ok(m) => m,
             Err(_) => return, // 扫描与落盘之间文件被移走：宁可不用缓存
@@ -675,12 +679,14 @@ impl ImageDecoder for SvgDecoder {
 }
 
 thread_local! {
-    /// 解码器注册表，PNG 预置（启用 `svg` feature 时追加 SVG）。后注册者优先级更高（覆盖在前）。
+    /// 解码器注册表，PNG 预置（启用 `svg` feature 时追加 SVG，再追加已启用的可选格式，
+    /// 见 `render::formats`）。后注册者优先级更高（覆盖在前）。
     static DECODERS: RefCell<Vec<Box<dyn ImageDecoder>>> = RefCell::new({
         #[allow(unused_mut)]
         let mut v: Vec<Box<dyn ImageDecoder>> = vec![Box::new(PngDecoder)];
         #[cfg(feature = "svg")]
         v.push(Box::new(SvgDecoder));
+        super::formats::register_builtin(&mut v);
         v
     });
 }
@@ -823,6 +829,16 @@ impl Image {
             rgba.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
         }
         Self::from_rgba(pw, ph, &rgba)
+    }
+
+    /// 从 ICO 字节解码，按显示边长挑条目（`ico` feature）。
+    ///
+    /// ICO 里通常有同一图标的多个尺寸。`target=Some(边长)` 取不小于它的最小条目（都比它小
+    /// 时取最大的），`None` 取最大的。`from_bytes` / `from_file` 也能识别 ICO，按 `None` 处理。
+    /// HiDPI 下按物理像素传，例如 32 逻辑像素在 200% 缩放下传 `Some(64)`。
+    #[cfg(feature = "ico")]
+    pub fn from_ico_bytes(bytes: &[u8], target: Option<u32>) -> Result<Self, ImageError> {
+        Self::from_decoded(super::formats::ico::decode(bytes, target)?)
     }
 
     /// 从原始非预乘 RGBA8 构造。`rgba.len()` 须等于 `width*height*4`。
@@ -1000,6 +1016,28 @@ impl Image {
     pub(crate) fn cache_id(&self) -> u64 {
         self.id
     }
+
+    /// 这张图的存活探针：所有克隆都释放后 [`ImageLiveness::is_alive`] 变假。
+    ///
+    /// 渲染后端的位图 / 纹理缓存按 [`cache_id`](Self::cache_id) 存，而 id 永不复用——
+    /// 图片释放后那一条再也不会命中，却要等缓存积满才随整批清掉。应用里换一份文档就
+    /// 重建一次图标，关掉的文档的图标就这样一直占着显存 / 内存。缓存条目带上探针，
+    /// 每帧扫一遍丢掉死条目，占用就跟着图片的生命周期走。
+    #[cfg_attr(not(any(all(windows, feature = "d2d"), gpu_backend)), allow(dead_code))]
+    pub(crate) fn liveness(&self) -> ImageLiveness {
+        ImageLiveness(Rc::downgrade(&self.pixmap))
+    }
+}
+
+/// 见 [`Image::liveness`]。只持弱引用：不延长像素数据的寿命。
+#[cfg_attr(not(any(all(windows, feature = "d2d"), gpu_backend)), allow(dead_code))]
+pub(crate) struct ImageLiveness(std::rc::Weak<Pixmap>);
+
+#[cfg_attr(not(any(all(windows, feature = "d2d"), gpu_backend)), allow(dead_code))]
+impl ImageLiveness {
+    pub(crate) fn is_alive(&self) -> bool {
+        self.0.strong_count() > 0
+    }
 }
 
 #[cfg(test)]
@@ -1052,6 +1090,17 @@ mod tests {
     }
 
     /// 同一张图的克隆共享身份：否则每次 `clone` 都会让后端重传一遍纹理。
+    #[test]
+    fn liveness_follows_last_clone() {
+        let a = Image::from_pixmap(Pixmap::new(2, 2).unwrap());
+        let probe = a.liveness();
+        let b = a.clone();
+        drop(a);
+        assert!(probe.is_alive(), "还有克隆持有时应存活");
+        drop(b);
+        assert!(!probe.is_alive(), "最后一个克隆释放后应失效");
+    }
+
     #[test]
     fn cache_id_shared_by_clone() {
         let a = Image::from_png_bytes(&red_png(4, 4)).unwrap();

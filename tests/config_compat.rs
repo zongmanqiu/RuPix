@@ -35,6 +35,9 @@ fn legacy_ini_loads_without_loss() {
         dbl_click: DblClick::Maximize,
         // 旧版 fixture 不含 decode_timeout_s（2026-11-04 挂死恢复新增）→ 回默认 20 秒。
         decode_timeout_s: 20,
+        // 旧 fixture 不含两个后台车道键（m349 T1 新增）→ 回默认（prefetch=2 / thumb=1）。
+        decode_prefetch_workers: 2,
+        decode_thumb_workers: 1,
         space_hold_close: false,
         // 旧版 fixture 不含 slide_interval 键（m167 新增）→ 回默认 3 秒。
         // 这条正是"加了新设置项也不能读坏老配置"的兼容判据：老 ini 缺键必须安静回默认。

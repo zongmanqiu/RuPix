@@ -733,7 +733,22 @@ impl Host {
         // ★ 同一枚 DLL 的调用权（2026-11-05 裁决，见 `dll_lock` 模块头与 `docs/待办.md` §28）：
         //   多开之后两条 worker 真的会同时进来，而 ABI 只承诺"可重入、不必 MT-safe"。
         //   拿不到 = "现在忙"，不是"这枚坏了" ⇒ `Unsupported`（换下一家还有救），不是 `Hard`。
-        let _dll = super::dll_lock::enter(key, &id, self.class()).map_err(Fail::Unsupported)?;
+        //
+        //   ★ m349 P2（`CAP_PARALLEL`）：解码器可用 `iv_caps` 里的这一位**申请豁免**——
+        //   声明者担保内部状态每调用/每线程隔离或在内部同步（须过并发压力验收：
+        //   多线程 × 多格式 × 高次数，像素与单线程逐字节一致）。宿主据此跳过这把锁，
+        //   同一枚 DLL 的调用真正并行；未声明者照旧持锁，行为与今天逐字节一致。
+        //   `Guard` 在 Option 里：跳锁 = `None`，作用域语义不变（无锁可释放）。
+        let _dll = if caps & CAP_PARALLEL != 0 {
+            // 与 `[dll-serial]` 对称的取证行：探针分析靠线程名 + 这一行确认走了哪条路。
+            log::info!(
+                "[dll-parallel] decoder={id} th={} verdict=skip-lock",
+                std::thread::current().name().unwrap_or("?")
+            );
+            None
+        } else {
+            Some(super::dll_lock::enter(key, &id, self.class()).map_err(Fail::Unsupported)?)
+        };
         // 读文件走 mmap：省掉 12MB 级的堆分配+拷贝（解码器只读，切片直给）。
         // 文件极小/被独占等 mmap 不可用时回退整读。Windows 下文件在解码途中被
         // 外部替换的理论风险由每次 FFI 的 catch_unwind + 三振黑名单兜底。

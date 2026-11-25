@@ -930,6 +930,16 @@ pub struct Config {
     ///
     /// 登记在 [`CONFIG_ONLY_KEYS`]：只有慢盘 / 超大文件这类场景需要手改 ini。
     pub decode_timeout_s: u64,
+    /// **预读车道**的 worker 数（m349 T1，2026-11-25）。
+    ///
+    /// `≥2` = 预读走独立解码车道（自己的队列 + N 个「监督者 + 私有后端 worker」对），
+    /// 与主画面并行；`0/1` = 预读与主图**共线程**（m349 之前的旧行为，一键回退）。
+    /// 上限 4（调研 §4.2：无上限线程池不照搬）。登记在 [`CONFIG_ONLY_KEYS`]——
+    /// 只服务后台并行度调参；行为读者 = `core::decode::set_lane_workers`。
+    pub decode_prefetch_workers: u32,
+    /// **缩略图车道**的 worker 数（m349 T1）。语义与 [`Config::decode_prefetch_workers`]
+    /// 相同；默认 1 = 缩略图仍与主图共线程（先保守，T6 复测后再调）。
+    pub decode_thumb_workers: u32,
     /// 设置页各张卡的**收起**列表（卡 id，`;` 分隔存盘，ini 键 `ui_cards`）。
     ///
     /// 空 = 全部展开（出厂默认）。存"收起的"而不是"展开的"：卡片会随版本增删，存展开集就得
@@ -1026,6 +1036,8 @@ impl Default for Config {
             hotkeys: crate::core::hotkey::Hotkeys::default(),
             allow_multiple: false,
             decode_timeout_s: 20,
+            decode_prefetch_workers: 2,
+            decode_thumb_workers: 1,
             ui_cards_collapsed: Vec::new(),
             info_panel: false,
             info_panel_width: INFO_PANEL_W_DEFAULT,
@@ -1290,6 +1302,15 @@ impl Config {
                 "decode_timeout_s" => {
                     cfg.decode_timeout_s = v.parse().unwrap_or(20).min(600);
                 }
+                // 后台解码车道（m349 T1）：≥2 起独立车道，0/1 与主图共线程（旧行为）。
+                // 上限 4 与 `core::decode::set_lane_workers` 的夹取一致——两处都是防线，
+                // ini 手改的 999 不许变成 999 条线程。
+                "decode_prefetch_workers" => {
+                    cfg.decode_prefetch_workers = v.parse().unwrap_or(2).min(4);
+                }
+                "decode_thumb_workers" => {
+                    cfg.decode_thumb_workers = v.parse().unwrap_or(1).min(4);
+                }
                 // 设置页各张卡的展开集（分号分隔的卡 id）。不认识的 id 照样记着——
                 // 界面层回填时按自己的卡表匹配，匹配不上就是"没有那张卡"，
                 // 下一次 `Handles::sync` 按现有卡重收集时会把它清掉。
@@ -1416,7 +1437,7 @@ impl Config {
              checker={}\nfilmstrip={}\nfilmstrip_left={}\nlocked={}\n\
              long_image_fit={}\nwheel_behavior={}\nctrl_wheel={}\nalt_wheel={}\nshift_wheel={}\ninit_window={}\nborderless={}\nwindow_w={}\n\
              window_h={}\nopacity={}\nsort_by={}\nsort_desc={}\n\
-             assoc_exts={}\nassoc_heal={}\ndecoders_disabled={}\nextensions_disabled={}\nextensions_isolated={}\ndecoders_preferred={}\nprefetch={}\nprefetch_depth={}\nclose_to_tray={}\nspace_preview={}\nspace_hold_close={}\ndrag_image={}\nshow_toolbar_buttons={}\nraw_last={}\ndownload_source={}\nui_theme={}\ndecoder_index_gitee={}\ndecoder_index_github={}\nplugin_index_gitee={}\nplugin_index_github={}\nupdate_index_gitee={}\nupdate_index_github={}\nhotkeys={}\nallow_multiple={}\ndecode_timeout_s={}\nui_cards={}\ninfo_panel={}\ninfo_panel_width={}\ninfo_cards={}\ninfo_cards_collapsed={}\n",
+             assoc_exts={}\nassoc_heal={}\ndecoders_disabled={}\nextensions_disabled={}\nextensions_isolated={}\ndecoders_preferred={}\nprefetch={}\nprefetch_depth={}\nclose_to_tray={}\nspace_preview={}\nspace_hold_close={}\ndrag_image={}\nshow_toolbar_buttons={}\nraw_last={}\ndownload_source={}\nui_theme={}\ndecoder_index_gitee={}\ndecoder_index_github={}\nplugin_index_gitee={}\nplugin_index_github={}\nupdate_index_gitee={}\nupdate_index_github={}\nhotkeys={}\nallow_multiple={}\ndecode_timeout_s={}\ndecode_prefetch_workers={}\ndecode_thumb_workers={}\nui_cards={}\ninfo_panel={}\ninfo_panel_width={}\ninfo_cards={}\ninfo_cards_collapsed={}\n",
             self.stay_on_top as i32,
             self.dbl_click.index(),
             self.slide_interval,
@@ -1464,6 +1485,8 @@ impl Config {
             self.hotkeys.to_ini(),
             self.allow_multiple as i32,
             self.decode_timeout_s,
+            self.decode_prefetch_workers,
+            self.decode_thumb_workers,
             // 分号分隔的卡 id；空串 = 全部展开。
             self.ui_cards_collapsed.join(";"),
             self.info_panel as i32,
@@ -1748,6 +1771,13 @@ allow_multiple=0
 # 只有网络盘 / 超大文件这类「合理很慢」的场景才需要调大。
 decode_timeout_s=20
 
+# 后台解码车道（m349）：预读 / 缩略图与主画面**并行**解码的线程数。
+# ≥2 = 该类请求走独立车道，与主画面并行（prefetch 默认 2；thumb 默认 1 = 仍与主图共线程）；
+# 0/1 = 与主图共线程（旧版行为，改动后出问题就改回这里，立即逐字节回退）。
+# 上限 4；调大只影响后台并行度，不加快单张解码。内存小的机器建议保持默认。
+decode_prefetch_workers=2
+decode_thumb_workers=1
+
 # 设置页各张卡的**收起**状态（卡 id 分号分隔；留空 = 全部展开）。
 # 只有点过卡片标题把它收起，这里才会出现内容，例如 options.appearance;keys.plugins。
 # 收起的卡下次开设置页仍是收起的；卡 id 改过就等于让老状态失效（认不出的忽略）。
@@ -1811,7 +1841,7 @@ info_cards_collapsed=
 ///   ★ 写在 UI 写点处的 `ini 键：<名>` 注释是**给人导航的约定，没有测试读它**（2026-10-24 实测：
 ///   20 个键里 13 个标了，没标的是 `double_click`、`filmstrip`、`locked`、`long_image_fit`、
 ///   `decoders_disabled`、`window_w`、`window_h`）——别把它当成门禁。
-pub const ALL_KEYS: [&str; 52] = [
+pub const ALL_KEYS: [&str; 54] = [
     "stay_on_top",
     "double_click",
     "slide_interval",
@@ -1859,6 +1889,8 @@ pub const ALL_KEYS: [&str; 52] = [
     "hotkeys",
     "allow_multiple",
     "decode_timeout_s",
+    "decode_prefetch_workers",
+    "decode_thumb_workers",
     "ui_cards",
     "info_panel",
     "info_panel_width",
@@ -1871,7 +1903,7 @@ pub const ALL_KEYS: [&str; 52] = [
 /// 两个门禁都读这张表，别在别处再抄第二份：
 /// - `hygiene_scan.py` 第 6 查：这类键只豁免"用户入口"，**行为读者照旧必须有**；
 /// - `ui_touchpoints_cover_all_keys`（本文件测试）：跳过"UI 源码里必须出现这个键名"。
-pub const CONFIG_ONLY_KEYS: [&str; 8] = [
+pub const CONFIG_ONLY_KEYS: [&str; 10] = [
     "decoder_index_gitee",
     "decoder_index_github",
     "plugin_index_gitee",
@@ -1883,6 +1915,10 @@ pub const CONFIG_ONLY_KEYS: [&str; 8] = [
     // 预读深度：开关在设置页，但「几张」这个参数刻意不进 UI（2026-11-09 用户口径）。
     // hygiene 第 6 查仍要求它有行为读者 → `viewer::prefetch_offsets` 读它。
     "prefetch_depth",
+    // 后台解码车道（m349 T1）：预读 / 缩略图的并行线程数，只服务后台并行度调参。
+    // hygiene 第 6 查仍要求它有行为读者 → `core::decode::set_lane_workers`（runtime 灌入）。
+    "decode_prefetch_workers",
+    "decode_thumb_workers",
 ];
 
 /// **纯界面状态**的键：它的"行为读者"只能是设置页自己（m243）。

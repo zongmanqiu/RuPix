@@ -1,7 +1,7 @@
 //! 输入事件类型。平台层产生物理像素坐标，但 `UiHost::on_pointer` 在分发前
 //! 已 ÷scale 转为**逻辑坐标**——控件 `on_event` 收到的 pos 是逻辑坐标。
 
-use crate::geometry::{Point, Rect};
+use crate::geometry::{Color, Point, Rect};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseButton {
@@ -89,6 +89,10 @@ pub struct WindowState {
     /// 当前已最大化。
     pub maximized: bool,
     /// 当前已最小化。
+    ///
+    /// ⚠️ 快照纪律与 [`window_state()`](window_state) 相同：仅事件回调 / 菜单构建 /
+    /// `paint` 期间有效。任何时机的仲裁读法用
+    /// [`main_window_state()`](main_window_state)。
     pub minimized: bool,
     /// 窗口当前可见（未被隐藏）。
     ///
@@ -99,6 +103,10 @@ pub struct WindowState {
     ///
     /// 与 [`minimized`](Self::minimized) 是两件事：最小化的窗口仍然「可见」（在任务栏上、
     /// 能被还原），隐藏的窗口则从任务栏与 Alt-Tab 里整个消失。
+    ///
+    /// ⚠️ 快照纪律：仅事件回调 / 菜单构建 / `paint` 期间有效——显隐转换（hide_on_minimize、
+    /// `WindowOp::Hide`、任务栏操作）之后到下一次推送之间，快照可能仍停在旧值。任何时机的
+    /// 仲裁读法用 [`main_window_state()`](main_window_state)。
     pub visible: bool,
     /// 可最大化。win32 下等价于窗口带 `WS_MAXIMIZEBOX`（`App::resizable(false)` 会剥掉它）。
     pub maximizable: bool,
@@ -163,6 +171,30 @@ thread_local! {
     /// 与主题快照、帧时钟同一套路数）。
     static WINDOW_STATE: std::cell::Cell<WindowState> =
         const { std::cell::Cell::new(WindowState::UNKNOWN) };
+    /// 最近一次指针事件携带的修饰键。见 [`pointer_mods`]。
+    static POINTER_MODS: std::cell::Cell<Mods> = const { std::cell::Cell::new(Mods {
+        ctrl: false,
+        alt: false,
+        shift: false,
+        meta: false,
+    }) };
+}
+
+/// 最近一次指针事件的修饰键快照。
+///
+/// **给 `Element::on_context_menu` 的构建器用**：它的签名是 `Fn() -> Vec<MenuItem>`，
+/// 收不到 `PointerEvent`，于是「Ctrl+右键」这类区分手势在构建器里无从判断。宿主在每次
+/// 指针分发的**最开头**写入本次事件的 `mods`，因此菜单构建期间读到的一定是触发它的那一次。
+///
+/// ⚠️ 与 [`window_state`] 同一条纪律：只在事件回调 / 菜单构建期间有意义，事件之外读到的是
+/// 上一次的残值。需要「此刻按着什么」的长时间轮询请勿用它。
+pub fn pointer_mods() -> Mods {
+    POINTER_MODS.with(|m| m.get())
+}
+
+/// 注入本次指针事件的修饰键（`Tree::dispatch_pointer` 专用）。
+pub(crate) fn set_pointer_mods(m: Mods) {
+    POINTER_MODS.with(|c| c.set(m));
 }
 
 /// 当前窗口的状态与能力快照。
@@ -215,6 +247,24 @@ pub fn window_open(key: &str) -> bool {
     crate::platform::single_window_open(key)
 }
 
+/// 查询**主窗**此刻的真实窗口状态。平台层同步查询，不走线程局部快照，任何时机成立
+/// ——热键 / `on_interval` / 托盘回调、显隐转换瞬间、对快照不信任时都用它。
+///
+/// 无主窗（常驻模式 [`App::run_resident`](crate::app::App::run_resident)）返回 `None`
+/// ——「无窗可谈状态」是事实陈述，不是失败。
+///
+/// 与 [`window_state()`](Self::window_state) 的分工：快照快、事件期内为真值，是首选；
+/// 本函数是任何时机的仲裁读法。两者并存不互斥，各自失败模式见各自文档。
+///
+/// # 平台
+///
+/// - Windows / macOS：同步读真值（win32 句柄登记为线程局部，非 UI 线程返回 `None`；
+///   macOS 读 NSWindow 属性，非主线程返回 `None`）。
+/// - Linux：暂未实现，恒返回 `None`（`window_state()` 快照不受影响，事件期内照常可用）。
+pub fn main_window_state() -> Option<WindowState> {
+    crate::platform::query_main_window_state()
+}
+
 /// 系统是否偏好**暗色**外观。
 ///
 /// Windows 上读的是「设置 → 个性化 → 颜色 → 选择应用模式」那一项。读不到时按**亮色**
@@ -237,9 +287,39 @@ pub fn system_prefers_dark() -> bool {
 pub struct ShortcutCtx {
     pub(crate) focus_main: bool,
     pub(crate) close: bool,
+    pub(crate) focused: Option<crate::core::NodeId>,
+    pub(crate) focus_text: bool,
 }
 
 impl ShortcutCtx {
+    /// 按下这个键时持有键盘焦点的节点（网页的 `document.activeElement`），无焦点为 `None`。
+    ///
+    /// 能走到快捷键回调，说明焦点控件**没要**这个键（它先于回调拿到每一个键）；但没要
+    /// 不等于应用该抢——比如方向键落在文本框行首没得移，应用的"←翻页"仍不该触发。
+    /// 判据用 [`focus_accepts_text`](Self::focus_accepts_text) 更直接。
+    pub fn focused_node(&self) -> Option<crate::core::NodeId> {
+        self.focused
+    }
+
+    /// 焦点是否落在接受文字输入的控件上（可编辑文本框等，只读框不算）。
+    ///
+    /// 「焦点在输入框里时全局快捷键让路」的标准判据：
+    ///
+    /// ```no_run
+    /// # use windui::prelude::*;
+    /// # use windui::event::Key;
+    /// App::new("t", 400, 300).on_shortcut(|ctx, ev| match ev.key {
+    ///     Key::Left if !ctx.focus_accepts_text() => {
+    ///         // 翻到上一页……
+    ///         true
+    ///     }
+    ///     _ => false,
+    /// });
+    /// ```
+    pub fn focus_accepts_text(&self) -> bool {
+        self.focus_text
+    }
+
     /// 把键盘焦点交还给声明了 [`Element::autofocus`](crate::ui::Element::autofocus)
     /// 的那个控件，并按其模式处理（`autofocus_select_all` 会一并全选）。
     ///
@@ -569,6 +649,18 @@ pub enum CursorShape {
     /// 上下调整（↕）。横向分栏的分隔条、可拖高的行边界。与 [`SizeWE`](Self::SizeWE)
     /// 对称：分栏容器两个方向都有，光标形状也得两个方向都有。
     SizeNS,
+    /// 四向移动（✥，CSS `cursor: move`）。浮动面板的标题条、可拖动的整块内容。
+    ///
+    /// 与 [`SizeWE`](Self::SizeWE) / [`SizeNS`](Self::SizeNS) 说的「沿一个方向拉大小」不同，
+    /// 它说的是「按住这里，整块跟着走」。macOS 没有公开的四向箭头 API，取系统自带的
+    /// HIServices `move` 光标资源，读不到时退回张开的手。
+    SizeAll,
+    /// 隐藏指针。全屏视频播放器、演示模式等「指针静止一会就藏起来」的场景。
+    ///
+    /// 只在指针**停在本窗口客户区内**时生效；移出窗口、移到系统标题栏或缩放边上，系统
+    /// 光标照常出现（无边框窗口的缩放边光标同理，是平台层自己的事）。应用负责在指针再次
+    /// 移动时换回别的形状——框架不替你做「一动就显示」。
+    Hidden,
 }
 
 /// 滚轮量 → 像素位移的换算，**留着不足 1 像素的零头**给下一次。
@@ -645,6 +737,12 @@ pub enum PointerKind {
     Leave,
     /// 滚轮，携带步进量（正=上滚）。
     Wheel(i32),
+    /// 横向滚轮（触控板横滑、倾斜滚轮），单位同 `Wheel`，**正=向左滚**（朝内容起点，
+    /// 与 `Wheel` 正=上滚同向）。各平台原始符号不一，平台层统一换算成这个约定。
+    ///
+    /// Shift+竖向滚轮不在平台层转换，仍以 `Wheel` 送达、`mods.shift` 置位，由滚动容器
+    /// 自己转成横向。
+    HWheel(i32),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -860,6 +958,43 @@ pub struct Preedit {
     /// 合成串内当前「选中分句」的字符范围。日文分节转换会把长串切成几段、
     /// 高亮其中一段；中文拼音一般整段或 `None`。
     pub sel: Option<(usize, usize)>,
+    /// 输入法指定的逐段样式（下划线线型、粗细、颜色）。空 = 输入法没给，控件按默认画法
+    /// （细实线下划线，选中分句加粗）；非空时控件照着画，`sel` 只用来标位置、不再决定粗细，
+    /// 没被任何一段覆盖的字不加修饰。目前只有 win32 的 TSF 输入法会给（见 `App::ime_inline`）。
+    pub spans: Vec<PreeditSpan>,
+}
+
+/// 合成串里一段的显示样式（见 [`Preedit::spans`]），对应 TSF 的 `TF_DISPLAYATTRIBUTE`。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PreeditSpan {
+    /// 字符范围 `start..end`（合成串内的字符索引）。
+    pub range: (usize, usize),
+    /// 下划线线型。
+    pub underline: UnderlineStyle,
+    /// 粗下划线（通常标当前正在转换的分句）。
+    pub bold: bool,
+    /// 下划线颜色。`None` = 跟随 `fg`，再没有就用主题的合成串下划线色。
+    pub line: Option<Color>,
+    /// 文字颜色。`None` = 正文色。
+    pub fg: Option<Color>,
+    /// 背景色。`None` = 不画背景。
+    pub bg: Option<Color>,
+}
+
+/// 合成串下划线线型。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnderlineStyle {
+    /// 不画下划线。
+    None,
+    /// 实线。
+    #[default]
+    Solid,
+    /// 点线。
+    Dot,
+    /// 虚线。
+    Dash,
+    /// 波浪线。
+    Squiggle,
 }
 
 impl Preedit {
@@ -913,6 +1048,36 @@ pub enum MenuAction {
 /// 每一级面板（详见 [`MenuAction`]）。
 pub type MenuActionFn = std::rc::Rc<dyn Fn(&mut crate::core::EventCtx)>;
 
+/// 右键菜单何时弹出：按下时，还是松开时。
+///
+/// 各桌面的习惯不同：Windows 在**松开**时弹（原生标题栏、资源管理器皆如此）；macOS 与
+/// Linux 桌面（GTK / Qt）在**按下**时弹，并且按住滑到某项上松开即可直接选中。默认
+/// [`Auto`](Self::Auto) 各平台走各自的习惯，应用也可以固定一种。
+///
+/// 只管右键菜单（控件的编辑菜单、`on_context_menu`、标题栏系统菜单）；菜单项本身
+/// 一律在松开时执行，菜单栏与下拉框按下即展开。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContextMenuTrigger {
+    /// 随平台：Windows 松开时弹，其余平台按下时弹。
+    #[default]
+    Auto,
+    /// 按下右键就弹。
+    Press,
+    /// 松开右键才弹。
+    Release,
+}
+
+impl ContextMenuTrigger {
+    /// 解析后是否在按下时弹（`Auto` 按当前平台落定）。
+    pub fn on_press(self) -> bool {
+        match self {
+            Self::Press => true,
+            Self::Release => false,
+            Self::Auto => !cfg!(target_os = "windows"),
+        }
+    }
+}
+
 /// 一个浮层菜单/下拉项。支持图标、尾随快捷键、分隔线与级联子菜单。
 ///
 /// `#[non_exhaustive]`：字段全 `pub`，本版已因加字段破坏过两次（`intent` 让字面量构造
@@ -957,6 +1122,9 @@ pub struct MenuItem {
     pub checkable: bool,
     /// 前置图标（字符/emoji，None=无图标列）。
     pub icon: Option<String>,
+    /// 前置位图图标（单色模板，绘制时按本项文字色着色：禁用变灰、悬停随强调色）。
+    /// 与 [`icon`](Self::icon) 同占图标列；两者都给时用位图。
+    pub icon_image: Option<std::rc::Rc<crate::render::image::Image>>,
     /// 尾随快捷键文本（如 "⌘C"）。submenu 非空时显示右箭头优先。
     pub shortcut: Option<String>,
     /// 分隔线项（label/action 忽略，渲染为细线，不可命中）。
@@ -1024,6 +1192,7 @@ impl MenuItem {
             checked: false,
             checkable: false,
             icon: None,
+            icon_image: None,
             shortcut: None,
             separator: false,
             submenu: Vec::new(),
@@ -1088,6 +1257,14 @@ impl MenuItem {
     /// 设置前置图标（字符/emoji）。
     pub fn icon(mut self, icon: impl Into<String>) -> Self {
         self.icon = Some(icon.into());
+        self
+    }
+    /// 设置前置位图图标（单色模板，按本项文字色着色）。
+    ///
+    /// 给"同一组命令在工具栏是图标按钮、在菜单里是一行字"这类场景：菜单里带上同一个
+    /// 图标，两边一眼对得上。模板颜色无关紧要，只用其 alpha。
+    pub fn icon_image(mut self, img: std::rc::Rc<crate::render::image::Image>) -> Self {
+        self.icon_image = Some(img);
         self
     }
     /// 设置尾随快捷键文本。
@@ -1264,6 +1441,35 @@ pub struct MenuRequest {
     pub click_through: bool,
 }
 
+impl MenuRequest {
+    /// 在 `pos` 弹出的普通菜单，其余字段取 [`EventCtx::show_menu`](crate::core::EventCtx::show_menu)
+    /// 的默认值：按内容定宽、不翻转、不重建、点外面穿透。改字段后交给
+    /// [`EventCtx::show_menu_request`](crate::core::EventCtx::show_menu_request)。
+    pub fn new(pos: Point, items: Vec<MenuItem>) -> Self {
+        Self {
+            pos,
+            items,
+            min_width: 0,
+            anchor_top: None,
+            rebuild: None,
+            bar: None,
+            click_through: true,
+        }
+    }
+
+    /// 贴着控件弹出：面板左上角贴 `bounds` 左下角，下方放不下时翻到控件**顶边**以上，
+    /// 不遮住控件。按钮弹菜单用它——[`new`](Self::new) 的 `pos` 按指针位置处理，放不下
+    /// 时翻到那个点的另一侧，传控件底边进去就会翻上来盖住控件本身。
+    ///
+    /// 与 [`EventCtx::show_dropdown_menu`](crate::core::EventCtx::show_dropdown_menu) 同一
+    /// 锚定语义，区别是宽度按内容、点外面穿透（可改 `click_through`）。
+    pub fn below(bounds: Rect, items: Vec<MenuItem>) -> Self {
+        let mut req = Self::new(Point::new(bounds.x, bounds.y + bounds.h), items);
+        req.anchor_top = Some(bounds.y);
+        req
+    }
+}
+
 /// 菜单栏交给宿主的联动信息：各标题的位置与项生成器。
 ///
 /// 菜单栏控件自己只画标题、收第一下点击；展开之后指针与键盘都归宿主浮层独占，
@@ -1366,6 +1572,8 @@ pub struct WindowRequest {
     pub frameless: bool,
     /// 自绘标题栏的拖动区右键是否弹出窗口系统菜单（默认 true）。
     pub system_menu: bool,
+    /// 右键菜单触发时机（默认随平台）。
+    pub menu_trigger: crate::event::ContextMenuTrigger,
     /// 最小客户区尺寸（逻辑 dp，0=不限制）。
     pub min_width: i32,
     pub min_height: i32,
@@ -1393,7 +1601,8 @@ pub struct WindowRequest {
     pub shortcut: Option<WindowShortcutHandler>,
     /// 单例键（`Window::single`）。`None` = 每次请求都开一个新窗口。
     ///
-    /// 有键时平台先查窗口登记表：已有同键窗口就**丢弃本次请求**并把那个窗口激活到前台。
+    /// 有键时平台先查窗口登记表：已有同键窗口就**丢弃本次请求**并重新显示那个窗口。
+    /// 默认激活到前台；Windows 遵循已有窗口的 `activate_on_show`。
     /// 判定放在平台层而非应用层，是因为"把已有窗口拉到前台"只有平台做得到。
     pub single: Option<String>,
     /// 窗口图标（`Window::icon`）。`None` 则跟随系统默认——子窗**不会**自动继承主窗
@@ -1403,6 +1612,14 @@ pub struct WindowRequest {
     pub position: Option<(i32, i32)>,
     /// 不在任务栏占按钮（`Window::skip_taskbar`），各平台落地见 `WindowConfig::skip_taskbar`。
     pub skip_taskbar: bool,
+    /// 显示时是否激活窗口，默认 true。Windows 支持，其他平台暂忽略。
+    pub activate_on_show: bool,
+    /// 无边框外框取色策略（`Window::window_outline`），见 `WindowOutline`。
+    pub window_outline: crate::platform::WindowOutline,
+    /// 无边框窗口圆角（`Window::window_corner`），见 `WindowCorner`。
+    pub window_corner: crate::platform::WindowCorner,
+    /// ESC 没有浮层 / 对话框可收时是否关闭本窗口（`Window::escape_closes_window`），默认 true。
+    pub escape_closes_window: bool,
     /// ★ RuPix 补丁 07 —— 建窗前**按内容自适应高度**（客户区逻辑 px）。`Some((min, max))`：
     /// 用 `width` 作为固定宽度量一次真实内容自然高（文本换行、滚动容器完整测量，与首帧
     /// 布局同源），夹进 `[min, max]` 作为起窗高度；`height` 参数被忽略。`None`（默认）行为
@@ -1485,6 +1702,37 @@ mod tests {
         ctx.close_window("settings");
         assert_eq!(take_callback_closes(), vec!["main", "settings"]);
         assert!(take_callback_closes().is_empty(), "取走一次就该空了");
+    }
+
+    /// 快照注入契约：宿主注入什么，`window_state()` 就读到什么；`UNKNOWN` 的字段取值
+    /// 全 false（visible=true 除外）也一并钉住——那是「错得显眼」设计的一部分。
+    ///
+    /// 事件期外的残值行为（读到上一次注入）是文档口径，不是这里要验的。
+    #[test]
+    fn window_state_snapshot_roundtrip() {
+        let st = WindowState {
+            maximized: true,
+            minimized: false,
+            visible: false,
+            maximizable: false,
+            minimizable: true,
+            // ★ RuPix 补丁 04/028：WindowState 新增 fullscreen/topmost 两字段。
+            fullscreen: false,
+            topmost: false,
+        };
+        set_window_state(st);
+        assert_eq!(window_state(), st);
+        // 恢复 UNKNOWN，避免污染同进程内其它测试的线程局部。
+        set_window_state(WindowState::UNKNOWN);
+        assert_eq!(window_state(), WindowState::UNKNOWN);
+    }
+
+    /// 平台门契约：未实现同步查询的平台（Linux）恒返回 None。
+    /// X11 的 round-trip 实现落地时，这条测试改成断言真值集合。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn main_window_state_is_none_where_not_implemented() {
+        assert!(main_window_state().is_none());
     }
 
     /// 撞键检测的**三个方向都要钉**，而后两个比第一个重要：一个见谁都喊的提示，三天后

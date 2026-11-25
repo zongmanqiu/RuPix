@@ -77,7 +77,9 @@ use scale::Scale;
 use shm::{create_buffer, write_pixels, Damage, ShmBuffer, ShmSlots};
 use xkb::Xkb;
 
-pub(super) use data::{get_text as clipboard_get, set_text as clipboard_set};
+pub(super) use data::{
+    active as clipboard_active, get_text as clipboard_get, set_text as clipboard_set,
+};
 
 /// 动画帧之间至少隔多久（ms）。刷新率由 `frame` 回调配速——回调本就按显示器的节拍来，
 /// 再叠一道 `host::FRAME_MS` 会让「回调到了但还差一点点到 16ms」错过一个垂直同步、
@@ -506,6 +508,8 @@ struct Ptr {
     /// 表面坐标（逻辑，带小数）。
     pos: (f64, f64),
     wheel: WheelFrame,
+    /// 横向滚动量（同一结构：Wayland 横轴正值 = 向右，换算后正 = 向左，正合 `HWheel`）。
+    wheel_x: WheelFrame,
     /// 按着的按钮数（隐式抓取期间指针事件仍送给按下时的表面）。
     pressed: u32,
 }
@@ -1403,6 +1407,8 @@ impl Wl {
 
     /// 事件分发后的收尾：窗口操作、标题、光标、对话框、开窗、关窗、跨窗口脏。
     fn after_event(&mut self, key: u32) {
+        // Wayland 后端尚无托盘：取走运行期托盘意图丢弃，以免队列无限增长。
+        let _ = crate::platform::tray::take_tray_ops();
         let Some(i) = self.idx(key) else { return };
         let open: Vec<String> = self
             .windows

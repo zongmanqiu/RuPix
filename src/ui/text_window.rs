@@ -3,7 +3,7 @@
 //! 做法对齐 CurSeen 的脚本信息窗（`ui/script_dialog.rs` 的信息档）：
 //! - **没有按钮、没有页脚**——整窗就是一片文本区；可以直接点进去改（改动只留在这个
 //!   窗里的本地草稿，不回写任何地方），选中后 Ctrl+C / Ctrl+A 复制；
-//! - **无框线、白底**：`.frameless_input()` + 白色窗口底，聚焦也不会出现边框变色；
+//! - **无框线、白底**：`.frameless()` + 白色窗口底，聚焦也不会出现边框变色；
 //! - **高度按内容算**（CJK 一字 ≈ 字号宽，ASCII 取半宽），钳在上下限内；
 //! - 关窗走标题栏 X 或 Esc。
 //!
@@ -87,7 +87,7 @@ pub fn show(ctx: &mut EventCtx, key: &str, title: &str, text: &str) {
                     .multiline()
                     .wrap(true)
                     // 无框线、聚焦也不变色；可点进去编辑，也可选中复制。
-                    .frameless_input()
+                    .frameless()
                     // 视图起点钉在 0：否则 windui 会把光标（默认在末尾）滚进可视区，
                     // 开窗第一眼看到的是最后几行。
                     .select_range(0, 0)

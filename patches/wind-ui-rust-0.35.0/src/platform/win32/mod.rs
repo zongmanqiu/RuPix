@@ -8,8 +8,10 @@ pub mod clipboard;
 #[cfg(feature = "d2d")]
 pub(super) mod d2d;
 pub mod dragdrop;
+pub(crate) mod file_icon;
 pub mod hotkey;
 pub mod tray;
+mod tsf;
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
@@ -23,16 +25,55 @@ use windows::Win32::Foundation::{
     COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
-    DwmExtendFrameIntoClientArea, DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_BORDER_COLOR,
-    DWMWA_COLOR_DEFAULT, DWMWA_COLOR_NONE, DWMWA_VISIBLE_FRAME_BORDER_THICKNESS,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_DONOTROUND, DWMWCP_ROUND,
+    DWMWA_BORDER_COLOR,
+    DWMWA_COLOR_DEFAULT,
+    DWMWA_COLOR_NONE,
+    DWMWA_VISIBLE_FRAME_BORDER_THICKNESS,
+    DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_DEFAULT,
+    DWMWCP_DONOTROUND,
+    DWMWCP_ROUND,
+    DWMWCP_ROUNDSMALL,
+    DwmExtendFrameIntoClientArea,
+    DwmGetWindowAttribute,
+    DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, ClientToScreen, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject,
-    EndPaint, GetDC, GetDeviceCaps, GetMonitorInfoW, InvalidateRect, MonitorFromWindow, ReleaseDC,
-    ScreenToClient, SelectObject, SetDIBitsToDevice, UpdateWindow, AC_SRC_ALPHA, AC_SRC_OVER,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DEFAULT_CHARSET, DIB_RGB_COLORS, HBITMAP,
-    HDC, HGDIOBJ, LOGFONTW, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, VREFRESH,
+    AC_SRC_ALPHA,
+    AC_SRC_OVER,
+    BITMAPINFO,
+    BITMAPINFOHEADER,
+    BI_RGB,
+    BLENDFUNCTION,
+    BeginPaint,
+    ClientToScreen,
+    CreateCompatibleDC,
+    CreateDIBSection,
+    DEFAULT_CHARSET,
+    DIB_RGB_COLORS,
+    DeleteDC,
+    DeleteObject,
+    EndPaint,
+    GetDC,
+    GetDeviceCaps,
+    GetMonitorInfoW,
+    HBITMAP,
+    HDC,
+    HGDIOBJ,
+    InvalidateRect,
+    LOGFONTW,
+    MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTOPRIMARY,
+    MonitorFromPoint,
+    MonitorFromWindow,
+    PAINTSTRUCT,
+    ReleaseDC,
+    ScreenToClient,
+    SelectObject,
+    SetDIBitsToDevice,
+    UpdateWindow,
+    VREFRESH,
 };
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -42,8 +83,13 @@ use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::Ime::{
-    ImmGetContext, ImmReleaseContext, ImmSetCandidateWindow, ImmSetCompositionFontW,
-    ImmSetCompositionWindow, CANDIDATEFORM, CFS_CANDIDATEPOS, CFS_POINT, COMPOSITIONFORM,
+    ImmAssociateContextEx, ImmGetCompositionStringW, ImmGetContext, ImmNotifyIME,
+    ImmReleaseContext, ImmSetCandidateWindow, ImmSetCompositionFontW, ImmSetCompositionWindow,
+    ATTR_TARGET_CONVERTED, ATTR_TARGET_NOTCONVERTED, CANDIDATEFORM, CFS_CANDIDATEPOS, CFS_EXCLUDE,
+    CFS_POINT, COMPOSITIONFORM, CPS_CANCEL, CPS_COMPLETE, GCS_COMPATTR, GCS_COMPCLAUSE,
+    GCS_COMPSTR, GCS_CURSORPOS, GCS_RESULTCLAUSE, GCS_RESULTREADCLAUSE, GCS_RESULTREADSTR,
+    GCS_RESULTSTR, HIMC, IACE_DEFAULT, IME_COMPOSITION_STRING, ISC_SHOWUICOMPOSITIONWINDOW,
+    NI_COMPOSITIONSTR, NOTIFY_IME_INDEX,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetDoubleClickTime, GetKeyState, ReleaseCapture, SetActiveWindow, SetCapture,
@@ -60,43 +106,186 @@ use windows::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, ShellExecuteW, HDROP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetCaretBlinkTime, GetClientRect, GetMessageExtraInfo, GetMessageTime, GetMessageW,
-    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindow, IsWindowVisible,
-    IsZoomed, KillTimer, LoadCursorW, LoadIconW, MsgWaitForMultipleObjectsEx, PeekMessageW,
-    PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor, SetForegroundWindow,
-    SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    SystemParametersInfoW, TranslateMessage, UpdateLayeredWindow, CREATESTRUCTW, CW_USEDEFAULT,
-    GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION,
-    HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_MESSAGE, HWND_NOTOPMOST,
-    HWND_TOPMOST, IDC_ARROW, IDC_HAND, IDC_IBEAM, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE,
-    IDC_SIZEWE, LWA_ALPHA, MINMAXINFO, MSG, MSGFLT_ALLOW, MWMO_INPUTAVAILABLE, NCCALCSIZE_PARAMS,
-    PM_REMOVE, QS_ALLINPUT, SIZE_MINIMIZED, SM_CXDOUBLECLK, SM_CXFRAME, SM_CXPADDEDBORDER,
-    SM_CXSCREEN, SM_CYDOUBLECLK, SM_CYFRAME, SM_CYSCREEN, SPI_GETCLIENTAREAANIMATION,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_MAXIMIZE,
-    SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    ULW_ALPHA, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED,
-    WM_CHAR, WM_CLOSE, WM_COPYDATA, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
-    WM_DWMCOLORIZATIONCOLORCHANGED, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_HOTKEY,
-    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCALCSIZE, WM_NCCREATE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCMBUTTONDOWN, WM_NCMOUSEMOVE,
-    WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_PAINT, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_TIMER, WM_TOUCH, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_THICKFRAME,
-};
-// 窗口图标（`App::icon`）：HICON 由 tray 那份 RGBA 转换复用，销毁归 WindowState::drop。
-use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyIcon, SendMessageW, HCURSOR, HICON, ICON_BIG, ICON_SMALL, SM_CXICON, SM_CXSMICON,
+    CREATESTRUCTW,
+    CW_USEDEFAULT,
+    ChangeWindowMessageFilterEx,
+    CreateWindowExW,
+    DefWindowProcW,
+    DestroyIcon,
+    DestroyWindow,
+    DispatchMessageW,
+    GWLP_USERDATA,
+    GWL_EXSTYLE,
+    GWL_STYLE,
+    GetCaretBlinkTime,
+    GetClientRect,
+    GetCursorPos,
+    GetMessageExtraInfo,
+    GetMessageTime,
+    GetMessageW,
+    GetSystemMetrics,
+    GetWindowLongPtrW,
+    GetWindowRect,
+    HCURSOR,
+    HICON,
+    HTBOTTOM,
+    HTBOTTOMLEFT,
+    HTBOTTOMRIGHT,
+    HTCAPTION,
+    HTCLIENT,
+    HTLEFT,
+    HTRIGHT,
+    HTTOP,
+    HTTOPLEFT,
+    HTTOPRIGHT,
+    HWND_MESSAGE,
+    HWND_NOTOPMOST,
+    HWND_TOPMOST,
+    ICON_BIG,
+    ICON_SMALL,
+    IDC_ARROW,
+    IDC_HAND,
+    IDC_IBEAM,
+    IDC_SIZEALL,
+    IDC_SIZENESW,
+    IDC_SIZENS,
+    IDC_SIZENWSE,
+    IDC_SIZEWE,
+    IsIconic,
+    IsWindow,
+    IsWindowVisible,
+    IsZoomed,
+    KillTimer,
+    LWA_ALPHA,
+    LoadCursorW,
+    LoadIconW,
+    MINMAXINFO,
+    MSG,
+    MSGFLT_ALLOW,
+    MWMO_INPUTAVAILABLE,
+    MsgWaitForMultipleObjectsEx,
+    NCCALCSIZE_PARAMS,
+    PM_REMOVE,
+    PeekMessageW,
+    PostMessageW,
+    PostQuitMessage,
+    QS_ALLINPUT,
+    RegisterClassExW,
+    SIZE_MINIMIZED,
+    SM_CXDOUBLECLK,
+    SM_CXFRAME,
+    SM_CXICON,
+    SM_CXPADDEDBORDER,
+    SM_CXSCREEN,
+    SM_CXSMICON,
+    SM_CYDOUBLECLK,
+    SM_CYFRAME,
+    SM_CYSCREEN,
+    SPI_GETCLIENTAREAANIMATION,
+    SWP_FRAMECHANGED,
+    SWP_NOACTIVATE,
+    SWP_NOMOVE,
+    SWP_NOSIZE,
+    SWP_NOZORDER,
+    SW_HIDE,
+    SW_MAXIMIZE,
+    SW_MINIMIZE,
+    SW_RESTORE,
+    SW_SHOW,
+    SW_SHOWNOACTIVATE,
+    SW_SHOWNORMAL,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SendMessageW,
+    SetCursor,
+    SetForegroundWindow,
+    SetLayeredWindowAttributes,
+    SetTimer,
+    SetWindowLongPtrW,
+    SetWindowPos,
+    ShowWindow,
+    SystemParametersInfoW,
+    TranslateMessage,
+    ULW_ALPHA,
+    UpdateLayeredWindow,
+    WA_INACTIVE,
+    WINDOW_EX_STYLE,
+    WINDOW_STYLE,
+    WM_ACTIVATE,
+    WM_APP,
+    WM_CAPTURECHANGED,
+    WM_CHAR,
+    WM_CLOSE,
+    WM_COPYDATA,
+    WM_DESTROY,
+    WM_DPICHANGED,
+    WM_DROPFILES,
+    WM_DWMCOLORIZATIONCOLORCHANGED,
+    WM_ENTERSIZEMOVE,
+    WM_EXITSIZEMOVE,
+    WM_GETMINMAXINFO,
+    WM_HOTKEY,
+    WM_IME_COMPOSITION,
+    WM_IME_ENDCOMPOSITION,
+    WM_IME_SETCONTEXT,
+    WM_IME_STARTCOMPOSITION,
+    WM_KEYDOWN,
+    WM_KEYUP,
+    WM_LBUTTONDOWN,
+    WM_LBUTTONUP,
+    WM_MBUTTONDOWN,
+    WM_MBUTTONUP,
+    WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE,
+    WM_MOUSEWHEEL,
+    WM_NCCALCSIZE,
+    WM_NCCREATE,
+    WM_NCHITTEST,
+    WM_NCLBUTTONDOWN,
+    WM_NCMBUTTONDOWN,
+    WM_NCMOUSEMOVE,
+    WM_NCRBUTTONDOWN,
+    WM_NCRBUTTONUP,
+    WM_PAINT,
+    WM_QUIT,
+    WM_RBUTTONDOWN,
+    WM_RBUTTONUP,
+    WM_SETCURSOR,
+    WM_SETICON,
+    WM_SETTINGCHANGE,
+    WM_SHOWWINDOW,
+    WM_SIZE,
+    WM_SYSCHAR,
+    WM_SYSKEYDOWN,
+    WM_SYSKEYUP,
+    WM_TIMER,
+    WM_TOUCH,
+    WNDCLASSEXW,
+    WS_EX_LAYERED,
+    WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST,
+    WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX,
+    WS_OVERLAPPEDWINDOW,
+    WS_POPUP,
+    WS_THICKFRAME,
+    WindowFromPoint,
 };
 // 只用于 d2d 后端选择（RDP 远程会话下强制软渲染），随该 feature 一起门控。
 #[cfg(feature = "d2d")]
 use windows::Win32::UI::WindowsAndMessaging::SM_REMOTESESSION;
 
-use super::{to_skia_color, AppHandler, NewWindow, Renderer, WindowConfig};
-use crate::event::{CursorShape, Key, KeyEvent, MouseButton, PointerEvent, PointerKind, WindowOp};
+use super::{to_skia_color, ActiveRenderer, AppHandler, NewWindow, Renderer, WindowConfig};
+use crate::event::{
+    CursorShape,
+    Key,
+    KeyEvent,
+    MouseButton,
+    PointerEvent,
+    PointerKind,
+    WindowOp,
+};
 use crate::geometry::{Color, Point, Rect, Size};
+use crate::spec::Axis;
 use crate::platform::OpaqueRegion;
 
 thread_local! {
@@ -271,12 +460,25 @@ const APP_HOST_CLASS: PCWSTR = w!("WindUiAppHostClass");
 thread_local! {
     /// App 级消息宿主窗口句柄（0=未创建）。
     static APP_HOST_HWND: Cell<isize> = const { Cell::new(0) };
+    /// 主窗句柄（0=无）。独立于 `AppHost::main` 登记：`main_window_state()` 在热键 /
+    /// interval / 托盘回调里被调用时，`app_host()` 的 `&mut AppHost` 借用可能正活着
+    /// （WM_HOTKEY 臂在借用内跑用户回调），再走 `app_host()` 就是两个活 `&mut`——
+    /// 实践无害、按 Stacked Borrows 属技术性 UB。thread_local 的 `Cell<isize>` 只做
+    /// Copy 读写，无借用可言。跨线程自然为 0（每线程独立）→ 查询返回 `None`，与文档
+    /// 口径一致。主窗销毁后清 0（见主窗 `WM_DESTROY`），悬空句柄上再兜一层 `IsWindow`。
+    static MAIN_HWND: Cell<isize> = const { Cell::new(0) };
     /// 常驻（零窗口）模式：窗口全部销毁后**不**结束消息循环。见 `WindowConfig::resident`。
     ///
     /// 与 `AppHost::main.is_none()` 是两件事，故单独一位：主窗有没有是"启动时建没建"，
     /// 而这一位问的是"窗口空了要不要退出"。放 thread_local 而不是 `AppHost` 里，是因为
     /// 读它的地方（`WM_DESTROY`）正处在最不该多借一次宿主状态的时刻。
     static RESIDENT: Cell<bool> = const { Cell::new(false) };
+    /// 组合中按下鼠标的处理策略（`WindowConfig::ime_interrupt`）。应用级，`run` 时从主窗配置取一次，
+    /// 子窗沿用——子窗配置里的这一项是应用层填的默认值，不读。
+    static IME_INTERRUPT: Cell<crate::platform::ImeInterrupt> =
+        const { Cell::new(crate::platform::ImeInterrupt::Commit) };
+    /// 组合串由框架内联绘制（`WindowConfig::ime_inline`）。应用级，取法同 `IME_INTERRUPT`。
+    static IME_INLINE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// 最后一个窗口销毁后是否该结束消息循环。
@@ -367,6 +569,8 @@ unsafe fn create_app_host(hinst: HINSTANCE, main: Option<HWND>, renderer: Render
                 allow_taskbar_created(h, taskbar_created);
             }
             APP_HOST_HWND.with(|c| c.set(h.0 as isize));
+            // 主窗句柄独立登记（见 MAIN_HWND 文档）。
+            MAIN_HWND.with(|c| c.set(main.map(|h| h.0 as isize).unwrap_or(0)));
         }
         Err(e) => {
             // 建不起来就回收状态：没有宿主窗口，托盘与热键随后都不会安装（见
@@ -805,33 +1009,29 @@ pub(crate) fn run(
     mut handler: Box<dyn AppHandler>,
     waker: Option<std::sync::Arc<crate::sync::WakerShared>>,
     single: Option<crate::single_instance::SingleInstance>,
-) {
-    // 全局动画开关：显式配置优先；否则截屏路径恒开（保证终态稳定）、窗口路径随系统设置。
-    let os_default = if cfg.screenshot.is_some() {
-        true
-    } else {
-        unsafe { os_animations_enabled() }
-    };
-    crate::anim::set_enabled(cfg.animations.unwrap_or(os_default));
+) -> bool {
+    // 系统「显示动画」关掉即视为要求减弱动效（UWP 的 `UISettings.AnimationsEnabled` 读的也是它）。
+    super::apply_motion_level(&cfg, || unsafe { !os_animations_enabled() });
     // 光标闪烁走**插入符**设置，不跟客户区动画走（见 `os_caret_blink_half_ms`）。
-    // 应用显式 `animations(false)` 时连它一起关：那是"我要一个完全静止的界面"。
-    crate::ui::caret::set_blink_period_ms(match cfg.animations {
-        Some(false) => None,
-        _ => unsafe { os_caret_blink_half_ms() },
+    // 应用把动效强制关死时连它一起关：那是"我要一个完全静止的界面"。
+    crate::ui::caret::set_blink_period_ms(if super::motion_forced_off(&cfg) {
+        None
+    } else {
+        unsafe { os_caret_blink_half_ms() }
     });
     if let Some(path) = cfg.screenshot.clone() {
         // 离屏渲染走平台无关的共享实现（与 macOS 后端共用）。
         super::run_offscreen(&cfg, &mut handler, &path);
-        return;
+        return true;
     }
     // 单实例仲裁（应用若已在 main 里 claim_instance 过，这里直接放行）：二次实例把 argv
     // 转发给首实例后直接返回、不建窗口。
     if let Some(si) = &single {
         if !crate::single_instance::arbitrate(&si.app_id) {
-            return;
+            return true;
         }
     }
-    unsafe { run_windowed(cfg, handler, waker, single) };
+    unsafe { run_windowed(cfg, handler, waker, single) }
 }
 
 // ── 渲染后端接缝 ────────────────────────────────────────────────────────────
@@ -1361,6 +1561,10 @@ struct WindowState {
     touch: Touch,
     /// 无标题栏窗口：wnd_proc 据此处理 WM_NCCALCSIZE / WM_NCHITTEST。
     frameless: bool,
+    activate_on_show: bool,
+    /// 标题栏右键的 Down 已在 `WM_NCRBUTTONDOWN` 提前交出（「按下即弹」策略），
+    /// `WM_NCRBUTTONUP` 只需补 Up。
+    nc_down_sent: bool,
     /// 无边框且 DWM 不在客户区上画边框（Win10）：未最大化时由宿主自己画 1px 外框，
     /// 见 `AppHandler::set_window_outline`。建窗时按圆角属性设没设成判定。
     self_outline: bool,
@@ -1395,6 +1599,15 @@ struct WindowState {
     /// 还回去——若等到 `WM_DESTROY` 再恢复，系统在销毁过程中早已把激活给了别的
     /// 顶层窗口（owner 那时还是禁用的，轮不到它），可能是别的应用。
     modal_owner: Option<HWND>,
+    /// 输入法正在组合（`WM_IME_STARTCOMPOSITION` 到 `WM_IME_ENDCOMPOSITION` 之间）。
+    /// 绘制后据此重报一次位置（见 `sync_ime`）。
+    ime_composing: bool,
+    /// 上次同步时（分发后 / 绘制后）看到的焦点文本控件（`AppHandler::ime_field`），用来侦测焦点换人。
+    ime_field: Option<crate::event::ImeField>,
+    /// 当前是否给窗口挂着输入法上下文（`None` = 还没设过）。避免每帧重复关开。
+    ime_enabled: Option<bool>,
+    /// 上次报给输入法的光标位置（`AppHandler::ime_caret`）。光标一动就重报，不等组合开始。
+    ime_pos: Option<(i32, i32, i32)>,
     /// ★ RuPix 补丁 04 —— 处于无边框全屏（`WindowOp::ToggleFullscreen` 进入后、恢复前）。
     /// 进入前的样式与窗口矩形存于 [`Self::saved_placement`]。
     fullscreen: bool,
@@ -1425,11 +1638,13 @@ struct Touch {
     /// 按下起点 + 上一帧位置（客户区物理像素）。
     start: (i32, i32),
     last: (i32, i32),
-    /// 是否已越过移动阈值进入滑动滚动。
-    scrolling: bool,
+    /// 越过移动阈值进入滑动滚动后锁定的轴（按越阈值时位移较大的一边），`None` = 尚未越阈值。
+    /// 整个手势只沿这个轴平移，斜着拖不会两个方向一起滚。
+    axis: Option<Axis>,
     /// 上一次移动的消息时间（ms，`GetMessageTime`）。
     last_t: u32,
-    /// 平滑后的 y 速度（**物理像素/ms**），松手时据此启动惯性滑动。
+    /// 平滑后的 x / y 速度（**物理像素/ms**），松手时取锁定轴那一个启动惯性滑动。
+    vx: f32,
     vy: f32,
 }
 
@@ -1506,8 +1721,14 @@ impl WindowState {
             last_click: ClickTracker::default(),
             touch: Touch::default(),
             frameless: false,
+            activate_on_show: true,
+            nc_down_sent: false,
             mouse_tracked: false,
             pending_surrogate: None,
+            ime_composing: false,
+            ime_field: None,
+            ime_enabled: None,
+            ime_pos: None,
             min_w: 0,
             min_h: 0,
             in_size_move: false,
@@ -1532,6 +1753,7 @@ impl WindowState {
         if downgrade {
             // 替换为软后端并请求重绘：下一帧用 Skia 呈现，进程不崩、内容继续渲染。
             self.backend = Box::new(SkiaBackend::new());
+            self.handler.set_active_renderer(ActiveRenderer::Software);
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
     }
@@ -1759,11 +1981,14 @@ unsafe fn create_window(
     #[cfg_attr(not(feature = "d2d"), allow(unused_variables))] renderer: Renderer,
     // 归属窗口（`cfg.owned` / `cfg.modal`）：`None` 就是独立顶层窗口。主窗恒为 `None`。
     owner: Option<HWND>,
+    // 发起开窗的窗口：不归属时也据它决定居中在哪块屏上。主窗 / 托盘开的窗口为 `None`。
+    origin: Option<HWND>,
 ) -> Option<HWND> {
     // 装箱前先问：样式要据此定（见下面 `WS_MINIMIZEBOX` 那段）。
     let hide_on_minimize = handler.hide_on_minimize();
     // 把 WindowState 装箱，指针随 CreateWindow 传入，在 WM_NCCREATE 挂到 HWND。
     let mut state = Box::new(WindowState::new(handler, cfg.bg));
+    state.activate_on_show = cfg.activate_on_show;
     state.min_w = cfg.min_width;
     state.min_h = cfg.min_height;
     let state_ptr = Box::into_raw(state);
@@ -1916,6 +2141,7 @@ unsafe fn create_window(
                 Some(b) => {
                     if let Some(s) = state_from(hwnd) {
                         s.backend = Box::new(b);
+                        s.handler.set_active_renderer(ActiveRenderer::Direct2D);
                     }
                 }
                 None => {
@@ -1930,24 +2156,24 @@ unsafe fn create_window(
         }
     }
 
-    // 居中窗口：有 owner 就居中在 owner 上（对话框该出现在它所属的窗口中央，而不是
-    // 主屏中央——主窗在副屏时尤其明显），再钳进 owner 所在显示器的工作区；否则居中屏幕。
-    // 指定了位置就以位置为准。
+    // 居中窗口：有 owner（或发起开窗的窗口）就居中在它上面（对话框该出现在它所属的窗口
+    // 中央，而不是主屏中央——主窗在副屏时尤其明显），再钳进那块显示器的工作区；
+    // 都没有（主窗、托盘开的窗口）就居中在鼠标所在的显示器上。指定了位置就以位置为准。
     if cfg.centered && cfg.position.is_none() {
         let mut rc = RECT::default();
         let _ = GetWindowRect(hwnd, &mut rc);
         let win_w = rc.right - rc.left;
         let win_h = rc.bottom - rc.top;
-        let (x, y) = match owner {
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let (x, y) = match owner.or(origin) {
             Some(o) => {
                 let mut orc = RECT::default();
                 let _ = GetWindowRect(o, &mut orc);
                 let mut x = orc.left + (orc.right - orc.left - win_w) / 2;
                 let mut y = orc.top + (orc.bottom - orc.top - win_h) / 2;
-                let mut mi = MONITORINFO {
-                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                    ..Default::default()
-                };
                 let mon = MonitorFromWindow(o, MONITOR_DEFAULTTONEAREST);
                 if GetMonitorInfoW(mon, &mut mi).as_bool() {
                     let w = mi.rcWork;
@@ -1956,12 +2182,33 @@ unsafe fn create_window(
                 }
                 (x, y)
             }
-            None => (
-                (GetSystemMetrics(SM_CXSCREEN) - win_w) / 2,
-                (GetSystemMetrics(SM_CYSCREEN) - win_h) / 2,
-            ),
+            None => {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+                if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                    let w = mi.rcWork;
+                    (
+                        w.left + (w.right - w.left - win_w) / 2,
+                        w.top + (w.bottom - w.top - win_h) / 2,
+                    )
+                } else {
+                    (
+                        (GetSystemMetrics(SM_CXSCREEN) - win_w) / 2,
+                        (GetSystemMetrics(SM_CYSCREEN) - win_h) / 2,
+                    )
+                }
+            }
         };
-        let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOZORDER | SWP_NOSIZE);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            x,
+            y,
+            0,
+            0,
+            SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
     }
 
     // 模态：禁用 owner 的输入直到本窗口关闭（见 `release_modal_owner`）。系统对被禁用
@@ -2024,7 +2271,11 @@ unsafe fn create_window(
         // 不认识这个属性号，返回 E_INVALIDARG——我们在此丢弃它，正好得到想要的降级
         // （Win10 本就没有圆角窗口一说）。属性号 33 在 Win10 上无任何合法属性占用，
         // 不存在误设成别的属性的风险，故无需 GetVersionEx 分支。
-        let pref = DWMWCP_ROUND;
+        let pref = match cfg.window_corner {
+            crate::platform::WindowCorner::Round => DWMWCP_ROUND,
+            crate::platform::WindowCorner::Small => DWMWCP_ROUNDSMALL,
+            crate::platform::WindowCorner::Square => DWMWCP_DONOTROUND,
+        };
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -2033,6 +2284,22 @@ unsafe fn create_window(
             // 日后有人改 `pref` 的类型时不会留下静默失配的尺寸参数。
             size_of_val(&pref) as u32,
         );
+        // `WindowOutline::Off`：Win11 上 DWM 会在客户区之上画一道 1px 边框，自绘的外框关掉了
+        // 它还在——「不要这圈线」得连它一起去掉。DWMWA_COLOR_NONE 即不画边框。
+        //
+        // 只在 Off 时设，别的策略不碰：该属性只能 Set 不能 Get，读不回原值；虽有
+        // `DWMWA_COLOR_DEFAULT` 可恢复系统默认，没必要在用户没要求时改写它。外框策略建窗后
+        // 不再变，所以这里一次设定即可。Win10 不认这个属性，返回 E_INVALIDARG，照样丢弃——
+        // 那里的外框本来就是宿主自画、Off 已经关掉了。
+        if cfg.window_outline == crate::platform::WindowOutline::Off {
+            let none = DWMWA_COLOR_NONE;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_BORDER_COLOR,
+                &none as *const _ as *const c_void,
+                size_of_val(&none) as u32,
+            );
+        }
         // 外框由谁画：问 DWM 认不认"可见边框厚度"这个属性。认（Win11，22000 起）就说明
         // 它会在客户区之上给所有窗口画 1px 边框；不认（Win10，含 Server 2022、LTSC）查询
         // 失败——那里没有任何边框：普通窗口那条边画在非客户区里，而我们把非客户区整个
@@ -2054,6 +2321,7 @@ unsafe fn create_window(
             s.self_outline = !dwm_border;
         }
         push_window_state(hwnd);
+        // 建窗中的外框重算也会激活窗口；必须留到 show_window 按配置决定是否激活。
         let _ = SetWindowPos(
             hwnd,
             None,
@@ -2061,7 +2329,7 @@ unsafe fn create_window(
             0,
             0,
             0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE,
         );
     }
 
@@ -2070,7 +2338,8 @@ unsafe fn create_window(
 
 /// 显示窗口。与创建分开：主窗要照顾 `start_hidden`，子窗建好即显。
 unsafe fn show_window(hwnd: HWND) {
-    let _ = ShowWindow(hwnd, SW_SHOW);
+    let activate = state_from(hwnd).is_none_or(|s| s.activate_on_show);
+    let _ = ShowWindow(hwnd, if activate { SW_SHOW } else { SW_SHOWNOACTIVATE });
     let _ = UpdateWindow(hwnd);
 }
 
@@ -2100,7 +2369,7 @@ unsafe fn run_windowed(
     handler: Box<dyn AppHandler>,
     waker: Option<std::sync::Arc<crate::sync::WakerShared>>,
     single: Option<crate::single_instance::SingleInstance>,
-) {
+) -> bool {
     let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     let hmodule = GetModuleHandleW(None).expect("GetModuleHandleW 失败");
@@ -2110,10 +2379,12 @@ unsafe fn run_windowed(
     // 常驻模式：不建主窗，直接进消息循环。窗口日后由托盘/热键回调按需建出，
     // 关掉即销毁——渲染资源随 `WindowState` 的 drop 归还，这正是本模式的全部意义。
     RESIDENT.with(|r| r.set(cfg.resident));
+    IME_INTERRUPT.with(|p| p.set(cfg.ime_interrupt));
+    IME_INLINE.with(|p| p.set(cfg.ime_inline));
     let hwnd = if cfg.resident {
         None
     } else {
-        Some(create_window(hinst, &cfg, handler, cfg.renderer, None).expect("主窗口创建失败"))
+        Some(create_window(hinst, &cfg, handler, cfg.renderer, None, None).expect("主窗口创建失败"))
     };
 
     // App 级消息宿主：托盘、全局热键、跨线程唤醒的落点。它们的生命周期属于应用而非
@@ -2127,7 +2398,7 @@ unsafe fn run_windowed(
         // 常驻模式下宿主窗口是唯一的落点：建不起来就既没有托盘也没有热键，进程会成为
         // 一个谁也看不见、谁也关不掉的僵尸。正常模式还有主窗兜底，故只在这里退出。
         eprintln!("[windui] 常驻模式启动失败：App 级消息宿主未能创建，进程退出");
-        return;
+        return false;
     }
 
     // 全局热键（若配置）：注册到 App 级宿主，状态存入 AppHost（drop 时自动注销）。
@@ -2200,6 +2471,7 @@ unsafe fn run_windowed(
     // 实测延迟可达 3–4 秒；此处提前释放可规避该问题。
     #[cfg(feature = "d2d")]
     d2d::release_shared_device();
+    true
 }
 
 /// 帧截止的上限（ms）：控件自报的"下次才需要"再长也不超过这个。
@@ -2408,22 +2680,11 @@ unsafe extern "system" fn wnd_proc(
             if let Some(state) = state_from(hwnd) {
                 state.paint(hwnd);
             }
-            // 帧路径也消费意图：`App::channel` 的 `on_message` 与 `on_interval` 的回调都
-            // 拿得到 `EventCtx`，它们请求的窗口操作/对话框/关窗与热键改绑都产生在**帧内**
-            // （pump 在 render 起始排空，定时器回调靠 InvalidateRect 汇到这一帧），
-            // 事件路径的消费点等不到它们——不在此落地就要拖到用户下一次点键盘鼠标，
-            // 表现为"后台任务完成了却半天不关窗"。
-            //
-            // 顺序与指针路径一致：窗口操作（含热键队列）→ 对话框 → 关窗。三者都在
-            // `state` 借用之外执行（铁律 6）：run_window_op 与阻塞式对话框都会同步重入本函数。
-            apply_window_op(hwnd);
-            apply_dialog_request(hwnd);
-            if state_from(hwnd)
-                .map(|s| s.handler.wants_close())
-                .unwrap_or(false)
-            {
-                destroy_window(hwnd);
-            }
+            // 焦点文本控件的光标是**绘制时**才算出来的：输入法相关的同步放在绘制之后，
+            // 读到的才是本帧的值。
+            sync_ime(hwnd, true);
+            // 帧路径也消费意图，理由与顺序见 `apply_frame_effects`。
+            apply_frame_effects(hwnd);
             LRESULT(0)
         }
         WM_GETMINMAXINFO => {
@@ -2454,6 +2715,32 @@ unsafe extern "system" fn wnd_proc(
                     return LRESULT(0);
                 }
             }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_SHOWWINDOW => {
+            // 显隐转换的真值推送，一条消息收口一切显隐来源（框架 op、hide_on_minimize 的
+            // SW_HIDE、用户经任务栏 / 快捷键的显隐）——它们最终都经过 ShowWindow。
+            //
+            // ⚠️ 这是**前置**消息（"about to be hidden or shown"）：WS_VISIBLE 位要等
+            // DefWindowProcW 处理完才翻转，臂内 IsWindowVisible 读到的还是旧值——
+            // 直接推 live 值等于没修（hide 方向推的还是 true，热键「露着就收起」依旧
+            // 无反应）。visible 从 wparam 合成：lparam==0 来自 ShowWindow；lparam 为
+            // SW_PARENTCLOSING/OPENING（1/3）时 owner 最小化/还原连带藏/显本窗（owned/
+            // modal 子窗会遇到），这两档 wparam 同样给出转换后的新可见性；唯独
+            // SW_OTHERZOOM/UNZOOM（2/4，MDI 被别窗盖住，窗口并未真藏）可见性不变，
+            // 保持 live 读。maximized/minimized/能力位不受显隐影响，此刻仍是真值
+            //（min/max 转换随后必有 WM_SIZE 推送收敛）。
+            //
+            // 缺口的由来：此前常规推送点只有建窗与 WM_SIZE（热键臂还有一处，等价于
+            // WM_SIZE 语义）。hide_on_minimize 在 WM_SIZE 里
+            // 推送完 minimized=true 之后立即 SW_HIDE，从此 visible 恒真——热键「露着就
+            // 收起、藏着就唤起」恒走隐藏分支毫无反应（设计调研发现，见
+            // docs/roadmap-three-designs.md §3）。
+            let mut st = read_window_state(hwnd);
+            if matches!(lparam.0, 0 | 1 | 3) {
+                st.visible = wparam.0 != 0;
+            }
+            push_window_state_with(hwnd, st);
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_SIZE => {
@@ -2489,6 +2776,8 @@ unsafe extern "system" fn wnd_proc(
                     state.paint(hwnd);
                 }
             }
+            // 同步出的这一帧同样要跟上输入法（光标随最大化 / 还原换了位置）。借用已释放。
+            sync_ime(hwnd, true);
             LRESULT(0)
         }
         // 进入/退出交互式拖拽移动/缩放模态循环：标记状态，供 WM_SIZE 分流同步/异步重绘。
@@ -2597,16 +2886,35 @@ unsafe extern "system" fn wnd_proc(
         // DefWindowProc 对 WM_NCRBUTTONUP 的默认处理就是弹系统的灰色原生菜单，与自绘
         // 标题栏视觉割裂。非 HTCAPTION 的部位（缩放边框）同样吞掉、不弹任何东西——
         // 无边框窗口没有系统外框，那里本就不该有系统菜单。
-        WM_NCRBUTTONDOWN if is_frameless(hwnd) => LRESULT(0),
+        WM_NCRBUTTONDOWN if is_frameless(hwnd) => {
+            // 策略是「按下即弹」时在这里就把 Down 交出去（菜单立刻出，且可按住滑选）；
+            // 否则等 `WM_NCRBUTTONUP` 一次补发完整的点击。
+            if wparam.0 as u32 == HTCAPTION && nc_menu_on_press(hwnd) {
+                nc_right_pointer(hwnd, lparam, PointerKind::Down);
+                if let Some(s) = state_from(hwnd) {
+                    s.nc_down_sent = true;
+                }
+            }
+            LRESULT(0)
+        }
         WM_NCRBUTTONUP if is_frameless(hwnd) => {
-            if wparam.0 as u32 == HTCAPTION {
+            let sent = state_from(hwnd).is_some_and(|s| std::mem::take(&mut s.nc_down_sent));
+            if sent {
+                nc_right_pointer(hwnd, lparam, PointerKind::Up);
+            } else if wparam.0 as u32 == HTCAPTION {
                 nc_right_click(hwnd, lparam);
             }
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
-            handle_wheel(hwnd, wparam, lparam);
+            handle_wheel(hwnd, wparam, lparam, false);
             LRESULT(0)
+        }
+        // 横向滚轮回 TRUE：部分鼠标驱动的倾斜滚轮要看到 TRUE 才继续连发（Chromium /
+        // Firefox 同样如此），回 0 只滚一格就停。
+        WM_MOUSEHWHEEL => {
+            handle_wheel(hwnd, wparam, lparam, true);
+            LRESULT(1)
         }
         WM_KEYDOWN => {
             handle_key(hwnd, wparam);
@@ -2697,14 +3005,7 @@ unsafe extern "system" fn wnd_proc(
                 //
                 // 这条臂此前从没真正跑通过（旧位置在 App 级宿主上，那里收不到广播，且
                 // 指针类型是错的），所以收尾的缺失一直被掩盖着，搬过来才第一次成为活路径。
-                apply_window_op(hwnd);
-                apply_dialog_request(hwnd);
-                if state_from(hwnd)
-                    .map(|s| s.handler.wants_close())
-                    .unwrap_or(false)
-                {
-                    destroy_window(hwnd);
-                }
+                apply_frame_effects(hwnd);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -2737,31 +3038,79 @@ unsafe extern "system" fn wnd_proc(
                 .unwrap_or(false);
             if need {
                 let _ = InvalidateRect(Some(hwnd), None, false);
+                // 隐藏 / 最小化的窗口收不到 WM_PAINT，回调排下的意图（托盘提示与图标、
+                // `ctx.show_window()`、关窗……）就会一直搁到窗口再次露面——而托盘常驻
+                // 应用恰恰是在这时最需要它们。此处直接走收尾；之后窗口露面时那一帧
+                // 再跑一次也无妨，意图都是取走即清空的。
+                if !window_presents(hwnd) {
+                    apply_hidden_frame_effects(hwnd);
+                }
+                // 定时器里改了光标形状，指针不动就不会有 WM_SETCURSOR（见 `sync_cursor`）。
+                sync_cursor(hwnd);
             }
             LRESULT(0)
         }
+        // 内联模式：请输入法别画组合窗（摘掉 `ISC_SHOWUICOMPOSITIONWINDOW`），候选窗等其余部分
+        // 照旧由它画。这条消息在窗口激活 / 焦点进出时到达，早于任何组合。
+        WM_IME_SETCONTEXT => {
+            let lparam = if IME_INLINE.with(Cell::get) && wparam.0 != 0 {
+                LPARAM((lparam.0 as u32 & !ISC_SHOWUICOMPOSITIONWINDOW) as isize)
+            } else {
+                lparam
+            };
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         // 输入法开始合成：通知焦点控件进入组合态（自绘光标隐藏，让系统组合浮层
         // 自带的、随组合进度前进的光标成为唯一可见光标），再定位候选窗。
+        //
+        // 内联模式不走组合态（控件画合成串时自己画合成内光标），也不交默认处理：默认处理会
+        // 打开系统组合窗，并用它自己的位置覆盖我们刚报的候选窗位置。
         WM_IME_STARTCOMPOSITION => {
+            let inline = IME_INLINE.with(Cell::get);
             let repaint = state_from(hwnd)
-                .map(|s| s.handler.set_ime_composing(true))
+                .map(|s| {
+                    s.ime_composing = true;
+                    !inline && s.handler.set_ime_composing(true)
+                })
                 .unwrap_or(false);
             if repaint {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
             handle_ime_position(hwnd);
-            DefWindowProcW(hwnd, msg, wparam, lparam)
+            if inline {
+                LRESULT(0)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
         }
         // 合成中：把候选窗重新定位到焦点控件的光标处，再交默认处理。重复定位到
         // 同一点是幂等的；兼顾"候选窗在合成中才出现"的输入法。
+        //
+        // 上屏的字由这里当场读出、作为 `Key::Char` 送给焦点，并从交给默认处理的标志里摘掉，
+        // 免得系统再经 `WM_IME_CHAR` → `WM_CHAR` 排队送一遍：排队的字要等当前消息处理完才到，
+        // 「组合中点击」时点击已经把光标挪走，字就插到了新位置（见 `interrupt_composition`）。
+        WM_IME_COMPOSITION if IME_INLINE.with(Cell::get) => {
+            handle_inline_composition(hwnd, lparam.0 as u32);
+            LRESULT(0)
+        }
         WM_IME_COMPOSITION => {
+            let plan = composition_plan(lparam.0 as u32);
+            if plan.commit {
+                commit_ime_result(hwnd);
+            }
             handle_ime_position(hwnd);
-            DefWindowProcW(hwnd, msg, wparam, lparam)
+            match plan.forward {
+                Some(flags) => DefWindowProcW(hwnd, msg, wparam, LPARAM(flags as isize)),
+                None => LRESULT(0),
+            }
         }
         // 输入法结束合成（提交上屏或取消）：通知焦点控件退出组合态，恢复自绘光标。
         WM_IME_ENDCOMPOSITION => {
             let repaint = state_from(hwnd)
-                .map(|s| s.handler.set_ime_composing(false))
+                .map(|s| {
+                    s.ime_composing = false;
+                    end_composition_ui(s)
+                })
                 .unwrap_or(false);
             if repaint {
                 let _ = InvalidateRect(Some(hwnd), None, false);
@@ -2803,6 +3152,13 @@ unsafe extern "system" fn wnd_proc(
             // 兜底：不经 `destroy_window` 的销毁（owner 关闭时系统级联销毁归属窗口）
             // 也要把 owner 的输入还回去；正常关窗路径这里已是空操作。
             release_modal_owner(hwnd);
+            // 关的是主窗本体：清 MAIN_HWND。AppHost::main 的悬空句柄清不了（它是启动时
+            // 的 Option<HWND>，只写一次），MAIN_HWND 清掉后热键路径随之对已关窗口
+            // no-op，查询返回 None——与 macOS windowWillClose 清 MAIN_WINDOW 同口径：
+            // 主窗没了 = 无主窗，不报全 false 的假状态。
+            if MAIN_HWND.with(|c| c.get()) == hwnd.0 as isize {
+                MAIN_HWND.with(|c| c.set(0));
+            }
             // 最后一个窗口关闭才结束消息循环：多窗口下关掉设置子窗不该把整个应用带走。
             //
             // 常驻模式下连"最后一个"也不退出：零窗口正是那个模式的常态，退出只能由
@@ -2891,13 +3247,46 @@ unsafe fn apply_window_icon(hwnd: HWND, src: &crate::icon::IconSource) {
     }
 }
 
+/// 让光标形状跟上应用刚改的状态，不等下一次 `WM_SETCURSOR`。
+///
+/// 系统只在指针**移动或点击**时发 `WM_SETCURSOR`；定时器、按键触发的形状变化（全屏播放器
+/// 「静止几秒后隐藏指针」、按键进入某种模式）在指针不动时看不到任何效果，等用户一动才
+/// 生效——对 `CursorShape::Hidden` 而言还会把时序弄反（动一下才藏起来，紧接着的移动又被
+/// 换回箭头）。做法是指针恰好在本窗口客户区内时，自己补发一条等价的 `WM_SETCURSOR`。
+///
+/// 调用方须已释放对 `state` 的借用：`SendMessageW` 同步重入 `wnd_proc`（铁律 6）。
+unsafe fn sync_cursor(hwnd: HWND) {
+    let mut pt = POINT::default();
+    if GetCursorPos(&mut pt).is_err() || WindowFromPoint(pt) != hwnd {
+        return;
+    }
+    let pos = LPARAM(((pt.y as u16 as isize) << 16) | (pt.x as u16 as isize));
+    let hit = SendMessageW(hwnd, WM_NCHITTEST, None, Some(pos));
+    if hit.0 as u32 == HTCLIENT {
+        let _ = SendMessageW(
+            hwnd,
+            WM_SETCURSOR,
+            Some(WPARAM(hwnd.0 as usize)),
+            Some(LPARAM(
+                (HTCLIENT as isize) | ((WM_MOUSEMOVE as isize) << 16),
+            )),
+        );
+    }
+}
+
 /// 按形状加载并设置系统光标（应答 WM_SETCURSOR）。加载失败时静默退回类光标。
 unsafe fn apply_cursor(shape: CursorShape) {
     let id = match shape {
+        // `SetCursor(None)` 即不画光标；WM_SETCURSOR 已应答，系统不会再覆盖回类光标。
+        CursorShape::Hidden => {
+            let _ = SetCursor(None);
+            return;
+        }
         CursorShape::Hand => IDC_HAND,
         CursorShape::Text => IDC_IBEAM,
         CursorShape::SizeWE => IDC_SIZEWE,
         CursorShape::SizeNS => IDC_SIZENS,
+        CursorShape::SizeAll => IDC_SIZEALL,
         CursorShape::Arrow => IDC_ARROW,
     };
     if let Ok(cur) = LoadCursorW(None, id) {
@@ -2979,24 +3368,34 @@ unsafe fn is_frameless(hwnd: HWND) -> bool {
     state_from(hwnd).map(|s| s.frameless).unwrap_or(false)
 }
 
-/// 无边框窗口标题栏（HTCAPTION）上的右键：转成客户区右键**按下**交给控件树。
+/// 无边框窗口标题栏（HTCAPTION）上的右键：合成一次完整的客户区右键点击（`Down` + `Up`）。
 ///
-/// **在抬起时才弹、合成的却是 `Down`**——这处不对称是刻意的，别顺手改齐：
-/// - 抬起时弹是 Windows 惯例（原生标题栏系统菜单就是 `WM_NCRBUTTONUP` 才出），而且
-///   "右键按住在标题栏上移动"没有任何别的语义，按下即弹只会让菜单跟着乱跑；
-/// - 合成 `Down` 是因为框架的上下文菜单统一在 `Down` 上开（`Tree::dispatch_pointer`
-///   只在「非左键 + Down」时才建 `MenuRequest`）。合成 `Up` 什么也不会发生。
+/// `WM_NCRBUTTONDOWN` 被吞掉了（见 `wnd_proc`），到 `WM_NCRBUTTONUP` 才一次性补发两下：
+/// - `Down` 给 `on_context_menu`（框架的上下文菜单统一在 `Down` 上开）；
+/// - `Up` 让宿主放行暂存的菜单（`defer_right_click_menu`），与 Windows 原生标题栏
+///   "抬起才出菜单"一致。
 ///
 /// 坐标：NC 消息的 lParam 是**屏幕**坐标，客户区消息的是客户区坐标，两者不能混用。
 /// 转换后仍是物理像素，÷scale 由宿主 `on_pointer` 统一做——漏掉任一步的症状都是
 /// "高 DPI 下菜单弹在离光标几十像素的地方"。
 unsafe fn nc_right_click(hwnd: HWND, lparam: LPARAM) {
+    nc_right_pointer(hwnd, lparam, PointerKind::Down);
+    nc_right_pointer(hwnd, lparam, PointerKind::Up);
+}
+
+/// 把一条 NC 右键消息（lParam 为屏幕坐标）转成客户区的一次右键指针事件。
+unsafe fn nc_right_pointer(hwnd: HWND, lparam: LPARAM, kind: PointerKind) {
     let mut pt = POINT {
         x: (lparam.0 & 0xffff) as i16 as i32,
         y: ((lparam.0 >> 16) & 0xffff) as i16 as i32,
     };
     let _ = ScreenToClient(hwnd, &mut pt);
-    handle_pointer_at(hwnd, PointerKind::Down, MouseButton::Right, pt.x, pt.y);
+    handle_pointer_at(hwnd, kind, MouseButton::Right, pt.x, pt.y);
+}
+
+/// 右键菜单策略是否为「按下即弹」。读完即放开 state 借用（调用方随后才会进 `handle_pointer_at`）。
+unsafe fn nc_menu_on_press(hwnd: HWND) -> bool {
+    state_from(hwnd).is_some_and(|s| s.handler.context_menu_on_press())
 }
 
 /// 系统是否偏好暗色外观（见 [`crate::event::system_prefers_dark`]）。
@@ -3031,11 +3430,27 @@ pub(crate) fn system_prefers_dark() -> bool {
 /// 能力位从**样式位**读而不是缓存 `cfg.resizable`：两者建窗时一致，但样式位是运行期的
 /// 真值。将来若加运行期改可缩放的能力，缓存那份会悄悄过期，而这里不会。
 ///
-/// 两段式（铁律 6）：四个 OS 查询先做完，再借 `state_from` 写入。查询本身不重入，
-/// 但"OS 调用不留在借用里"是这一层的统一纪律——留一个例外，下一个人就得重新判断一遍。
+/// 两段式（铁律 6）：OS 查询先做完，再借 `state_from` 写入。
 unsafe fn push_window_state(hwnd: HWND) {
+    let st = read_window_state(hwnd);
+    push_window_state_with(hwnd, st);
+}
+
+/// 推送一份**现成的**状态（`WM_SHOWWINDOW` 臂用：它要在读到的真值上替换单个字段）。
+unsafe fn push_window_state_with(hwnd: HWND, st: crate::event::WindowState) {
+    if let Some(state) = state_from(hwnd) {
+        state.handler.on_window_state(st);
+    }
+    sync_outline(hwnd);
+}
+
+/// 读一组窗口状态的 OS 真值（推送与同步查询共用同一集合，保证两个读法口径一致）。
+///
+/// 四个 OS 查询（IsZoomed/IsIconic/IsWindowVisible/GetWindowLongPtrW）不派发消息、
+/// 不重入 wnd_proc——与 `single_window_open` 读登记表同一性质，任何时机成立。
+unsafe fn read_window_state(hwnd: HWND) -> crate::event::WindowState {
     let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
-    let st = crate::event::WindowState {
+    crate::event::WindowState {
         maximized: IsZoomed(hwnd).as_bool(),
         minimized: IsIconic(hwnd).as_bool(),
         visible: IsWindowVisible(hwnd).as_bool(),
@@ -3044,11 +3459,26 @@ unsafe fn push_window_state(hwnd: HWND) {
         // ★ RuPix 补丁 04：全屏/置顶真值由运行期样式位反推（见 toggle_fullscreen/toggle_topmost）。
         fullscreen: state_from(hwnd).map(|s| s.fullscreen).unwrap_or(false),
         topmost: (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) != 0,
-    };
-    if let Some(state) = state_from(hwnd) {
-        state.handler.on_window_state(st);
     }
-    sync_outline(hwnd);
+}
+
+/// [`crate::event::main_window_state`] 的 win32 落地：对主窗做一组不派发消息的同步查询，
+/// 任何时机成立——热键 / interval / 托盘回调里读到的都是此刻真值，不依赖快照纪律。
+///
+/// 无主窗（常驻模式）返回 `None`——「无窗可谈状态」是事实陈述，不是失败。
+pub(crate) fn query_main_window_state() -> Option<crate::event::WindowState> {
+    // 不走 `app_host()`（MAIN_HWND 文档说明的借用问题），主窗句柄从独立登记读；
+    // 跨线程每线程独立 → 0 → None，与文档口径一致。
+    let hwnd = MAIN_HWND.with(|c| c.get());
+    if hwnd == 0 {
+        return None;
+    }
+    // 主窗已销毁：句柄悬空。IsWindow 对失效句柄返回 false——主窗没了 = 无主窗
+    //（None），不报全 false 的假状态（与 macOS 同口径）。
+    if !unsafe { IsWindow(Some(HWND(hwnd as *mut _))) }.as_bool() {
+        return None;
+    }
+    Some(unsafe { read_window_state(HWND(hwnd as *mut _)) })
 }
 
 /// Win10 无边框窗口的外框色，仿 Win11 DWM 给所有窗口画的那圈边：灰色；激活且开了
@@ -3209,6 +3639,60 @@ unsafe fn handle_nchittest(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     })
 }
 
+/// 窗口此刻能否出帧：`InvalidateRect` 投给隐藏或最小化的窗口不会产生 `WM_PAINT`。
+fn can_present(visible: bool, iconic: bool) -> bool {
+    visible && !iconic
+}
+
+/// 帧路径的意图收尾：`App::channel` 的 `on_message` 与 `on_interval` 的回调都拿得到
+/// `EventCtx`，它们请求的窗口操作 / 对话框 / 关窗与热键改绑都产生在**帧内**（pump 在
+/// render 起始排空，定时器回调靠 `InvalidateRect` 汇到这一帧），事件路径的消费点等不到
+/// 它们——不在此落地就要拖到用户下一次点键盘鼠标，表现为"后台任务完成了却半天不关窗"。
+///
+/// 顺序与指针路径一致：窗口操作（含热键与托盘队列）→ 对话框 → 关窗。三者都在 `state`
+/// 借用之外执行（铁律 6）：`run_window_op` 与阻塞式对话框都会同步重入 `wnd_proc`。
+///
+/// 调用点：`WM_PAINT` 之后、`WM_SETTINGCHANGE`；窗口出不了帧时的 `WM_TIMER` 走
+/// [`apply_hidden_frame_effects`]。
+unsafe fn apply_frame_effects(hwnd: HWND) {
+    apply_window_op(hwnd);
+    apply_dialog_request(hwnd);
+    close_if_requested(hwnd);
+}
+
+/// 窗口隐藏 / 最小化时的收尾：同 [`apply_frame_effects`]，但对话框通常留到窗口露面再弹。
+///
+/// 隐藏窗口名下的模态框很可能弹在别的窗口后面（定时器不是用户输入，拿不到前台激活权），
+/// 又没有任务栏按钮；而模态期间宿主被禁用，用户从托盘唤出的是一个点不动的窗口。所以
+/// 对话框留给窗口露面后的那一帧，两种情况除外：
+/// - 同一批意图里的 `show_window` 已经把窗口显示出来了；
+/// - 这一批还要关窗：关窗即销毁宿主，排着的请求再也等不到那一帧。`defer_blocking` 也走
+///   这条队列，「退出前保存」这类闭包若被跳过就是丢数据，故维持与帧路径相同的
+///   「对话框 → 关窗」次序。
+unsafe fn apply_hidden_frame_effects(hwnd: HWND) {
+    apply_window_op(hwnd);
+    if window_presents(hwnd) || wants_close(hwnd) {
+        apply_dialog_request(hwnd);
+    }
+    close_if_requested(hwnd);
+}
+
+unsafe fn wants_close(hwnd: HWND) -> bool {
+    state_from(hwnd)
+        .map(|s| s.handler.wants_close())
+        .unwrap_or(false)
+}
+
+unsafe fn close_if_requested(hwnd: HWND) {
+    if wants_close(hwnd) {
+        destroy_window(hwnd);
+    }
+}
+
+unsafe fn window_presents(hwnd: HWND) -> bool {
+    can_present(IsWindowVisible(hwnd).as_bool(), IsIconic(hwnd).as_bool())
+}
+
 /// 事件分发后执行待处理的窗口操作（自定义标题栏按钮、`EventCtx::hide_window` 等）。
 ///
 /// 两段式：`state_from` 的借用在取出 op 的那条语句结束时即释放，随后 `run_window_op`
@@ -3216,7 +3700,7 @@ unsafe fn handle_nchittest(hwnd: HWND, lparam: LPARAM) -> LRESULT {
 unsafe fn apply_window_op(hwnd: HWND) {
     let op = state_from(hwnd).and_then(|s| s.handler.take_window_op());
     run_window_op(hwnd, op);
-    // 标题同点消费：本函数在事件路径与 WM_PAINT 两处都被调用，正是
+    // 标题同点消费：本函数在事件路径与帧收尾（`apply_frame_effects` 等）都被调用，正是
     // `take_window_title` 契约要求的两个时机（换语言可能发生在点击回调里，也可能
     // 发生在 on_interval 里）。
     apply_window_title(hwnd);
@@ -3225,6 +3709,11 @@ unsafe fn apply_window_op(hwnd: HWND) {
     apply_hotkey_ops(hwnd);
     // 运行期托盘操作同点消费（TrayHandle 排队 → 此处落地）。
     apply_tray_ops();
+    // 应用通道也可能由可见窗口的一帧消费，指定键的关闭不能只在 AppHost 收尾时落地。
+    // 此处没有 WindowState 借用；先排关闭，再建新窗，与应用级回调的顺序一致。
+    for key in crate::event::take_callback_closes() {
+        close_single_window(&key);
+    }
     // 开窗请求同点消费（`ctx.open_window` 排队 → 此处落地）。
     open_pending_windows(hwnd);
     // 跨窗口状态：本次分发若写过信号，让其余窗口也重绘一次。
@@ -3286,7 +3775,9 @@ unsafe fn open_pending_windows(hwnd: HWND) {
             NewWindow::Create(cfg, handler) => {
                 // 归属 / 模态窗口的 owner 就是发起开窗的这个窗口。
                 let owner = (cfg.owned || cfg.modal).then_some(hwnd);
-                if let Some(child) = create_window(hinst, &cfg, handler, renderer, owner) {
+                if let Some(child) =
+                    create_window(hinst, &cfg, handler, renderer, owner, Some(hwnd))
+                {
                     show_window(child);
                 }
             }
@@ -3337,7 +3828,7 @@ unsafe fn materialize_window(item: NewWindow) {
             let hinst = HINSTANCE(hmodule.0);
             // 后端沿用应用那次的选择；宿主没了（理论上不会，托盘消息正由它派发）就用默认。
             let renderer = app_host().map(|h| h.renderer).unwrap_or_default();
-            if let Some(child) = create_window(hinst, &cfg, handler, renderer, None) {
+            if let Some(child) = create_window(hinst, &cfg, handler, renderer, None, None) {
                 // 托盘/热键开的窗口是用户此刻要用的东西，建完直接前置——否则它会开在
                 // 当前前台窗口的背后，用户按了热键却什么也没看见。
                 show_and_activate(child);
@@ -3355,16 +3846,26 @@ unsafe fn materialize_window(item: NewWindow) {
 /// 没装托盘时意图被丢弃而不是攒着：一个没有托盘的应用改托盘提示是调用方的错，
 /// 攒起来只会让它在某天真装了托盘时突然生效，那更难查。
 unsafe fn apply_tray_ops() {
-    let ops = crate::platform::tray::take_tray_ops();
-    if ops.is_empty() {
+    // 先在 `Quit` 处切开：退出不依赖托盘（没装托盘也要生效），其后的意图丢弃。
+    let (ops, quit) = crate::platform::tray::split_at_quit(crate::platform::tray::take_tray_ops());
+    if ops.is_empty() && !quit {
         return;
     }
     let target = app_host()
         .and_then(|h| h.tray.as_ref())
         .map(|ts| ts.notify_target());
-    let Some((h, uid)) = target else {
-        return;
-    };
+    if let Some((h, uid)) = target {
+        apply_tray_ops_to(h, uid, ops);
+    }
+    // 在前面所有 OS 调用与借用之后才退出：`quit_app` 同步销毁窗口、重入 `wnd_proc`。
+    // 与 `TrayAction::Quit` 共用 `quit_app`，两条退出路径同义。
+    if quit {
+        quit_app();
+    }
+}
+
+/// `apply_tray_ops` 的主体：把（已在 `Quit` 处截断的）意图投给托盘 `(h, uid)`。
+unsafe fn apply_tray_ops_to(h: HWND, uid: u32, ops: Vec<crate::platform::tray::TrayOp>) {
     for op in ops {
         match op {
             crate::platform::tray::TrayOp::SetTooltip(s) => {
@@ -3375,9 +3876,13 @@ unsafe fn apply_tray_ops() {
                     ts.remember_tooltip(s);
                 }
             }
-            // 气泡是一次性的，shell 重启后无需重放，故不进 `TrayState`。
-            crate::platform::tray::TrayOp::Notify { title, body } => {
+            // 气泡是一次性的，shell 重启后无需重放；只有标签进 `TrayState`（点击时用）。
+            crate::platform::tray::TrayOp::Notify { title, body, tag } => {
                 tray::notify(h, uid, &title, &body);
+                // 记下标签供点击时回调；同样在 OS 调用之后才借宿主。
+                if let Some(ts) = app_host().and_then(|host| host.tray.as_mut()) {
+                    ts.remember_notify_tag(tag);
+                }
             }
             // ★ RuPix 补丁 01：运行期显隐。先 OS 调用，成功后才记账——`NIM_ADD` 失败
             // 时 keep 旧值，下一次同向的 `SetVisible` 还能再试（见 `remember_visible`）。
@@ -3428,6 +3933,8 @@ unsafe fn apply_tray_ops() {
                     }
                 }
             }
+            // 已由 `apply_tray_ops` 切走，不会到这里。
+            crate::platform::tray::TrayOp::Quit => {}
         }
     }
 }
@@ -3883,6 +4390,18 @@ unsafe fn on_tray_message(lparam: LPARAM) {
             // 执行意图：已无借用。
             run_tray_actions(main, actions);
         }
+        tray::TrayEvent::NotificationClick => {
+            let actions = app_host()
+                .and_then(|h| h.tray.as_mut())
+                .map(tray::run_notification_click)
+                .unwrap_or_default();
+            run_tray_actions(main, actions);
+        }
+        tray::TrayEvent::NotificationGone => {
+            if let Some(ts) = app_host().and_then(|h| h.tray.as_mut()) {
+                tray::clear_notify_tag(ts);
+            }
+        }
         tray::TrayEvent::Other => {}
     }
     // 托盘回调与热键回调同属"不属于任何窗口"的入口，收尾也必须同一套：菜单项里
@@ -3954,12 +4473,15 @@ unsafe fn run_tray_actions(main: Option<HWND>, actions: Vec<tray::TrayAction>) {
                 break;
             }
             // 先取出投递目标释放借用，再调 Shell_NotifyIconW（它会跨线程发消息）。
-            tray::TrayAction::Notify { title, body } => {
+            tray::TrayAction::Notify { title, body, tag } => {
                 let target = app_host()
                     .and_then(|h| h.tray.as_ref())
                     .map(|ts| ts.notify_target());
                 if let Some((h, uid)) = target {
                     tray::notify(h, uid, &title, &body);
+                    if let Some(ts) = app_host().and_then(|host| host.tray.as_mut()) {
+                        ts.remember_notify_tag(tag);
+                    }
                 }
             }
         }
@@ -3974,6 +4496,15 @@ unsafe fn run_tray_actions(main: Option<HWND>, actions: Vec<tray::TrayAction>) {
 /// 托盘点击同理（用户交互授予）。
 pub(crate) fn show_and_activate(hwnd: HWND) {
     unsafe {
+        let activate = state_from(hwnd).is_none_or(|s| s.activate_on_show);
+        if !activate {
+            let was_hidden = !IsWindowVisible(hwnd).as_bool();
+            show_window(hwnd);
+            if was_hidden {
+                notify_shown(hwnd);
+            }
+            return;
+        }
         // 先问再显示：`ShowWindow` 之后 `IsWindowVisible` 恒为真，跃迁就无从判断了。
         let was_hidden = !IsWindowVisible(hwnd).as_bool();
         // 隐藏与最小化是**两个独立的位**，可以同时为真——`hide_on_minimize` 就是这么
@@ -4160,13 +4691,7 @@ unsafe fn handle_pointer_at(hwnd: HWND, kind: PointerKind, button: MouseButton, 
     } else {
         1
     };
-    let down = |vk: VIRTUAL_KEY| (GetKeyState(vk.0 as i32) as u16 & 0x8000) != 0;
-    let mods = crate::event::Mods {
-        ctrl: down(VK_CONTROL),
-        alt: down(VK_MENU),
-        shift: down(VK_SHIFT),
-        meta: down(VK_LWIN) || down(VK_RWIN),
-    };
+    let mods = pointer_mods();
     dispatch_pointer_event(
         hwnd,
         PointerEvent {
@@ -4177,6 +4702,17 @@ unsafe fn handle_pointer_at(hwnd: HWND, kind: PointerKind, button: MouseButton, 
             mods,
         },
     );
+}
+
+/// 当前消息时刻的修饰键状态（`GetKeyState` 跟随消息队列，与该鼠标消息同步）。
+unsafe fn pointer_mods() -> crate::event::Mods {
+    let down = |vk: VIRTUAL_KEY| (GetKeyState(vk.0 as i32) as u16 & 0x8000) != 0;
+    crate::event::Mods {
+        ctrl: down(VK_CONTROL),
+        alt: down(VK_MENU),
+        shift: down(VK_SHIFT),
+        meta: down(VK_LWIN) || down(VK_RWIN),
+    }
 }
 
 /// 向系统申请鼠标离开通知（含非客户区），离开时收到 WM_MOUSELEAVE / WM_NCMOUSELEAVE。
@@ -4223,16 +4759,17 @@ unsafe fn handle_nc_mouse_move(hwnd: HWND, lparam: LPARAM) {
     );
 }
 
-/// WM_MOUSEWHEEL：高位字为滚动量（±120/刻度），lParam 为屏幕坐标需转客户区。
+/// WM_MOUSEWHEEL / WM_MOUSEHWHEEL：高位字为滚动量（±120/刻度），lParam 为屏幕坐标需转客户区。
 ///
-/// ★ RuPix 补丁 027 —— 滚轮事件必须带上事件发生时按着的修饰键。此前用
-///   `PointerEvent::single`（`Mods` 全 false），宿主读 `p.mods.ctrl` 永远是
-///   false ⇒ Ctrl+滚轮的独立开关（翻页 / 缩放）形同虚设，缩略图条上的
-///   Shift+滚轮（一次一屏）也一起失效。与 `handle_pointer` 同源：既认消息自带的
-///   `MK_*` 位（MSDN：`LOWORD(wParam)`），也用 `GetKeyState` 兜住把低位留 0
-///   的合成消息（探针 / 辅助技术发的滚轮）。
-unsafe fn handle_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
+/// 横向消息的正值是**向右**，`PointerKind::HWheel` 约定正=向左，故取反。带上修饰键：
+/// Shift+竖向滚轮由滚动容器转成横向。
+unsafe fn handle_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM, horizontal: bool) {
     let delta = ((wparam.0 >> 16) & 0xffff) as i16 as i32;
+    let kind = if horizontal {
+        PointerKind::HWheel(-delta)
+    } else {
+        PointerKind::Wheel(delta)
+    };
     let mut pt = POINT {
         x: (lparam.0 & 0xffff) as i16 as i32,
         y: ((lparam.0 >> 16) & 0xffff) as i16 as i32,
@@ -4253,7 +4790,7 @@ unsafe fn handle_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
     dispatch_pointer_event(
         hwnd,
         PointerEvent::single_with(
-            PointerKind::Wheel(delta),
+            kind,
             Point::new(pt.x, pt.y),
             MouseButton::Left,
             mods,
@@ -4263,6 +4800,9 @@ unsafe fn handle_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
 
 /// 指针事件分发的公共两段式实现（事件分发 + OS 捕获同步 + 关闭）。
 unsafe fn dispatch_pointer_event(hwnd: HWND, ev: PointerEvent) {
+    if matches!(ev.kind, PointerKind::Down) {
+        interrupt_composition(hwnd);
+    }
     let (repaint, active, was_capturing, close) = {
         let Some(state) = state_from(hwnd) else {
             return;
@@ -4292,6 +4832,10 @@ unsafe fn dispatch_pointer_event(hwnd: HWND, ev: PointerEvent) {
             s.capturing = false;
         }
     }
+    // 点击可能换了焦点：输入法开关当场跟上，不等下一帧（见 `sync_ime`）。
+    sync_ime(hwnd, false);
+    // 点击可能改了光标形状；Down / Up 之后系统不会补发 WM_SETCURSOR。
+    sync_cursor(hwnd);
     // 自定义标题栏按钮请求的窗口操作（最小化/最大化）；在可能的关窗之前执行。
     apply_window_op(hwnd);
     // 原生文件对话框请求：此时 OS 捕获已在上面同步完毕，才轮到这个阻塞调用。
@@ -4396,83 +4940,93 @@ unsafe fn handle_touch(hwnd: HWND, kind: PointerKind, x: i32, y: i32, t: u32) {
             }
         }
         PointerKind::Move => {
-            let (down, start, last, last_t, scrolling, vy) = match state_from(hwnd) {
-                Some(s) => (
-                    s.touch.down,
-                    s.touch.start,
-                    s.touch.last,
-                    s.touch.last_t,
-                    s.touch.scrolling,
-                    s.touch.vy,
-                ),
-                None => return,
+            let Some(prev) = state_from(hwnd).map(|s| s.touch) else {
+                return;
             };
-            if !down {
+            if !prev.down {
                 return;
             }
-            let dy = y - last.1;
+            let (dx, dy) = (x - prev.last.0, y - prev.last.1);
             // 估算瞬时速度并低通平滑（dt=0 的重复样本跳过，避免除零）。
-            let dt = t.wrapping_sub(last_t) as i32;
-            let vy = if dt > 0 {
-                let inst = dy as f32 / dt as f32;
-                vy * (1.0 - TOUCH_VEL_SMOOTH) + inst * TOUCH_VEL_SMOOTH
-            } else {
-                vy
+            let dt = t.wrapping_sub(prev.last_t) as i32;
+            let smooth = |v: f32, d: i32| {
+                if dt > 0 {
+                    v * (1.0 - TOUCH_VEL_SMOOTH) + (d as f32 / dt as f32) * TOUCH_VEL_SMOOTH
+                } else {
+                    v
+                }
             };
-            let past = scrolling
-                || (x - start.0).abs() >= TOUCH_THRESHOLD
-                || (y - start.1).abs() >= TOUCH_THRESHOLD;
+            let (vx, vy) = (smooth(prev.vx, dx), smooth(prev.vy, dy));
+            let axis = prev.axis.or_else(|| {
+                let state = state_from(hwnd)?;
+                let pos = Point::new(x, y);
+                crate::platform::touch_lock_axis(
+                    x - prev.start.0,
+                    y - prev.start.1,
+                    TOUCH_THRESHOLD,
+                    |a| state.handler.can_pan(pos, a),
+                )
+            });
             if let Some(s) = state_from(hwnd) {
                 s.touch.last = (x, y);
                 s.touch.last_t = t;
+                s.touch.vx = vx;
                 s.touch.vy = vy;
-                if past {
-                    s.touch.scrolling = true;
-                }
+                s.touch.axis = axis;
             }
-            if past {
-                dispatch_pan(hwnd, Point::new(x, y), dy);
+            if let Some(axis) = axis {
+                let d = if axis == Axis::Horizontal { dx } else { dy };
+                dispatch_pan(hwnd, Point::new(x, y), axis, d);
             }
         }
         PointerKind::Up => {
-            let (down, start, scrolling, vy) = match state_from(hwnd) {
-                Some(s) => (s.touch.down, s.touch.start, s.touch.scrolling, s.touch.vy),
-                None => return,
+            let Some(prev) = state_from(hwnd).map(|s| s.touch) else {
+                return;
             };
             if let Some(s) = state_from(hwnd) {
                 s.touch.down = false;
-                s.touch.scrolling = false;
+                s.touch.axis = None;
             }
-            if down && scrolling {
-                // 拖动滚动后松手：按释放速度启动惯性滑动（速度过低时宿主会忽略）。
-                dispatch_fling(hwnd, Point::new(x, y), vy);
-            } else if down {
+            match (prev.down, prev.axis) {
+                // 拖动滚动后松手：按锁定轴的释放速度启动惯性滑动（速度过低时宿主会忽略）。
+                (true, Some(axis)) => {
+                    let v = if axis == Axis::Horizontal {
+                        prev.vx
+                    } else {
+                        prev.vy
+                    };
+                    dispatch_fling(hwnd, Point::new(x, y), axis, v);
+                }
                 // 未进入滚动 → 视为点击：在起点合成按下，抬起处合成抬起，走正常派发。
-                dispatch_pointer_event(
-                    hwnd,
-                    PointerEvent::single(
-                        PointerKind::Down,
-                        Point::new(start.0, start.1),
-                        MouseButton::Left,
-                    ),
-                );
-                dispatch_pointer_event(
-                    hwnd,
-                    PointerEvent::single(PointerKind::Up, Point::new(x, y), MouseButton::Left),
-                );
+                (true, None) => {
+                    let start = prev.start;
+                    dispatch_pointer_event(
+                        hwnd,
+                        PointerEvent::single(
+                            PointerKind::Down,
+                            Point::new(start.0, start.1),
+                            MouseButton::Left,
+                        ),
+                    );
+                    dispatch_pointer_event(
+                        hwnd,
+                        PointerEvent::single(PointerKind::Up, Point::new(x, y), MouseButton::Left),
+                    );
+                }
+                _ => {}
             }
         }
         _ => {}
     }
 }
 
-/// 触摸滚动：把 dy 注入手指下的滚动容器（两段式：借用读取后释放再 InvalidateRect）。
-unsafe fn dispatch_pan(hwnd: HWND, pos: Point, dy: i32) {
+/// 触摸滚动：把沿 `axis` 的位移 `d` 注入手指下的滚动容器（两段式：借用读取后释放再 InvalidateRect）。
+unsafe fn dispatch_pan(hwnd: HWND, pos: Point, axis: Axis, d: i32) {
     let repaint = {
         let Some(state) = state_from(hwnd) else {
             return;
         };
-        state.handler.on_pan(pos, dy)
+        state.handler.on_pan(pos, axis, d)
     };
     if repaint {
         let _ = InvalidateRect(Some(hwnd), None, false);
@@ -4480,12 +5034,12 @@ unsafe fn dispatch_pan(hwnd: HWND, pos: Point, dy: i32) {
 }
 
 /// 触摸松手：按释放速度启动惯性滑动。启动后触发首帧，其余由动画循环按帧推进。
-unsafe fn dispatch_fling(hwnd: HWND, pos: Point, vy: f32) {
+unsafe fn dispatch_fling(hwnd: HWND, pos: Point, axis: Axis, v: f32) {
     let started = {
         let Some(state) = state_from(hwnd) else {
             return;
         };
-        state.handler.start_fling(pos, vy)
+        state.handler.start_fling(pos, axis, v)
     };
     if started {
         let _ = InvalidateRect(Some(hwnd), None, false);
@@ -4505,15 +5059,355 @@ unsafe fn cancel_fling(hwnd: HWND) {
     }
 }
 
+/// 同步输入法（分发之后 `reposition = false`；绘制之后 `true`）：
+///
+/// - 焦点文本控件换人且正在组合 → 取消这次组合。此时焦点已经换了，若改为提交，上屏的字会
+///   送进**新**焦点，比丢掉还糟；未上屏的拼音丢掉是各应用的常见行为。（点击换焦点的情形在
+///   分发之前已按 `ImeInterrupt` 处理过，见 `interrupt_composition`，走到这里的是程序移焦点。）
+/// - 焦点不是可输入文本（按钮、列表、无焦点）或是密码框 → 摘掉输入法上下文，回到普通文本
+///   框再挂回。否则中文输入法在按钮上照样能打出组合串、无处可去；密码框会被联想与记忆。
+/// - `reposition` 且正在组合、或光标位置变了 → 按**本帧刚算出**的光标重报位置（不在组合中也报，
+///   见函数末尾）。组合消息到达时报的是上一帧的
+///   光标：光标刚滚回可视区、还没排过版时取不到位置，候选窗就落到客户区左上角。绘制后统一
+///   重报覆盖所有「布局变了」的情形，也不必在组合消息里补帧（提交那一刻补帧会把「拼音没了、
+///   汉字还没到」的中间态画上屏）。
+///
+/// 开关只看焦点控件接不接受输入法，不依赖本帧光标，故按键 / 点击分发之后当场再同步一次：
+/// WM_PAINT 是队列空了才合成的低优先级消息，只在绘制后同步的话，Tab 之后连打的几个字母会
+/// 先按旧的开关状态交给输入法。
+///
+/// 两段式（铁律 6）：读完状态放掉借用再调 Imm*，后者可能同步回进 `wnd_proc`（取消组合会
+/// 立刻收到 `WM_IME_ENDCOMPOSITION`）。
+unsafe fn sync_ime(hwnd: HWND, reposition: bool) {
+    let Some((field, prev, composing, enabled)) = state_from(hwnd).map(|s| {
+        let field = s.handler.ime_field();
+        let prev = std::mem::replace(&mut s.ime_field, field);
+        (field, prev, s.ime_composing, s.ime_enabled)
+    }) else {
+        return;
+    };
+    let plan = ime_sync_plan(prev, field, composing, enabled);
+    if plan.cancel_composition {
+        let himc = ImmGetContext(hwnd);
+        if !himc.0.is_null() {
+            let _ = ImmNotifyIME(himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+            let _ = ImmReleaseContext(hwnd, himc);
+        }
+    }
+    if let Some(want) = plan.set_enabled {
+        // 先记下新状态再调 OS：摘上下文时输入法可能同步上屏，`commit_ime_result` → 分发按键 →
+        // 嵌套的 `sync_ime` 若读到旧值，会在这次调用里面再关开一遍。
+        if let Some(s) = state_from(hwnd) {
+            s.ime_enabled = Some(want);
+            // 摘掉期间输入法拿不到位置；挂回后当作没报过，下一帧重报。
+            s.ime_pos = None;
+        }
+        // NULL 上下文 + 0 = 摘掉；IACE_DEFAULT = 挂回窗口的默认上下文。
+        let _ = ImmAssociateContextEx(hwnd, HIMC::default(), if want { IACE_DEFAULT } else { 0 });
+        // 摘掉时若组合态还挂着（TSF 输入法可能延后、甚至不再发 WM_IME_ENDCOMPOSITION），
+        // 主动收尾——否则控件一直藏着自绘光标。
+        let repaint = state_from(hwnd).is_some_and(|s| {
+            let stale = !want && std::mem::replace(&mut s.ime_composing, false);
+            stale && end_composition_ui(s)
+        });
+        if repaint {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+    // 不在组合时也跟着光标报：经 TSF 的输入法（清风、Rime 等）在组合开始那一刻就按手里的位置
+    // 弹候选窗，等 `WM_IME_STARTCOMPOSITION` 再报，第一眼看到的是上一次组合的位置。
+    let report = reposition
+        && state_from(hwnd).is_some_and(|s| {
+            should_report_position(
+                s.ime_enabled,
+                s.ime_composing,
+                s.handler.ime_caret(),
+                s.ime_pos,
+            )
+        });
+    if report {
+        handle_ime_position(hwnd);
+    }
+}
+
+/// 绘制后要不要向输入法重报光标位置：上下文挂着、焦点有光标，且在组合中（候选窗随组合进度
+/// 移动，次次都报）或光标位置变了。光标闪烁这类不动位置的帧不碰输入法。
+fn should_report_position(
+    enabled: Option<bool>,
+    composing: bool,
+    caret: Option<(i32, i32, i32)>,
+    last: Option<(i32, i32, i32)>,
+) -> bool {
+    enabled == Some(true) && caret.is_some() && (composing || caret != last)
+}
+
+/// 组合中按下鼠标：按 [`ImeInterrupt`](crate::platform::ImeInterrupt) 先把组合收掉，再分发这次点击。
+///
+/// 必须在分发**之前**：点击会移动光标、甚至换焦点，之后才上屏的字就落到了新位置。上屏结果由
+/// `WM_IME_COMPOSITION` 当场送进控件（见那条臂），只要输入法在 `ImmNotifyIME` 内同步发出它，字就
+/// 落在原位置。输入法若改为异步上屏，字会晚到并落在新光标处——那是它自己的行为，记一行日志备查。
+unsafe fn interrupt_composition(hwnd: HWND) {
+    let composing = state_from(hwnd).is_some_and(|s| s.ime_composing);
+    log::trace!("ime: 按下鼠标，组合中={composing}");
+    let Some(action) = interrupt_action(IME_INTERRUPT.with(Cell::get), composing) else {
+        return;
+    };
+    let himc = ImmGetContext(hwnd);
+    if himc.0.is_null() {
+        return;
+    }
+    let _ = ImmNotifyIME(himc, NI_COMPOSITIONSTR, action, 0);
+    let _ = ImmReleaseContext(hwnd, himc);
+    if state_from(hwnd).is_some_and(|s| s.ime_composing) {
+        log::debug!("ime: 点击打断组合后输入法未同步结束组合（{action:?}）");
+    }
+}
+
+/// 组合中按下鼠标时要发给输入法的 `CPS_*`；`None` = 不干预。
+fn interrupt_action(
+    policy: crate::platform::ImeInterrupt,
+    composing: bool,
+) -> Option<NOTIFY_IME_INDEX> {
+    use crate::platform::ImeInterrupt;
+    if !composing {
+        return None;
+    }
+    match policy {
+        ImeInterrupt::Commit => Some(CPS_COMPLETE),
+        ImeInterrupt::Cancel => Some(CPS_CANCEL),
+        ImeInterrupt::Ime => None,
+    }
+}
+
+/// 读出这次上屏的串，逐字作为 `Key::Char` 送给焦点（与 `WM_CHAR` 同一条通路，控制字符跳过）。
+unsafe fn commit_ime_result(hwnd: HWND) {
+    let himc = ImmGetContext(hwnd);
+    if himc.0.is_null() {
+        return;
+    }
+    let buf = read_comp_utf16(himc, GCS_RESULTSTR);
+    let _ = ImmReleaseContext(hwnd, himc);
+    log::debug!("ime: 上屏 {} 个 UTF-16 码元", buf.len());
+    for c in char::decode_utf16(buf).filter_map(Result::ok) {
+        if c.is_control() {
+            continue;
+        }
+        dispatch_key_event(
+            hwnd,
+            KeyEvent {
+                key: Key::Char(c),
+                pressed: true,
+                shift: false,
+                ctrl: false,
+                alt: false,
+                meta: false,
+            },
+        );
+    }
+}
+
+/// 组合结束时撤掉控件上的组合态：内联模式清掉合成串，系统绘制模式恢复自绘光标。返回是否要重绘。
+fn end_composition_ui(s: &mut WindowState) -> bool {
+    if IME_INLINE.with(Cell::get) {
+        s.handler.set_ime_preedit(&crate::event::Preedit::default())
+    } else {
+        s.handler.set_ime_composing(false)
+    }
+}
+
+/// 读一段组合信息（`GCS_COMPSTR` / `GCS_RESULTSTR` / `GCS_COMPATTR` 等），按字节取回。
+/// 返回值单位是字节，负数是错误码，一律当空处理。
+unsafe fn read_comp_bytes(himc: HIMC, kind: IME_COMPOSITION_STRING) -> Vec<u8> {
+    let bytes = ImmGetCompositionStringW(himc, kind, None, 0);
+    if bytes <= 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; bytes as usize];
+    let got = ImmGetCompositionStringW(himc, kind, Some(buf.as_mut_ptr().cast()), buf.len() as u32);
+    buf.truncate(got.max(0) as usize);
+    buf
+}
+
+/// 同 [`read_comp_bytes`]，按 UTF-16 码元取回（串类信息）。
+unsafe fn read_comp_utf16(himc: HIMC, kind: IME_COMPOSITION_STRING) -> Vec<u16> {
+    read_comp_bytes(himc, kind)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| u16::from_le_bytes(*b))
+        .collect()
+}
+
+/// 内联模式的 `WM_IME_COMPOSITION`：上屏的字送进焦点，组合串交控件自己画，都不交默认处理。
+///
+/// 次序与 macOS `insertText:` 相同：先撤掉合成串再送上屏的字（字要插在合成串原来的位置，
+/// 而不是合成串之后），最后挂上同一条消息里可能带着的下一段组合串。
+unsafe fn handle_inline_composition(hwnd: HWND, flags: u32) {
+    let empty = crate::event::Preedit::default();
+    let plan = inline_plan(flags);
+    let mut repaint = false;
+    if plan.commit {
+        repaint |= state_from(hwnd).is_some_and(|s| s.handler.set_ime_preedit(&empty));
+        commit_ime_result(hwnd);
+    }
+    if plan.reread {
+        let himc = ImmGetContext(hwnd);
+        if !himc.0.is_null() {
+            let text = read_comp_utf16(himc, GCS_COMPSTR);
+            let attrs = read_comp_bytes(himc, GCS_COMPATTR);
+            let cursor = ImmGetCompositionStringW(himc, GCS_CURSORPOS, None, 0);
+            let _ = ImmReleaseContext(hwnd, himc);
+            let mut pe = preedit_from_imm(&text, cursor, &attrs);
+            // 输入法配置的线型与颜色只在 TSF 里有；读不到（纯 IMM 输入法等）就留空走默认画法。
+            if pe.is_active() {
+                pe.spans = tsf::display_spans(&text);
+            }
+            repaint |= state_from(hwnd).is_some_and(|s| s.handler.set_ime_preedit(&pe));
+        }
+    } else if plan.clear {
+        repaint |= state_from(hwnd).is_some_and(|s| s.handler.set_ime_preedit(&empty));
+    }
+    if repaint {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+    handle_ime_position(hwnd);
+}
+
+/// 内联模式下一条 `WM_IME_COMPOSITION` 要做的事（见 [`inline_plan`]）。
+#[derive(Debug, PartialEq, Eq)]
+struct InlinePlan {
+    /// 有上屏的字：先撤合成串，再把字送进焦点。
+    commit: bool,
+    /// 组合串、光标或分句变了：重读一遍交给控件。
+    reread: bool,
+    /// 什么标志都没有：组合串被清空了（输入法里退格删光等）。
+    clear: bool,
+}
+
+fn inline_plan(flags: u32) -> InlinePlan {
+    // 不只看 GCS_COMPSTR：日文输入法在组合串里移光标、换分句时可能只报光标或属性。
+    let comp = GCS_COMPSTR.0 | GCS_COMPATTR.0 | GCS_COMPCLAUSE.0 | GCS_CURSORPOS.0;
+    InlinePlan {
+        commit: flags & GCS_RESULTSTR.0 != 0,
+        reread: flags & comp != 0,
+        clear: flags == 0,
+    }
+}
+
+/// 把 IMM 给的组合串、光标（UTF-16 下标）与逐码元属性换成 [`Preedit`](crate::event::Preedit)
+/// （字符下标）。选中分句取属性为「目标」（`ATTR_TARGET_*`）的那一段；整串都是目标或没有目标
+/// 时不标分句（中文拼音通常如此）。光标越界退到末尾，与 macOS 同。
+fn preedit_from_imm(text: &[u16], cursor: i32, attrs: &[u8]) -> crate::event::Preedit {
+    let s: String = char::decode_utf16(text.iter().copied())
+        .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect();
+    // UTF-16 下标 → 字符下标：数下标之前有几个非低代理码元。
+    let to_char = |u: usize| {
+        text[..u.min(text.len())]
+            .iter()
+            .filter(|&&c| !(0xDC00..=0xDFFF).contains(&c))
+            .count()
+    };
+    let n = s.chars().count();
+    let caret = match usize::try_from(cursor) {
+        Ok(c) if c <= text.len() => to_char(c),
+        _ => n,
+    };
+    let is_target = |a: &u8| {
+        let a = u32::from(*a);
+        a == ATTR_TARGET_CONVERTED || a == ATTR_TARGET_NOTCONVERTED
+    };
+    let attrs = &attrs[..attrs.len().min(text.len())];
+    let sel = attrs.iter().position(is_target).and_then(|start| {
+        let end = attrs[start..]
+            .iter()
+            .position(|a| !is_target(a))
+            .map_or(attrs.len(), |k| start + k);
+        let (a, b) = (to_char(start), to_char(end));
+        (b > a && !(a == 0 && b == n)).then_some((a, b))
+    });
+    crate::event::Preedit {
+        text: s,
+        caret,
+        sel,
+        spans: Vec::new(),
+    }
+}
+
+/// `WM_IME_COMPOSITION` 怎么处理（纯函数，便于单测）。
+#[derive(Debug, PartialEq)]
+struct CompositionPlan {
+    /// 带上屏结果：由我们读出并送进焦点。
+    commit: bool,
+    /// 交给 `DefWindowProc` 的标志；`None` = 不交（只有上屏、没有组合串，默认处理已无事可做）。
+    forward: Option<u32>,
+}
+
+fn composition_plan(flags: u32) -> CompositionPlan {
+    if flags & GCS_RESULTSTR.0 == 0 {
+        // 没有上屏（含 lparam 为 0 的「组合被清空」）：原样交默认处理。
+        return CompositionPlan {
+            commit: false,
+            forward: Some(flags),
+        };
+    }
+    let rest = strip_result_flags(flags);
+    CompositionPlan {
+        commit: true,
+        forward: (rest != 0).then_some(rest),
+    }
+}
+
+/// 从 `WM_IME_COMPOSITION` 的标志里摘掉上屏相关的几位（上屏已由我们处理），保留组合串的部分。
+fn strip_result_flags(flags: u32) -> u32 {
+    flags & !(GCS_RESULTSTR.0 | GCS_RESULTREADSTR.0 | GCS_RESULTCLAUSE.0 | GCS_RESULTREADCLAUSE.0)
+}
+
+/// `sync_ime` 要做的事（纯函数，便于单测）。
+#[derive(Debug, PartialEq)]
+struct ImeSyncPlan {
+    /// 焦点换人时正在组合：取消这次组合。
+    cancel_composition: bool,
+    /// 要把输入法上下文挂上（`true`）还是摘掉（`false`）；`None` = 不变。
+    set_enabled: Option<bool>,
+}
+
+/// 由「上次 / 这次的焦点文本控件、是否在组合、上下文当前是否挂着」算出要做的事。
+/// 能输入的判据是焦点控件接受输入法（`ime_field` 为 `Some`，见 `Widget::accepts_ime`）且不是
+/// 密码框。
+fn ime_sync_plan(
+    prev: Option<crate::event::ImeField>,
+    now: Option<crate::event::ImeField>,
+    composing: bool,
+    enabled: Option<bool>,
+) -> ImeSyncPlan {
+    let focus_changed = prev.map(|f| f.id) != now.map(|f| f.id);
+    let want = now.is_some_and(|f| !f.hints.password);
+    ImeSyncPlan {
+        // 焦点没换、但控件变得不接受输入（运行期切成密码框 / 只读）也先取消：直接摘掉上下文
+        // 的话，未上屏的串留在默认上下文里，下次挂回时又冒出来。
+        cancel_composition: composing && (focus_changed || !want),
+        set_enabled: (enabled != Some(want)).then_some(want),
+    }
+}
+
 /// 把输入法合成窗 + 候选窗定位到焦点文本控件的光标处。
 /// 光标位置由 handler 提供（物理像素、相对客户区），无文本焦点时不动作。
 unsafe fn handle_ime_position(hwnd: HWND) {
     // 两段式：先把要的都读出来、放掉 state 借用，再调 Imm*（可能同步回进 wnd_proc）。
-    let (caret, family) = match state_from(hwnd) {
-        Some(s) => (s.handler.ime_caret(), s.handler.ime_font_family()),
+    let (caret, family, area) = match state_from(hwnd) {
+        Some(s) => (
+            s.handler.ime_caret(),
+            s.handler.ime_font_family(),
+            s.handler.ime_area(),
+        ),
         None => return,
     };
     let Some((x, y, h)) = caret else { return };
+    // 拿不到上下文也记下：否则此后每帧都判定「位置变了」，光标闪烁也去调 ImmGetContext。
+    if let Some(s) = state_from(hwnd) {
+        s.ime_pos = caret;
+    }
     let himc = ImmGetContext(hwnd);
     if himc.0.is_null() {
         return; // 无输入法上下文
@@ -4539,21 +5433,46 @@ unsafe fn handle_ime_position(hwnd: HWND) {
         *dst = src;
     }
     let _ = ImmSetCompositionFontW(himc, &lf);
-    // 合成串定位在光标处。
+    // 合成串定位在光标处（系统自画合成串时，光标停在插入点，即合成串的起点）。
+    // `rcArea` 按文档只在 `CFS_RECT` 下才读；这里仍用 `CFS_POINT`（改成按矩形折行需要真机
+    // 逐个输入法验证），填上焦点控件矩形只是无害的预留。
+    let area = area
+        .map(|(ax, ay, aw, ah)| RECT {
+            left: ax,
+            top: ay,
+            right: ax + aw,
+            bottom: ay + ah,
+        })
+        .unwrap_or_default();
     let cf = COMPOSITIONFORM {
         dwStyle: CFS_POINT,
         ptCurrentPos: POINT { x, y },
-        rcArea: RECT::default(),
+        rcArea: area,
     };
     let _ = ImmSetCompositionWindow(himc, &cf);
-    // 候选窗放在光标行下方，避免遮住输入处。
-    let cand = CANDIDATEFORM {
+    // 候选窗设两次，与 Chromium 同：
+    // - `CFS_CANDIDATEPOS`：光标行下方的一个点。经 TSF/CUAS 的中文输入法只认这一种。
+    // - `CFS_EXCLUDE`：声明「避开光标这一段」，日韩输入法据此在下方放不下时翻到上方而不盖住
+    //   正在输入的那一行。点取光标顶端、矩形取光标那一段（主流写法）。
+    let pos = CANDIDATEFORM {
         dwIndex: 0,
         dwStyle: CFS_CANDIDATEPOS,
         ptCurrentPos: POINT { x, y: y + h },
         rcArea: RECT::default(),
     };
-    let _ = ImmSetCandidateWindow(himc, &cand);
+    let _ = ImmSetCandidateWindow(himc, &pos);
+    let exclude = CANDIDATEFORM {
+        dwIndex: 0,
+        dwStyle: CFS_EXCLUDE,
+        ptCurrentPos: POINT { x, y },
+        rcArea: RECT {
+            left: x,
+            top: y,
+            right: x + 1,
+            bottom: y + h,
+        },
+    };
+    let _ = ImmSetCandidateWindow(himc, &exclude);
     let _ = ImmReleaseContext(hwnd, himc);
 }
 
@@ -4763,6 +5682,8 @@ unsafe fn dispatch_key_event(hwnd: HWND, ev: KeyEvent) {
     if repaint {
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
+    // Tab 等可能换了焦点：输入法开关当场跟上（见 `sync_ime`）。
+    sync_ime(hwnd, false);
     apply_window_op(hwnd);
     apply_dialog_request(hwnd);
     if close {
@@ -4786,7 +5707,17 @@ unsafe fn state_from<'a>(hwnd: HWND) -> Option<&'a mut WindowState> {
 
 #[cfg(test)]
 mod live_windows_tests {
-    use super::{copy_swap_rect, should_quit_on_last_window, LiveWindows, Rect};
+    use super::{can_present, copy_swap_rect, should_quit_on_last_window, LiveWindows, Rect};
+
+    /// 只有可见且未最小化的窗口能出帧。判反的后果是：托盘常驻应用收进托盘后，
+    /// `on_interval` 回调里改托盘提示、`ctx.show_window()` 这类意图全部搁置到窗口露面。
+    #[test]
+    fn only_visible_restored_window_presents() {
+        assert!(can_present(true, false));
+        assert!(!can_present(false, false), "隐藏（收进托盘）");
+        assert!(!can_present(true, true), "最小化");
+        assert!(!can_present(false, true));
+    }
 
     /// 常规模式：最后一个窗口关掉才退出，之前不退。
     #[test]
@@ -5218,5 +6149,241 @@ mod tests {
         assert_eq!(t.bump(1, 30, 10, 1100, DBL, DX, DY), 1, "漂移过大不算连击");
         // 换按键 → 重新计数。
         assert_eq!(t.bump(2, 30, 10, 1150, DBL, DX, DY), 1, "换按键不算连击");
+    }
+}
+
+#[cfg(test)]
+mod ime_sync_tests {
+    use super::{
+        composition_plan, ime_sync_plan, inline_plan, interrupt_action, preedit_from_imm,
+        should_report_position, strip_result_flags, CompositionPlan, ImeSyncPlan, InlinePlan,
+    };
+    use crate::platform::ImeInterrupt;
+    use windows::Win32::UI::Input::Ime::{
+        ATTR_TARGET_CONVERTED, ATTR_TARGET_NOTCONVERTED, CPS_CANCEL, CPS_COMPLETE, GCS_COMPATTR,
+        GCS_COMPSTR, GCS_CURSORPOS, GCS_RESULTCLAUSE, GCS_RESULTREADCLAUSE, GCS_RESULTREADSTR,
+        GCS_RESULTSTR,
+    };
+
+    fn u16s(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
+
+    /// 上屏与新一段组合串同在一条消息里时两件都做；只移光标也要重读；空标志是清空。
+    #[test]
+    fn inline_plan_covers_every_composition_shape() {
+        let plan = |commit, reread, clear| InlinePlan {
+            commit,
+            reread,
+            clear,
+        };
+        assert_eq!(
+            inline_plan(GCS_RESULTSTR.0 | GCS_COMPSTR.0 | GCS_CURSORPOS.0),
+            plan(true, true, false)
+        );
+        assert_eq!(inline_plan(GCS_RESULTSTR.0), plan(true, false, false));
+        assert_eq!(inline_plan(GCS_CURSORPOS.0), plan(false, true, false));
+        assert_eq!(inline_plan(0), plan(false, false, true));
+    }
+
+    #[test]
+    fn preedit_from_imm_maps_utf16_cursor_to_chars() {
+        let pe = preedit_from_imm(&u16s("ni'hao"), 3, &[0; 6]);
+        assert_eq!((pe.text.as_str(), pe.caret, pe.sel), ("ni'hao", 3, None));
+        // 代理对（表情）占两个 UTF-16 码元、一个字符：光标在它之后是字符下标 2。
+        let pe = preedit_from_imm(&u16s("a😀b"), 3, &[0; 4]);
+        assert_eq!(pe.caret, 2);
+        // 越界 / 负数（输入法没给光标）退到末尾。
+        assert_eq!(preedit_from_imm(&u16s("abc"), -1, &[]).caret, 3);
+        assert_eq!(preedit_from_imm(&u16s("abc"), 9, &[]).caret, 3);
+    }
+
+    #[test]
+    fn preedit_from_imm_marks_only_a_partial_target_clause() {
+        let t = ATTR_TARGET_CONVERTED as u8;
+        let n = ATTR_TARGET_NOTCONVERTED as u8;
+        // 日文分节：第二段是目标。
+        let pe = preedit_from_imm(&u16s("ABCDEF"), 0, &[2, 2, t, t, 2, 2]);
+        assert_eq!(pe.sel, Some((2, 4)));
+        let pe = preedit_from_imm(&u16s("ABCD"), 0, &[0, 0, n, n]);
+        assert_eq!(pe.sel, Some((2, 4)), "未转换的目标同样算");
+        // 整串都是目标：不标（否则整串加粗，与没有分句无从区分）。
+        assert_eq!(preedit_from_imm(&u16s("AB"), 0, &[t, t]).sel, None);
+        // 目标段后面跟着代理对：下标按字符算。
+        let pe = preedit_from_imm(&u16s("😀AB"), 0, &[2, 2, t, 2]);
+        assert_eq!(pe.sel, Some((1, 2)));
+    }
+
+    #[test]
+    fn position_is_reported_when_the_caret_moves_even_without_composition() {
+        let a = Some((10, 20, 18));
+        let b = Some((40, 20, 18));
+        assert!(
+            should_report_position(Some(true), false, b, a),
+            "光标挪了：不等组合就报"
+        );
+        assert!(
+            should_report_position(Some(true), false, a, None),
+            "挂回后头一帧要报"
+        );
+        assert!(
+            !should_report_position(Some(true), false, a, a),
+            "位置没变（光标闪烁）不报"
+        );
+        assert!(
+            should_report_position(Some(true), true, a, a),
+            "组合中次次都报"
+        );
+        assert!(
+            !should_report_position(Some(false), true, b, a),
+            "上下文摘掉了不报"
+        );
+        assert!(
+            !should_report_position(None, false, b, a),
+            "还没挂过上下文不报"
+        );
+        assert!(
+            !should_report_position(Some(true), true, None, a),
+            "没光标不报"
+        );
+    }
+
+    #[test]
+    fn interrupt_maps_policy_to_notify_only_while_composing() {
+        assert_eq!(
+            interrupt_action(ImeInterrupt::Commit, true),
+            Some(CPS_COMPLETE)
+        );
+        assert_eq!(
+            interrupt_action(ImeInterrupt::Cancel, true),
+            Some(CPS_CANCEL)
+        );
+        assert_eq!(interrupt_action(ImeInterrupt::Ime, true), None);
+        for p in [
+            ImeInterrupt::Commit,
+            ImeInterrupt::Cancel,
+            ImeInterrupt::Ime,
+        ] {
+            assert_eq!(
+                interrupt_action(p, false),
+                None,
+                "{p:?}：没在组合就不打扰输入法"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_result_flags_keeps_the_composition_part() {
+        let comp = GCS_COMPSTR.0 | GCS_COMPATTR.0 | GCS_CURSORPOS.0;
+        // 上屏紧接着开始下一段组合：上屏位摘掉，组合串照常交默认处理。
+        for bit in [
+            GCS_RESULTSTR,
+            GCS_RESULTREADSTR,
+            GCS_RESULTCLAUSE,
+            GCS_RESULTREADCLAUSE,
+        ] {
+            assert_eq!(
+                strip_result_flags(comp | bit.0),
+                comp,
+                "{:#x} 没摘掉",
+                bit.0
+            );
+        }
+        assert_eq!(strip_result_flags(comp), comp);
+    }
+
+    #[test]
+    fn composition_plan_never_lets_the_result_reach_def_window_proc() {
+        let comp = GCS_COMPSTR.0 | GCS_CURSORPOS.0;
+        let result = GCS_RESULTSTR.0 | GCS_RESULTCLAUSE.0;
+        // lparam 为 0（组合被清空）：照常交默认处理，好让系统浮层擦掉。
+        assert_eq!(
+            composition_plan(0),
+            CompositionPlan {
+                commit: false,
+                forward: Some(0)
+            }
+        );
+        // 只有上屏：我们送字，默认处理不收（收了会再经 WM_IME_CHAR 送一遍）。
+        assert_eq!(
+            composition_plan(result),
+            CompositionPlan {
+                commit: true,
+                forward: None
+            }
+        );
+        // 上屏紧跟新组合：组合部分照交。
+        assert_eq!(
+            composition_plan(result | comp),
+            CompositionPlan {
+                commit: true,
+                forward: Some(comp)
+            }
+        );
+        assert_eq!(
+            composition_plan(comp),
+            CompositionPlan {
+                commit: false,
+                forward: Some(comp)
+            }
+        );
+    }
+    use crate::event::{ImeField, ImeHints};
+
+    fn field(id: u64, password: bool) -> Option<ImeField> {
+        Some(ImeField {
+            id,
+            hints: ImeHints {
+                multiline: false,
+                password,
+            },
+        })
+    }
+
+    /// 输入法同步的判定：焦点换人时正在组合就取消；可输入文本框挂上下文、按钮 / 无焦点 /
+    /// 密码框摘掉；状态没变不重复调 Imm*。
+    #[test]
+    fn ime_sync_plan_cancels_and_toggles_context() {
+        let (a, b, pw) = (field(1, false), field(2, false), field(3, true));
+        // 首帧：焦点在文本框 → 挂上；无焦点 → 摘掉。
+        assert_eq!(ime_sync_plan(None, a, false, None).set_enabled, Some(true));
+        assert_eq!(
+            ime_sync_plan(None, None, false, None).set_enabled,
+            Some(false)
+        );
+        // 状态不变不再调。
+        assert_eq!(ime_sync_plan(a, a, false, Some(true)).set_enabled, None);
+        // 焦点换到另一个文本框：组合中取消、不在组合不取消；上下文保持挂着。
+        assert!(ime_sync_plan(a, b, true, Some(true)).cancel_composition);
+        assert!(!ime_sync_plan(a, b, false, Some(true)).cancel_composition);
+        assert_eq!(ime_sync_plan(a, b, true, Some(true)).set_enabled, None);
+        // 同一个框里继续组合：不取消。
+        assert!(!ime_sync_plan(a, a, true, Some(true)).cancel_composition);
+        // 焦点到按钮（无文本焦点）：摘掉，组合中顺带取消。
+        assert_eq!(
+            ime_sync_plan(a, None, true, Some(true)),
+            ImeSyncPlan {
+                cancel_composition: true,
+                set_enabled: Some(false),
+            }
+        );
+        // 密码框摘掉；回到普通文本框挂回。
+        assert_eq!(
+            ime_sync_plan(a, pw, false, Some(true)).set_enabled,
+            Some(false)
+        );
+        assert_eq!(
+            ime_sync_plan(pw, a, false, Some(false)).set_enabled,
+            Some(true)
+        );
+        // 同一个节点运行期变得不接受输入（切成密码框）：组合中也先取消，再摘掉。
+        let a_pw = field(1, true);
+        assert_eq!(
+            ime_sync_plan(a, a_pw, true, Some(true)),
+            ImeSyncPlan {
+                cancel_composition: true,
+                set_enabled: Some(false),
+            }
+        );
     }
 }
