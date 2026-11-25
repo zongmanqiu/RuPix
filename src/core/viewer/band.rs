@@ -176,6 +176,17 @@ impl Viewer {
         band.cur = band.item_at(band.scroll);
     }
 
+    /// 拖带：滚动位置**绝对设定**（拖动的跟手模型 = 起点 scroll − 指针位移），
+    /// 钳位后重算当前项。
+    pub(crate) fn band_scroll_to(&mut self, scroll_abs: f64, viewport_along: f64) {
+        let Some(band) = self.band.as_mut() else {
+            return;
+        };
+        band.scroll = scroll_abs;
+        band.clamp_scroll(viewport_along);
+        band.cur = band.item_at(band.scroll);
+    }
+
     /// 当前项步进（`←→` / `↑↓` 的连续模式语义）：视口跳到相邻项带首。
     /// 返回是否移动（没动就让调用方回落到单页翻页）。
     pub(crate) fn band_step_item(&mut self, delta: isize, viewport_along: f64) -> bool {

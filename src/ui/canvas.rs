@@ -191,6 +191,9 @@ pub struct ImageCanvas {
     band_tex: RefCell<HashMap<(std::path::PathBuf, u32), Image>>,
     /// m351：上次 paint_band 算出的沿轴视口长度（滚轮/拖动的滚动量基准）。
     band_viewport: Cell<f64>,
+    /// m351 拖带状态：`Some((按下时的带内 scroll, 指针 y))`。纵向拖 = y 差；
+    /// 横向拖复用同一槽（用 x 存 pos——轴语义在取用时按 band.axis 解释）。
+    band_drag: Cell<Option<(f64, f32)>>,
     /// 实时调色状态（每窗一份）：参数窗写、本画布 paint 读。
     live: LiveState,
     /// 施加调色后的主图 / 鸟瞰纹理，按 (源 gen, 六个参数) 判脏。
@@ -1035,6 +1038,7 @@ impl ImageCanvas {
             nav_img: RefCell::new(ImageCache::new()),
             band_tex: RefCell::new(HashMap::new()),
             band_viewport: Cell::new(0.0),
+            band_drag: Cell::new(None),
             live: LiveState::new(),
             tint_main: RefCell::new(TintCache::new_pixelated()),
             tint_nav: RefCell::new(TintCache::new()),
@@ -4188,6 +4192,16 @@ impl ImageCanvas {
     /// 先算成局部变量再分支：`self.viewer.borrow()` 的 `Ref` 若活进分支里，
     /// 那句 `borrow_mut()` 就是 `already borrowed` panic（§七 的禁写形状）。
     fn press_left(&self, pos: (f32, f32), view: (f32, f32, f32, f32), ctrl: bool) {
+        // m351 连续阅读：带开着时左键恒拖带（横向拖用 x 轴，同一槽按轴解释）。
+        // Ctrl 例外仍让位（band 模式下 Ctrl 滚轮是缩放，按住拖不抢）。
+        if let Some(band) = self.viewer.borrow().band.as_ref() {
+            let pos_along = match band.axis {
+                crate::core::reading::continuous::Axis::Vertical => pos.1,
+                crate::core::reading::continuous::Axis::Horizontal => pos.0,
+            };
+            self.band_drag.set(Some((band.scroll, pos_along)));
+            return;
+        }
         // 无边框那两问也在这里一次取好：`chrome::borderless()` 是模块级镜像（不借
         // viewer），`can_pan` / `overflows` 借 viewer 的 `Ref`——与本函数下面那次
         // `borrow_mut()` 必须错开，所以拷成 bool 再往下传。
@@ -4634,6 +4648,24 @@ impl ImageCanvas {
                 // 平移图片的跟手帧。三种开局都汇到这一条：Ctrl+左键、中键（都不看开关），
                 // 以及 `drag_image` 开着时的裸左键（[`left_drag`] 判成 PanImage 那一支）。
                 // 已经开局的平移不因中途松开 Ctrl 而断，故判据里带上 `dragging()`。
+                // m351 拖带跟手：起点 scroll − 指针沿轴位移 = 当前 scroll。
+                if let Some((start_scroll, start_pos)) = self.band_drag.get() {
+                    if p.kind == PointerKind::Move {
+                        let cur_pos = {
+                            let v = self.viewer.borrow();
+                            let band = v.band.as_ref().unwrap();
+                            match band.axis {
+                                crate::core::reading::continuous::Axis::Vertical => pos.1,
+                                crate::core::reading::continuous::Axis::Horizontal => pos.0,
+                            }
+                        };
+                        let vp = self.band_viewport.get();
+                        let delta = (start_pos - cur_pos) as f64;
+                        self.viewer.borrow_mut().band_scroll_to(start_scroll + delta, vp);
+                        ctx.mark_dirty();
+                        return true;
+                    }
+                }
                 let panning = self.viewer.borrow().dragging();
                 if p.kind == PointerKind::Move
                     && self.chrome.pressed.get().is_none()
@@ -4656,6 +4688,7 @@ impl ImageCanvas {
                 // ★ 这里还要收掉**所有按下/拖动位**：窗口没有 SetCapture，指针拖出窗口后
                 // 在外面松手时收不到 Up。只清悬停位会留下 `nav_drag`/`lmb_pending`/
                 // `viewer.dragging()`——回到窗口后不动按钮也会继续拖图/拖窗，直到下一次点击。
+                self.band_drag.set(None);
                 let was_nav = self.nav_drag.replace(false);
                 let was_strip = self.strip_pressed.replace(None).is_some();
                 let was_dragging_strip = self.strip_drag.replace(None).is_some();
@@ -4986,6 +5019,8 @@ impl ImageCanvas {
                 true
             }
             PointerKind::Up if p.button == MouseButton::Left => {
+                // m351 拖带收尾：松手即断，绝不让带跟着指针继续飘。
+                self.band_drag.set(None);
                 // 没挪够阈值的一击（单击 / 双击序列）：清账，不当拖动看。
                 self.lmb_pending.set(None);
                 // 拖树的滚动指示（m307）：松手即收，绝不当成"点行进层"。
