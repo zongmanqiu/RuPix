@@ -38,9 +38,9 @@ python build\release_pack.py --version 0.4.1
 
 | 产物 | 内容 |
 |---|---|
-| `RuPix_<ver>.zip` | `rupix.exe` / `LICENSE` / `THIRD-PARTY-NOTICES.md` / `README.txt` + `classic` / `common` / `modern` / `pro` / `texture` 5 枚 DLL，**每枚都带同版本 `<id>_<version>/` 许可文件夹** + `docs/decoders.json` / `plugins.json` / `MCP接入指南.md` |
+| `RuPix_<ver>.zip` | `rupix.exe` / `LICENSE` / `THIRD-PARTY-NOTICES.md` / `README.txt` + `classic` / `common` / `modern` / `pro` 4 枚 DLL，**每枚都带同版本 `<id>_<version>/` 许可文件夹** + `docs/decoders.json` / `plugins.json` / `MCP接入指南.md` |
 
-- `doc`（PDF/PS/AI/DXF，约 26.7 MB）**不进包**；`raw` / `doc-legacy` 也不进（2026-11-25 用户裁决：随包集合由 classic/common/modern/pro/raw 调整为含 texture 不含 raw）。
+- `texture` / `doc`（PDF/PS/AI/DXF，约 26.7 MB）**不进包**；`raw` / `doc-legacy` 也不进（2026-11-25 两步裁决：先随包含 texture 不含 raw；同日再裁 texture 剔除，随包定为 classic/common/modern/pro 4 枚，0.4.3 起生效——0.4.2 资产仍为 5 枚）。
   三者都在设置页「解码器 → 可下载」按需安装，包里的 `docs/decoders.json` 已经列全。
 - 不带 `rupix.ini` / `recent.txt` / `reading.txt` / `cache/` / `temp/` / `plugins/` /
   样本图；也不带 `formats.md|json`——格式覆盖需要时跑 `rupix.exe --list-formats`。

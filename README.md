@@ -1,68 +1,16 @@
-# RuPix
+# RuPix —— Windows 10/11 上的小巧极速看图器
 
 **[⬇️ 下载 0.4.2 (Gitee)](https://gitee.com/qiuzongman/RuPix/releases/download/0.4.2/RuPix_0.4.2.zip)**
  ｜ **[⬇️ 下载 0.4.2 (GitHub)](https://github.com/zongmanqiu/RuPix/releases/download/0.4.2/RuPix_0.4.2.zip)**
 
-> 发布包已带 `classic` / `common` / `modern` / `pro` / `texture` 5 枚基础解码器；`doc`（PDF/PS/AI/DXF）、
-> `raw`、`doc-legacy` 仍可在 设置 → 解码器 里按需下载。0.4.x 暂停自动更新（旧更新器只接受
-> 四文件包）：请从发布页手动下载本包覆盖，下一版恢复。
+> 发布包已带 `classic` / `common` / `modern` / `pro` 4 枚基础解码器；`texture`、`doc`（PDF/PS/AI/DXF）、
+> `raw`、`doc-legacy` 仍可在 设置 → 解码器 里按需下载。
 
 > 宿主仓库（本仓）: [Gitee](https://gitee.com/qiuzongman/RuPix) | [GitHub](https://github.com/zongmanqiu/RuPix)
 
 > 解码器仓库: [Gitee](https://gitee.com/qiuzongman/RuPix-Decoders) | [GitHub](https://github.com/zongmanqiu/RuPix-Decoders)
 
 > 插件仓库: [Gitee](https://gitee.com/qiuzongman/RuPix-Plugins) | [GitHub](https://github.com/zongmanqiu/RuPix-Plugins)
-
-Windows 10/11 上的小巧极速看图器。**宿主只做「看图」，位图解码全部外置为解码器 DLL**——
-`rupix.exe`（体积与逐 crate 构成见
-[`docs/产品定位与边界.md`](docs/产品定位与边界.md) §4.1，本页不复制数字）不内置任何第三方解码库，想多支持一种格式就是往 exe 旁边的
-`decoders\` 放一个 DLL，宿主一行代码不用改。唯一例外：SVG 走内置 resvg（矢量需按
-视口 1:1 重渲，位图解码器语义表达不了，见 [`docs/架构总览.md`](docs/架构总览.md)）。
-
-**便携**：整个程序就是可拷走的一个目录，全部持久化写在 **exe 同级目录**。放在根上的是你会直接看的
-——配置 `rupix.ini`、最近打开列表 `recent.txt`、解码器 `decoders/`、插件 `plugins/`、随包清单 `docs/`；诊断物收在 exe 旁的 `temp\`
-（运行日志 `rupix-<日期>.log`、崩溃报告 `crash-<日期>.log` 与转储 `crash-<日期>-<时分秒>.dmp`、
-会话戳 `rupix.run`）；只用来提速的（SVG 字体索引 `cache\svg-fonts.bin`）收在 `cache\`，删了只是慢一点。
-不碰用户配置目录（`%APPDATA%` 一律不写）——删掉目录就干净了。
-**唯一会写注册表的是设置页里你主动勾选的「文件关联」**：只写当前用户（HKCU）自己的那几个键，
-不锁系统默认程序、随时可以被别家改回去。`rupix.ini` 里每项都有中文注释；
-设置页没摆出来的少数高级项可以直接改它，例如图片预读深度 `prefetch_depth`
-（每个方向预读几张，默认 `3`，可填 `1`–`4`）。**手改 ini 后重启才生效**；
-设置页里的开关则是改完即时生效。诊断物**按天命名**，启动时清掉文件名日期
-早于 7 天前的那些，所以 `temp\` 不会越用越大。
-`rupix-<日期>.log` 每次启动先写一段**会话头**（版本、Windows 版本、是否管理员运行、显示器与缩放、
-启动参数），此后每一行都是 `[02:38:47.547] [ INFO] rupix_lib::core::viewer: 正文`——带本地时刻、
-级别定宽、来源模块，并且"打开了哪张图、等了多久、用的是哪一档、关窗怎么裁决"都写在默认档里。
-出问题时把 `temp\` 里最新那枚运行日志与崩溃报告发出来，环境就不用来回问。
-
-界面采用无边框窗口：画布铺满、无常驻工具栏/状态栏，控件悬浮、悬停才出现；
-深/浅主题与整窗不透明度都可在设置页或右键「界面 ▸」里调。
-
-## 格式覆盖
-
-宿主不内置位图解码库，能开什么由 exe 旁的 `decoders\` 决定。三种读法，口径各不同：
-
-- **可下载档位并集**：[`docs/格式覆盖.md`](docs/格式覆盖.md)（生成物，源是解码器仓的
-  `decoders.json` 与宿主内置登记表）。
-- **发布包实际覆盖**：随包带 `classic` / `common` / `modern` / `pro` / `texture` 5 枚；
-  `doc` / `raw` / `doc-legacy` 按需下载。具体清单以本机 `--list-formats` 为准，
-  包里不放手写/快照格式表。
-- **这台机器现在覆盖**：`rupix.exe --list-formats`，一行 JSON，含内置、各解码器自述与
-  唯一扩展名总数；与设置页「解码器」三张卡同源。
-
-三份都是同一真源的视图，宿主不维护第二份手写格式表。
-
-## 差异点
-
-同类工具里，RuPix 把下面几条做成硬能力，而不是可选项：
-
-- **解码崩溃不带走看图进程**：解码看门狗 + 可丢弃 worker + C SEH 隔离；插件在独立进程里跑。
-- **坏解码器不会造成启动崩溃循环**：加载前写 `<dll>.loading` 面包屑，崩溃留下的标记会让下次扫描跳过该 DLL；设置 → 解码器详情里可清除并重试。
-- **一个进程，多扇窗口**：多开不等于多进程，系统托盘只有一个。
-- **无头命令面**：`--list` / `--metadata` / `--thumbnail` / `--render` / `--list-formats`，
-  供脚本与 MCP 适配器转调；不建窗、不进单实例闸门。
-- **压缩包直接看图**：zip/7z/rar/tar 及多层文件树；包内图片不用先解压到资源管理器。
-- **空格看图**：资源管理器里选中文件按空格，直接盖出无边框预览，再按空格或 Esc 收起。
 
 ## 功能速览
 
@@ -115,6 +63,32 @@ Windows 10/11 上的小巧极速看图器。**宿主只做「看图」，位图�
 - **PDF 不在这份"不做"清单里**：它走解码器路线——由 `doc` 这枚解码库认领 `pdf` 后缀，
   一页当一帧，翻页与动图共用同一组键（宪章 §5.2 的口径是"多认一个格式"，不是"做导出"）。
   `doc` 约 26.7 MB，**不随发布包分发**，在设置 → 解码器里按需安装。
+
+## 格式覆盖
+
+宿主不内置位图解码库，能开什么由 exe 旁的 `decoders\` 决定。三种读法，口径各不同：
+
+- **可下载档位并集**：[`docs/格式覆盖.md`](docs/格式覆盖.md)（生成物，源是解码器仓的
+  `decoders.json` 与宿主内置登记表）。
+- **发布包实际覆盖**：随包带 `classic` / `common` / `modern` / `pro` 4 枚；
+  `texture` / `doc` / `raw` / `doc-legacy` 按需下载。具体清单以本机 `--list-formats` 为准，
+  包里不放手写/快照格式表。
+- **这台机器现在覆盖**：`rupix.exe --list-formats`，一行 JSON，含内置、各解码器自述与
+  唯一扩展名总数；与设置页「解码器」三张卡同源。
+
+三份都是同一真源的视图，宿主不维护第二份手写格式表。
+
+## 差异点
+
+同类工具里，RuPix 把下面几条做成硬能力，而不是可选项：
+
+- **解码崩溃不带走看图进程**：解码看门狗 + 可丢弃 worker + C SEH 隔离；插件在独立进程里跑。
+- **坏解码器不会造成启动崩溃循环**：加载前写 `<dll>.loading` 面包屑，崩溃留下的标记会让下次扫描跳过该 DLL；设置 → 解码器详情里可清除并重试。
+- **一个进程，多扇窗口**：多开不等于多进程，系统托盘只有一个。
+- **无头命令面**：`--list` / `--metadata` / `--thumbnail` / `--render` / `--list-formats`，
+  供脚本与 MCP 适配器转调；不建窗、不进单实例闸门。
+- **压缩包直接看图**：zip/7z/rar/tar 及多层文件树；包内图片不用先解压到资源管理器。
+- **空格看图**：资源管理器里选中文件按空格，直接盖出无边框预览，再按空格或 Esc 收起。
 
 ## 快速开始
 

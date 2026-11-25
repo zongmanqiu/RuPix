@@ -2,7 +2,7 @@
 """Build the single RuPix release package.
 
 One package only: `RuPix_<ver>.zip` = exe + LICENSE + notices + README +
-`classic` / `common` / `modern` / `pro` / `texture` (each DLL **and** its
+`classic` / `common` / `modern` / `pro` (each DLL **and** its
 `<id>_<version>/` license/metadata folder) + `docs/decoders.json` /
 `plugins.json` / `MCP接入指南.md`.
 
@@ -34,7 +34,7 @@ BUILD = PROJECT / ".build"
 DECODER_PACKAGES = PROJECT / ".temp" / "decoder-packages"
 OUT = PROJECT / ".temp" / "release-out"
 
-BASELINE = ("classic", "common", "modern", "pro", "texture")
+BASELINE = ("classic", "common", "modern", "pro")
 SHELL_FILES = ("rupix.exe", "LICENSE", "THIRD-PARTY-NOTICES.md", "README.txt")
 PORTABLE_DOCS = ("decoders.json", "plugins.json", "MCP接入指南.md")
 ZIP_FLAGS = ("-tzip", "-mx=9", "-mtm=off", "-mta=off", "-mtc=off")
