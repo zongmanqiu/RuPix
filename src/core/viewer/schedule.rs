@@ -683,6 +683,13 @@ impl Viewer {
         // m349 T4：回包已消费 = 这笔后台请求的在飞字节账要销（没有账就是 no-op）。
         // 挂在 apply 入口而不是各分支：Main / 预读 / 缩略图 / 取消哨兵全部走这里。
         self.decoder.note_done(done.seq);
+        // 连续阅读（m351）的页带回包：band_inflight 按 seq 认领（回包不带帧号）。
+        // ★ 必须在"过期丢弃"判据之前——band 窗口项的 seq 天然不等于 `want_seq`，
+        //   放后面就永远被当过期结果扔了。Main 回包（当前项）不在这里拦：它要照常
+        //   走 install 更新 `loaded`（状态格/胶片条/信息面板同源），落地后再进驻留池。
+        if self.band.is_some() && self.band_inflight.contains_key(&done.seq) {
+            return self.band_on_done(&done);
+        }
         // 预读回包：入缓存即可，与上屏无关。
         if Some(done.seq) == self.prefetch_seq {
             self.prefetch_seq = None;

@@ -17,16 +17,12 @@ use crate::core::decode::{Done, ReqKind};
 use crate::core::reading::continuous::{Axis, Band, BandCache, BAND_CACHE_BYTES};
 
 /// 可见窗口前后各多取几项（跨屏缓冲，滚动时不至于露白）。
-#[allow(dead_code)] // m351 Phase C 接线后移除
-pub(super) const BAND_CONTEXT: usize = 2;
+pub(crate) const BAND_CONTEXT: usize = 2;
 
 impl Viewer {
-    // ★ m351 Phase C（canvas 绘制/菜单/键鼠接线）落地前五个方法暂无调用点；
-  // 接线后整段标注移除。
     /// 进入连续阅读模式。以当前画廊序列建带，视口对准当前项；基准横截面取
     /// `cross_px`（画布 work 区的宽/高，调用方从布局拿）。
-    #[allow(dead_code)]
-    pub(super) fn enter_band(&mut self, axis: Axis, cross_px: f64) {
+    pub(crate) fn enter_band(&mut self, axis: Axis, cross_px: f64) {
         let Some(g) = self.gallery.as_ref() else {
             return;
         };
@@ -66,18 +62,31 @@ impl Viewer {
     }
 
     /// 退出连续阅读模式：清带与驻留（在途回包落地时因 inflight 已清而被丢弃）。
-    #[allow(dead_code)]
-    pub(super) fn leave_band(&mut self) {
+    pub(crate) fn leave_band(&mut self) {
         self.band = None;
         self.band_cache = BandCache::new();
         self.band_inflight.clear();
     }
 
+    /// 视口横截面变化（窗口 resize）：重设归一基准并整带重排。
+    /// 锚定当前项：`scroll` 对准 `band.cur` 的带首（resize 是显式几何操作，
+    /// 不做"像素位置保持"——按项锚定符合直觉且实现简单）。
+    pub(crate) fn band_resize(&mut self, cross_px: f64) {
+        let Some(band) = self.band.as_mut() else {
+            return;
+        };
+        if (band.base - cross_px).abs() < 0.5 {
+            return;
+        }
+        band.base = cross_px.max(64.0);
+        band.relayout_from(0);
+        band.scroll = band.offset_of(band.cur);
+    }
+
     /// 页带窗口刷新：可见项 ± [`BAND_CONTEXT`] 里没有驻留的，按显示尺寸发
     /// Prefetch 请求（独立车道）。`viewport_along` = 沿滚动轴的视口长度。
     /// 便宜调用：窗口没变化时零开销。
-    #[allow(dead_code)]
-    pub(super) fn band_refresh_window(&mut self, viewport_along: f64) {
+    pub(crate) fn band_refresh_window(&mut self, viewport_along: f64) {
         // 第一段借用：只算窗口与裁剪，不碰 send_decode（它要整个 &self）。
         let (_cur, cross, axis, wanted) = {
             let Some(band) = self.band.as_mut() else {
@@ -121,8 +130,7 @@ impl Viewer {
 
     /// 回包落地：band 在途请求按 seq 认领，驻留 + 布局修正 + 锚定补偿。
     /// 返回 `true` = 这笔回包已被 band 消费（apply 不再走单页过期过滤）。
-    #[allow(dead_code)]
-    pub(super) fn band_on_done(&mut self, done: &Done) -> bool {
+    pub(crate) fn band_on_done(&mut self, done: &Done) -> bool {
         if self.band.is_none() {
             return false;
         }
@@ -157,11 +165,30 @@ impl Viewer {
         true
     }
 
+    /// 沿轴滚动 `delta_px`（滚轮/拖动的统一入口），钳位后重算当前项。
+    /// `viewport_along` = 沿滚动轴的视口长度（canvas 缓存的上次 paint 值）。
+    pub(crate) fn band_scroll_by(&mut self, delta_px: f64, viewport_along: f64) {
+        let Some(band) = self.band.as_mut() else {
+            return;
+        };
+        band.scroll += delta_px;
+        band.clamp_scroll(viewport_along);
+        band.cur = band.item_at(band.scroll);
+    }
+
+    /// 当前项步进（`←→` / `↑↓` 的连续模式语义）：视口跳到相邻项带首。
+    /// 返回是否移动（没动就让调用方回落到单页翻页）。
+    pub(crate) fn band_step_item(&mut self, delta: isize, viewport_along: f64) -> bool {
+        let Some(band) = self.band.as_mut() else {
+            return false;
+        };
+        band.step_item(delta, viewport_along)
+    }
+
     /// 当前项（`band.cur`）变化后的对齐：把单页管线切到新当前项（复用现有
     /// navigate），不复位带——滚动位置就是用户拖到的位置。由 canvas 在滚动
     /// 分派里调用：`cur` 与 loaded 对不上才动。
-    #[allow(dead_code)]
-    pub(super) fn band_sync_current(&mut self) {
+    pub(crate) fn band_sync_current(&mut self) {
         let cur_path = {
             let Some(band) = self.band.as_ref() else {
                 return;

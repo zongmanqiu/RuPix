@@ -49,6 +49,7 @@
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -185,6 +186,11 @@ pub struct ImageCanvas {
     pending_main_page: Cell<Option<(PathBuf, u32)>>,
     /// 鸟瞰缩略位图的上屏纹理缓存。
     nav_img: RefCell<ImageCache>,
+    /// m351 连续阅读：页带位图的上屏纹理（键 = (路径, 帧号)）。
+    /// 与 `BandCache` 同窗口生命周期——paint_band 每帧按可见窗口 retain。
+    band_tex: RefCell<HashMap<(std::path::PathBuf, u32), Image>>,
+    /// m351：上次 paint_band 算出的沿轴视口长度（滚轮/拖动的滚动量基准）。
+    band_viewport: Cell<f64>,
     /// 实时调色状态（每窗一份）：参数窗写、本画布 paint 读。
     live: LiveState,
     /// 施加调色后的主图 / 鸟瞰纹理，按 (源 gen, 六个参数) 判脏。
@@ -330,6 +336,12 @@ fn beyond_slop(start: (f32, f32), pos: (f32, f32)) -> bool {
     let dx = pos.0 - start.0;
     let dy = pos.1 - start.1;
     dx * dx + dy * dy >= DRAG_SLOP * DRAG_SLOP
+}
+
+// m351：上次 paint_band 算出的沿轴视口长度（进程级槽——`exec_action` 是自由
+// 函数，拿不到 `ImageCanvas` 的 Cell；paint_band 每帧写入，读侧容忍一帧延迟）。
+thread_local! {
+    static BAND_VIEWPORT: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
 }
 
 /// 缩略图条拖动（m258）：条是**独立滚动的列表**，左键拖它 = 去看更远的图。
@@ -882,6 +894,109 @@ fn edit_actions(
 }
 
 impl ImageCanvas {
+    fn paint_band(&self, canvas: &mut dyn Canvas, work: &Rect) {
+        // ① viewer 同步：resize 基准 + 窗口刷新 + 当前项对齐（各自内部便宜短路）。
+        let (axis, cross, scroll) = {
+            let mut v = self.viewer.borrow_mut();
+            let band = v.band.as_mut().expect("paint_band 只在 band 模式下进入");
+            let (cross_px, _along_px) = match band.axis {
+                crate::core::reading::continuous::Axis::Vertical => {
+                    (work.w as f64, work.h as f64)
+                }
+                crate::core::reading::continuous::Axis::Horizontal => {
+                    (work.h as f64, work.w as f64)
+                }
+            };
+            v.band_resize(cross_px);
+            v.band_refresh_window(_along_px);
+            self.band_viewport.set(_along_px);
+            BAND_VIEWPORT.with(|c| c.set(_along_px));
+            v.band_sync_current();
+            let band = v.band.as_ref().unwrap();
+            (band.axis, band.cross(), band.scroll)
+        };
+        let items = {
+            let v = self.viewer.borrow();
+            let band = v.band.as_ref().unwrap();
+            band.items.clone()
+        };
+        let mut wanted: Vec<(std::path::PathBuf, u32)> = Vec::new();
+        canvas.save();
+        canvas.clip_rect(*work);
+        for it in items.iter() {
+            let (ratio, known) = match it.natural {
+                Some((w, h)) if w > 0 => ((h as f64) / (w as f64), true),
+                _ => (1.4, false),
+            };
+            let len = match axis {
+                crate::core::reading::continuous::Axis::Vertical => cross * ratio,
+                crate::core::reading::continuous::Axis::Horizontal => cross / ratio,
+            }
+            .max(16.0);
+            let rel = it.offset - scroll;
+            let (hit, rect) = match axis {
+                crate::core::reading::continuous::Axis::Vertical => {
+                    let y = rel + work.y as f64;
+                    let hit = y + len >= work.y as f64 && y <= (work.y + work.h) as f64;
+                    (hit, Rect::new(work.x, y as i32, cross as i32, len as i32))
+                }
+                crate::core::reading::continuous::Axis::Horizontal => {
+                    let x = rel + work.x as f64;
+                    let hit = x + len >= work.x as f64 && x <= (work.x + work.w) as f64;
+                    (hit, Rect::new(x as i32, work.y, len as i32, cross as i32))
+                }
+            };
+            if !hit {
+                continue;
+            }
+            wanted.push((it.path.clone(), it.page));
+            let key = (it.path.clone(), it.page);
+            let tex_ready = self.band_tex.borrow().contains_key(&key);
+            if !tex_ready {
+                // 驻留池取位图（命中续命）：作用域内完成克隆，出域再动 band_tex。
+                let snap = {
+                    let mut v = self.viewer.borrow_mut();
+                    v.band_cache.get(&it.path, it.page).map(|c| {
+                        (c.w, c.h, c.rgba.clone())
+                    })
+                };
+                if let Some((bw, bh, rgba)) = snap {
+                    if bw <= MAX_TEXTURE_SIDE && bh <= MAX_TEXTURE_SIDE {
+                        match Image::from_rgba(bw, bh, &rgba) {
+                            Ok(img) => {
+                                self.band_tex.borrow_mut().insert(key.clone(), img);
+                            }
+                            Err(e) => {
+                                log::error!("页带纹理上传失败：{e}");
+                            }
+                        }
+                    }
+                }
+            }
+            let tex = self.band_tex.borrow();
+            let img = tex.get(&key);
+            match img {
+                Some(tex) => {
+                    canvas.draw_image(tex, rect, Fit::Fill, 0.0, 1.0);
+                }
+                None => {
+                    // 未落地：占位底（空窗底色），回包落地后自动换真图。
+                    canvas.fill_rect(
+                        rect.x as f32,
+                        rect.y as f32,
+                        rect.w as f32,
+                        rect.h as f32,
+                        &Paint::fill(tk::empty_bg()),
+                    );
+                    let _ = known;
+                }
+            }
+        }
+        canvas.restore();
+        // ③ 窗口外纹理随帧裁剪（与 BandCache::evict_outside 同节奏）。
+        self.band_tex.borrow_mut().retain(|k, _| wanted.contains(k));
+    }
+
     /// 与窗口根节点的拖放回调共享 pane 几何；`new` 默认自建一份，测试不受影响。
     pub(crate) fn with_pane_geom(mut self, geom: PaneGeom) -> Self {
         self.pane_geom = geom;
@@ -918,6 +1033,8 @@ impl ImageCanvas {
             comp_nav_drag: Cell::new(false),
             pending_main_page: Cell::new(None),
             nav_img: RefCell::new(ImageCache::new()),
+            band_tex: RefCell::new(HashMap::new()),
+            band_viewport: Cell::new(0.0),
             live: LiveState::new(),
             tint_main: RefCell::new(TintCache::new_pixelated()),
             tint_nav: RefCell::new(TintCache::new()),
@@ -3184,53 +3301,83 @@ impl Widget for ImageCanvas {
         // 里含它那一块（摆图居中用的就是整块），所以这里单独告诉 core「顶上被挡了多少」。
         // 判据与 `chrome::paint` 同源（`title_strip_h`），不另写一遍。
         let chrome_top = chrome::title_strip_h(self.chrome.minimal_mode.get(), &self.chrome);
-        {
-            let mut v = self.viewer.borrow_mut();
-            v.on_viewport(
-                primary_work.x as f32,
-                primary_work.y as f32,
-                primary_work.w as f32,
-                primary_work.h as f32,
-                canvas.dpi_scale(),
-            );
-            v.set_chrome_top(chrome_top);
-            // ★ 画的是**位图**的目标矩形（SVG 切片 ≠ 整图 dst），而鸟瞰几何仍用整图 dst。
-            let base_dst = v.dst_rect(from_rect(primary_work));
-            let img_src = v.image();
-            let img_dst = v.image_dst(from_rect(primary_work));
-            let error = v.error_text();
-            if let (Some(src), Some(idst)) = (img_src, img_dst) {
-                // 目标矩形已经是我们算好的等比尺寸，故用 `Fill` 直铺即可（不会拉伸变形）。
-                // gen 代号没变就不重新上传纹理（未变换的翻页/缩放零成本命中缓存）。
-                let mut cache = self.main_img.borrow_mut();
-                let mut tinted = self.tint_main.borrow_mut();
-                let shown = if let Some(t) = &live {
-                    tinted.obtain(src, t.values, t.gamma, rotate_deg)
-                } else if rotate_deg != 0 {
-                    // 没调色但转了角度：仍要走 tinted 那一趟，只不过参数取中性。
-                    tinted.obtain(
-                        src,
-                        crate::core::pixels::CHANNEL_NEUTRAL,
-                        crate::core::pixels::GAMMA_NEUTRAL,
-                        rotate_deg,
-                    )
-                } else {
-                    cache.obtain(src)
-                };
-                if let Some(img) = shown {
-                    // 主图也按自己的 pane 裁剪：以前只裁辅图，主图平移能侵到右栏，
-                    // 而辅图越不过去，两边手感不对称。现在两块地各自裁齐。
-                    canvas.save();
-                    canvas.clip_rect(primary_work);
-                    canvas.draw_image(img, to_rect(idst), Fit::Fill, 0.0, 1.0);
-                    canvas.restore();
-                } else if src.width > MAX_TEXTURE_SIDE || src.height > MAX_TEXTURE_SIDE {
-                    // ★ 显卡放不下这张图 ⇒ **给一句人话**，而不是留一片空白。
-                    //   （正常路径上显示位图已由 `core::derive` 降过边，这里是兜底。）
-                    let msg = format!(
-                        "这张图太大，显卡放不下（单边上限 {MAX_TEXTURE_SIDE} 像素，实际 {}×{}）",
-                        src.width, src.height
-                    );
+        // m351 连续阅读：带开着时整带绘制（单页分支不跑——fit/pan/rot 全部让位）。
+        if self.viewer.borrow().band.is_some() {
+            self.paint_band(canvas, &primary_work);
+        } else {
+            {
+                let mut v = self.viewer.borrow_mut();
+                v.on_viewport(
+                    primary_work.x as f32,
+                    primary_work.y as f32,
+                    primary_work.w as f32,
+                    primary_work.h as f32,
+                    canvas.dpi_scale(),
+                );
+                v.set_chrome_top(chrome_top);
+                // ★ 画的是**位图**的目标矩形（SVG 切片 ≠ 整图 dst），而鸟瞰几何仍用整图 dst。
+                let base_dst = v.dst_rect(from_rect(primary_work));
+                let img_src = v.image();
+                let img_dst = v.image_dst(from_rect(primary_work));
+                let error = v.error_text();
+                if let (Some(src), Some(idst)) = (img_src, img_dst) {
+                    // 目标矩形已经是我们算好的等比尺寸，故用 `Fill` 直铺即可（不会拉伸变形）。
+                    // gen 代号没变就不重新上传纹理（未变换的翻页/缩放零成本命中缓存）。
+                    let mut cache = self.main_img.borrow_mut();
+                    let mut tinted = self.tint_main.borrow_mut();
+                    let shown = if let Some(t) = &live {
+                        tinted.obtain(src, t.values, t.gamma, rotate_deg)
+                    } else if rotate_deg != 0 {
+                        // 没调色但转了角度：仍要走 tinted 那一趟，只不过参数取中性。
+                        tinted.obtain(
+                            src,
+                            crate::core::pixels::CHANNEL_NEUTRAL,
+                            crate::core::pixels::GAMMA_NEUTRAL,
+                            rotate_deg,
+                        )
+                    } else {
+                        cache.obtain(src)
+                    };
+                    if let Some(img) = shown {
+                        // 主图也按自己的 pane 裁剪：以前只裁辅图，主图平移能侵到右栏，
+                        // 而辅图越不过去，两边手感不对称。现在两块地各自裁齐。
+                        canvas.save();
+                        canvas.clip_rect(primary_work);
+                        canvas.draw_image(img, to_rect(idst), Fit::Fill, 0.0, 1.0);
+                        canvas.restore();
+                    } else if src.width > MAX_TEXTURE_SIDE || src.height > MAX_TEXTURE_SIDE {
+                        // ★ 显卡放不下这张图 ⇒ **给一句人话**，而不是留一片空白。
+                        //   （正常路径上显示位图已由 `core::derive` 降过边，这里是兜底。）
+                        let msg = format!(
+                            "这张图太大，显卡放不下（单边上限 {MAX_TEXTURE_SIDE} 像素，实际 {}×{}）",
+                            src.width, src.height
+                        );
+                        let z = chrome::ARROW_ZONE as i32;
+                        let slot = Rect::new(
+                            primary_work.x + z,
+                            primary_work.y,
+                            (primary_work.w - 2 * z).max(60),
+                            primary_work.h,
+                        );
+                        canvas.draw_text(&msg, slot, tk::error_text(), Align::Center, &hint_ts);
+                    }
+                    drop(tinted);
+                    drop(cache);
+                    // 鸟瞰缩略图（菠萝 NavigatorView）：显示尺寸超出视口时出现。
+                    // 几何锚在**整图** dst 上（位图是切片时映射关系也不变，见 viewer 的
+                    // 归一化坐标设计）。位图存在则整图 dst 必然存在。
+                    if let Some(bd) = base_dst {
+                        nav = self.nav_geom_in(
+                            if companion_on { primary_work } else { work },
+                            work,
+                            to_rect(bd),
+                        );
+                    }
+                } else if let Some(e) = error {
+                    // 中央这一句现在是错误的**唯一**载体（状态格里不再重复一遍），所以两头
+                    // 必须让开翻页箭头：504 宽实测文案两头各骑在一个箭头上，读不全。
+                    // 让宽之后 DirectWrite 自动折行（软硬两后端都按 rect.w 排版、纵向仍居中），
+                    // 长错误变成两行而不是一行两头截断。
                     let z = chrome::ARROW_ZONE as i32;
                     let slot = Rect::new(
                         primary_work.x + z,
@@ -3238,47 +3385,22 @@ impl Widget for ImageCanvas {
                         (primary_work.w - 2 * z).max(60),
                         primary_work.h,
                     );
-                    canvas.draw_text(&msg, slot, tk::error_text(), Align::Center, &hint_ts);
-                }
-                drop(tinted);
-                drop(cache);
-                // 鸟瞰缩略图（菠萝 NavigatorView）：显示尺寸超出视口时出现。
-                // 几何锚在**整图** dst 上（位图是切片时映射关系也不变，见 viewer 的
-                // 归一化坐标设计）。位图存在则整图 dst 必然存在。
-                if let Some(bd) = base_dst {
-                    nav = self.nav_geom_in(
-                        if companion_on { primary_work } else { work },
-                        work,
-                        to_rect(bd),
-                    );
-                }
-            } else if let Some(e) = error {
-                // 中央这一句现在是错误的**唯一**载体（状态格里不再重复一遍），所以两头
-                // 必须让开翻页箭头：504 宽实测文案两头各骑在一个箭头上，读不全。
-                // 让宽之后 DirectWrite 自动折行（软硬两后端都按 rect.w 排版、纵向仍居中），
-                // 长错误变成两行而不是一行两头截断。
-                let z = chrome::ARROW_ZONE as i32;
-                let slot = Rect::new(
-                    primary_work.x + z,
-                    primary_work.y,
-                    (primary_work.w - 2 * z).max(60),
-                    primary_work.h,
-                );
-                canvas.draw_text(&e, slot, tk::error_text(), Align::Center, &hint_ts);
-            } else {
-                // 首图还在解 = 说"载入中"，不许写"把图片拖进来"（m71）：后者是
-                // **空窗口**的邀请，摆在已经打开的文件上就是谎话——真机上那张卡住
-                // 13 s 的截图中央正是这句。
-                //
-                // 两句的**颜色也分开**（2026-11-02 用户口径"这句感觉要设置红色比较好"）：
-                // 空窗是"等你做事"，灰字容易被当成背景装饰略过，用红请人动手；
-                // "载入中…"是"已经在做事"，红字反而像出错了，保持灰。
-                let (hint, color) = if v.awaiting_first_bitmap() {
-                    ("载入中…", tk::hint_text())
+                    canvas.draw_text(&e, slot, tk::error_text(), Align::Center, &hint_ts);
                 } else {
-                    ("把图片拖进来 · 右键打开", tk::hint_invite())
-                };
-                canvas.draw_text(hint, primary_work, color, Align::Center, &hint_ts);
+                    // 首图还在解 = 说"载入中"，不许写"把图片拖进来"（m71）：后者是
+                    // **空窗口**的邀请，摆在已经打开的文件上就是谎话——真机上那张卡住
+                    // 13 s 的截图中央正是这句。
+                    //
+                    // 两句的**颜色也分开**（2026-11-02 用户口径"这句感觉要设置红色比较好"）：
+                    // 空窗是"等你做事"，灰字容易被当成背景装饰略过，用红请人动手；
+                    // "载入中…"是"已经在做事"，红字反而像出错了，保持灰。
+                    let (hint, color) = if v.awaiting_first_bitmap() {
+                        ("载入中…", tk::hint_text())
+                    } else {
+                        ("把图片拖进来 · 右键打开", tk::hint_invite())
+                    };
+                    canvas.draw_text(hint, primary_work, color, Align::Center, &hint_ts);
+                }
             }
         }
 
@@ -4260,6 +4382,19 @@ impl ImageCanvas {
                     }
                     return true;
                 }
+                // ── m351 连续阅读：带开着时滚轮 = 沿带滚动（Ctrl+滚轮仍走缩放档，
+                //    缩的是整条带；Shift 一屏）。四档定制在单页模式才有意义。──────
+                if self.viewer.borrow().band.is_some() && !p.mods.ctrl {
+                    let unit = self.band_viewport.get() / 3.0;
+                    let step = if p.mods.shift {
+                        self.band_viewport.get()
+                    } else {
+                        unit * (delta as f64 / 120.0)
+                    };
+                    self.viewer.borrow_mut().band_scroll_by(-step, self.band_viewport.get());
+                    ctx.mark_dirty();
+                    return true;
+                }
                 // ── 滚轮行为（m278）：四档定制的**成对动作**，一个下拉管上下两个方向 ──
                 // Ctrl / Alt / Shift 各读自己那一档，都不按才走裸滚轮档。缩略图条内
                 // 那一支已在上面 return（条上滚轮恒滚条、Shift 一屏），不会来抢。
@@ -5105,6 +5240,15 @@ fn exec_action(
     match a {
         // ── 仅动 viewer：各臂内部临时 borrow_mut，绝不跨臂持有借用 ──
         Action::Prev => {
+            // m351 连续阅读：带开着时按项步进（视口跳到相邻项带首）。
+            if viewer.borrow().band.is_some() {
+                let vp = BAND_VIEWPORT.with(|c| c.get());
+                viewer.borrow_mut().band_step_item(-1, vp);
+                if let Some(ctx) = ctx {
+                    ctx.mark_dirty();
+                }
+                return true;
+            }
             let pair = pair_step(chrome.companion_source.get(), chrome.companion_link.get());
             let paired = !chrome::borderless()
                 && chrome.companion.get()
@@ -5114,6 +5258,14 @@ fn exec_action(
             true
         }
         Action::Next => {
+            if viewer.borrow().band.is_some() {
+                let vp = BAND_VIEWPORT.with(|c| c.get());
+                viewer.borrow_mut().band_step_item(1, vp);
+                if let Some(ctx) = ctx {
+                    ctx.mark_dirty();
+                }
+                return true;
+            }
             let pair = pair_step(chrome.companion_source.get(), chrome.companion_link.get());
             let paired = !chrome::borderless()
                 && chrome.companion.get()
@@ -6254,18 +6406,23 @@ fn system_body(h: &Handles) -> Element {
     #[test]
     fn changing_the_directory_resets_the_strip_anchor() {
         let src = include_str!("canvas.rs");
-        let i = src.find("let dir_changed =").expect("换目录判据不见了");
-        let tail = &src[i..];
-        let j = tail.find("if dir_changed {").expect("判据没接到清零动作上");
+        // m351 订正：原钉子找 `if dir_changed {` 字面量——m275 之后生产代码的判据
+        // 已是 `if dir_changed || sort_changed {`，字面量只会命中**本测试自己的源码**
+        // （include_str 嵌整个文件），于是 j 落进测试函数、闭合块永远找不到。
+        // 改为对现行联合判据做结构断言：判据存在 + 其后千字内接清零动作。
+        let i = src.find("if dir_changed || sort_changed {").expect("换目录判据不见了");
+        // UTF-8 安全窗口：按行取（固定字节窗口会切在多字节字符中间）。
+        let window: String = src[i..].lines().take(40).collect::<Vec<_>>().join("\n");
         assert!(
-            tail[..j].contains("gallery_dir"),
-            "判据必须问目录（`gallery_dir`），不许拿格数或别的近似值顶替"
-        );
-        let block = &tail[j..];
-        let end = block.find("\n        }\n").expect("清零块没闭合");
-        assert!(
-            block[..end].contains("self.strip_first.set(None)"),
+            window.contains("self.strip_first.set(None)"),
             "换目录要把滚动锚点归零，否则条停在旧目录的位置上"
+        );
+        // 判据必须问目录：`dir_changed` 的取值块里要查 `gallery_dir`。
+        let k = src.find("let dir_changed =").expect("换目录判据不见了");
+        let decl_window: String = src[k..].lines().take(12).collect::<Vec<_>>().join("\n");
+        assert!(
+            decl_window.contains("gallery_dir"),
+            "判据必须问目录（`gallery_dir`），不许拿格数或别的近似值顶替"
         );
     }
 
