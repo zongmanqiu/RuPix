@@ -1,7 +1,7 @@
 # RuPix
 
-**[⬇️ 下载 0.4.1 (Gitee)](https://gitee.com/qiuzongman/RuPix/releases/download/0.4.1/RuPix_0.4.1.zip)**
- ｜ **[⬇️ 下载 0.4.1 (GitHub)](https://github.com/zongmanqiu/RuPix/releases/download/0.4.1/RuPix_0.4.1.zip)**
+**[⬇️ 下载 0.4.2 (Gitee)](https://gitee.com/qiuzongman/RuPix/releases/download/0.4.2/RuPix_0.4.2.zip)**
+ ｜ **[⬇️ 下载 0.4.2 (GitHub)](https://github.com/zongmanqiu/RuPix/releases/download/0.4.2/RuPix_0.4.2.zip)**
 
 > 发布包已带 `classic` / `common` / `modern` / `pro` / `texture` 5 枚基础解码器；`doc`（PDF/PS/AI/DXF）、
 > `raw`、`doc-legacy` 仍可在 设置 → 解码器 里按需下载。0.4.x 暂停自动更新（旧更新器只接受
