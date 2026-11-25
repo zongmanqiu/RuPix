@@ -1679,6 +1679,60 @@ impl ImageCanvas {
         out
     }
 
+    /// 「画面 ▸ 连续阅读」（m351）：纵向 / 横向两向、随时开关。序列 = 当前
+    /// 画廊（目录或压缩包层）；页式文件第一版占一项（帧展开待动态拼接）。
+    fn continuous_menu(&self) -> MenuItem {
+        let band = self.viewer.borrow().band.clone();
+        let (v_on, h_on, any) = match &band {
+            Some(b) => (
+                b.axis == crate::core::reading::continuous::Axis::Vertical,
+                b.axis == crate::core::reading::continuous::Axis::Horizontal,
+                true,
+            ),
+            None => (false, false, false),
+        };
+        let v = self.viewer.clone();
+        let mut sub = Vec::new();
+        for (label, axis, checked) in [
+            (
+                "纵向（从上到下）",
+                crate::core::reading::continuous::Axis::Vertical,
+                v_on,
+            ),
+            (
+                "横向（从左到右）",
+                crate::core::reading::continuous::Axis::Horizontal,
+                h_on,
+            ),
+        ] {
+            let v = v.clone();
+            sub.push(MenuItem::run(
+                label,
+                move |ctx| {
+                    // 延迟基准：paint 首帧 band_resize 设真值，这里传 0。
+                    v.borrow_mut().enter_band(axis, 0.0);
+                    ctx.mark_dirty();
+                },
+                checked,
+            ));
+        }
+        sub.push(MenuItem::separator());
+        sub.push({
+            let v = v.clone();
+            let mut it = MenuItem::run(
+                "关闭（回到单页）",
+                move |ctx| {
+                    v.borrow_mut().leave_band();
+                    ctx.mark_dirty();
+                },
+                false,
+            );
+            it.enabled = any;
+            it
+        });
+        MenuItem::submenu("连续阅读", sub)
+    }
+
     /// 「最近 ▸」（m325）：只服务"再打开一次刚才那张"。
     ///
     /// 列表来自 `core::recent`，最多 100 条，最新在前。点一条 = 与「打开…」走同一条
@@ -2841,6 +2895,10 @@ impl ImageCanvas {
             it.enabled = enabled;
             it
         });
+
+        // ── 连续阅读（m351）：纵向 / 横向 / 关闭，勾选态互斥。enter_band 基准
+        // 传 0（钳到 64），paint 首帧 band_resize 设成 work 区真实宽/高。
+        out.push(self.continuous_menu());
 
         out
     }
