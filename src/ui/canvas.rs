@@ -901,6 +901,8 @@ impl ImageCanvas {
         // ① viewer 同步：resize 基准 + 窗口刷新 + 当前项对齐（各自内部便宜短路）。
         let (axis, cross, scroll) = {
             let mut v = self.viewer.borrow_mut();
+            // 红线豁免: paint_band 的唯一调用点就是 paint 里 `band.is_some()` 的分支，
+            // 进到这里 band 必然在——不变量由调用点唯一性保证。
             let band = v.band.as_mut().expect("paint_band 只在 band 模式下进入");
             let (cross_px, _along_px) = match band.axis {
                 crate::core::reading::continuous::Axis::Vertical => {
@@ -915,10 +917,12 @@ impl ImageCanvas {
             self.band_viewport.set(_along_px);
             BAND_VIEWPORT.with(|c| c.set(_along_px));
             v.band_sync_current();
+            // 红线豁免: 同上——paint_band 进入即 band 在，函数内无人清它。
             let band = v.band.as_ref().unwrap();
             (band.axis, band.cross(), band.scroll)
         };
         let items = {
+            // 红线豁免: paint_band 生存期内 band 不会被清（leave_band 只来自菜单闭包）。
             let v = self.viewer.borrow();
             let band = v.band.as_ref().unwrap();
             band.items.clone()
@@ -4653,6 +4657,8 @@ impl ImageCanvas {
                     if p.kind == PointerKind::Move {
                         let cur_pos = {
                             let v = self.viewer.borrow();
+                            // 红线豁免: band_drag 只在 band 模式下 set（press_left 拦截），
+                            // 它有值 ⇒ band 必在；paint 与事件互斥，中途清不掉。
                             let band = v.band.as_ref().unwrap();
                             match band.axis {
                                 crate::core::reading::continuous::Axis::Vertical => pos.1,
