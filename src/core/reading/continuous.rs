@@ -251,14 +251,29 @@ impl BandCache {
     }
 
     /// 插入；超限时按最旧逐出（可能包含刚插入项——调用方无须特判）。
-    pub fn insert(&mut self, path: PathBuf, page: u32, rgba: std::sync::Arc<Vec<u8>>, w: u32, h: u32) {
+    pub fn insert(
+        &mut self,
+        path: PathBuf,
+        page: u32,
+        rgba: std::sync::Arc<Vec<u8>>,
+        w: u32,
+        h: u32,
+    ) {
         let cost = (w as u64) * (h as u64) * 4;
         let key = (path, page);
         if let Some(old) = self.map.remove(&key) {
             self.bytes -= (old.w as u64) * (old.h as u64) * 4;
         }
         let clock = self.tick();
-        self.map.insert(key, CachedImg { rgba, w, h, last_use: clock });
+        self.map.insert(
+            key,
+            CachedImg {
+                rgba,
+                w,
+                h,
+                last_use: clock,
+            },
+        );
         self.bytes += cost;
         while self.bytes > BAND_CACHE_BYTES && self.map.len() > 1 {
             let Some(victim) = self
@@ -324,15 +339,10 @@ mod tests {
             1.4,
         );
         let cross = b.cross();
-        let hs: Vec<f64> = b
-            .items
-            .iter()
-            .map(|it| it.extent(b.axis, cross))
-            .collect();
+        let hs: Vec<f64> = b.items.iter().map(|it| it.extent(b.axis, cross)).collect();
         assert!((hs[0] - 600.0).abs() < 1e-3); // 800×300/400
         assert!((hs[1] - 400.0).abs() < 1e-3); // 800×1000/2000
         assert!((hs[2] - 1120.0).abs() < 1e-3); // est 1.4
-        assert!(b.items[0].offset > 0.0 || b.items[0].offset == 0.0);
         assert_eq!(b.items[1].offset, hs[0] + GAP_PX);
         assert_eq!(b.items[2].offset, hs[0] + GAP_PX + hs[1] + GAP_PX);
         assert_eq!(b.item_at(0.0), 0);
@@ -348,7 +358,10 @@ mod tests {
         let b = Band::build(
             Axis::Horizontal,
             600.0,
-            [(p("a"), 0, Some((300, 600))), (p("b"), 0, Some((1000, 2500)))],
+            [
+                (p("a"), 0, Some((300, 600))),
+                (p("b"), 0, Some((1000, 2500))),
+            ],
             1.4,
         );
         let cross = b.cross();
@@ -362,10 +375,7 @@ mod tests {
         let mut b = Band::build(
             Axis::Vertical,
             800.0,
-            [
-                (p("a"), 0, None),
-                (p("b"), 0, Some((1000, 4000))),
-            ],
+            [(p("a"), 0, None), (p("b"), 0, Some((1000, 4000)))],
             1.4,
         );
         let est_a = b.items[0].extent(b.axis, b.cross());
@@ -373,7 +383,10 @@ mod tests {
         // 锚定 items[1]：视口正对它的带首（此时布局还是 est 占位）。
         b.scroll = b.items[1].offset;
         let delta = b.set_natural(0, (800, 3200)); // 真实比 4.0 > est 1.4 → 变长
-        assert!((delta - (3200.0 - est_a)).abs() < 1e-3, "delta = 长度变化量");
+        assert!(
+            (delta - (3200.0 - est_a)).abs() < 1e-3,
+            "delta = 长度变化量"
+        );
         assert!(delta > 0.0);
         assert!((b.items[1].offset - (b.items[0].extent(b.axis, b.cross()) + GAP_PX)).abs() < 1e-3);
         // 锚定项在 idx 之后 → scroll += delta 补偿，锚定项仍正对视口首。
@@ -404,13 +417,25 @@ mod tests {
         // 8 MiB/张，40 张必然超 256 MiB。
         for i in 0..40 {
             let n = (8 * 1024 * 1024) as usize; // 8 MiB
-            c.insert(p(&format!("f{i}")), 0, std::sync::Arc::new(vec![0u8; n]), 1024, 2048);
+            c.insert(
+                p(&format!("f{i}")),
+                0,
+                std::sync::Arc::new(vec![0u8; n]),
+                1024,
+                2048,
+            );
         }
         assert!(c.bytes() <= BAND_CACHE_BYTES);
         assert!(c.len() < 40);
         // 命中续命后，旧项先被逐出。
         assert!(c.get(&p("f8"), 0).is_some());
-        c.insert(p("x"), 0, std::sync::Arc::new(vec![0u8; 8 * 1024 * 1024]), 1024, 2048);
+        c.insert(
+            p("x"),
+            0,
+            std::sync::Arc::new(vec![0u8; 8 * 1024 * 1024]),
+            1024,
+            2048,
+        );
         assert!(c.get(&p("f8"), 0).is_some(), "刚续命的项不应被逐出");
     }
 
@@ -418,7 +443,13 @@ mod tests {
     fn evict_outside_keeps_window() {
         let mut c = BandCache::new();
         for i in 0..4 {
-            c.insert(p(&format!("f{i}")), 0, std::sync::Arc::new(vec![0u8; 16]), 2, 2);
+            c.insert(
+                p(&format!("f{i}")),
+                0,
+                std::sync::Arc::new(vec![0u8; 16]),
+                2,
+                2,
+            );
         }
         c.evict_outside(&[(p("f1"), 0), (p("f2"), 0)]);
         assert!(c.get(&p("f1"), 0).is_some());
