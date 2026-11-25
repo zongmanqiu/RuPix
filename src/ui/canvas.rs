@@ -5085,13 +5085,22 @@ impl ImageCanvas {
                 self.sync_hand(pos);
                 true
             }
-            // 中键拖动平移图片（不看修饰键）。
+            // 中键拖动平移图片（不看修饰键）。m351：带模式下改拖带（单图 pan
+            // 对整带没有意义，两键手势保持一致的手感）。
             PointerKind::Down if p.button == MouseButton::Middle => {
                 if self.chrome.locked.get() {
                     return true; // 锁定：中键平移也不留
                 }
                 if self.chrome_activity(pos) {
                     ctx.mark_dirty();
+                }
+                if let Some(band) = self.viewer.borrow().band.as_ref() {
+                    let pos_along = match band.axis {
+                        crate::core::reading::continuous::Axis::Vertical => pos.1,
+                        crate::core::reading::continuous::Axis::Horizontal => pos.0,
+                    };
+                    self.band_drag.set(Some((band.scroll, pos_along)));
+                    return true;
                 }
                 self.viewer.borrow_mut().begin_drag(pos);
                 true
