@@ -187,6 +187,25 @@ impl Viewer {
         band.cur = band.item_at(band.scroll);
     }
 
+    /// 整带缩放：`zoom ×= factor`，重排后按视口中心锚定——缩放前视口中心
+    /// 落在哪一项的哪个位置，缩放后仍近似落在同一处（长带按比例近似）。
+    pub(crate) fn band_zoom_by(&mut self, factor: f32, viewport_along: f64) {
+        let Some(band) = self.band.as_mut() else {
+            return;
+        };
+        let old_zoom = band.zoom;
+        band.zoom = (band.zoom * factor).clamp(0.25, 4.0);
+        if (band.zoom - old_zoom).abs() < 1e-6 {
+            return;
+        }
+        let scale = band.zoom / old_zoom;
+        let center = band.scroll + viewport_along / 2.0;
+        band.relayout_from(0);
+        band.scroll = (center * scale as f64 - viewport_along / 2.0).max(0.0);
+        band.clamp_scroll(viewport_along);
+        band.cur = band.item_at(band.scroll);
+    }
+
     /// 当前项步进（`←→` / `↑↓` 的连续模式语义）：视口跳到相邻项带首。
     /// 返回是否移动（没动就让调用方回落到单页翻页）。
     pub(crate) fn band_step_item(&mut self, delta: isize, viewport_along: f64) -> bool {

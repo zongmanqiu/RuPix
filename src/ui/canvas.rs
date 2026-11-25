@@ -905,9 +905,7 @@ impl ImageCanvas {
             // 进到这里 band 必然在——不变量由调用点唯一性保证。
             let band = v.band.as_mut().expect("paint_band 只在 band 模式下进入");
             let (cross_px, _along_px) = match band.axis {
-                crate::core::reading::continuous::Axis::Vertical => {
-                    (work.w as f64, work.h as f64)
-                }
+                crate::core::reading::continuous::Axis::Vertical => (work.w as f64, work.h as f64),
                 crate::core::reading::continuous::Axis::Horizontal => {
                     (work.h as f64, work.w as f64)
                 }
@@ -963,9 +961,9 @@ impl ImageCanvas {
                 // 驻留池取位图（命中续命）：作用域内完成克隆，出域再动 band_tex。
                 let snap = {
                     let mut v = self.viewer.borrow_mut();
-                    v.band_cache.get(&it.path, it.page).map(|c| {
-                        (c.w, c.h, c.rgba.clone())
-                    })
+                    v.band_cache
+                        .get(&it.path, it.page)
+                        .map(|c| (c.w, c.h, c.rgba.clone()))
                 };
                 if let Some((bw, bh, rgba)) = snap {
                     if bw <= MAX_TEXTURE_SIDE && bh <= MAX_TEXTURE_SIDE {
@@ -1000,6 +998,50 @@ impl ImageCanvas {
             }
         }
         canvas.restore();
+        // ④ 常驻进度指示（m351 用户反馈）：连续阅读时浮条靠悬停唤醒看不见进度，
+        //    在带底部内侧画一条 2px 进度条（位置比例 = scroll/total）+ 右下角
+        //    「cur+1/total」。数据源与浮条状态格同源（band.cur / items.len）。
+        {
+            let v = self.viewer.borrow();
+            // 红线豁免: 进度块在 paint_band 内——进入本函数即 band 在，
+            // 函数生存期内无人清它（leave_band 只来自菜单闭包）。
+            let band = v.band.as_ref().unwrap();
+            let total_px = band.total();
+            let frac = if total_px > 0.0 {
+                (band.scroll / total_px).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let bar_h = 2.0f32;
+            let y = (work.y + work.h - 3) as f32;
+            canvas.fill_rect(
+                work.x as f32,
+                y,
+                work.w as f32,
+                bar_h,
+                &Paint::fill(tk::empty_bg()),
+            );
+            let done_w = ((work.w as f64) * frac) as i32;
+            if done_w > 0 {
+                canvas.fill_rect(
+                    work.x as f32,
+                    y,
+                    done_w as f32,
+                    bar_h,
+                    &Paint::fill(tk::to_color(tk::TEXT_ACCENT)),
+                );
+            }
+            let label = format!("{}/{}", band.cur + 1, band.items.len());
+            let ts = TextStyle::new(super::tokens::SIZE_BODY);
+            let slot = Rect::new(work.x + work.w - 120, work.y + work.h - 28, 112, 24);
+            canvas.draw_text(
+                &label,
+                slot,
+                tk::to_color(tk::TEXT_SECONDARY),
+                Align::Center,
+                &ts,
+            );
+        }
         // ③ 窗口外纹理随帧裁剪（与 BandCache::evict_outside 同节奏）。
         self.band_tex.borrow_mut().retain(|k, _| wanted.contains(k));
     }
@@ -4196,15 +4238,19 @@ impl ImageCanvas {
     /// 先算成局部变量再分支：`self.viewer.borrow()` 的 `Ref` 若活进分支里，
     /// 那句 `borrow_mut()` 就是 `already borrowed` panic（§七 的禁写形状）。
     fn press_left(&self, pos: (f32, f32), view: (f32, f32, f32, f32), ctrl: bool) {
-        // m351 连续阅读：带开着时左键恒拖带（横向拖用 x 轴，同一槽按轴解释）。
-        // Ctrl 例外仍让位（band 模式下 Ctrl 滚轮是缩放，按住拖不抢）。
-        if let Some(band) = self.viewer.borrow().band.as_ref() {
-            let pos_along = match band.axis {
-                crate::core::reading::continuous::Axis::Vertical => pos.1,
-                crate::core::reading::continuous::Axis::Horizontal => pos.0,
-            };
-            self.band_drag.set(Some((band.scroll, pos_along)));
-            return;
+        // m351 连续阅读：带开着时**画布区**左键拖带（横向拖用 x 轴，同一槽按轴解释）。
+        // ★ 标题栏与浮条按钮**不拦**：实测 2026-11-26 无条件拦导致"标题栏无法拖动、
+        //   浮条按钮点不了"——那些地的左键各有自己的主人（拖窗 / 按钮），带只在
+        //   画布上接管。
+        if !Chrome::in_title_strip(pos, view) && self.chrome_hit(pos).is_none() {
+            if let Some(band) = self.viewer.borrow().band.as_ref() {
+                let pos_along = match band.axis {
+                    crate::core::reading::continuous::Axis::Vertical => pos.1,
+                    crate::core::reading::continuous::Axis::Horizontal => pos.0,
+                };
+                self.band_drag.set(Some((band.scroll, pos_along)));
+                return;
+            }
         }
         // 无边框那两问也在这里一次取好：`chrome::borderless()` 是模块级镜像（不借
         // viewer），`can_pan` / `overflows` 借 viewer 的 `Ref`——与本函数下面那次
@@ -4458,16 +4504,39 @@ impl ImageCanvas {
                     }
                     return true;
                 }
-                // ── m351 连续阅读：带开着时滚轮 = 沿带滚动（Ctrl+滚轮仍走缩放档，
-                //    缩的是整条带；Shift 一屏）。四档定制在单页模式才有意义。──────
-                if self.viewer.borrow().band.is_some() && !p.mods.ctrl {
-                    let unit = self.band_viewport.get() / 3.0;
-                    let step = if p.mods.shift {
-                        self.band_viewport.get()
-                    } else {
-                        unit * (delta as f64 / 120.0)
-                    };
-                    self.viewer.borrow_mut().band_scroll_by(-step, self.band_viewport.get());
+                // ── m351 连续阅读滚轮语义（2026-11-26 用户裁定）──────────────
+                // Alt+滚轮 = 沿带滚动（Shift 叠加 = 一屏）——比裸滚轮顺手，也不与
+                // "滚轮缩放"的习惯打架；Ctrl+滚轮 = 按项步进（用户把 Ctrl 档配置成
+                // 「切换图片」，带模式下同一意图 = 跳相邻项）；**裸滚轮 = 整带缩放**
+                // （与单页默认滚轮=缩放一致；用户实测"图片完全无法缩放"的根因就是
+                //  原实现把 Ctrl+滚轮放行给了 Navigate 档）。四档定制在带模式不参与。
+                if self.viewer.borrow().band.is_some() {
+                    let vp = self.band_viewport.get();
+                    if p.mods.alt {
+                        let unit = vp / 3.0;
+                        let step = if p.mods.shift {
+                            vp
+                        } else {
+                            unit * (delta as f64 / 120.0)
+                        };
+                        self.viewer.borrow_mut().band_scroll_by(-step, vp);
+                        ctx.mark_dirty();
+                        return true;
+                    }
+                    if p.mods.ctrl {
+                        let (acc, dir) = wheel_detent(self.wheel_acc.get(), delta);
+                        self.wheel_acc.set(acc);
+                        if dir != 0 {
+                            let step_dir = wheel_nav_dir(dir);
+                            if self.chrome.wheel_gate(step_dir) {
+                                self.viewer.borrow_mut().band_step_item(step_dir, vp);
+                            }
+                        }
+                        ctx.mark_dirty();
+                        return true;
+                    }
+                    let factor = 1.1f32.powf(delta as f32 / 120.0);
+                    self.viewer.borrow_mut().band_zoom_by(factor, vp);
                     ctx.mark_dirty();
                     return true;
                 }
@@ -4478,6 +4547,7 @@ impl ImageCanvas {
                 match wa {
                     // 放大 / 缩小：保留指针锚点与连续缩放，不改走离散 Action。
                     crate::core::config::WheelAction::Zoom => {
+                        // band 模式的缩放已在上面统一接管（裸滚轮），走不到这里。
                         let c = self.center();
                         self.viewer.borrow_mut().zoom_by_wheel(delta, pos, c);
                     }
@@ -4667,7 +4737,9 @@ impl ImageCanvas {
                         };
                         let vp = self.band_viewport.get();
                         let delta = (start_pos - cur_pos) as f64;
-                        self.viewer.borrow_mut().band_scroll_to(start_scroll + delta, vp);
+                        self.viewer
+                            .borrow_mut()
+                            .band_scroll_to(start_scroll + delta, vp);
                         ctx.mark_dirty();
                         return true;
                     }
@@ -5409,12 +5481,32 @@ fn exec_action(
         }
         // 以视口中心为锚点缩放：没有锚点时（按钮触发）让画面中心保持不动。
         Action::ZoomIn => {
+            // m351：带模式下 + / − 键 = 整带缩放。
+            if viewer.borrow().band.is_some() {
+                let vp = BAND_VIEWPORT.with(|c| c.get());
+                viewer.borrow_mut().band_zoom_by(1.25, vp);
+                if let Some(ctx) = ctx {
+                    ctx.mark_dirty();
+                }
+                return true;
+            }
+
             let mut v = viewer.borrow_mut();
             let z = v.scale() * 1.25;
             v.zoom_at_center(z);
             true
         }
         Action::ZoomOut => {
+            // m351：带模式下 + / − 键 = 整带缩放。
+            if viewer.borrow().band.is_some() {
+                let vp = BAND_VIEWPORT.with(|c| c.get());
+                viewer.borrow_mut().band_zoom_by(1.0 / 1.25, vp);
+                if let Some(ctx) = ctx {
+                    ctx.mark_dirty();
+                }
+                return true;
+            }
+
             let mut v = viewer.borrow_mut();
             let z = v.scale() / 1.25;
             v.zoom_at_center(z);
@@ -6509,7 +6601,9 @@ fn system_body(h: &Handles) -> Element {
         // 已是 `if dir_changed || sort_changed {`，字面量只会命中**本测试自己的源码**
         // （include_str 嵌整个文件），于是 j 落进测试函数、闭合块永远找不到。
         // 改为对现行联合判据做结构断言：判据存在 + 其后千字内接清零动作。
-        let i = src.find("if dir_changed || sort_changed {").expect("换目录判据不见了");
+        let i = src
+            .find("if dir_changed || sort_changed {")
+            .expect("换目录判据不见了");
         // UTF-8 安全窗口：按行取（固定字节窗口会切在多字节字符中间）。
         let window: String = src[i..].lines().take(40).collect::<Vec<_>>().join("\n");
         assert!(
