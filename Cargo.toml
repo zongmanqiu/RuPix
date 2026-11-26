@@ -1,9 +1,9 @@
-[package]
+﻿[package]
 name = "rupix"
 # ★ 宿主版本号的**唯一来源**：exe 的 VERSIONINFO 由 `build.rs` 从这里注入
 # （`assets/version.rc.in` 只留占位符，不许手填），`6_deploy` 的 RT_VERSION 门禁会核对
-# 属性页数值与字符串都等于这一行。仓根 `update.json` 是**已发布**清单、发版时才重出，
-# 所以它会**故意落后于这里**——顺序见 `AGENTS.md` §九 第 13 行（资产先上，清单最后推）。
+# 属性页数值与字符串都等于这一行。仓根 `update.json` 随源码一起提交（2026-11-26
+# 用户裁定：链接地址有规律，附件上传前即可预填）——顺序见 `AGENTS.md` §九 第 13 行。
 version = "0.4.3"
 edition = "2021"
 rust-version = "1.94"

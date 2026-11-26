@@ -1,7 +1,7 @@
 # RuPix —— Windows 10/11 上的小巧极速看图器
 
-**[⬇️ 下载 0.4.2 (Gitee)](https://gitee.com/qiuzongman/RuPix/releases/download/0.4.2/RuPix_0.4.2.zip)**
- ｜ **[⬇️ 下载 0.4.2 (GitHub)](https://github.com/zongmanqiu/RuPix/releases/download/0.4.2/RuPix_0.4.2.zip)**
+**[⬇️ 下载 0.4.3 (Gitee)](https://gitee.com/qiuzongman/RuPix/releases/download/0.4.3/RuPix_0.4.3.zip)**
+ ｜ **[⬇️ 下载 0.4.3 (GitHub)](https://github.com/zongmanqiu/RuPix/releases/download/0.4.3/RuPix_0.4.3.zip)**
 
 > 发布包已带 `classic` / `common` / `modern` / `pro` 4 枚基础解码器；`texture`、`doc`（PDF/PS/AI/DXF）、
 > `raw`、`doc-legacy` 仍可在 设置 → 解码器 里按需下载。
@@ -17,6 +17,7 @@
 - **窗口**：无边框、四缘四角拖缩放、Aero 吸附；双击行为可配（无操作 / 关窗 / 最大化）
 - **最小化到托盘**：开启后关窗只收走窗口、进程常驻，托盘是零窗口时唯一的出入口
 - **压缩包直接看图**：zip/cbz、7z/cb7、rar/cbr、tar 系直接打开；文件树一次列全层级，点一层进一层
+- **连续看图**：右键「画面 ▸ 连续看图」，整条序列铺成可滚动长带（纵向 / 横向），Alt+滚轮沿带滚动、按住拖动 1:1 跟手；带内前后各预读 5 张，信息面板跟随滚动
 - **窗口尺寸三档**（`init_window`）：固定尺寸 / 全屏 / 图片尺寸；无边框形态与之正交（`borderless`），透明区直接透出桌面
 - **空格看图**：资源管理器里选中文件按空格，无边框预览即出即收
 - **最近与阅读位置**：右键「最近 ▸」保留 100 条；PDF、漫画包、文件夹按「书」记住看到哪一页
