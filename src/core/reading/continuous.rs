@@ -19,6 +19,11 @@ pub enum Axis {
     Horizontal,
 }
 
+/// 交叉轴**满宽档**（zoom=1）的越界余量（逻辑像素）：满宽图左右没有内容
+/// 可看，余量只够「挪开一点看边缘」——大余量（六轮的视口−衣角 ≈ ±776px）
+/// 实测一动就跑出大半屏（用户报「移动速度太快」）。放大档不受此限。
+pub const BAND_FIT_OVERSHOW: f64 = 48.0;
+
 /// 相邻两项之间沿滚动轴的间隔（逻辑像素）。给一条细缝便于分辨页界，不做成可配置。
 pub const GAP_PX: f64 = 2.0;
 
@@ -208,8 +213,17 @@ impl Band {
     /// ★ 速度手感（m351 九轮定稿）：**全程 1:1 绝对基准拖动**——内容侧与
     ///   越界段都跟手，按住即冻结、松手停原地、再按从当前位置继续（普通看图
     ///   器手感）。八轮的越界阻尼被用户否决（松手再按会「重新校正」弹跳）。
+    /// `keep` = 放大档越界拖到头时至少留在画面里的带内容（像素）。
     ///
-    /// `keep` = 越界拖到头时至少留在画面里的带内容（像素）。
+    /// 越界余量分两档（m351 十轮）：
+    /// - **满宽档**（`inner = 0`，zoom=1）：`BAND_FIT_OVERSHOW`（48px）——
+    ///   满宽图左右没有内容可看，大余量 = 一动就跑出大半屏（用户实测
+    ///   「移动速度太快」）；48px 够「挪开一点看边缘」，且拖到头自然停。
+    /// - **放大档**（`inner > 0`）：视口 − 衣角——放大后看带两侧被裁掉的
+    ///   内容，挪到只剩 24px 衣角（与单页 pan 同款）。
+    ///
+    /// ★ 两档都是**硬钳位**，不是阻尼：位置恒连续（1:1 跟手、按住冻结、
+    ///   松手停原地、再按从当前位置继续），只是可拖的总距离不同。
     pub fn clamp_cross(&mut self, viewport_cross: f64, keep: f64) {
         let cross = self.cross();
         if viewport_cross <= 0.0 || cross <= 0.0 {
@@ -217,8 +231,12 @@ impl Band {
             return;
         }
         let keep = keep.max(0.0).min(viewport_cross);
-        let overs = (viewport_cross - keep).max(0.0);
         let inner = (cross - viewport_cross).max(0.0);
+        let overs = if inner > 0.0 {
+            (viewport_cross - keep).max(0.0)
+        } else {
+            BAND_FIT_OVERSHOW.min(viewport_cross)
+        };
         self.cross_off = self.cross_off.clamp(-overs, inner + overs);
     }
 
@@ -486,19 +504,20 @@ mod tests {
         let mut b = Band::build(Axis::Vertical, 800.0, [(p("a"), 0, Some((800, 600)))], 1.4);
         let keep = BAND_KEEP_VISIBLE;
 
-        // ① zoom=1：带恰满视口宽——钳位范围 [-776, +776]（满宽也能横向挪）。
+        // ① zoom=1：带恰满视口宽——满宽档越界余量 48px，钳位 [-48, +48]
+        //    （十轮：大余量实测「移动速度太快」）。
         b.cross_off = 5000.0;
         b.clamp_cross(800.0, keep);
         assert!(
-            (b.cross_off - 776.0).abs() < 1e-9,
-            "zoom=1 钳位上限 = 越界 776（实际 {}）",
+            (b.cross_off - BAND_FIT_OVERSHOW).abs() < 1e-9,
+            "zoom=1 钳位上限 = 满宽档越界 48（实际 {}）",
             b.cross_off
         );
         b.cross_off = -5000.0;
         b.clamp_cross(800.0, keep);
         assert!(
-            (b.cross_off + 776.0).abs() < 1e-9,
-            "zoom=1 钳位下限 = −776（实际 {}）",
+            (b.cross_off + BAND_FIT_OVERSHOW).abs() < 1e-9,
+            "zoom=1 钳位下限 = −48（实际 {}）",
             b.cross_off
         );
 

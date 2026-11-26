@@ -7776,14 +7776,15 @@ fn system_body(h: &Handles) -> Element {
             });
         };
 
-        // ① zoom = 1：整带恰满视口宽——交叉轴全是越界段，但拖动照样 **1:1
-        //    跟手**（九轮定稿：满宽也能横向挪，拖 80 走 80，到钳位边界才停）。
+        // ① zoom = 1：整带恰满视口宽——满宽档越界余量 48px（十轮）：拖动
+        //    照样 **1:1 跟手**，但拖到 ±48 就到头（原 ±776 实测一动就跑出
+        //    大半屏，「移动速度太快」）。左拖 80px ⇒ 钳位后恰 +48。
         press_at(&mut canvas, 200, 300);
         move_to(&mut canvas, 120, 300);
         let cross1 = viewer.borrow().band.as_ref().unwrap().cross_off;
         assert!(
-            (cross1 - 80.0).abs() < 1e-6,
-            "zoom=1 左拖 80px ⇒ cross_off 应恰 +80（1:1 跟手，实际 {cross1}）"
+            (cross1 - crate::core::reading::continuous::BAND_FIT_OVERSHOW).abs() < 1e-6,
+            "zoom=1 左拖 80px ⇒ 满宽档钳到 +48（1:1 跟手、到头即停，实际 {cross1}）"
         );
 
         // ② 裸滚轮放大 2×（中心锚定预置 cross_off）→ 左拖 80px ⇒ cross_off
