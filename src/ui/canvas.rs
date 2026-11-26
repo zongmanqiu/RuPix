@@ -3072,6 +3072,30 @@ fn persist_session(cfg: &Rc<RefCell<Config>>, hub: &Hub, apply: impl FnOnce(&mut
 fn exec_btn(_ctx: &mut EventCtx, viewer: &Rc<RefCell<Viewer>>, chrome: &Rc<Chrome>, b: Btn) {
     // 手动按浮条任何一颗都算"用户插手了画面"，幻灯片当场让位（见 `Chrome::slide_stop`）。
     chrome.slide_stop();
+    // ★ m351 十四轮：带模式下放大/缩小/适应窗口/1:1 四颗走**整带缩放**
+    //   （与 `+/−` 键同一条 `band_zoom_by` 路）——原来直接调单页的
+    //   `zoom_at_center` / `set_fit` / `zoom_actual`，动不了 `band.zoom`，
+    //   实测「看长途时按钮行的放大缩小和适应窗口都没效果」。带模式的
+    //   「适应窗口」= 整带归一（zoom 回 1），1:1 在归一显示下与它同义。
+    if matches!(b, Btn::Out | Btn::In | Btn::Fit | Btn::Actual) && viewer.borrow().band.is_some() {
+        let vp = BAND_VIEWPORT.with(|c| c.get());
+        match b {
+            Btn::Out => viewer.borrow_mut().band_zoom_by(1.0 / 1.25, vp, vp, None),
+            Btn::In => viewer.borrow_mut().band_zoom_by(1.25, vp, vp, None),
+            Btn::Fit | Btn::Actual => {
+                let z = viewer
+                    .borrow()
+                    .band
+                    .as_ref()
+                    .map(|x| x.zoom)
+                    .unwrap_or(1.0)
+                    .max(0.25);
+                viewer.borrow_mut().band_zoom_by(1.0 / z, vp, vp, None);
+            }
+            _ => {}
+        }
+        return;
+    }
     // 2026-11-15 全屏退役：原「Fullscreen 先分流、不带 Viewer 碰窗口动作」的整块特判
     // 随按钮删除——现存按钮全部只动画面，没有需要在 borrow_mut 前绕开的窗口态动作。
     let mut v = viewer.borrow_mut();
@@ -7856,6 +7880,62 @@ fn system_body(h: &Handles) -> Element {
         assert!(
             (cross5 - cross4 + 20.0).abs() < 1e-6,
             "松手再按住拖回 20px ⇒ 相对按下位置恰 −20（按下 {cross4}、拖后 {cross5}）"
+        );
+    }
+
+    /// m351 十四轮：带模式下浮条**放大/缩小/适应窗口**三颗必须走整带缩放——
+    /// 原来直接调单页 `zoom_at_center`/`set_fit`，动不了 `band.zoom`，实测
+    /// 「看长途时按钮行没效果」。「1:1」在归一显示下与适应窗口同义，不单测。
+    #[test]
+    fn band_mode_toolbar_zoom_buttons_drive_the_band() {
+        let dir = crate::core::paths::test_scratch_root()
+            .join(format!("sv-test-band-toolbar-zoom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|n| {
+                let p = dir.join(format!("{n}.svg"));
+                std::fs::File::create(&p).unwrap();
+                p
+            })
+            .collect();
+
+        let (mut canvas, viewer) = zoomed_canvas();
+        canvas.last_work.set(Rect::new(0, 0, 800, 600));
+        viewer.borrow_mut().open(&paths[0]);
+        viewer
+            .borrow_mut()
+            .enter_band(crate::core::reading::continuous::Axis::Vertical, 800.0);
+
+        let press = |b: Btn| {
+            windui::testing::run_with_ctx(|ctx| {
+                exec_btn(ctx, &viewer, &canvas.chrome, b);
+            });
+        };
+
+        // 放大：band.zoom 1.0 → 1.25（原实现动它不动，实测没效果）。
+        press(Btn::In);
+        assert!(
+            (viewer.borrow().band.as_ref().unwrap().zoom - 1.25).abs() < 1e-6,
+            "浮条放大 ⇒ band.zoom 应 1.25（实际 {}）",
+            viewer.borrow().band.as_ref().unwrap().zoom
+        );
+        // 缩小：1.25 → 1.0。
+        press(Btn::Out);
+        assert!(
+            (viewer.borrow().band.as_ref().unwrap().zoom - 1.0).abs() < 1e-6,
+            "浮条缩小 ⇒ band.zoom 应回 1.0（实际 {}）",
+            viewer.borrow().band.as_ref().unwrap().zoom
+        );
+        // 放大两步后「适应窗口」：zoom 回 1（整带归一）。
+        press(Btn::In);
+        press(Btn::In);
+        press(Btn::Fit);
+        assert!(
+            (viewer.borrow().band.as_ref().unwrap().zoom - 1.0).abs() < 1e-6,
+            "浮条适应窗口 ⇒ band.zoom 应回 1（实际 {}）",
+            viewer.borrow().band.as_ref().unwrap().zoom
         );
     }
 
