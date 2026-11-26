@@ -204,7 +204,15 @@ impl Viewer {
         };
         band.scroll = along_abs;
         // 内容跟手：指针拖右（d_cross > 0）⇒ 内容右移 ⇒ 带相对视口左移量减小。
-        band.cross_off -= d_cross;
+        let target = band.cross_off - d_cross;
+        // 越界段橡皮筋阻尼（m351 八轮）：内容侧（0..=inner）1:1 跟手；
+        // 拖出内容的越界部分 ×0.3——满宽时轻拖不再把图片大半滑出屏幕
+        // （六轮实测「拖动速度太快」的真身）。BAND_CROSS_DAMPING = 0.3。
+        let inner = (band.cross() - viewport_cross).max(0.0);
+        let clamped = target.clamp(0.0, inner);
+        let over = target - clamped;
+        let damped = over * crate::core::reading::continuous::BAND_CROSS_DAMPING;
+        band.cross_off = clamped + damped;
         band.clamp_scroll(viewport_along);
         band.clamp_cross(viewport_cross, BAND_KEEP_VISIBLE);
         band.cur = band.item_at_center(band.scroll, viewport_along);

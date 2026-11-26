@@ -19,6 +19,10 @@ pub enum Axis {
     Horizontal,
 }
 
+/// 交叉轴**越界段**的拖动阻尼系数（内容侧恒 1:1 跟手；越出内容的部分
+/// 按此系数衰减——橡皮筋手感，满宽时轻拖不再大幅滑出）。
+pub const BAND_CROSS_DAMPING: f64 = 0.3;
+
 /// 相邻两项之间沿滚动轴的间隔（逻辑像素）。给一条细缝便于分辨页界，不做成可配置。
 pub const GAP_PX: f64 = 2.0;
 
@@ -196,36 +200,29 @@ impl Band {
         }
     }
 
-    /// 交叉轴偏移钳位（m351 七轮订正：**越界余量只在放大后有收益**）。
+    /// 交叉轴偏移钳位（m351 八轮定稿）。
     ///
-    /// 语义分两段：
-    /// 1. **内容可达**——带比视口宽/高（放大过）时，交叉轴能在带内平移看
-    ///    被裁掉的那一侧，范围 `0 ..= cross − viewport_cross`；
-    /// 2. **少量越界**——放大时与单页 pan 同款手感（`BAND_KEEP_VISIBLE`，
-    ///    24px 衣角）：图边可以越过窗口边，画面里永远剩一枚衣角。
+    /// 范围 `[-越界, 内容余量 + 越界]`：
+    /// - **内容可达**——带比视口宽/高（放大过）时，交叉轴能在带内平移看
+    ///   被裁掉的那一侧，范围 `0 ..= cross − viewport_cross`；
+    /// - **越界余量**——与单页 pan 同款手感（`BAND_KEEP_VISIBLE`，24px 衣角）：
+    ///   图边可以越过窗口边，画面里永远剩一枚衣角。zoom=1 满宽/满高时也能
+    ///   横向挪（用户裁定「本来可以拖动」，六轮口径保留）。
     ///
-    /// ★ 六轮曾给 zoom≤1 也发越界余量（±(视口−24)），动机是回应「纵向模式
-    ///   左右拖不动」——但 zoom=1 时带恰满视口宽/高，**横向挪走内容没有任何
-    ///   收益**（露出的全是背景，被挪走的那一侧本来就没有内容）；实测感受
-    ///   是「一动就大幅平移、图片只剩一角」，像失控/太快。七轮改回：满宽时
-    ///   `cross_off` 恒 0（横向无内容可看），放大后才有平移与少量越界。
+    /// ★ 速度手感：**内容侧 1:1 跟手；越界段（拖出内容的部分）在拖动增量里
+    ///   应用 0.3× 阻尼**（见 `Viewer::band_drag_by`）——满宽时轻轻一动就把
+    ///   图片大半拖出屏幕（六轮实测「速度太快」）就是越界段 1:1 造成的。
     ///
-    /// `keep` = 放大越界时至少留在画面里的带内容（像素）。
+    /// `keep` = 越界拖到头时至少留在画面里的带内容（像素）。
     pub fn clamp_cross(&mut self, viewport_cross: f64, keep: f64) {
         let cross = self.cross();
         if viewport_cross <= 0.0 || cross <= 0.0 {
             self.cross_off = 0.0;
             return;
         }
-        // 内容侧余量：带比视口宽/高（放大过）才有——zoom≤1 恒 0。
-        let inner = (cross - viewport_cross).max(0.0);
-        if inner <= 0.0 {
-            self.cross_off = 0.0;
-            return;
-        }
         let keep = keep.max(0.0).min(viewport_cross);
-        // 放大越界：拖到只剩 keep 像素还在画面里。
         let overs = (viewport_cross - keep).max(0.0);
+        let inner = (cross - viewport_cross).max(0.0);
         self.cross_off = self.cross_off.clamp(-overs, inner + overs);
     }
 
@@ -485,21 +482,31 @@ mod tests {
         assert!(!empty.step_item(1, 800.0));
     }
 
-    /// m351 七轮：交叉轴钳位口径——zoom=1 满宽无内容可看（cross_off 恒 0），
-    /// 放大后内容平移 + 24px 衣角越界（与单页 pan 同款）。
+    /// m351 八轮：交叉轴钳位——六轮口径恢复（可自由拖，越界留衣角）：
+    /// zoom=1 满宽也能拖出 `[-越界, +越界]`；放大后 `[-24, 内容余量+越界]`。
+    /// 速度问题不靠钳位解决，靠 `band_drag_by` 的越界段阻尼（见 viewer 测试）。
     #[test]
-    fn cross_axis_pans_only_when_zoomed() {
+    fn cross_axis_clamp_allows_free_pan() {
         let mut b = Band::build(Axis::Vertical, 800.0, [(p("a"), 0, Some((800, 600)))], 1.4);
         let keep = BAND_KEEP_VISIBLE;
 
-        // ① zoom=1：带恰满视口宽——横向挪走内容只会露出背景，恒 0。
-        for off in [0.0, 5000.0, -5000.0] {
-            b.cross_off = off;
-            b.clamp_cross(800.0, keep);
-            assert_eq!(b.cross_off, 0.0, "zoom=1 → cross_off 恒 0");
-        }
+        // ① zoom=1：带恰满视口宽——钳位范围 [-776, +776]（满宽也能横向挪）。
+        b.cross_off = 5000.0;
+        b.clamp_cross(800.0, keep);
+        assert!(
+            (b.cross_off - 776.0).abs() < 1e-9,
+            "zoom=1 钳位上限 = 越界 776（实际 {}）",
+            b.cross_off
+        );
+        b.cross_off = -5000.0;
+        b.clamp_cross(800.0, keep);
+        assert!(
+            (b.cross_off + 776.0).abs() < 1e-9,
+            "zoom=1 钳位下限 = −776（实际 {}）",
+            b.cross_off
+        );
 
-        // ② 放大 2×：cross=1600，内容平移范围 800，钳位 = [−24, 824]。
+        // ② 放大 2×：cross=1600，内容平移范围 800，钳位 = [−24, 1576]。
         b.zoom = 2.0;
         b.relayout_from(0);
         b.cross_off = 5000.0;
@@ -509,8 +516,6 @@ mod tests {
             "放大后钳位上限 = 内容余量(800) + 越界(776，剩24衣角) = 1576（实际 {}）",
             b.cross_off
         );
-        b.cross_off = -5000.0;
-        b.clamp_cross(800.0, keep);
     }
 
     #[test]

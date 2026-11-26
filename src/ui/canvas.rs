@@ -7732,19 +7732,12 @@ fn system_body(h: &Handles) -> Element {
         assert!(after > 0.0, "拖带应改 scroll（实测 {after}）");
     }
 
-    /// m351 六轮：交叉轴拖带——**横向拖动不再是死手势**。
+    /// m351 八轮：交叉轴拖带——六轮口径恢复（zoom=1 也能横向拖），速度问题
+    /// 用**越界段阻尼**解决：内容侧 1:1 跟手；拖出内容的部分 ×0.3（橡皮筋）。
     ///
-    /// ★ 这条用例改写了四轮那条「zoom=1 满宽无余量（设计）」的旧断言：
-    ///   旧口径把 `cross_off` 在 zoom=1 时钉死 0 ⇒ 纵向模式下左右拖动整个
-    ///   没有反应（用户实报「纵向模式左右拖不动」）。现在横向拖动照样把带
-    ///   挪走（与单页模式同款越界余量：图边可以越过窗口边，始终留一枚衣角）。
-    ///
-    /// 断言钉**精确位移**（拖左 80 ⇒ cross_off 相对拖前恰 +80）——只查符号
-    /// 会漏掉「x − 按下时的 y」那类混合值 bug（五轮教训）。
-    #[test]
-    /// m351 三轮（七轮口径）：交叉轴拖带——zoom=1 满宽无内容可看，恒 0；
-    /// 放大后左拖 80px ⇒ cross_off 相对拖前恰 +80（内容跟手的精确断言）。
-    /// ★ 精确断言是为了钉住「x − 按下时的 y」那类混合值 bug（五轮教训）。
+    /// 断言钉**精确位移**（拖左 80 ⇒ cross_off 相对拖前恰 +80；zoom=1 时
+    /// 恰 +24 = 80×0.3）——只查符号会漏掉「x − 按下时的 y」那类混合值 bug
+    /// （五轮教训）。
     #[test]
     fn band_cross_drag_moves_the_band_even_at_fit_zoom() {
         use windui::event::{MouseButton, PointerEvent, PointerKind};
@@ -7783,15 +7776,15 @@ fn system_body(h: &Handles) -> Element {
             });
         };
 
-        // ① zoom = 1：整带恰满视口宽——横向没有内容可看，cross_off 恒 0
-        //    （七轮口径：六轮的越界余量让「一动就大幅平移、只剩衣角」，实测像失控；
-        //    左右平移是放大后的操作）。
+        // ① zoom = 1：整带恰满视口宽——交叉轴全是越界段，左拖 80px ⇒
+        //    cross_off = 80 × 0.3 = +24（橡皮筋：能拖动，但不会「一动就把
+        //    图片大半滑出屏幕」——六轮实测「速度太快」的真身）。
         press_at(&mut canvas, 200, 300);
         move_to(&mut canvas, 120, 300);
         let cross1 = viewer.borrow().band.as_ref().unwrap().cross_off;
         assert!(
-            cross1.abs() < 1e-6,
-            "zoom=1 满宽无内容可看，横向拖动恒 0（实际 {cross1}）"
+            (cross1 - 24.0).abs() < 1e-6,
+            "zoom=1 左拖 80px ⇒ 越界阻尼 0.3 ⇒ cross_off 应恰 +24（实际 {cross1}）"
         );
 
         // ② 裸滚轮放大 2×（中心锚定预置 cross_off）→ 左拖 80px ⇒ cross_off
