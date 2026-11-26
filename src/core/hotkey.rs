@@ -326,6 +326,59 @@ impl Action {
             Action::Companion => "主辅视图",
         }
     }
+
+    /// **模式能力声明**：该动作是否只在单页模式有效（连续阅读模式下被统一闸拒绝）。
+    ///
+    /// m351 十五轮立表（用户裁定：模式必须控制功能——「有的功能绝不能出现在
+    /// 连续看图里」）。规则：
+    /// - `true` = 单页专属：连续模式下 `exec_action` 统一闸直接拒绝（带日志），
+    ///   右键菜单也不再生成对应项；
+    /// - `false` = 两模式都可用：带模式下要么语义天然成立（复制/信息面板跟随
+    ///   滚动/窗口态），要么已有带模式分流实现（缩放/翻页/平移）。
+    ///
+    /// ★ 新增 `Action` 变体必须在此**表态**——match 对 `Action` 穷尽，漏写编不过；
+    ///   写错口径由 tests 里的 `single_page_only_roster_matches_decision` 钉住。
+    pub fn single_page_only(self) -> bool {
+        match self {
+            // 逐帧/播放：带内动图只显第一帧（m351 十三轮口径），没有帧可推。
+            Action::PauseAnim | Action::FramePrev | Action::FrameNext => true,
+            // 几何变换只对「一张图」有意义，整带没有旋转基准。
+            Action::Rotate | Action::Flip => true,
+            // 归一显示下 1:1 与「适应窗口」同义（十四轮），独立语义不保留。
+            Action::ActualSize => true,
+            // 十三轮已定：带模式没有「一张」的概念，逐张放映与整带滚动冲突。
+            Action::Slideshow => true,
+            // 以下动作两模式都可用（明写出来是为了 review 时一眼看到全集）。
+            Action::Prev
+            | Action::Next
+            | Action::First
+            | Action::Last
+            | Action::ZoomIn
+            | Action::ZoomOut
+            | Action::Fit
+            | Action::Filmstrip
+            | Action::Open
+            | Action::CopyImage
+            | Action::CopyPath
+            | Action::Minimal
+            | Action::Checker
+            | Action::Properties
+            | Action::OpacityUp
+            | Action::OpacityDown
+            | Action::Settings
+            | Action::Topmost
+            | Action::Lock
+            | Action::Minimize
+            | Action::Maximize
+            | Action::Close
+            | Action::PanUp
+            | Action::PanLeft
+            | Action::PanDown
+            | Action::PanRight
+            | Action::Picker
+            | Action::Companion => false,
+        }
+    }
 }
 
 /// 主键（去掉修饰键后的那一键）。
@@ -865,6 +918,31 @@ mod tests {
             shift,
             win,
         }
+    }
+
+    /// m351 十五轮：模式能力名单钉子——连续阅读模式禁用的动作**恰好这九个**。
+    /// 多了 = 误伤（连续模式的正面能力被砍），少了 = 单页专属动作漏进带模式。
+    /// 改名单先改这里，再想清楚 exec_action 闸 / 菜单置灰两侧要不要跟。
+    #[test]
+    fn single_page_only_roster_matches_decision() {
+        let single_only: Vec<Action> = Action::ALL
+            .iter()
+            .copied()
+            .filter(|a| a.single_page_only())
+            .collect();
+        let expected = [
+            Action::ActualSize,
+            Action::Rotate,
+            Action::Flip,
+            Action::PauseAnim,
+            Action::FramePrev,
+            Action::FrameNext,
+            Action::Slideshow,
+        ];
+        assert_eq!(
+            single_only, expected,
+            "单页专属名单与裁定不符——新增 Action 必须在 single_page_only 里表态"
+        );
     }
 
     /// 出厂默认：每个动作**恰好一条**主键（2026-10-13 单键化，各保留原多键列表的

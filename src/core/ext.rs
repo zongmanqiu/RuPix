@@ -709,6 +709,13 @@ pub struct Manifest {
     /// 为什么必须同时声明 `settings.write`：只有读没有写，改完存不下来——
     /// 那样的 `settings_ui=true` 是坏清单，解析期就拒。
     pub settings_ui: bool,
+    /// 适用模式声明（可选，m351 十五轮）：`"single"` / `"continuous"` 的子集。
+    ///
+    /// 用户裁定：模式必须控制功能——本体动作有 [`模式能力表`](crate::core::hotkey::Action::single_page_only)，
+    /// 插件用清单里的 `modes` 字段声明同一件事。**缺省（字段缺失或空数组）=
+    /// 所有模式可用**（向后兼容：老清单一个字不用改）。连续阅读模式下，
+    /// 声明了 `["single"]` 的插件在右键「插件 ▸」里置灰并标注「仅单页模式」。
+    pub modes: Vec<String>,
     /// 声明式设置项（可选）。给了它，宿主就**自己渲染**设置窗（齿轮 → 宿主窗口），
     /// 不再以 `action=settings` 拉起插件；`settings_ui` 那条老路留给没有 schema 的插件。
     ///
@@ -924,6 +931,7 @@ impl Manifest {
                 capabilities: f.capabilities,
                 platforms,
                 settings_ui: f.settings_ui,
+                modes: parse_modes(&root)?,
                 settings: f.settings,
                 run_ui: f.run_ui,
                 preview: f.preview,
@@ -1003,6 +1011,7 @@ impl Manifest {
             capabilities: first.capabilities,
             platforms,
             settings_ui: first.settings_ui,
+            modes: parse_modes(&root)?,
             settings: first.settings,
             run_ui: first.run_ui,
             preview: first.preview,
@@ -1016,6 +1025,15 @@ impl Manifest {
             commands,
             command_id: None,
         })
+    }
+
+    /// 连续阅读模式下这枚插件是否可用（m351 十五轮）。
+    ///
+    /// `modes` 缺省（空）= 所有模式都可用；声明了 `"continuous"` 才在带模式开放。
+    /// 宿主的过滤点在右键「插件 ▸」（`Canvas::plugin_items`）：声明了
+    /// `["single"]` 的插件在带模式下置灰并标注「仅单页模式」。
+    pub fn usable_in_continuous(&self) -> bool {
+        self.modes.is_empty() || self.modes.iter().any(|m| m == "continuous")
     }
 
     /// 声明式实时参数占用的设置项 key：`preview` 的六个数值项 + 预设那个下拉。
@@ -1150,6 +1168,19 @@ fn get_str_array(root: &Value, key: &str) -> Result<Vec<String>, String> {
     }
 }
 
+/// 清单里的 `modes` 字段（m351 十五轮）：适用模式声明，只认
+/// `"single"` / `"continuous"`。缺省（字段缺失或空数组）= 全模式可用。
+fn parse_modes(root: &Value) -> Result<Vec<String>, String> {
+    const MODE_NAMES: [&str; 2] = ["single", "continuous"];
+    let modes = get_str_array(root, "modes")?;
+    for m in &modes {
+        if !MODE_NAMES.contains(&m.as_str()) {
+            return Err(format!("`modes` 里只允许 {MODE_NAMES:?}，出现了 `{m}`"));
+        }
+    }
+    Ok(modes)
+}
+
 fn get_capabilities(root: &Value) -> Result<Vec<Capability>, String> {
     let names = get_str_array(root, "capabilities")?;
     let mut out = Vec::with_capacity(names.len());
@@ -1235,6 +1266,43 @@ mod tests {
         assert!(m.has_capability(Capability::ImageRead));
         assert!(!m.has_capability(Capability::Network));
         assert_eq!(m.args, Vec::<String>::new());
+    }
+
+    /// m351 十五轮：`modes` 适用模式声明——缺省 = 全模式；`["single"]` 生效；
+    /// 未知值解析期就拒（清单校验纪律：静默吞掉等于坏清单悄悄上线）。
+    #[test]
+    fn modes_field_defaults_to_all_and_rejects_unknown() {
+        // 缺省：老清单一个字不改 = 全模式可用。
+        let m = Manifest::parse(minimal()).expect("valid manifest");
+        assert!(m.modes.is_empty());
+        assert!(m.usable_in_continuous());
+
+        // 声明 ["single"]：连续模式拒收。
+        let text = minimal().replace(
+            r#""author": "example""#,
+            r#""author": "example",
+            "modes": ["single"]"#,
+        );
+        let m = Manifest::parse(&text).expect("valid manifest");
+        assert_eq!(m.modes, vec!["single".to_string()]);
+        assert!(!m.usable_in_continuous());
+
+        // 声明 ["continuous"]：照常可用。
+        let text = minimal().replace(
+            r#""author": "example""#,
+            r#""author": "example",
+            "modes": ["continuous"]"#,
+        );
+        let m = Manifest::parse(&text).expect("valid manifest");
+        assert!(m.usable_in_continuous());
+
+        // 未知模式名：解析失败。
+        let text = minimal().replace(
+            r#""author": "example""#,
+            r#""author": "example",
+            "modes": ["slideshow"]"#,
+        );
+        assert!(Manifest::parse(&text).is_err(), "未知模式名必须解析期拒绝");
     }
 
     fn minimal_v2() -> &'static str {

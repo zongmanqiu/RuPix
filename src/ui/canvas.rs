@@ -2399,6 +2399,10 @@ impl ImageCanvas {
                 && matches!(e.manifest.kind, crate::core::ext::Kind::Editor)
         });
         let mut out = Vec::new();
+        // ★ m351 十五轮：连续阅读模式下，清单声明了 `["single"]`（缺省不声明 =
+        //   全模式可用）的插件**可见但置灰**并标注原因——与 `min_host` 置灰同款，
+        //   行为层由扩展启动编排兜底拒绝（菜单只是把话说在前面）。
+        let band_on = self.viewer.borrow().band.is_some();
         for ext in list.into_iter().filter(|e| e.enabled) {
             let name = ext.display_name.clone();
             if ext.blocked {
@@ -2408,6 +2412,12 @@ impl ImageCanvas {
                     |_ctx| {},
                     false,
                 );
+                it.enabled = false;
+                out.push(it);
+                continue;
+            }
+            if band_on && !ext.manifest.usable_in_continuous() {
+                let mut it = MenuItem::run(format!("{name}（仅单页模式）"), |_ctx| {}, false);
                 it.enabled = false;
                 out.push(it);
                 continue;
@@ -2827,6 +2837,10 @@ impl ImageCanvas {
         // ★ 菜单**恒列** `Btn::ALL`：浮条为了美观把没有帧/页号的播放组藏起来，
         //   菜单不需要美观，缺项只会让人以为功能被删了（用户 2026-11-06）。
         //   从 Viewer 现算，不读 `chrome.anim`（那是绘制时回灌的 Cell，可能慢一帧）。
+        // ★ m351 十五轮：连续阅读模式下，模式能力名单（[`Btn::single_page_only`]）
+        //   的项**恒列但置灰**（排序置灰同款先例；行为层有统一闸兜底）——模式是
+        //   临时的，退出带模式功能原地回来，位置不变好找。
+        let band_on = self.viewer.borrow().band.is_some();
         let has_index = self.viewer.borrow().has_index();
         let mut out = Vec::with_capacity(Btn::ALL.len());
         for (b, enabled) in ops_row(has_index) {
@@ -2847,7 +2861,7 @@ impl ImageCanvas {
                 },
                 false,
             );
-            it.enabled = enabled;
+            it.enabled = enabled && !(band_on && b.single_page_only());
             if let Some(sc) = b.shortcut(&self.config.borrow().hotkeys) {
                 it.shortcut = Some(sc);
             }
@@ -2915,14 +2929,14 @@ impl ImageCanvas {
                                 &v,
                                 &chrome,
                                 &cfg,
-                            &hub,
-                            crate::core::hotkey::Action::Slideshow,
-                        );
-                        ctx.mark_dirty();
-                    }
-                },
-                false,
-            );
+                                &hub,
+                                crate::core::hotkey::Action::Slideshow,
+                            );
+                            ctx.mark_dirty();
+                        }
+                    },
+                    false,
+                );
                 it.shortcut = self
                     .config
                     .borrow()
@@ -3072,6 +3086,13 @@ fn persist_session(cfg: &Rc<RefCell<Config>>, hub: &Hub, apply: impl FnOnce(&mut
 fn exec_btn(_ctx: &mut EventCtx, viewer: &Rc<RefCell<Viewer>>, chrome: &Rc<Chrome>, b: Btn) {
     // 手动按浮条任何一颗都算"用户插手了画面"，幻灯片当场让位（见 `Chrome::slide_stop`）。
     chrome.slide_stop();
+    // ★ m351 十五轮：模式能力统一闸（浮条侧）——单页专属按钮在带模式直接拒绝，
+    //   与 `exec_action` 的 [`Action::single_page_only`] 闸同一纪律（行为层拒绝 +
+    //   菜单置灰）。缩放四颗不在名单，走下面十四轮的整带缩放分流。
+    if b.single_page_only() && viewer.borrow().band.is_some() {
+        log::info!("[mode-gate] refused {b:?}: single-page-only in band mode");
+        return;
+    }
     // ★ m351 十四轮：带模式下放大/缩小/适应窗口/1:1 四颗走**整带缩放**
     //   （与 `+/−` 键同一条 `band_zoom_by` 路）——原来直接调单页的
     //   `zoom_at_center` / `set_fit` / `zoom_actual`，动不了 `band.zoom`，
@@ -4840,12 +4861,9 @@ impl ImageCanvas {
                                 ),
                             }
                         };
-                        self.viewer.borrow_mut().band_drag_by(
-                            along_abs,
-                            cross_abs,
-                            vp_along,
-                            vp_cross,
-                        );
+                        self.viewer
+                            .borrow_mut()
+                            .band_drag_by(along_abs, cross_abs, vp_along, vp_cross);
                         ctx.mark_dirty();
                         return true;
                     }
@@ -5374,6 +5392,18 @@ pub fn handle_key(
             let Some(plugin_id) = plugin_id else {
                 return false;
             };
+            // ★ m351 十五轮：模式能力闸（插件热键路）——带模式下声明了 `["single"]`
+            //   的插件不从热键启动（右键菜单那条路已置灰挡住，这里是唯一的另一条）。
+            //   插件输出卡的**自动重跑**不受此限：信息跟随滚动正是带模式的正面能力。
+            if viewer.borrow().band.is_some() {
+                let blocked = crate::extensions::discover_configured(&cfg.borrow())
+                    .into_iter()
+                    .any(|e| e.run_key == plugin_id && !e.manifest.usable_in_continuous());
+                if blocked {
+                    log::info!("[plugin-hotkey] id={plugin_id} verdict=refused:band-mode");
+                    return true;
+                }
+            }
             // ★ 实时参数型编辑插件：热键与右键菜单走同一条路——打开它自己的参数窗。
             //   `run_by_hotkey` 只会 `start_command`，对调色这类插件等于"跑一遍没有
             //   界面的滤镜"，用户看不到任何可调的东西（2026-11-06 用户要"快捷键设置"）。
@@ -5521,6 +5551,14 @@ fn exec_action(
     if a != Action::Slideshow {
         chrome.slide_stop();
     }
+    // ★ m351 十五轮：**模式能力统一闸**——单页专属动作（[`Action::single_page_only`]
+    //   的名单）在连续阅读模式下直接拒绝。键与菜单都汇到本入口，堵这里 = 全堵；
+    //   各臂内部的 `band.is_some()` 判据全是「换实现」（同一动作两种模式各有做法），
+    //   只有这一道是「禁用」。菜单显示层同样按名单过滤，不出现「点了没反应」的摆设。
+    if a.single_page_only() && viewer.borrow().band.is_some() {
+        log::info!("[mode-gate] refused {a:?}: single-page-only in band mode");
+        return true;
+    }
     match a {
         // ── 仅动 viewer：各臂内部临时 borrow_mut，绝不跨臂持有借用 ──
         Action::Prev => {
@@ -5576,15 +5614,9 @@ fn exec_action(
         // 幻灯片放映：**这里只开关，不翻页**。到点由 16 ms 轮询的 `Chrome::tick_slideshow`
         // 发那一步，走的还是键盘/滚轮同一条 `Viewer::step`——所以放映天然继承"末尾回绕"，
         // 也不需要第二条翻页实现，更不需要一个定时器线程（宪章：不引常驻线程）。
-        // ★ m351 十三轮：连续阅读模式**不开放映**（用户实报「居然还能打开，太坑」）——
-        //   带模式没有「一张」的概念，放映逐张翻页与整带滚动语义冲突；此前的
-        //   「进入带模式自动停放映」只堵了单向（先放映后进带），这里堵反向。
-        //   键与菜单都走本入口，堵这里 = 全堵；菜单项在带模式下也不再生成。
+        // ★ m351 十三轮建、十五轮收编：带模式拒绝已上移到顶部统一闸（模式能力
+        //   `single_page_only`）——同一判据只立一个定义点，这里不再重复。
         Action::Slideshow => {
-            if viewer.borrow().band.is_some() {
-                log::info!("[slideshow] verdict=refused:band-mode");
-                return true;
-            }
             chrome.toggle_slideshow();
             // 状态一翻就要重绘：右侧那颗持续亮起的箭头是放映唯一的状态面（无文字提示）。
             if let Some(ctx) = ctx {
@@ -7901,7 +7933,7 @@ fn system_body(h: &Handles) -> Element {
             })
             .collect();
 
-        let (mut canvas, viewer) = zoomed_canvas();
+        let (canvas, viewer) = zoomed_canvas();
         canvas.last_work.set(Rect::new(0, 0, 800, 600));
         viewer.borrow_mut().open(&paths[0]);
         viewer

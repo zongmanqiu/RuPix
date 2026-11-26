@@ -205,6 +205,21 @@ pub enum Btn {
     FrameFwd,
 }
 
+impl Btn {
+    /// **模式能力声明**（m351 十五轮，与 [`crate::core::hotkey::Action::single_page_only`]
+    /// 同一张表的浮条侧投影）：连续阅读模式下置灰的按钮。
+    ///
+    /// 缩放四颗（Out/In/Fit/Actual）不在名单——十四轮起它们在带模式分流到
+    /// 整带缩放（换实现，不是禁用）。旋转/镜像/帧组对整带没有语义，
+    /// `exec_btn` 顶部闸直接拒绝，菜单恒列但置灰（排序置灰同款先例）。
+    pub fn single_page_only(self) -> bool {
+        match self {
+            Btn::Rotate | Btn::Mirror | Btn::FrameBack | Btn::PlayPause | Btn::FrameFwd => true,
+            Btn::Out | Btn::In | Btn::Fit | Btn::Actual => false,
+        }
+    }
+}
+
 /// 标题栏窗口按钮。
 ///
 /// `ALL` 是**右→左序**（下标越大越靠左），也是布局、命中、绘制三处的唯一真源：

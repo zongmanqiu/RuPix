@@ -265,6 +265,7 @@ mod tests {
                 timeout_ms: None,
                 hotkey: None,
                 settings_ui: false,
+                modes: Vec::new(),
                 settings: Vec::new(),
                 run_ui: false,
                 preview: None,
