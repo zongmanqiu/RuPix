@@ -919,11 +919,11 @@ impl ImageCanvas {
             let band = v.band.as_ref().unwrap();
             (band.axis, band.cross(), band.scroll)
         };
-        let items = {
+        let (items, cross_off) = {
             // 红线豁免: paint_band 生存期内 band 不会被清（leave_band 只来自菜单闭包）。
             let v = self.viewer.borrow();
             let band = v.band.as_ref().unwrap();
-            band.items.clone()
+            (band.items.clone(), band.cross_off)
         };
         let mut wanted: Vec<(std::path::PathBuf, u32)> = Vec::new();
         canvas.save();
@@ -940,15 +940,19 @@ impl ImageCanvas {
             .max(16.0);
             let rel = it.offset - scroll;
             let (hit, rect) = match axis {
+                // 交叉轴带 cross_off（m351 二轮）：放大后带从视口左/上缘外开始，
+                // 拖交叉轴可以看被裁掉的两侧。
                 crate::core::reading::continuous::Axis::Vertical => {
                     let y = rel + work.y as f64;
+                    let x = work.x as f64 - cross_off;
                     let hit = y + len >= work.y as f64 && y <= (work.y + work.h) as f64;
-                    (hit, Rect::new(work.x, y as i32, cross as i32, len as i32))
+                    (hit, Rect::new(x as i32, y as i32, cross as i32, len as i32))
                 }
                 crate::core::reading::continuous::Axis::Horizontal => {
                     let x = rel + work.x as f64;
+                    let y = work.y as f64 - cross_off;
                     let hit = x + len >= work.x as f64 && x <= (work.x + work.w) as f64;
-                    (hit, Rect::new(x as i32, work.y, len as i32, cross as i32))
+                    (hit, Rect::new(x as i32, y as i32, len as i32, cross as i32))
                 }
             };
             if !hit {
@@ -1780,7 +1784,7 @@ impl ImageCanvas {
             it.enabled = any;
             it
         });
-        MenuItem::submenu("连续阅读", sub)
+        MenuItem::submenu("连续看图", sub)
     }
 
     /// 「最近 ▸」（m325）：只服务"再打开一次刚才那张"。
@@ -4512,6 +4516,7 @@ impl ImageCanvas {
                 //  原实现把 Ctrl+滚轮放行给了 Navigate 档）。四档定制在带模式不参与。
                 if self.viewer.borrow().band.is_some() {
                     let vp = self.band_viewport.get();
+                    let band_axis = self.viewer.borrow().band.as_ref().unwrap().axis;
                     if p.mods.alt {
                         let unit = vp / 3.0;
                         let step = if p.mods.shift {
@@ -4536,7 +4541,20 @@ impl ImageCanvas {
                         return true;
                     }
                     let factor = 1.1f32.powf(delta as f32 / 120.0);
-                    self.viewer.borrow_mut().band_zoom_by(factor, vp);
+                    let (vp_cross, ptr_cross) = {
+                        let wt = self.work_tuple();
+                        match band_axis {
+                            crate::core::reading::continuous::Axis::Vertical => {
+                                (wt.3 as f64, pos.0 as f64 - wt.0 as f64)
+                            }
+                            crate::core::reading::continuous::Axis::Horizontal => {
+                                (wt.2 as f64, pos.1 as f64 - wt.1 as f64)
+                            }
+                        }
+                    };
+                    self.viewer
+                        .borrow_mut()
+                        .band_zoom_by(factor, vp, vp_cross, Some(ptr_cross));
                     ctx.mark_dirty();
                     return true;
                 }
@@ -4722,24 +4740,39 @@ impl ImageCanvas {
                 // 平移图片的跟手帧。三种开局都汇到这一条：Ctrl+左键、中键（都不看开关），
                 // 以及 `drag_image` 开着时的裸左键（[`left_drag`] 判成 PanImage 那一支）。
                 // 已经开局的平移不因中途松开 Ctrl 而断，故判据里带上 `dragging()`。
-                // m351 拖带跟手：起点 scroll − 指针沿轴位移 = 当前 scroll。
+                // m351 拖带跟手（二轮双轴）：沿轴 = 起点 scroll − 沿轴位移；
+                // 交叉轴 = 指针横/纵向位移（放大后看带的两侧）。
                 if let Some((start_scroll, start_pos)) = self.band_drag.get() {
                     if p.kind == PointerKind::Move {
-                        let cur_pos = {
+                        let (d_along, d_cross, vp_along, vp_cross) = {
                             let v = self.viewer.borrow();
                             // 红线豁免: band_drag 只在 band 模式下 set（press_left 拦截），
                             // 它有值 ⇒ band 必在；paint 与事件互斥，中途清不掉。
                             let band = v.band.as_ref().unwrap();
+                            // 视口几何：on_pointer 没有 work 矩形，用 paint 回写的
+                            // `last_work` 正本（`work_tuple`，与绘制同源）。
+                            let wt = self.work_tuple();
                             match band.axis {
-                                crate::core::reading::continuous::Axis::Vertical => pos.1,
-                                crate::core::reading::continuous::Axis::Horizontal => pos.0,
+                                crate::core::reading::continuous::Axis::Vertical => (
+                                    (start_pos - pos.1) as f64,
+                                    (pos.0 - start_pos) as f64,
+                                    band.base,
+                                    wt.3 as f64,
+                                ),
+                                crate::core::reading::continuous::Axis::Horizontal => (
+                                    (start_pos - pos.0) as f64,
+                                    (pos.1 - start_pos) as f64,
+                                    band.base,
+                                    wt.2 as f64,
+                                ),
                             }
                         };
-                        let vp = self.band_viewport.get();
-                        let delta = (start_pos - cur_pos) as f64;
-                        self.viewer
-                            .borrow_mut()
-                            .band_scroll_to(start_scroll + delta, vp);
+                        self.viewer.borrow_mut().band_drag_by(
+                            start_scroll + d_along,
+                            d_cross,
+                            vp_along,
+                            vp_cross,
+                        );
                         ctx.mark_dirty();
                         return true;
                     }
@@ -5493,7 +5526,7 @@ fn exec_action(
             // m351：带模式下 + / − 键 = 整带缩放。
             if viewer.borrow().band.is_some() {
                 let vp = BAND_VIEWPORT.with(|c| c.get());
-                viewer.borrow_mut().band_zoom_by(1.25, vp);
+                viewer.borrow_mut().band_zoom_by(1.25, vp, vp, None);
                 if let Some(ctx) = ctx {
                     ctx.mark_dirty();
                 }
@@ -5509,7 +5542,7 @@ fn exec_action(
             // m351：带模式下 + / − 键 = 整带缩放。
             if viewer.borrow().band.is_some() {
                 let vp = BAND_VIEWPORT.with(|c| c.get());
-                viewer.borrow_mut().band_zoom_by(1.0 / 1.25, vp);
+                viewer.borrow_mut().band_zoom_by(1.0 / 1.25, vp, vp, None);
                 if let Some(ctx) = ctx {
                     ctx.mark_dirty();
                 }

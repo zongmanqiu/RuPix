@@ -22,6 +22,11 @@ pub enum Axis {
 /// 相邻两项之间沿滚动轴的间隔（逻辑像素）。给一条细缝便于分辨页界，不做成可配置。
 pub const GAP_PX: f64 = 2.0;
 
+/// 带的横截面是否放得进视口（放得下 ⇒ 无交叉轴平移，`cross_off` 恒 0）。
+fn band_fits(cross: f64, viewport_cross: f64) -> bool {
+    cross <= viewport_cross + 0.5
+}
+
 /// 页带里的一项。
 #[derive(Debug, Clone)]
 pub struct BandItem {
@@ -64,6 +69,9 @@ pub struct Band {
     pub items: Vec<BandItem>,
     /// 视口起点在带上的位置（`0` = 带首）。
     pub scroll: f64,
+    /// 交叉轴偏移（m351 二轮）：放大后带比视口宽/高，这个值决定看带的哪一段
+    /// （0 = 贴左/贴顶）。`zoom <= 1` 时恒为 0——整条带完全可见，无从平移。
+    pub cross_off: f64,
     /// 当前项（视口内首入项的下标）。
     pub cur: usize,
 }
@@ -82,6 +90,7 @@ impl Band {
             zoom: 1.0,
             items: Vec::new(),
             scroll: 0.0,
+            cross_off: 0.0,
             cur: 0,
         };
         for (path, page, natural) in specs {
@@ -164,6 +173,37 @@ impl Band {
         }
     }
 
+    /// 当前项判据（m351 二轮用户口径）：**最靠近视口中心的项**。滚动/缩放后
+    /// 计数跟中心走，而不是跟视口首缘走——首缘判据在放大后一项占几屏时
+    /// 计数会长期冻结在顶上那一张。
+    pub fn item_at_center(&self, scroll: f64, viewport: f64) -> usize {
+        if self.items.is_empty() {
+            return 0;
+        }
+        let cross = self.cross();
+        let center = scroll + viewport / 2.0;
+        // 找中心点命中的项；中心落在 gap 上时取前一项（阅读语义：刚翻过去的页）。
+        match self
+            .items
+            .partition_point(|it| it.offset + it.extent(self.axis, cross) <= center)
+        {
+            0 => 0,
+            i if i >= self.items.len() => self.items.len() - 1,
+            i => i,
+        }
+    }
+
+    /// 交叉轴偏移钳位：`zoom <= 1` 时带完全可见，恒 0；放大后上限 =
+    /// `cross − viewport_cross`。
+    pub fn clamp_cross(&mut self, viewport_cross: f64) {
+        let cross = self.cross();
+        if band_fits(cross, viewport_cross) {
+            self.cross_off = 0.0;
+        } else {
+            self.cross_off = self.cross_off.clamp(0.0, cross - viewport_cross);
+        }
+    }
+
     /// 第 `idx` 项的带首位置（越界时钳到边界）。
     pub fn offset_of(&self, idx: usize) -> f64 {
         match self.items.get(idx) {
@@ -178,7 +218,10 @@ impl Band {
         self.scroll = self.scroll.clamp(0.0, max);
     }
 
-    /// 当前项步进：视口跳到相邻项的带首（`←→` / `↑↓` 的连续模式语义）。
+    /// 当前项步进：视口跳到相邻项（`←→` / `↑↓` 的连续模式语义）。
+    /// m351 二轮：滚动位置对准目标项**中心**——中心判据（`item_at_center`）在
+    /// 落定后稳定返回目标项，计数与画面严格同步；对齐带首会在放大时把目标顶
+    /// 出视口中心、判据又把它拉回去（用户实测「画面不变计数却变了」的成因）。
     /// 返回是否移动。
     pub fn step_item(&mut self, delta: isize, viewport: f64) -> bool {
         let next = self.cur as isize + delta;
@@ -186,7 +229,10 @@ impl Band {
             return false;
         }
         self.cur = next as usize;
-        self.scroll = self.offset_of(self.cur);
+        let cross = self.cross();
+        let it = &self.items[self.cur];
+        let mid = it.offset + it.extent(self.axis, cross) / 2.0;
+        self.scroll = (mid - viewport / 2.0).max(0.0);
         self.clamp_scroll(viewport);
         true
     }
@@ -349,7 +395,10 @@ mod tests {
         assert_eq!(b.item_at(hs[0] + GAP_PX + 1.0), 1);
         b.step_item(1, 800.0);
         assert_eq!(b.cur, 1);
-        assert!((b.scroll - b.items[1].offset).abs() < 1e-9);
+        // 步进后 scroll 对准目标项**中心**（中心判据稳定返回该页——二轮口径）。
+        let mid = b.items[1].offset + b.items[1].extent(b.axis, b.cross()) / 2.0;
+        assert!((b.scroll - (mid - 400.0)).abs() < 1e-3, "scroll 对准项中心");
+        b.clamp_scroll(800.0);
     }
 
     #[test]

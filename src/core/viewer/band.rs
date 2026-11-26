@@ -173,23 +173,40 @@ impl Viewer {
         };
         band.scroll += delta_px;
         band.clamp_scroll(viewport_along);
-        band.cur = band.item_at(band.scroll);
+        band.cur = band.item_at_center(band.scroll, viewport_along);
     }
 
-    /// 拖带：滚动位置**绝对设定**（拖动的跟手模型 = 起点 scroll − 指针位移），
-    /// 钳位后重算当前项。
-    pub(crate) fn band_scroll_to(&mut self, scroll_abs: f64, viewport_along: f64) {
+    /// 拖带跟手（m351 二轮双轴）：`along_abs` = 起点 scroll − 指针沿轴位移；
+    /// `d_cross` = 指针**交叉轴**位移（纵向带用 dx、横向带用 dy——放大后带
+    /// 比视口宽/高，两个方向都要能拖）。双轴钳位后按中心判据重算当前项。
+    pub(crate) fn band_drag_by(
+        &mut self,
+        along_abs: f64,
+        d_cross: f64,
+        viewport_along: f64,
+        viewport_cross: f64,
+    ) {
         let Some(band) = self.band.as_mut() else {
             return;
         };
-        band.scroll = scroll_abs;
+        band.scroll = along_abs;
+        band.cross_off += d_cross;
         band.clamp_scroll(viewport_along);
-        band.cur = band.item_at(band.scroll);
+        band.clamp_cross(viewport_cross);
+        band.cur = band.item_at_center(band.scroll, viewport_along);
     }
 
-    /// 整带缩放：`zoom ×= factor`，重排后按视口中心锚定——缩放前视口中心
-    /// 落在哪一项的哪个位置，缩放后仍近似落在同一处（长带按比例近似）。
-    pub(crate) fn band_zoom_by(&mut self, factor: f32, viewport_along: f64) {
+    /// 整带缩放：`zoom ×= factor`，双轴锚定——沿轴按**视口中心**（长带比例
+    /// 近似），交叉轴按**指针位置**（m351 二轮：修「缩放后靠边、无法拖动位置」
+    /// ——放大后带比视口宽/高，指针下的内容保持不动，`cross_off` 让两侧都可达）。
+    /// `pointer_cross` = 指针在视口横截面上的坐标；None = 按视口中心。
+    pub(crate) fn band_zoom_by(
+        &mut self,
+        factor: f32,
+        viewport_along: f64,
+        viewport_cross: f64,
+        pointer_cross: Option<f64>,
+    ) {
         let Some(band) = self.band.as_mut() else {
             return;
         };
@@ -199,11 +216,17 @@ impl Viewer {
             return;
         }
         let scale = band.zoom / old_zoom;
+        // 沿轴：中心锚定。
         let center = band.scroll + viewport_along / 2.0;
         band.relayout_from(0);
         band.scroll = (center * scale as f64 - viewport_along / 2.0).max(0.0);
         band.clamp_scroll(viewport_along);
-        band.cur = band.item_at(band.scroll);
+        // 交叉轴：指针锚定（zoom 回 1 以下时 clamp_cross 归零——带完全可见）。
+        let px = pointer_cross.unwrap_or(viewport_cross / 2.0);
+        let cross_content = band.cross_off + px;
+        band.cross_off = cross_content * scale as f64 - px;
+        band.clamp_cross(viewport_cross);
+        band.cur = band.item_at_center(band.scroll, viewport_along);
     }
 
     /// 当前项步进（`←→` / `↑↓` 的连续模式语义）：视口跳到相邻项带首。
@@ -215,19 +238,44 @@ impl Viewer {
         band.step_item(delta, viewport_along)
     }
 
-    /// 当前项（`band.cur`）变化后的对齐：把单页管线切到新当前项（复用现有
-    /// navigate），不复位带——滚动位置就是用户拖到的位置。由 canvas 在滚动
-    /// 分派里调用：`cur` 与 loaded 对不上才动。
+    /// 当前项（`band.cur`）变化后的对齐：**先把清单下标推到 `band.cur`**（m351
+    /// 二轮修：原先只看 loaded 路径，`navigate()` 永远拿旧下标——计数冻结、
+    /// 每帧重发同一张的解码），再把单页管线切过去。同时检测序列变更：
+    /// 排序 / 目录增删后带还是旧序列 ⇒ 自动退出连续模式（用户重开即新序列）。
     pub(crate) fn band_sync_current(&mut self) {
-        let cur_path = {
+        let (cur, cur_path, stale) = {
             let Some(band) = self.band.as_ref() else {
                 return;
             };
-            match band.items.get(band.cur) {
+            let cur_path = match band.items.get(band.cur) {
                 Some(it) => it.path.clone(),
                 None => return,
-            }
+            };
+            let stale = match self.gallery.as_ref() {
+                Some(g) => {
+                    g.len() != band.items.len()
+                        || band
+                            .items
+                            .first()
+                            .zip(g.peek(0))
+                            .map(|(it, p0)| !crate::core::reading::same_path(&it.path, p0))
+                            .unwrap_or(true)
+                }
+                None => false,
+            };
+            (band.cur, cur_path, stale)
         };
+        if stale {
+            // 排序变了 / 目录内容变了：带序列已过期，自动关（第一版不支持热刷新）。
+            self.leave_band();
+            return;
+        }
+        // 清单下标先对齐（band.cur 是唯一真相），否则 navigate 用的还是旧下标。
+        if let Some(g) = self.gallery.as_mut() {
+            if g.position().saturating_sub(1) != cur {
+                g.jump_to(cur);
+            }
+        }
         let moved = match self.loaded.as_ref() {
             Some(l) => !crate::core::reading::same_path(&l.path, &cur_path),
             None => true,
