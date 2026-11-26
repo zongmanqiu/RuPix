@@ -1010,8 +1010,10 @@ impl ImageCanvas {
         }
         canvas.restore();
         // ④ 常驻进度指示（m351 用户反馈）：连续阅读时浮条靠悬停唤醒看不见进度，
-        //    在带底部内侧画一条 2px 进度条（位置比例 = scroll/total）+ 右下角
-        //    「cur+1/total」。数据源与浮条状态格同源（band.cur / items.len）。
+        //    在带底部内侧画一条 2px 进度条（位置比例 = scroll/total）。
+        //    ★ 三轮订正：**不画计数文本**——右下角的「cur/total」与浮条状态格
+        //    重复出现两份计数（用户实测"右下角也有计数"）。计数只在浮条里，
+        //    进度条只管"读到哪了"。
         {
             let v = self.viewer.borrow();
             // 同步块可能已把模式关掉（序列变更）——进度块跟着跳过。
@@ -1043,16 +1045,6 @@ impl ImageCanvas {
                     &Paint::fill(tk::to_color(tk::TEXT_ACCENT)),
                 );
             }
-            let label = format!("{}/{}", band.cur + 1, band.items.len());
-            let ts = TextStyle::new(super::tokens::SIZE_BODY);
-            let slot = Rect::new(work.x + work.w - 120, work.y + work.h - 28, 112, 24);
-            canvas.draw_text(
-                &label,
-                slot,
-                tk::to_color(tk::TEXT_SECONDARY),
-                Align::Center,
-                &ts,
-            );
         }
         // ③ 窗口外纹理随帧裁剪（与 BandCache::evict_outside 同节奏）。
         self.band_tex.borrow_mut().retain(|k, _| wanted.contains(k));
@@ -7666,6 +7658,55 @@ fn system_body(h: &Handles) -> Element {
             ),
             "Ctrl+滚轮不该缩放"
         );
+    }
+
+    /// m351 拖带链路单测：真 Down → Move 走生产入口 `on_pointer`，验证
+    /// press_left 记起点、Move 改 scroll。真机报"无法拖动"时这条单测
+    /// 就是分诊器：红了 = 链路代码问题；绿了 = 真机特有状态（浮条/锁等）。
+    #[test]
+    fn band_drag_press_then_move_changes_scroll() {
+        use windui::event::{MouseButton, PointerEvent, PointerKind};
+        use windui::geometry::Point;
+        let dir = crate::core::paths::test_scratch_root()
+            .join(format!("sv-test-band-drag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|n| {
+                let p = dir.join(format!("{n}.svg"));
+                std::fs::File::create(&p).unwrap();
+                p
+            })
+            .collect();
+
+        let (mut canvas, viewer) = zoomed_canvas();
+        viewer.borrow_mut().open(&paths[0]);
+        viewer
+            .borrow_mut()
+            .enter_band(crate::core::reading::continuous::Axis::Vertical, 400.0);
+        assert!(
+            viewer.borrow().band.is_some(),
+            "enter_band 应建带（gallery 已开）"
+        );
+
+        // 按下画布中部：应记拖带起点。
+        let ev = PointerEvent::single(PointerKind::Down, Point::new(200, 300), MouseButton::Left);
+        windui::testing::run_with_ctx(|ctx| {
+            canvas.on_pointer(ctx, &ev);
+        });
+        assert!(
+            canvas.band_drag.get().is_some(),
+            "按下应记拖带起点——没记说明 press_left 没进 band 分支（chrome_hit / title 误拦？）"
+        );
+
+        // 向上拖 120px：scroll 应从 0 变为正值（clamp 后）。
+        let ev2 = PointerEvent::single(PointerKind::Move, Point::new(200, 180), MouseButton::Left);
+        windui::testing::run_with_ctx(|ctx| {
+            canvas.on_pointer(ctx, &ev2);
+        });
+        let after = viewer.borrow().band.as_ref().unwrap().scroll;
+        assert!(after > 0.0, "拖带应改 scroll（实测 {after}）");
     }
 
     /// 指针拖出窗口再松手：所有按下/拖动位必须一起收掉，不能带回窗口继续拖。
