@@ -14,7 +14,9 @@ use std::path::PathBuf;
 
 use super::Viewer;
 use crate::core::decode::{Done, ReqKind};
-use crate::core::reading::continuous::{Axis, Band, BandCache, BAND_CACHE_BYTES};
+use crate::core::reading::continuous::{
+    Axis, Band, BandCache, BAND_CACHE_BYTES, BAND_KEEP_VISIBLE,
+};
 
 /// 可见窗口前后各多取几项（跨屏缓冲，滚动时不至于露白）。
 pub(crate) const BAND_CONTEXT: usize = 2;
@@ -74,6 +76,9 @@ impl Viewer {
     /// 视口横截面变化（窗口 resize）：重设归一基准并整带重排。
     /// 锚定当前项：`scroll` 对准 `band.cur` 的带首（resize 是显式几何操作，
     /// 不做"像素位置保持"——按项锚定符合直觉且实现简单）。
+    ///
+    /// ★ m351 六轮：视口宽变了 ⇒ 交叉轴的钳位范围也变了（越界余量按视口宽算），
+    ///   旧 `cross_off` 会停在越界的位置上（带歪在一边）。这里重夹一次。
     pub(crate) fn band_resize(&mut self, cross_px: f64) {
         let Some(band) = self.band.as_mut() else {
             return;
@@ -84,6 +89,7 @@ impl Viewer {
         band.base = cross_px.max(64.0);
         band.relayout_from(0);
         band.scroll = band.offset_of(band.cur);
+        band.clamp_cross(cross_px.max(64.0), BAND_KEEP_VISIBLE);
     }
 
     /// 页带窗口刷新：可见项 ± [`BAND_CONTEXT`] 里没有驻留的，按显示尺寸发
@@ -182,6 +188,10 @@ impl Viewer {
     /// 拖带跟手（m351 二轮双轴）：`along_abs` = 起点 scroll − 指针沿轴位移；
     /// `d_cross` = 指针**交叉轴**位移（纵向带用 dx、横向带用 dy——放大后带
     /// 比视口宽/高，两个方向都要能拖）。双轴钳位后按中心判据重算当前项。
+    ///
+    /// ★ m351 六轮：交叉轴的钳位范围改了（见 [`Band::clamp_cross`]）——旧口径
+    ///   在 zoom=1 时把 `cross_off` 钉死 0，横向拖动整个是死手势（用户实报
+    ///   「纵向模式左右拖不动」）。现在横向拖动照样把带挪走。
     pub(crate) fn band_drag_by(
         &mut self,
         along_abs: f64,
@@ -196,7 +206,7 @@ impl Viewer {
         // 内容跟手：指针拖右（d_cross > 0）⇒ 内容右移 ⇒ 带相对视口左移量减小。
         band.cross_off -= d_cross;
         band.clamp_scroll(viewport_along);
-        band.clamp_cross(viewport_cross);
+        band.clamp_cross(viewport_cross, BAND_KEEP_VISIBLE);
         band.cur = band.item_at_center(band.scroll, viewport_along);
     }
 
@@ -225,11 +235,11 @@ impl Viewer {
         band.relayout_from(0);
         band.scroll = (center * scale as f64 - viewport_along / 2.0).max(0.0);
         band.clamp_scroll(viewport_along);
-        // 交叉轴：指针锚定（zoom 回 1 以下时 clamp_cross 归零——带完全可见）。
+        // 交叉轴：指针锚定（zoom 回 1 以下时带完全可见，偏移自然归到 0 附近）。
         let px = pointer_cross.unwrap_or(viewport_cross / 2.0);
         let cross_content = band.cross_off + px;
         band.cross_off = cross_content * scale as f64 - px;
-        band.clamp_cross(viewport_cross);
+        band.clamp_cross(viewport_cross, BAND_KEEP_VISIBLE);
         band.cur = band.item_at_center(band.scroll, viewport_along);
     }
 

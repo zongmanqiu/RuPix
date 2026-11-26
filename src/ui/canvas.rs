@@ -4330,6 +4330,15 @@ impl ImageCanvas {
             super::hand_cursor::apply(None);
             return;
         }
+        // ★ m351 六轮：连续阅读（带）开着时，画布区**恒可拖带**——`press_left`
+        //   的 band 分支无条件接管左键拖动，与单页那张此刻有没有平移余量无关。
+        //   光标必须与之一致：旧口径拿单页的 [`left_drag`] 判（单页没余量 ⇒
+        //   判成「拖窗口」），于是画布上是**箭头**，看着就像"这地方拖不动"
+        //   （用户实报「鼠标无法拖动图片」）。标题栏那一条仍是拖窗口。
+        if self.viewer.borrow().band.is_some() && !Chrome::in_title_strip(pos, self.work_tuple()) {
+            super::hand_cursor::apply(Some(false));
+            return;
+        }
         let in_title = Chrome::in_title_strip(pos, self.work_tuple());
         let (borderless, can_pan, overflows) = {
             let v = self.viewer.borrow();
@@ -4557,15 +4566,18 @@ impl ImageCanvas {
                     }
                     let factor = 1.1f32.powf(delta as f32 / 120.0);
                     let (vp_cross, ptr_cross) = {
-                        let wt = self.work_tuple();
-                        // ★ 四轮订正：交叉轴视口长——纵向=宽(wt.2)、横向=高(wt.3)；
+                        // ★ 六轮订正：视口取**主图那块**（`view_work` = `primary_work`），
+                        //   与带实际绘制的那块同源；主辅视图开着时整块 `last_work` 宽一倍，
+                        //   缩放锚定的交叉轴范围会全错。
+                        let vr = self.view_work();
+                        // ★ 四轮订正：交叉轴视口长——纵向=宽、横向=高；
                         //   上一版传反（纵向拿了 work.h），缩放锚定的交叉轴范围全错。
                         match band_axis {
                             crate::core::reading::continuous::Axis::Vertical => {
-                                (wt.2 as f64, pos.0 as f64 - wt.0 as f64)
+                                (vr.w as f64, pos.0 as f64 - vr.x as f64)
                             }
                             crate::core::reading::continuous::Axis::Horizontal => {
-                                (wt.3 as f64, pos.1 as f64 - wt.1 as f64)
+                                (vr.h as f64, pos.1 as f64 - vr.y as f64)
                             }
                         }
                     };
@@ -4767,8 +4779,11 @@ impl ImageCanvas {
                             // 它有值 ⇒ band 必在；paint 与事件互斥，中途清不掉。
                             let band = v.band.as_ref().unwrap();
                             // 视口几何：on_pointer 没有 work 矩形，用 paint 回写的
-                            // `last_work` 正本（`work_tuple`，与绘制同源）。
-                            let wt = self.work_tuple();
+                            // 正本（与绘制同源）——★ m351 六轮订正：取**主图那块**
+                            // （`view_work` = `primary_work`），不是整块 `last_work`：
+                            // 主辅视图开着时两者差一半，用整块算 ⇒ 交叉轴的钳位
+                            // 范围按整窗宽算 ⇒ 纵向带永远判成"放得下" ⇒ 左右拖不动。
+                            let vr = self.view_work();
                             // ★ 五轮订正：两个位移都用**同轴分量**——
                             //   纵向：d_along = 起点 y − 当前 y、d_cross = 当前 x − 起点 x；
                             //   横向：d_along = 起点 x − 当前 x、d_cross = 当前 y − 起点 y。
@@ -4778,14 +4793,14 @@ impl ImageCanvas {
                                 crate::core::reading::continuous::Axis::Vertical => (
                                     (start_y - pos.1) as f64,
                                     (pos.0 - start_x) as f64,
-                                    wt.3 as f64,
-                                    wt.2 as f64,
+                                    vr.h as f64,
+                                    vr.w as f64,
                                 ),
                                 crate::core::reading::continuous::Axis::Horizontal => (
                                     (start_x - pos.0) as f64,
                                     (pos.1 - start_y) as f64,
-                                    wt.2 as f64,
-                                    wt.3 as f64,
+                                    vr.w as f64,
+                                    vr.h as f64,
                                 ),
                             }
                         };
@@ -7717,11 +7732,21 @@ fn system_body(h: &Handles) -> Element {
         assert!(after > 0.0, "拖带应改 scroll（实测 {after}）");
     }
 
-    /// m351 四轮：交叉轴拖带——zoom=1 满宽无余量（cross_off 恒 0 是设计），
-    /// 放大后左右拖才有效。这条专门钉住「纵向左右拖不动」那个字段传反的坑
-    /// （vp_along/vp_cross 传错 work_tuple 的 w/h）。
+    /// m351 六轮：交叉轴拖带——**横向拖动不再是死手势**。
+    ///
+    /// ★ 这条用例改写了四轮那条「zoom=1 满宽无余量（设计）」的旧断言：
+    ///   旧口径把 `cross_off` 在 zoom=1 时钉死 0 ⇒ 纵向模式下左右拖动整个
+    ///   没有反应（用户实报「纵向模式左右拖不动」）。现在横向拖动照样把带
+    ///   挪走（与单页模式同款越界余量：图边可以越过窗口边，始终留一枚衣角）。
+    ///
+    /// 断言钉**精确位移**（拖左 80 ⇒ cross_off 相对拖前恰 +80）——只查符号
+    /// 会漏掉「x − 按下时的 y」那类混合值 bug（五轮教训）。
     #[test]
-    fn band_cross_drag_pans_only_when_zoomed() {
+    /// m351 三轮（七轮口径）：交叉轴拖带——zoom=1 满宽无内容可看，恒 0；
+    /// 放大后左拖 80px ⇒ cross_off 相对拖前恰 +80（内容跟手的精确断言）。
+    /// ★ 精确断言是为了钉住「x − 按下时的 y」那类混合值 bug（五轮教训）。
+    #[test]
+    fn band_cross_drag_moves_the_band_even_at_fit_zoom() {
         use windui::event::{MouseButton, PointerEvent, PointerKind};
         use windui::geometry::Point;
         let dir = crate::core::paths::test_scratch_root()
@@ -7758,26 +7783,27 @@ fn system_body(h: &Handles) -> Element {
             });
         };
 
-        // ① zoom = 1：整带恰满宽，左右拖无余量（cross_off 必须为 0）。
+        // ① zoom = 1：整带恰满视口宽——横向没有内容可看，cross_off 恒 0
+        //    （七轮口径：六轮的越界余量让「一动就大幅平移、只剩衣角」，实测像失控；
+        //    左右平移是放大后的操作）。
         press_at(&mut canvas, 200, 300);
         move_to(&mut canvas, 120, 300);
         let cross1 = viewer.borrow().band.as_ref().unwrap().cross_off;
         assert!(
             cross1.abs() < 1e-6,
-            "zoom=1 满宽不该有余量（实际 {cross1}）"
+            "zoom=1 满宽无内容可看，横向拖动恒 0（实际 {cross1}）"
         );
 
-        // ② 放大 2×（中心锚定会把 cross_off 预置到视口中心比例），随后**左拖
-        //    80px ⇒ cross_off 相对拖前恰好 +80**（内容跟手的精确语义；五轮订正：
-        //    只查符号 >0 会漏掉「x − 按下时的 y」那类混合值 bug，必须断言位移）。
+        // ② 裸滚轮放大 2×（中心锚定预置 cross_off）→ 左拖 80px ⇒ cross_off
+        //    相对拖前恰 +80（内容跟手的精确断言）。
         viewer.borrow_mut().band_zoom_by(2.0, 600.0, 800.0, None);
         let cross_before = viewer.borrow().band.as_ref().unwrap().cross_off;
         press_at(&mut canvas, 200, 300);
         move_to(&mut canvas, 120, 300);
-        let cross2 = viewer.borrow().band.as_ref().unwrap().cross_off;
+        let cross3 = viewer.borrow().band.as_ref().unwrap().cross_off;
         assert!(
-            (cross2 - cross_before - 80.0).abs() < 1e-6,
-            "拖左 80px ⇒ cross_off 相对拖前应恰 +80（拖前 {cross_before}、拖后 {cross2}）——若不符，说明位移算错分量"
+            (cross3 - cross_before - 80.0).abs() < 1e-6,
+            "拖左 80px ⇒ cross_off 相对拖前应恰 +80（拖前 {cross_before}、拖后 {cross3}）"
         );
     }
 
