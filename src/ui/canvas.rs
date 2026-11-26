@@ -1746,6 +1746,7 @@ impl ImageCanvas {
             None => (false, false, false),
         };
         let v = self.viewer.clone();
+        let chrome = self.chrome.clone();
         let mut sub = Vec::new();
         for (label, axis, checked) in [
             (
@@ -1760,9 +1761,12 @@ impl ImageCanvas {
             ),
         ] {
             let v = v.clone();
+            let chrome = chrome.clone();
             sub.push(MenuItem::run(
                 label,
                 move |ctx| {
+                    // 进入连续看图先停放映（放映按页步进，与「一路拖动不切页」冲突）。
+                    chrome.slide_stop();
                     // 延迟基准：paint 首帧 band_resize 设真值，这里传 0。
                     v.borrow_mut().enter_band(axis, 0.0);
                     ctx.mark_dirty();
