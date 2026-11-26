@@ -26,6 +26,9 @@ impl Viewer {
         let Some(g) = self.gallery.as_ref() else {
             return;
         };
+        // 记建带时的排序代次：序列变更检测（band_sync_current）用它兜底——
+        // 排序后 len 与首项都可能侥幸不变，代次不会骗人。
+        self.band_sort_epoch = self.sort_epoch;
         // 占位纵横比：当前这张的真实比例最有代表性；没有就 1.4（比 A4 略长）。
         let est = self
             .loaded
@@ -254,7 +257,11 @@ impl Viewer {
             };
             let stale = match self.gallery.as_ref() {
                 Some(g) => {
-                    g.len() != band.items.len()
+                    // 排序代次（m275）变了 ⇒ 清单顺序全变，带必过期——比"首项
+                    // 相同"可靠（排序后第一项可能侥幸不变）。代次在 Viewer 自身
+                    // （`set_sort` 时 +1），与 Gallery 无关。
+                    self.sort_epoch != self.band_sort_epoch
+                        || g.len() != band.items.len()
                         || band
                             .items
                             .first()

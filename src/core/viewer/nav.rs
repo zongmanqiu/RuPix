@@ -31,6 +31,7 @@ impl Viewer {
             band: None,
             band_cache: crate::core::reading::continuous::BandCache::new(),
             band_inflight: std::collections::HashMap::new(),
+            band_sort_epoch: 0,
             edited: std::collections::HashMap::new(),
             error: None,
             preview_meta: None,

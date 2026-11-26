@@ -1862,39 +1862,43 @@ impl ImageCanvas {
     /// 勾选态直接读配置（唯一正本）；改完**当场**重排——`Viewer::sync_sort` 在
     /// 下一次 tick（16ms 内）对齐，重排拿当前这张当锚点，画面不闪、不重解码。
     fn sort_menu(&self) -> MenuItem {
+        // m351 用户裁定（2026-11-26）：连续看图开着时**不允许改排序**——带的序列
+        // 是建带时的快照，热刷新第一版不支持（序列变更会自动退出模式），与其让
+        // 用户在旧序列里看到对不上的计数，不如直接置灰。关闭连续看图即恢复。
+        let band_on = self.viewer.borrow().band.is_some();
         let cur = self.config.borrow().sort_spec();
         let mut sub = Vec::with_capacity(6);
         for by in SortBy::ALL {
             let cfg = self.config.clone();
             let hub = self.hub.clone();
-            sub.push(
-                MenuItem::run(
-                    by.label(),
-                    move |ctx| {
-                        persist_session(&cfg, &hub, |c| c.sort_by = by);
-                        ctx.mark_dirty();
-                    },
-                    cur.by == by,
-                )
-                // 四项都要留勾选列：只给勾着的那项 `.check` 会让整列随选项跳。
-                .check(cur.by == by),
-            );
+            let mut it = MenuItem::run(
+                by.label(),
+                move |ctx| {
+                    persist_session(&cfg, &hub, |c| c.sort_by = by);
+                    ctx.mark_dirty();
+                },
+                cur.by == by,
+            )
+            // 四项都要留勾选列：只给勾着的那项 `.check` 会让整列随选项跳。
+            .check(cur.by == by);
+            it.enabled = !band_on;
+            sub.push(it);
         }
         sub.push(MenuItem::separator());
         let cfg = self.config.clone();
         let hub = self.hub.clone();
-        sub.push(
-            MenuItem::run(
-                "倒序",
-                move |ctx| {
-                    let on = !cfg.borrow().sort_desc;
-                    persist_session(&cfg, &hub, |c| c.sort_desc = on);
-                    ctx.mark_dirty();
-                },
-                cur.desc,
-            )
-            .check(cur.desc),
-        );
+        let mut desc_it = MenuItem::run(
+            "倒序",
+            move |ctx| {
+                let on = !cfg.borrow().sort_desc;
+                persist_session(&cfg, &hub, |c| c.sort_desc = on);
+                ctx.mark_dirty();
+            },
+            cur.desc,
+        )
+        .check(cur.desc);
+        desc_it.enabled = !band_on;
+        sub.push(desc_it);
         MenuItem::submenu("排序", sub)
     }
 
@@ -4251,10 +4255,10 @@ impl ImageCanvas {
     /// 那句 `borrow_mut()` 就是 `already borrowed` panic（§七 的禁写形状）。
     fn press_left(&self, pos: (f32, f32), view: (f32, f32, f32, f32), ctrl: bool) {
         // m351 连续阅读：带开着时**画布区**左键拖带（横向拖用 x 轴，同一槽按轴解释）。
-        // ★ 标题栏与浮条按钮**不拦**：实测 2026-11-26 无条件拦导致"标题栏无法拖动、
-        //   浮条按钮点不了"——那些地的左键各有自己的主人（拖窗 / 按钮），带只在
-        //   画布上接管。
-        if !Chrome::in_title_strip(pos, view) && self.chrome_hit(pos).is_none() {
+        // ★ 标题栏**不拦**（拖窗是它的本职）；浮条按钮不需要在这里排——它们在
+        //   Down 分支更早的 chrome_hit 分支已经消费并 return，能流到这里的左键
+        //   必然 chrome_hit 为 None（二轮实测曾因在这里重复排 chrome_hit 误拦）。
+        if !Chrome::in_title_strip(pos, view) {
             if let Some(band) = self.viewer.borrow().band.as_ref() {
                 let pos_along = match band.axis {
                     crate::core::reading::continuous::Axis::Vertical => pos.1,

@@ -327,6 +327,9 @@ pub struct Viewer {
     pub(crate) band_cache: crate::core::reading::continuous::BandCache,
     /// 页带在途请求登记（seq → (路径, 帧号)）：`Done` 不带帧号，回包按 seq 认领。
     pub(crate) band_inflight: std::collections::HashMap<u64, (PathBuf, u32)>,
+    /// 建带时的排序代次（`sort_epoch` 快照）：band_sync_current 用它检测
+    /// 「排序变了但 len/首项侥幸没变」的序列过期。
+    pub(crate) band_sort_epoch: u64,
     /// 已应用的编辑覆盖（path → 覆盖），见 [`edited`] 模块；只存内存，会话级。
     edited: std::collections::HashMap<PathBuf, edited::EditedKeep>,
     pub(super) error: Option<ViewFailure>,
