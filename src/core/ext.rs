@@ -1027,13 +1027,23 @@ impl Manifest {
         })
     }
 
-    /// 连续阅读模式下这枚插件是否可用（m351 十五轮）。
+    /// 连续阅读模式下这枚插件是否可用（m351 十五轮，十六轮补对称侧与文档口径）。
     ///
-    /// `modes` 缺省（空）= 所有模式都可用；声明了 `"continuous"` 才在带模式开放。
-    /// 宿主的过滤点在右键「插件 ▸」（`Canvas::plugin_items`）：声明了
-    /// `["single"]` 的插件在带模式下置灰并标注「仅单页模式」。
+    /// `modes` 缺省（空）= **所有模式都可用**；显式声明了 `"continuous"` 才在
+    /// 带模式开放——所以「声明了 continuous」与「声明了 single」都能表达约束，
+    /// 两条路径互为镜像：带模式看 [`Manifest::usable_in_continuous`]，
+    /// 单页看 [`Manifest::usable_in_single`]。过滤点在右键「插件 ▸」
+    /// （`Canvas::plugin_items`）与插件热键（canvas 的 `run_by_hotkey` 路）。
     pub fn usable_in_continuous(&self) -> bool {
         self.modes.is_empty() || self.modes.iter().any(|m| m == "continuous")
+    }
+
+    /// 单页模式下这枚插件是否可用（m351 十六轮，B3 对称侧）。
+    ///
+    /// 声明 `["continuous"]`（只连续）的插件在单页模式置灰——与带模式的
+    /// `usable_in_continuous` 同一条纪律的两面。
+    pub fn usable_in_single(&self) -> bool {
+        self.modes.is_empty() || self.modes.iter().any(|m| m == "single")
     }
 
     /// 声明式实时参数占用的设置项 key：`preview` 的六个数值项 + 预设那个下拉。

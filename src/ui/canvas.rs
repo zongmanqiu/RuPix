@@ -346,6 +346,10 @@ fn beyond_slop(start: (f32, f32), pos: (f32, f32)) -> bool {
 // 函数，拿不到 `ImageCanvas` 的 Cell；paint_band 每帧写入，读侧容忍一帧延迟）。
 thread_local! {
     static BAND_VIEWPORT: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    // ★ m351 十六轮（审查报告 B2）：交叉轴视口长度单独一槽——band_zoom_by 的
+    //   钳位范围与锚定点都要用**交叉轴**值，原来三处调用把沿轴长一鱼两吃，
+    //   与四轮修过的「沿轴/交叉轴传反」同族（纵向带高≠宽，横向带反之）。
+    static BAND_VIEWPORT_CROSS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
 }
 
 /// 缩略图条拖动（m258）：条是**独立滚动的列表**，左键拖它 = 去看更远的图。
@@ -915,6 +919,7 @@ impl ImageCanvas {
             v.band_refresh_window(_along_px);
             self.band_viewport.set(_along_px);
             BAND_VIEWPORT.with(|c| c.set(_along_px));
+            BAND_VIEWPORT_CROSS.with(|c| c.set(cross_px));
             v.band_sync_current();
             // ★ m351 二轮订正：band_sync_current 检测到序列变更（排序 / 目录增删）
             //   会**当场退出连续看图**（leave_band 清 band）——这里必须重查，
@@ -1010,6 +1015,11 @@ impl ImageCanvas {
             }
         }
         canvas.restore();
+        // ③ 窗口外纹理随帧裁剪（与 BandCache::evict_outside 同节奏）。
+        //    ★ 十六轮（审查报告 B7）：必须放在进度块**之前**——进度块的
+        //    「模式已关」提前 return 原来会跳过这一句，退出连续看图那一帧
+        //    的带纹理就不裁了。
+        self.band_tex.borrow_mut().retain(|k, _| wanted.contains(k));
         // ④ 常驻进度指示（m351 用户反馈）：连续阅读时浮条靠悬停唤醒看不见进度，
         //    在带底部内侧画一条 2px 进度条（位置比例 = scroll/total）。
         //    ★ 三轮订正：**不画计数文本**——右下角的「cur/total」与浮条状态格
@@ -1047,8 +1057,6 @@ impl ImageCanvas {
                 );
             }
         }
-        // ③ 窗口外纹理随帧裁剪（与 BandCache::evict_outside 同节奏）。
-        self.band_tex.borrow_mut().retain(|k, _| wanted.contains(k));
     }
 
     /// 与窗口根节点的拖放回调共享 pane 几何；`new` 默认自建一份，测试不受影响。
@@ -2399,9 +2407,11 @@ impl ImageCanvas {
                 && matches!(e.manifest.kind, crate::core::ext::Kind::Editor)
         });
         let mut out = Vec::new();
-        // ★ m351 十五轮：连续阅读模式下，清单声明了 `["single"]`（缺省不声明 =
-        //   全模式可用）的插件**可见但置灰**并标注原因——与 `min_host` 置灰同款，
-        //   行为层由扩展启动编排兜底拒绝（菜单只是把话说在前面）。
+        // ★ m351 十五轮：清单 `modes` 声明的模式过滤（十六轮补单页对称侧）——
+        //   缺省不声明 = 全模式可用；声明 `["single"]` 的在带模式置灰标注
+        //   「仅单页模式」、声明 `["continuous"]` 的在单页模式置灰标注
+        //   「仅连续模式」——两条都是**可见但置灰**（与 `min_host` 置灰同款，
+        //   行为层由扩展启动编排兜底拒绝，菜单只是把话说在前面）。
         let band_on = self.viewer.borrow().band.is_some();
         for ext in list.into_iter().filter(|e| e.enabled) {
             let name = ext.display_name.clone();
@@ -2416,8 +2426,18 @@ impl ImageCanvas {
                 out.push(it);
                 continue;
             }
-            if band_on && !ext.manifest.usable_in_continuous() {
-                let mut it = MenuItem::run(format!("{name}（仅单页模式）"), |_ctx| {}, false);
+            let mode_mismatch = if band_on {
+                !ext.manifest.usable_in_continuous()
+            } else {
+                !ext.manifest.usable_in_single()
+            };
+            if mode_mismatch {
+                let tag = if band_on {
+                    "仅单页模式"
+                } else {
+                    "仅连续模式"
+                };
+                let mut it = MenuItem::run(format!("{name}（{tag}）"), |_ctx| {}, false);
                 it.enabled = false;
                 out.push(it);
                 continue;
@@ -3100,9 +3120,12 @@ fn exec_btn(_ctx: &mut EventCtx, viewer: &Rc<RefCell<Viewer>>, chrome: &Rc<Chrom
     //   「适应窗口」= 整带归一（zoom 回 1），1:1 在归一显示下与它同义。
     if matches!(b, Btn::Out | Btn::In | Btn::Fit | Btn::Actual) && viewer.borrow().band.is_some() {
         let vp = BAND_VIEWPORT.with(|c| c.get());
+        let vp_cross = BAND_VIEWPORT_CROSS.with(|c| c.get());
         match b {
-            Btn::Out => viewer.borrow_mut().band_zoom_by(1.0 / 1.25, vp, vp, None),
-            Btn::In => viewer.borrow_mut().band_zoom_by(1.25, vp, vp, None),
+            Btn::Out => viewer
+                .borrow_mut()
+                .band_zoom_by(1.0 / 1.25, vp, vp_cross, None),
+            Btn::In => viewer.borrow_mut().band_zoom_by(1.25, vp, vp_cross, None),
             Btn::Fit | Btn::Actual => {
                 let z = viewer
                     .borrow()
@@ -3111,7 +3134,9 @@ fn exec_btn(_ctx: &mut EventCtx, viewer: &Rc<RefCell<Viewer>>, chrome: &Rc<Chrom
                     .map(|x| x.zoom)
                     .unwrap_or(1.0)
                     .max(0.25);
-                viewer.borrow_mut().band_zoom_by(1.0 / z, vp, vp, None);
+                viewer
+                    .borrow_mut()
+                    .band_zoom_by(1.0 / z, vp, vp_cross, None);
             }
             _ => {}
         }
@@ -4313,7 +4338,9 @@ impl ImageCanvas {
                 //（与单图 pan 同款），不许把总位移喂给增量式（位移逐帧累积）。
                 self.band_drag
                     .set(Some((band.scroll, band.cross_off, pos.0, pos.1)));
-                log::info!(
+                // 十六轮（审查 B8）：按点坐标是排障用低价值信息，降 debug，
+                // 不进默认日志。
+                log::debug!(
                     "[band] press: 拖带起点 scroll={:.0} cross={:.0} x={:.0} y={:.0} zoom={:.2}",
                     band.scroll,
                     band.cross_off,
@@ -5304,6 +5331,10 @@ impl ImageCanvas {
                 was
             }
             PointerKind::Up if p.button == MouseButton::Middle => {
+                // ★ m351 十六轮（审查报告 B1）：中键拖带松手也必须清 band_drag——
+                //   左键 Up 那条分支有清（「松手即断」），中键这条漏了，实测松手后
+                //   画面跟着指针飘到出窗/按左键为止。
+                self.band_drag.set(None);
                 let was = self.viewer.borrow().dragging();
                 self.viewer.borrow_mut().end_drag();
                 // 松手就把手型放回去：此时 `dragging()` 已归位，`sync_hand` 会判成
@@ -5394,13 +5425,22 @@ pub fn handle_key(
             };
             // ★ m351 十五轮：模式能力闸（插件热键路）——带模式下声明了 `["single"]`
             //   的插件不从热键启动（右键菜单那条路已置灰挡住，这里是唯一的另一条）。
+            //   ★ 十六轮（B3 对称）：单页模式下声明 `["continuous"]` 的同理。
             //   插件输出卡的**自动重跑**不受此限：信息跟随滚动正是带模式的正面能力。
-            if viewer.borrow().band.is_some() {
+            {
+                let band_on = viewer.borrow().band.is_some();
                 let blocked = crate::extensions::discover_configured(&cfg.borrow())
                     .into_iter()
-                    .any(|e| e.run_key == plugin_id && !e.manifest.usable_in_continuous());
+                    .any(|e| {
+                        e.run_key == plugin_id
+                            && (if band_on {
+                                !e.manifest.usable_in_continuous()
+                            } else {
+                                !e.manifest.usable_in_single()
+                            })
+                    });
                 if blocked {
-                    log::info!("[plugin-hotkey] id={plugin_id} verdict=refused:band-mode");
+                    log::info!("[plugin-hotkey] id={plugin_id} verdict=refused:mode-mismatch");
                     return true;
                 }
             }
@@ -5635,9 +5675,11 @@ fn exec_action(
         // 以视口中心为锚点缩放：没有锚点时（按钮触发）让画面中心保持不动。
         Action::ZoomIn => {
             // m351：带模式下 + / − 键 = 整带缩放。
+            // ★ 十六轮（审查报告 B2）：交叉轴视口长单独一槽，不再拿沿轴长一鱼两吃。
             if viewer.borrow().band.is_some() {
                 let vp = BAND_VIEWPORT.with(|c| c.get());
-                viewer.borrow_mut().band_zoom_by(1.25, vp, vp, None);
+                let vp_cross = BAND_VIEWPORT_CROSS.with(|c| c.get());
+                viewer.borrow_mut().band_zoom_by(1.25, vp, vp_cross, None);
                 if let Some(ctx) = ctx {
                     ctx.mark_dirty();
                 }
@@ -5653,7 +5695,10 @@ fn exec_action(
             // m351：带模式下 + / − 键 = 整带缩放。
             if viewer.borrow().band.is_some() {
                 let vp = BAND_VIEWPORT.with(|c| c.get());
-                viewer.borrow_mut().band_zoom_by(1.0 / 1.25, vp, vp, None);
+                let vp_cross = BAND_VIEWPORT_CROSS.with(|c| c.get());
+                viewer
+                    .borrow_mut()
+                    .band_zoom_by(1.0 / 1.25, vp, vp_cross, None);
                 if let Some(ctx) = ctx {
                     ctx.mark_dirty();
                 }
