@@ -915,14 +915,21 @@ impl ImageCanvas {
             self.band_viewport.set(_along_px);
             BAND_VIEWPORT.with(|c| c.set(_along_px));
             v.band_sync_current();
-            // 红线豁免: 同上——paint_band 进入即 band 在，函数内无人清它。
-            let band = v.band.as_ref().unwrap();
+            // ★ m351 二轮订正：band_sync_current 检测到序列变更（排序 / 目录增删）
+            //   会**当场退出连续看图**（leave_band 清 band）——这里必须重查，
+            //   原来的 unwrap 假设"函数内无人清 band"被这条路径打破（实测 panic
+            //   canvas.rs:919）。模式被关掉时本帧直接不画，下一帧走单页分支。
+            let band = match v.band.as_ref() {
+                Some(b) => b,
+                None => return,
+            };
             (band.axis, band.cross(), band.scroll)
         };
         let (items, cross_off) = {
-            // 红线豁免: paint_band 生存期内 band 不会被清（leave_band 只来自菜单闭包）。
             let v = self.viewer.borrow();
-            let band = v.band.as_ref().unwrap();
+            let Some(band) = v.band.as_ref() else {
+                return;
+            };
             (band.items.clone(), band.cross_off)
         };
         let mut wanted: Vec<(std::path::PathBuf, u32)> = Vec::new();
@@ -1007,9 +1014,10 @@ impl ImageCanvas {
         //    「cur+1/total」。数据源与浮条状态格同源（band.cur / items.len）。
         {
             let v = self.viewer.borrow();
-            // 红线豁免: 进度块在 paint_band 内——进入本函数即 band 在，
-            // 函数生存期内无人清它（leave_band 只来自菜单闭包）。
-            let band = v.band.as_ref().unwrap();
+            // 同步块可能已把模式关掉（序列变更）——进度块跟着跳过。
+            let Some(band) = v.band.as_ref() else {
+                return;
+            };
             let total_px = band.total();
             let frac = if total_px > 0.0 {
                 (band.scroll / total_px).clamp(0.0, 1.0)
@@ -4253,6 +4261,12 @@ impl ImageCanvas {
                     crate::core::reading::continuous::Axis::Horizontal => pos.0,
                 };
                 self.band_drag.set(Some((band.scroll, pos_along)));
+                log::info!(
+                    "[band] press: 拖带起点 scroll={:.0} pos_along={:.0} zoom={:.2}",
+                    band.scroll,
+                    pos_along,
+                    band.zoom
+                );
                 return;
             }
         }
@@ -4516,6 +4530,7 @@ impl ImageCanvas {
                 //  原实现把 Ctrl+滚轮放行给了 Navigate 档）。四档定制在带模式不参与。
                 if self.viewer.borrow().band.is_some() {
                     let vp = self.band_viewport.get();
+                    // 红线豁免: 与上面的 is_some() 同一帧同一 borrow 链，恒成立。
                     let band_axis = self.viewer.borrow().band.as_ref().unwrap().axis;
                     if p.mods.alt {
                         let unit = vp / 3.0;

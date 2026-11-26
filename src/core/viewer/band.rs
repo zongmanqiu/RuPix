@@ -190,7 +190,8 @@ impl Viewer {
             return;
         };
         band.scroll = along_abs;
-        band.cross_off += d_cross;
+        // 内容跟手：指针拖右（d_cross > 0）⇒ 内容右移 ⇒ 带相对视口左移量减小。
+        band.cross_off -= d_cross;
         band.clamp_scroll(viewport_along);
         band.clamp_cross(viewport_cross);
         band.cur = band.item_at_center(band.scroll, viewport_along);
