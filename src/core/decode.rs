@@ -1485,10 +1485,13 @@ static THUMB_WORKERS: AtomicU32 = AtomicU32::new(1);
 
 /// 灌入两个后台 lane 的 worker 数（`runtime` 启动时按 ini 调一次）。
 ///
-/// 上限夹到 4；`< 2` 时该 lane 不起独立线程（请求与主图共线程，旧行为）。
+/// 上限夹到 16；`< 2` 时该 lane 不起独立线程（请求与主图共线程，旧行为）。
 pub fn set_lane_workers(prefetch: u32, thumb: u32) {
-    PREFETCH_WORKERS.store(prefetch.min(4), Ordering::Relaxed);
-    THUMB_WORKERS.store(thumb.min(4), Ordering::Relaxed);
+    // m351 十三轮：上限 4→16（用户裁定：并行解码是特意做的功能，不许掐死——
+    // 连续阅读 ±5 窗口 11 张图，2 条 worker 大跳时追不上）。仍是防线：
+    // ini 手改的天文数字不许变成天文数字条线程。
+    PREFETCH_WORKERS.store(prefetch.min(16), Ordering::Relaxed);
+    THUMB_WORKERS.store(thumb.min(16), Ordering::Relaxed);
 }
 
 /// 当前 lane worker 数（诊断日志与单测用）。
@@ -2435,10 +2438,10 @@ pub(crate) mod tests {
 
     /// worker 数上限：手改 ini 的天文数字不许变成天文数字条线程。
     #[test]
-    fn lane_workers_clamp_to_four() {
+    fn lane_workers_clamp_to_sixteen() {
         let saved = lane_workers();
-        set_lane_workers(9, 9);
-        assert_eq!(lane_workers(), (4, 4));
+        set_lane_workers(99, 99);
+        assert_eq!(lane_workers(), (16, 16));
         set_lane_workers(0, 0);
         assert_eq!(lane_workers(), (0, 0));
         set_lane_workers(saved.0, saved.1);

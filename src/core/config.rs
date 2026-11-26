@@ -1036,7 +1036,7 @@ impl Default for Config {
             hotkeys: crate::core::hotkey::Hotkeys::default(),
             allow_multiple: false,
             decode_timeout_s: 20,
-            decode_prefetch_workers: 2,
+            decode_prefetch_workers: 4,
             decode_thumb_workers: 1,
             ui_cards_collapsed: Vec::new(),
             info_panel: false,
@@ -1303,13 +1303,14 @@ impl Config {
                     cfg.decode_timeout_s = v.parse().unwrap_or(20).min(600);
                 }
                 // 后台解码车道（m349 T1）：≥2 起独立车道，0/1 与主图共线程（旧行为）。
-                // 上限 4 与 `core::decode::set_lane_workers` 的夹取一致——两处都是防线，
-                // ini 手改的 999 不许变成 999 条线程。
+                // m351 十三轮：默认 4、上限 16（原 2/4，用户裁定并行解码不许掐死——
+                // 连续阅读 ±5 窗口 11 张图追不上）；与 `core::decode::set_lane_workers`
+                // 的夹取一致——两处都是防线，ini 手改的 999 不许变成 999 条线程。
                 "decode_prefetch_workers" => {
-                    cfg.decode_prefetch_workers = v.parse().unwrap_or(2).min(4);
+                    cfg.decode_prefetch_workers = v.parse().unwrap_or(4).min(16);
                 }
                 "decode_thumb_workers" => {
-                    cfg.decode_thumb_workers = v.parse().unwrap_or(1).min(4);
+                    cfg.decode_thumb_workers = v.parse().unwrap_or(1).min(16);
                 }
                 // 设置页各张卡的展开集（分号分隔的卡 id）。不认识的 id 照样记着——
                 // 界面层回填时按自己的卡表匹配，匹配不上就是"没有那张卡"，
@@ -1772,10 +1773,11 @@ allow_multiple=0
 decode_timeout_s=20
 
 # 后台解码车道（m349）：预读 / 缩略图与主画面**并行**解码的线程数。
-# ≥2 = 该类请求走独立车道，与主画面并行（prefetch 默认 2；thumb 默认 1 = 仍与主图共线程）；
+# ≥2 = 该类请求走独立车道，与主画面并行（prefetch 默认 4；thumb 默认 1 = 仍与主图共线程）；
 # 0/1 = 与主图共线程（旧版行为，改动后出问题就改回这里，立即逐字节回退）。
-# 上限 4；调大只影响后台并行度，不加快单张解码。内存小的机器建议保持默认。
-decode_prefetch_workers=2
+# 上限 16（m351 十三轮 4→16：并行解码是特意做的功能，不许掐死）；调大只影响
+# 后台并行度，不加快单张解码。内存小的机器建议保持默认。
+decode_prefetch_workers=4
 decode_thumb_workers=1
 
 # 设置页各张卡的**收起**状态（卡 id 分号分隔；留空 = 全部展开）。

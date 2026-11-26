@@ -2894,24 +2894,27 @@ impl ImageCanvas {
         // 它不在 `Btn::ALL` 里（浮条上没有这一颗：MDL2 的 PUA 字形是赌局，而浮条几何由
         // `Btn::ALL` 驱动，多一颗要连动命中与窄窗排布），因此只能作为菜单项存在；
         // 行为仍走 `exec_action` 那唯一入口——键与菜单同一份代码，不存在"菜单里有、点了没反应"。
-        out.push({
-            let mut it = MenuItem::run(
-                if self.chrome.slideshow_on() {
-                    "停止放映"
-                } else {
-                    "幻灯片放映"
-                },
-                {
-                    let v = self.viewer.clone();
-                    let chrome = self.chrome.clone();
-                    let cfg = self.config.clone();
-                    let hub = self.hub.clone();
-                    move |ctx| {
-                        exec_action(
-                            Some(ctx),
-                            &v,
-                            &chrome,
-                            &cfg,
+        // ★ m351 十三轮：连续阅读模式**不生成**这一项（放映在带模式被 Action 分派拒绝，
+        //   菜单再列它就是「点了没反应」的半截实现）。
+        if self.viewer.borrow().band.is_none() {
+            out.push({
+                let mut it = MenuItem::run(
+                    if self.chrome.slideshow_on() {
+                        "停止放映"
+                    } else {
+                        "幻灯片放映"
+                    },
+                    {
+                        let v = self.viewer.clone();
+                        let chrome = self.chrome.clone();
+                        let cfg = self.config.clone();
+                        let hub = self.hub.clone();
+                        move |ctx| {
+                            exec_action(
+                                Some(ctx),
+                                &v,
+                                &chrome,
+                                &cfg,
                             &hub,
                             crate::core::hotkey::Action::Slideshow,
                         );
@@ -2920,13 +2923,14 @@ impl ImageCanvas {
                 },
                 false,
             );
-            it.shortcut = self
-                .config
-                .borrow()
-                .hotkeys
-                .display(crate::core::hotkey::Action::Slideshow);
-            it
-        });
+                it.shortcut = self
+                    .config
+                    .borrow()
+                    .hotkeys
+                    .display(crate::core::hotkey::Action::Slideshow);
+                it
+            });
+        }
 
         // ── 动图/文档播放速度 ▸（m332 建，m335 改名）──
         // 动图切帧与分页文档切页共用 `viewer::anim_wait` 这一个折算点，所以两者都
@@ -5548,7 +5552,15 @@ fn exec_action(
         // 幻灯片放映：**这里只开关，不翻页**。到点由 16 ms 轮询的 `Chrome::tick_slideshow`
         // 发那一步，走的还是键盘/滚轮同一条 `Viewer::step`——所以放映天然继承"末尾回绕"，
         // 也不需要第二条翻页实现，更不需要一个定时器线程（宪章：不引常驻线程）。
+        // ★ m351 十三轮：连续阅读模式**不开放映**（用户实报「居然还能打开，太坑」）——
+        //   带模式没有「一张」的概念，放映逐张翻页与整带滚动语义冲突；此前的
+        //   「进入带模式自动停放映」只堵了单向（先放映后进带），这里堵反向。
+        //   键与菜单都走本入口，堵这里 = 全堵；菜单项在带模式下也不再生成。
         Action::Slideshow => {
+            if viewer.borrow().band.is_some() {
+                log::info!("[slideshow] verdict=refused:band-mode");
+                return true;
+            }
             chrome.toggle_slideshow();
             // 状态一翻就要重绘：右侧那颗持续亮起的箭头是放映唯一的状态面（无文字提示）。
             if let Some(ctx) = ctx {
