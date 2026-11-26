@@ -7732,12 +7732,12 @@ fn system_body(h: &Handles) -> Element {
         assert!(after > 0.0, "拖带应改 scroll（实测 {after}）");
     }
 
-    /// m351 八轮：交叉轴拖带——六轮口径恢复（zoom=1 也能横向拖），速度问题
-    /// 用**越界段阻尼**解决：内容侧 1:1 跟手；拖出内容的部分 ×0.3（橡皮筋）。
+    /// m351 九轮：交叉轴拖带——**纯 1:1 绝对基准**（用户定稿口径：普通看图器
+    /// 手感，按住冻结 / 拖多少走多少 / 松手停原地）。八轮阻尼被否（松手再按
+    /// 会「重新校正」弹跳）。
     ///
-    /// 断言钉**精确位移**（拖左 80 ⇒ cross_off 相对拖前恰 +80；zoom=1 时
-    /// 恰 +24 = 80×0.3）——只查符号会漏掉「x − 按下时的 y」那类混合值 bug
-    /// （五轮教训）。
+    /// 断言钉**精确位移**（拖左 80 ⇒ cross_off 相对拖前恰 +80，zoom=1 也一样）
+    /// ——只查符号会漏掉「x − 按下时的 y」那类混合值 bug（五轮教训）。
     #[test]
     fn band_cross_drag_moves_the_band_even_at_fit_zoom() {
         use windui::event::{MouseButton, PointerEvent, PointerKind};
@@ -7776,15 +7776,14 @@ fn system_body(h: &Handles) -> Element {
             });
         };
 
-        // ① zoom = 1：整带恰满视口宽——交叉轴全是越界段，左拖 80px ⇒
-        //    cross_off = 80 × 0.3 = +24（橡皮筋：能拖动，但不会「一动就把
-        //    图片大半滑出屏幕」——六轮实测「速度太快」的真身）。
+        // ① zoom = 1：整带恰满视口宽——交叉轴全是越界段，但拖动照样 **1:1
+        //    跟手**（九轮定稿：满宽也能横向挪，拖 80 走 80，到钳位边界才停）。
         press_at(&mut canvas, 200, 300);
         move_to(&mut canvas, 120, 300);
         let cross1 = viewer.borrow().band.as_ref().unwrap().cross_off;
         assert!(
-            (cross1 - 24.0).abs() < 1e-6,
-            "zoom=1 左拖 80px ⇒ 越界阻尼 0.3 ⇒ cross_off 应恰 +24（实际 {cross1}）"
+            (cross1 - 80.0).abs() < 1e-6,
+            "zoom=1 左拖 80px ⇒ cross_off 应恰 +80（1:1 跟手，实际 {cross1}）"
         );
 
         // ② 裸滚轮放大 2×（中心锚定预置 cross_off）→ 左拖 80px ⇒ cross_off
@@ -7797,6 +7796,26 @@ fn system_body(h: &Handles) -> Element {
         assert!(
             (cross3 - cross_before - 80.0).abs() < 1e-6,
             "拖左 80px ⇒ cross_off 相对拖前应恰 +80（拖前 {cross_before}、拖后 {cross3}）"
+        );
+
+        // ③ 松手再按住（从当前位置续算）：按住不动 ⇒ 一动不动；往回拖 20px ⇒
+        //    恰 −20。★ 阻尼版在此翻车：松手再按会把位置重算成「本次位移 ×0.3」，
+        //    实测「每次图片都好像要重新校正到指定的水平位置」——绝对基准下
+        //    按下点基准 = 当前 cross_off，回归断言钉死这条手感。
+        let cross4 = viewer.borrow().band.as_ref().unwrap().cross_off;
+        press_at(&mut canvas, 200, 300);
+        // ④ 按住不动（只发一个原地 Move）：画面必须冻结。
+        move_to(&mut canvas, 200, 300);
+        let cross_frozen = viewer.borrow().band.as_ref().unwrap().cross_off;
+        assert!(
+            (cross_frozen - cross4).abs() < 1e-9,
+            "按住不动 ⇒ 画面冻结（拖前 {cross4}、原地 Move 后 {cross_frozen}）"
+        );
+        move_to(&mut canvas, 220, 300);
+        let cross5 = viewer.borrow().band.as_ref().unwrap().cross_off;
+        assert!(
+            (cross5 - cross4 + 20.0).abs() < 1e-6,
+            "松手再按住拖回 20px ⇒ 相对按下位置恰 −20（按下 {cross4}、拖后 {cross5}）"
         );
     }
 

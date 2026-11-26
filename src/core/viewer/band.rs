@@ -204,15 +204,13 @@ impl Viewer {
         };
         band.scroll = along_abs;
         // 内容跟手：指针拖右（d_cross > 0）⇒ 内容右移 ⇒ 带相对视口左移量减小。
-        let target = band.cross_off - d_cross;
-        // 越界段橡皮筋阻尼（m351 八轮）：内容侧（0..=inner）1:1 跟手；
-        // 拖出内容的越界部分 ×0.3——满宽时轻拖不再把图片大半滑出屏幕
-        // （六轮实测「拖动速度太快」的真身）。BAND_CROSS_DAMPING = 0.3。
-        let inner = (band.cross() - viewport_cross).max(0.0);
-        let clamped = target.clamp(0.0, inner);
-        let over = target - clamped;
-        let damped = over * crate::core::reading::continuous::BAND_CROSS_DAMPING;
-        band.cross_off = clamped + damped;
+        // ★ m351 九轮（用户定稿口径）：**纯 1:1 绝对基准拖动，不做任何阻尼**——
+        //   与普通看图器同款手感：按住时画面冻结不动、拖多少走多少、松手停在
+        //   原地、再按住从当前位置继续。八轮试过「越界段 ×0.3 橡皮筋」，被否：
+        //   阻尼把位置变成「按下以来总位移 ×0.3」的函数，松手再按住时上次的
+        //   越界位置被遗忘，一动就弹回——实测「每次图片都好像要重新校正到指定
+        //   的水平位置」。绝对基准（每帧都从按下时的 cross_off 算）天然没有这个问题。
+        band.cross_off -= d_cross;
         band.clamp_scroll(viewport_along);
         band.clamp_cross(viewport_cross, BAND_KEEP_VISIBLE);
         band.cur = band.item_at_center(band.scroll, viewport_along);
