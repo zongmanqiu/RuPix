@@ -19,7 +19,10 @@ use crate::core::reading::continuous::{
 };
 
 /// 可见窗口前后各多取几项（跨屏缓冲，滚动时不至于露白）。
-pub(crate) const BAND_CONTEXT: usize = 2;
+/// m351 十二轮：2→5（用户实测 ±2 在连续阅读里不够用——纵向带一屏 2~3 张，
+/// 快速滚动时 ±2 的提前量太小，滚过去经常还没解出来；±5 = 窗口 11 张，
+/// 按归一显示尺寸降采样 ≈ 40 MiB，远小于 256 MiB 驻留池与在飞预算）。
+pub(crate) const BAND_CONTEXT: usize = 5;
 
 impl Viewer {
     /// 进入连续阅读模式。以当前画廊序列建带，视口对准当前项；基准横截面取
@@ -316,10 +319,10 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// 窗口缓冲约定：前后各 2 项。跨屏滚动时不露白的下限。
+    /// 窗口缓冲约定：前后各 5 项（十二轮 2→5，用户实测滚动露白）。
     #[test]
     fn band_context_window_is_symmetric() {
-        assert_eq!(BAND_CONTEXT, 2);
+        assert_eq!(BAND_CONTEXT, 5);
         let w: HashMap<u64, (PathBuf, u32)> = HashMap::new();
         assert!(w.is_empty());
     }
