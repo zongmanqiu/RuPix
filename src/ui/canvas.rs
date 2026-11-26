@@ -4558,12 +4558,14 @@ impl ImageCanvas {
                     let factor = 1.1f32.powf(delta as f32 / 120.0);
                     let (vp_cross, ptr_cross) = {
                         let wt = self.work_tuple();
+                        // ★ 四轮订正：交叉轴视口长——纵向=宽(wt.2)、横向=高(wt.3)；
+                        //   上一版传反（纵向拿了 work.h），缩放锚定的交叉轴范围全错。
                         match band_axis {
                             crate::core::reading::continuous::Axis::Vertical => {
-                                (wt.3 as f64, pos.0 as f64 - wt.0 as f64)
+                                (wt.2 as f64, pos.0 as f64 - wt.0 as f64)
                             }
                             crate::core::reading::continuous::Axis::Horizontal => {
-                                (wt.2 as f64, pos.1 as f64 - wt.1 as f64)
+                                (wt.3 as f64, pos.1 as f64 - wt.1 as f64)
                             }
                         }
                     };
@@ -4767,18 +4769,23 @@ impl ImageCanvas {
                             // 视口几何：on_pointer 没有 work 矩形，用 paint 回写的
                             // `last_work` 正本（`work_tuple`，与绘制同源）。
                             let wt = self.work_tuple();
+                            // ★ 四轮订正：work_tuple = (x, y, w, h)——
+                            //   纵向：沿轴=高(wt.3)、交叉轴=宽(wt.2)；
+                            //   横向：沿轴=宽(wt.2)、交叉轴=高(wt.3)。
+                            //   上一版把两者传反（vp_along 还错用了 band.base），
+                            //   交叉轴钳位范围全错 ⇒ 实测「左右完全拖不动」。
                             match band.axis {
                                 crate::core::reading::continuous::Axis::Vertical => (
                                     (start_pos - pos.1) as f64,
                                     (pos.0 - start_pos) as f64,
-                                    band.base,
                                     wt.3 as f64,
+                                    wt.2 as f64,
                                 ),
                                 crate::core::reading::continuous::Axis::Horizontal => (
                                     (start_pos - pos.0) as f64,
                                     (pos.1 - start_pos) as f64,
-                                    band.base,
                                     wt.2 as f64,
+                                    wt.3 as f64,
                                 ),
                             }
                         };
@@ -7711,6 +7718,64 @@ fn system_body(h: &Handles) -> Element {
         });
         let after = viewer.borrow().band.as_ref().unwrap().scroll;
         assert!(after > 0.0, "拖带应改 scroll（实测 {after}）");
+    }
+
+    /// m351 四轮：交叉轴拖带——zoom=1 满宽无余量（cross_off 恒 0 是设计），
+    /// 放大后左右拖才有效。这条专门钉住「纵向左右拖不动」那个字段传反的坑
+    /// （vp_along/vp_cross 传错 work_tuple 的 w/h）。
+    #[test]
+    fn band_cross_drag_pans_only_when_zoomed() {
+        use windui::event::{MouseButton, PointerEvent, PointerKind};
+        use windui::geometry::Point;
+        let dir = crate::core::paths::test_scratch_root()
+            .join(format!("sv-test-band-cross-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|n| {
+                let p = dir.join(format!("{n}.svg"));
+                std::fs::File::create(&p).unwrap();
+                p
+            })
+            .collect();
+
+        let (mut canvas, viewer) = zoomed_canvas();
+        // 真几何：work 800×600（纵向：沿轴=高 600、交叉轴=宽 800）。
+        canvas.last_work.set(Rect::new(0, 0, 800, 600));
+        viewer.borrow_mut().open(&paths[0]);
+        viewer
+            .borrow_mut()
+            .enter_band(crate::core::reading::continuous::Axis::Vertical, 800.0);
+
+        let press_at = |c: &mut ImageCanvas, x: i32, y: i32| {
+            let ev = PointerEvent::single(PointerKind::Down, Point::new(x, y), MouseButton::Left);
+            windui::testing::run_with_ctx(|ctx| {
+                c.on_pointer(ctx, &ev);
+            });
+        };
+        let move_to = |c: &mut ImageCanvas, x: i32, y: i32| {
+            let ev = PointerEvent::single(PointerKind::Move, Point::new(x, y), MouseButton::Left);
+            windui::testing::run_with_ctx(|ctx| {
+                c.on_pointer(ctx, &ev);
+            });
+        };
+
+        // ① zoom = 1：整带恰满宽，左右拖无余量（cross_off 必须为 0）。
+        press_at(&mut canvas, 200, 300);
+        move_to(&mut canvas, 120, 300);
+        let cross1 = viewer.borrow().band.as_ref().unwrap().cross_off;
+        assert!(
+            cross1.abs() < 1e-6,
+            "zoom=1 满宽不该有余量（实际 {cross1}）"
+        );
+
+        // ② 放大 2× 后左拖：看带的右侧（cross_off 增大）。
+        viewer.borrow_mut().band_zoom_by(2.0, 600.0, 800.0, None);
+        press_at(&mut canvas, 200, 300);
+        move_to(&mut canvas, 120, 300);
+        let cross2 = viewer.borrow().band.as_ref().unwrap().cross_off;
+        assert!(cross2 > 0.0, "放大后左拖应看右侧（cross_off={cross2}）");
     }
 
     /// 指针拖出窗口再松手：所有按下/拖动位必须一起收掉，不能带回窗口继续拖。
