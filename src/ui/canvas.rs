@@ -193,7 +193,7 @@ pub struct ImageCanvas {
     band_viewport: Cell<f64>,
     /// m351 拖带状态：`Some((按下时的带内 scroll, 指针 y))`。纵向拖 = y 差；
     /// 横向拖复用同一槽（用 x 存 pos——轴语义在取用时按 band.axis 解释）。
-    band_drag: Cell<Option<(f64, f32)>>,
+    band_drag: Cell<Option<(f64, f32, f32)>>,
     /// 实时调色状态（每窗一份）：参数窗写、本画布 paint 读。
     live: LiveState,
     /// 施加调色后的主图 / 鸟瞰纹理，按 (源 gen, 六个参数) 判脏。
@@ -4256,15 +4256,15 @@ impl ImageCanvas {
         //   必然 chrome_hit 为 None（二轮实测曾因在这里重复排 chrome_hit 误拦）。
         if !Chrome::in_title_strip(pos, view) {
             if let Some(band) = self.viewer.borrow().band.as_ref() {
-                let pos_along = match band.axis {
-                    crate::core::reading::continuous::Axis::Vertical => pos.1,
-                    crate::core::reading::continuous::Axis::Horizontal => pos.0,
-                };
-                self.band_drag.set(Some((band.scroll, pos_along)));
+                // ★ 五轮订正：按下点必须存**完整二维坐标**——上一版只存沿轴分量
+                // （pos_along），Move 里算交叉轴却拿 x − start_pos(=y)，交叉轴
+                // 位移成了 x−y 的混合值 ⇒ 钳位后恒不动（实测「只能沿轴移动」）。
+                self.band_drag.set(Some((band.scroll, pos.0, pos.1)));
                 log::info!(
-                    "[band] press: 拖带起点 scroll={:.0} pos_along={:.0} zoom={:.2}",
+                    "[band] press: 拖带起点 scroll={:.0} x={:.0} y={:.0} zoom={:.2}",
                     band.scroll,
-                    pos_along,
+                    pos.0,
+                    pos.1,
                     band.zoom
                 );
                 return;
@@ -4759,7 +4759,7 @@ impl ImageCanvas {
                 // 已经开局的平移不因中途松开 Ctrl 而断，故判据里带上 `dragging()`。
                 // m351 拖带跟手（二轮双轴）：沿轴 = 起点 scroll − 沿轴位移；
                 // 交叉轴 = 指针横/纵向位移（放大后看带的两侧）。
-                if let Some((start_scroll, start_pos)) = self.band_drag.get() {
+                if let Some((start_scroll, start_x, start_y)) = self.band_drag.get() {
                     if p.kind == PointerKind::Move {
                         let (d_along, d_cross, vp_along, vp_cross) = {
                             let v = self.viewer.borrow();
@@ -4769,21 +4769,21 @@ impl ImageCanvas {
                             // 视口几何：on_pointer 没有 work 矩形，用 paint 回写的
                             // `last_work` 正本（`work_tuple`，与绘制同源）。
                             let wt = self.work_tuple();
-                            // ★ 四轮订正：work_tuple = (x, y, w, h)——
-                            //   纵向：沿轴=高(wt.3)、交叉轴=宽(wt.2)；
-                            //   横向：沿轴=宽(wt.2)、交叉轴=高(wt.3)。
-                            //   上一版把两者传反（vp_along 还错用了 band.base），
-                            //   交叉轴钳位范围全错 ⇒ 实测「左右完全拖不动」。
+                            // ★ 五轮订正：两个位移都用**同轴分量**——
+                            //   纵向：d_along = 起点 y − 当前 y、d_cross = 当前 x − 起点 x；
+                            //   横向：d_along = 起点 x − 当前 x、d_cross = 当前 y − 起点 y。
+                            //   上一版 d_cross 用了「x − 按下时的 y」（只存了沿轴分量），
+                            //   交叉轴恒被钳死 ⇒ 实测「只能沿轴移动」。
                             match band.axis {
                                 crate::core::reading::continuous::Axis::Vertical => (
-                                    (start_pos - pos.1) as f64,
-                                    (pos.0 - start_pos) as f64,
+                                    (start_y - pos.1) as f64,
+                                    (pos.0 - start_x) as f64,
                                     wt.3 as f64,
                                     wt.2 as f64,
                                 ),
                                 crate::core::reading::continuous::Axis::Horizontal => (
-                                    (start_pos - pos.0) as f64,
-                                    (pos.1 - start_pos) as f64,
+                                    (start_x - pos.0) as f64,
+                                    (pos.1 - start_y) as f64,
                                     wt.2 as f64,
                                     wt.3 as f64,
                                 ),
@@ -5150,11 +5150,8 @@ impl ImageCanvas {
                     ctx.mark_dirty();
                 }
                 if let Some(band) = self.viewer.borrow().band.as_ref() {
-                    let pos_along = match band.axis {
-                        crate::core::reading::continuous::Axis::Vertical => pos.1,
-                        crate::core::reading::continuous::Axis::Horizontal => pos.0,
-                    };
-                    self.band_drag.set(Some((band.scroll, pos_along)));
+                    // 中键拖带：与左键一致，存完整二维按下点。
+                    self.band_drag.set(Some((band.scroll, pos.0, pos.1)));
                     return true;
                 }
                 self.viewer.borrow_mut().begin_drag(pos);
@@ -7770,12 +7767,18 @@ fn system_body(h: &Handles) -> Element {
             "zoom=1 满宽不该有余量（实际 {cross1}）"
         );
 
-        // ② 放大 2× 后左拖：看带的右侧（cross_off 增大）。
+        // ② 放大 2×（中心锚定会把 cross_off 预置到视口中心比例），随后**左拖
+        //    80px ⇒ cross_off 相对拖前恰好 +80**（内容跟手的精确语义；五轮订正：
+        //    只查符号 >0 会漏掉「x − 按下时的 y」那类混合值 bug，必须断言位移）。
         viewer.borrow_mut().band_zoom_by(2.0, 600.0, 800.0, None);
+        let cross_before = viewer.borrow().band.as_ref().unwrap().cross_off;
         press_at(&mut canvas, 200, 300);
         move_to(&mut canvas, 120, 300);
         let cross2 = viewer.borrow().band.as_ref().unwrap().cross_off;
-        assert!(cross2 > 0.0, "放大后左拖应看右侧（cross_off={cross2}）");
+        assert!(
+            (cross2 - cross_before - 80.0).abs() < 1e-6,
+            "拖左 80px ⇒ cross_off 相对拖前应恰 +80（拖前 {cross_before}、拖后 {cross2}）——若不符，说明位移算错分量"
+        );
     }
 
     /// 指针拖出窗口再松手：所有按下/拖动位必须一起收掉，不能带回窗口继续拖。
