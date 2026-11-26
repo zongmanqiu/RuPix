@@ -524,7 +524,7 @@ cost=…ms bitmap=…`、`[decode-req] kind=… tier=… verdict=…`、`[close]
 | 9 | 发布 | `main\build\full.bat`（或 `6_deploy.bat`） | `rupix.exe` 落 `.build\`，解码器清单核对过；**许可全文与第三方署名清单也落 `.build\`**（`deploy.py` 的 `license_gate` 硬拦：缺文件、空壳、或全文不是 AGPL 都不给部署） |
 | 10 | 文档同步 | 核 `docs/` 与 `DOCS_MANIFEST.md` | 清单里的文件描述成立 |
 | 11 | 结构文档新鲜度 | `python build\structure_gen.py --check`（漂移则 `--write` 重生成） | exit 0；第一/三/四节数字与第五节符号索引 = `src/` 现状。**这些数字与索引不许手改**，改 `src/` 后跑 `--write` |
-| 12 | 发布包打包器 | 一律 7-Zip 命令行 `7za a -tzip -mx=9 -mtm=off -mta=off -mtc=off <包.zip> <顶层目录>`；**禁止** Python `zipfile` / `shutil.make_archive` / `.7z` 容器，找不到 `7za` 直接报错；细则见 `开发指南.md` §一「打包铁律」 | 产物是标准 ZIP/Deflate；`7za l -slt` 核对条目；主程序包为空壳（exe + 许可 + 说明，不含解码器 / 插件 / 清单 / 运行期数据） |
+| 12 | 发布包打包器 | 一律 7-Zip 命令行 `7za a -tzip -mx=9 -mtm=off -mta=off -mtc=off <包.zip> <顶层目录>`；**禁止** Python `zipfile` / `shutil.make_archive` / `.7z` 容器，找不到 `7za` 直接报错；细则见 `开发指南.md` §一「打包铁律」 | 产物是标准 ZIP/Deflate；`7za l -slt` 核对条目；单一完整包 = exe + 许可 + 说明 + 4 枚随包解码器（各带同版本许可文件夹）+ docs 清单与 MCP 指南，基线见 `build/release_pack.py` 的 `BASELINE` |
 | 13 | 发布顺序（2026-11-26 用户裁定） | HISTORY 节（源码提交前）→ `update.json` / README 链接**随源码**提交推送 → 全部文档过一遍 → 推 Gitee → **最后**上传两侧附件 | 链接地址有规律，附件上传前可预填；`update.json` 不再被更新按钮消费（无自动更新），只作版本清单文档 |
 
 > 红线：本清单只检查、不提交。本仓 2026-11-02 起是 git 仓（origin = `gitee.com/qiuzongman/RuPix`，分支 `master`）；`commit` / `push` 仍须先取得用户明确许可。`.bf/` 快照继续打——它存的是 `main/` + `.3rd/` + 解码器仓三处合集，git 只管 `main/` 这一层。

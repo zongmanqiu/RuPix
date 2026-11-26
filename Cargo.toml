@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "rupix"
 # ★ 宿主版本号的**唯一来源**：exe 的 VERSIONINFO 由 `build.rs` 从这里注入
 # （`assets/version.rc.in` 只留占位符，不许手填），`6_deploy` 的 RT_VERSION 门禁会核对
