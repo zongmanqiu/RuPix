@@ -19,11 +19,6 @@ pub enum Axis {
     Horizontal,
 }
 
-/// 交叉轴**满宽档**（zoom=1）的越界余量（逻辑像素）：满宽图左右没有内容
-/// 可看，余量只够「挪开一点看边缘」——大余量（六轮的视口−衣角 ≈ ±776px）
-/// 实测一动就跑出大半屏（用户报「移动速度太快」）。放大档不受此限。
-pub const BAND_FIT_OVERSHOW: f64 = 48.0;
-
 /// 相邻两项之间沿滚动轴的间隔（逻辑像素）。给一条细缝便于分辨页界，不做成可配置。
 pub const GAP_PX: f64 = 2.0;
 
@@ -231,12 +226,8 @@ impl Band {
             return;
         }
         let keep = keep.max(0.0).min(viewport_cross);
+        let overs = (viewport_cross - keep).max(0.0);
         let inner = (cross - viewport_cross).max(0.0);
-        let overs = if inner > 0.0 {
-            (viewport_cross - keep).max(0.0)
-        } else {
-            BAND_FIT_OVERSHOW.min(viewport_cross)
-        };
         self.cross_off = self.cross_off.clamp(-overs, inner + overs);
     }
 
@@ -504,20 +495,21 @@ mod tests {
         let mut b = Band::build(Axis::Vertical, 800.0, [(p("a"), 0, Some((800, 600)))], 1.4);
         let keep = BAND_KEEP_VISIBLE;
 
-        // ① zoom=1：带恰满视口宽——满宽档越界余量 48px，钳位 [-48, +48]
-        //    （十轮：大余量实测「移动速度太快」）。
+        // ① zoom=1：带恰满视口宽——钳位范围 [-776, +776]（十轮的 48px 档
+        //    已撤：它建立在错误归因上，「太快」的真身是增量式累加 bug，见
+        //    band_drag_by 十一轮注释）。
         b.cross_off = 5000.0;
         b.clamp_cross(800.0, keep);
         assert!(
-            (b.cross_off - BAND_FIT_OVERSHOW).abs() < 1e-9,
-            "zoom=1 钳位上限 = 满宽档越界 48（实际 {}）",
+            (b.cross_off - 776.0).abs() < 1e-9,
+            "zoom=1 钳位上限 = 越界 776（实际 {}）",
             b.cross_off
         );
         b.cross_off = -5000.0;
         b.clamp_cross(800.0, keep);
         assert!(
-            (b.cross_off + BAND_FIT_OVERSHOW).abs() < 1e-9,
-            "zoom=1 钳位下限 = −48（实际 {}）",
+            (b.cross_off + 776.0).abs() < 1e-9,
+            "zoom=1 钳位下限 = −776（实际 {}）",
             b.cross_off
         );
 

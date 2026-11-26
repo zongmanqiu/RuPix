@@ -186,16 +186,21 @@ impl Viewer {
     }
 
     /// 拖带跟手（m351 二轮双轴）：`along_abs` = 起点 scroll − 指针沿轴位移；
-    /// `d_cross` = 指针**交叉轴**位移（纵向带用 dx、横向带用 dy——放大后带
-    /// 比视口宽/高，两个方向都要能拖）。双轴钳位后按中心判据重算当前项。
+    /// `cross_abs` = **起点 cross_off − 指针交叉轴位移**（按下时把当时的
+    /// `cross_off` 存进 `band_drag`，每帧都从它算——与单图 pan 同款绝对基准）。
+    /// 双轴钳位后按中心判据重算当前项。
     ///
-    /// ★ m351 六轮：交叉轴的钳位范围改了（见 [`Band::clamp_cross`]）——旧口径
-    ///   在 zoom=1 时把 `cross_off` 钉死 0，横向拖动整个是死手势（用户实报
-    ///   「纵向模式左右拖不动」）。现在横向拖动照样把带挪走。
+    /// ★ m351 十一轮（真凶）：交叉轴必须**绝对基准**。九轮写的是
+    ///   `cross_off -= d_cross`——但 `d_cross` 是从按下点算的**总位移**，
+    ///   每帧都在当前值上再减一遍 ⇒ 位移逐帧累积（1+2+3…），实测「图片比手
+    ///   快、越拖越快」。八轮阻尼版没这 bug（它是 `cross_off = 总位移函数`
+    ///   的绝对式），九轮删阻尼把它放了回来。单测只发一帧 Move，单帧下
+    ///   增量式与绝对式恰好相等，测试全绿而真机飞快——教训：拖动链路的
+    ///   断言必须发**多帧序列**（见 canvas 同名用例 ③⑤）。
     pub(crate) fn band_drag_by(
         &mut self,
         along_abs: f64,
-        d_cross: f64,
+        cross_abs: f64,
         viewport_along: f64,
         viewport_cross: f64,
     ) {
@@ -203,14 +208,10 @@ impl Viewer {
             return;
         };
         band.scroll = along_abs;
-        // 内容跟手：指针拖右（d_cross > 0）⇒ 内容右移 ⇒ 带相对视口左移量减小。
-        // ★ m351 九轮（用户定稿口径）：**纯 1:1 绝对基准拖动，不做任何阻尼**——
-        //   与普通看图器同款手感：按住时画面冻结不动、拖多少走多少、松手停在
-        //   原地、再按住从当前位置继续。八轮试过「越界段 ×0.3 橡皮筋」，被否：
-        //   阻尼把位置变成「按下以来总位移 ×0.3」的函数，松手再按住时上次的
-        //   越界位置被遗忘，一动就弹回——实测「每次图片都好像要重新校正到指定
-        //   的水平位置」。绝对基准（每帧都从按下时的 cross_off 算）天然没有这个问题。
-        band.cross_off -= d_cross;
+        // 内容跟手：指针拖右（交叉轴位移 > 0）⇒ 内容右移 ⇒ cross_off 减小。
+        // 绝对基准 = 按下时的 cross_off − 按下以来的总位移，恒 1:1 跟手：
+        // 按住冻结、松手停原地、再按从当前位置继续（用户定稿口径）。
+        band.cross_off = cross_abs;
         band.clamp_scroll(viewport_along);
         band.clamp_cross(viewport_cross, BAND_KEEP_VISIBLE);
         band.cur = band.item_at_center(band.scroll, viewport_along);

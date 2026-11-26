@@ -191,9 +191,10 @@ pub struct ImageCanvas {
     band_tex: RefCell<HashMap<(std::path::PathBuf, u32), Image>>,
     /// m351：上次 paint_band 算出的沿轴视口长度（滚轮/拖动的滚动量基准）。
     band_viewport: Cell<f64>,
-    /// m351 拖带状态：`Some((按下时的带内 scroll, 指针 y))`。纵向拖 = y 差；
-    /// 横向拖复用同一槽（用 x 存 pos——轴语义在取用时按 band.axis 解释）。
-    band_drag: Cell<Option<(f64, f32, f32)>>,
+    /// m351 拖带状态：`Some((按下时的带内 scroll, 按下时的 cross_off, x, y))`。
+    /// 两个轴的位移都从按下点算**总位移**、回到起点状态上算绝对值（十一轮：
+    /// 增量式会把总位移每帧重复扣一遍，位移逐帧累积 ⇒ 实测「图片比手快」）。
+    band_drag: Cell<Option<(f64, f64, f32, f32)>>,
     /// 实时调色状态（每窗一份）：参数窗写、本画布 paint 读。
     live: LiveState,
     /// 施加调色后的主图 / 鸟瞰纹理，按 (源 gen, 六个参数) 判脏。
@@ -4259,10 +4260,14 @@ impl ImageCanvas {
                 // ★ 五轮订正：按下点必须存**完整二维坐标**——上一版只存沿轴分量
                 // （pos_along），Move 里算交叉轴却拿 x − start_pos(=y)，交叉轴
                 // 位移成了 x−y 的混合值 ⇒ 钳位后恒不动（实测「只能沿轴移动」）。
-                self.band_drag.set(Some((band.scroll, pos.0, pos.1)));
+                // ★ 十一轮：再存按下时的 cross_off——Move 每帧都从它算绝对值
+                //（与单图 pan 同款），不许把总位移喂给增量式（位移逐帧累积）。
+                self.band_drag
+                    .set(Some((band.scroll, band.cross_off, pos.0, pos.1)));
                 log::info!(
-                    "[band] press: 拖带起点 scroll={:.0} x={:.0} y={:.0} zoom={:.2}",
+                    "[band] press: 拖带起点 scroll={:.0} cross={:.0} x={:.0} y={:.0} zoom={:.2}",
                     band.scroll,
+                    band.cross_off,
                     pos.0,
                     pos.1,
                     band.zoom
@@ -4771,9 +4776,9 @@ impl ImageCanvas {
                 // 已经开局的平移不因中途松开 Ctrl 而断，故判据里带上 `dragging()`。
                 // m351 拖带跟手（二轮双轴）：沿轴 = 起点 scroll − 沿轴位移；
                 // 交叉轴 = 指针横/纵向位移（放大后看带的两侧）。
-                if let Some((start_scroll, start_x, start_y)) = self.band_drag.get() {
+                if let Some((start_scroll, start_cross, start_x, start_y)) = self.band_drag.get() {
                     if p.kind == PointerKind::Move {
-                        let (d_along, d_cross, vp_along, vp_cross) = {
+                        let (along_abs, cross_abs, vp_along, vp_cross) = {
                             let v = self.viewer.borrow();
                             // 红线豁免: band_drag 只在 band 模式下 set（press_left 拦截），
                             // 它有值 ⇒ band 必在；paint 与事件互斥，中途清不掉。
@@ -4789,24 +4794,27 @@ impl ImageCanvas {
                             //   横向：d_along = 起点 x − 当前 x、d_cross = 当前 y − 起点 y。
                             //   上一版 d_cross 用了「x − 按下时的 y」（只存了沿轴分量），
                             //   交叉轴恒被钳死 ⇒ 实测「只能沿轴移动」。
+                            // ★ 十一轮：两个轴都算**绝对值**（起点状态 − 总位移），
+                            //   不许把总位移再喂给增量式——`cross_off -= d_cross` 会在
+                            //   每帧重复扣总位移，位移逐帧累积 ⇒ 实测「图片比手快」。
                             match band.axis {
                                 crate::core::reading::continuous::Axis::Vertical => (
-                                    (start_y - pos.1) as f64,
-                                    (pos.0 - start_x) as f64,
+                                    start_scroll + (start_y - pos.1) as f64,
+                                    start_cross - (pos.0 - start_x) as f64,
                                     vr.h as f64,
                                     vr.w as f64,
                                 ),
                                 crate::core::reading::continuous::Axis::Horizontal => (
-                                    (start_x - pos.0) as f64,
-                                    (pos.1 - start_y) as f64,
+                                    start_scroll + (start_x - pos.0) as f64,
+                                    start_cross - (pos.1 - start_y) as f64,
                                     vr.w as f64,
                                     vr.h as f64,
                                 ),
                             }
                         };
                         self.viewer.borrow_mut().band_drag_by(
-                            start_scroll + d_along,
-                            d_cross,
+                            along_abs,
+                            cross_abs,
                             vp_along,
                             vp_cross,
                         );
@@ -5165,8 +5173,9 @@ impl ImageCanvas {
                     ctx.mark_dirty();
                 }
                 if let Some(band) = self.viewer.borrow().band.as_ref() {
-                    // 中键拖带：与左键一致，存完整二维按下点。
-                    self.band_drag.set(Some((band.scroll, pos.0, pos.1)));
+                    // 中键拖带：与左键一致，存完整二维按下点与起点 cross_off。
+                    self.band_drag
+                        .set(Some((band.scroll, band.cross_off, pos.0, pos.1)));
                     return true;
                 }
                 self.viewer.borrow_mut().begin_drag(pos);
@@ -7776,15 +7785,33 @@ fn system_body(h: &Handles) -> Element {
             });
         };
 
-        // ① zoom = 1：整带恰满视口宽——满宽档越界余量 48px（十轮）：拖动
-        //    照样 **1:1 跟手**，但拖到 ±48 就到头（原 ±776 实测一动就跑出
-        //    大半屏，「移动速度太快」）。左拖 80px ⇒ 钳位后恰 +48。
+        // ① zoom = 1：整带恰满视口宽——交叉轴全是越界段，但拖动照样 **1:1
+        //    跟手**（越界口径统一为视口−衣角；十轮的 48px 档已撤——「太快」
+        //    的真身是增量式累加 bug，见 band_drag_by 十一轮注释）。
+        //    左拖 80px ⇒ cross_off 恰 +80。
         press_at(&mut canvas, 200, 300);
         move_to(&mut canvas, 120, 300);
         let cross1 = viewer.borrow().band.as_ref().unwrap().cross_off;
         assert!(
-            (cross1 - crate::core::reading::continuous::BAND_FIT_OVERSHOW).abs() < 1e-6,
-            "zoom=1 左拖 80px ⇒ 满宽档钳到 +48（1:1 跟手、到头即停，实际 {cross1}）"
+            (cross1 - 80.0).abs() < 1e-6,
+            "zoom=1 左拖 80px ⇒ cross_off 应恰 +80（1:1 跟手，实际 {cross1}）"
+        );
+
+        // ⑤ ★ 多帧序列（十一轮真凶回归断言）：一次按住分**三帧**拖左
+        //    ⇒ 终点 cross_off = 起点 + 140（绝对基准）。增量式累加 bug 在此
+        //    翻车：它每帧都把总位移再扣一遍，位移随帧数平方级增长——实测
+        //    「图片比手快、越拖越快」。单帧下两种算法恰好相等，所以这条
+        //    断言必须发多帧。换按压位置避开 ③ 的同点双击判定，并显式归零
+        //    起点让断言只钉「终点 = 起点 − 总位移」这一条。
+        viewer.borrow_mut().band.as_mut().unwrap().cross_off = 0.0;
+        press_at(&mut canvas, 250, 300);
+        move_to(&mut canvas, 170, 300);
+        move_to(&mut canvas, 130, 300);
+        move_to(&mut canvas, 110, 300);
+        let cross6 = viewer.borrow().band.as_ref().unwrap().cross_off;
+        assert!(
+            (cross6 - 140.0).abs() < 1e-6,
+            "三帧拖左共 140px ⇒ cross_off 应恰 +140（绝对基准；增量累加会得 −300，实际 {cross6}）"
         );
 
         // ② 裸滚轮放大 2×（中心锚定预置 cross_off）→ 左拖 80px ⇒ cross_off
